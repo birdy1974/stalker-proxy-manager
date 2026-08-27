@@ -26,8 +26,17 @@ function make() {
       { key: "expire_date", label: "Expires", render: r => esc(r.expire_date || "—") },
       { key: "max_connections", label: "Max conn", width: "80px" },
       { key: "groups", label: "Group whitelist", render: r => Object.entries(r.groups || {}).filter(([k, v]) => v.length).map(([k, v]) => `<span class="badge text-bg-light me-1">${k}: ${v.length}</span>`).join("") || '<span class="text-muted small">all groups</span>' },
-      { key: "links", label: "Output URLs", render: r => `
-        <button class="btn btn-sm btn-outline-secondary" onclick="showLinks(${r.id})"><i class="bi bi-link-45deg"></i> M3U / Xtream</button>` },
+      { key: "links", label: "Output — M3U URL / Xtream login", render: r => `
+        <div class="d-flex gap-1 align-items-center">
+          <span class="muted-label mb-0" style="width:40px">M3U</span>
+          <input class="form-control form-control-sm mono" style="max-width:380px" readonly
+            value="${esc(r.m3u_url)}" onclick="event.stopPropagation();this.select()">
+          <button class="btn btn-sm btn-outline-secondary" title="copy M3U URL"
+            onclick="event.stopPropagation();navigator.clipboard.writeText('${esc(r.m3u_url)}');toast('M3U URL copied','ok')"><i class="bi bi-clipboard"></i></button>
+          <button class="btn btn-sm btn-outline-secondary" title="all output URLs (get.php, player_api, EPG)"
+            onclick="event.stopPropagation();showLinks(${r.id})"><i class="bi bi-link-45deg"></i></button>
+        </div>
+        <div class="small text-muted mono mt-1">Xtream: ${esc(r.xtream.url)} · ${esc(r.name)} / ${esc(r.password)}</div>` },
       { key: "actions", label: "", render: r => `
         <button class="btn btn-sm btn-outline-secondary" onclick="editUser(${r.id})"><i class="bi bi-pencil"></i></button>
         <button class="btn btn-sm btn-outline-danger" onclick="delUser(${r.id})"><i class="bi bi-trash"></i></button>` },
@@ -76,10 +85,24 @@ window.editUser = (id) => {
     <hr class="my-2">
     <div class="small text-muted mb-1">Group whitelist — empty type = ALL groups of that type allowed</div>
     <div class="row g-2">
-      ${["live", "vod", "series", "local"].map(k => `<div class="col-md-3"><div class="muted-label">${k}</div><div class="border rounded p-1" style="max-height:150px;overflow:auto">${grpChk(k)}</div></div>`).join("")}
+      ${["live", "vod", "series", "local"].map(k => `<div class="col-md-3">
+        <div class="d-flex justify-content-between align-items-center">
+          <span class="muted-label mb-0">${k}</span>
+          <label class="small mb-0 user-select-none"><input type="checkbox" class="sa-${k}" title="select all ${k} groups"> all</label>
+        </div>
+        <div class="border rounded p-1" style="max-height:150px;overflow:auto">${grpChk(k)}</div></div>`).join("")}
     </div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: id ? "Edit user" : "Add user", body, footer, size: "xl" });
+  /* select-all toggles per content type (kept in sync with individual boxes) */
+  for (const k of ["live", "vod", "series", "local"]) {
+    const boxes = $$( ".g-" + k, body), sa = $(".sa-" + k, body);
+    if (!sa) continue;
+    const sync = () => sa.checked = boxes.length > 0 && boxes.every(b => b.checked);
+    sa.checked = boxes.length > 0 && boxes.every(b => b.checked);
+    sa.addEventListener("change", () => boxes.forEach(b => { b.checked = sa.checked; }));
+    boxes.forEach(b => b.addEventListener("change", sync));
+  }
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
     mBtn("Save", "btn-accent", async () => {
       const groups = {};

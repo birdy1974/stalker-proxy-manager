@@ -55,7 +55,7 @@ const SETTING_DEFS = [
   ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
   ["epg_refresh_hours", "EPG refresh interval (hours)", "number", 24],
   ["logo_country", "Logo country folder (tv-logos)", "text", "netherlands"],
-  ["tmdb_api_key", "TMDB API key (Phase 3)", "text", ""],
+  ["tmdb_api_key", "TMDB API key (detail-popups enrichment)", "text", ""],
 ];
 async function loadSettings() {
   const { settings } = await api("/api/settings");

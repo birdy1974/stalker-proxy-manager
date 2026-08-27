@@ -24,6 +24,7 @@ from ..models import (
     VodGenre, VodPlaylist, VodPlaylistSource, VodSource,
 )
 from ..security import require_admin
+from ..services import item_info
 from ..services.db_logging import db_log
 
 router = APIRouter(prefix="/api/playlist", tags=["playlist"], dependencies=[Depends(require_admin)])
@@ -156,7 +157,10 @@ async def live_update(pid: int, payload: dict, db=Depends(get_db)):
         raise HTTPException(404, "not found")
     _apply_live_payload(r, payload)
     if "source_ids" in payload:
-        existing = {x.live_source_id: x for x in r.sources}
+        # explicit select: lazy r.sources would trigger sync IO -> 500 (async session)
+        existing = {x.live_source_id: x for x in (await db.execute(
+            select(LivePlaylistSource).where(
+                LivePlaylistSource.live_playlist_id == pid))).scalars().all()}
         wanted = [int(x) for x in payload["source_ids"]]
         for sid, link in existing.items():
             if sid not in wanted:
@@ -466,6 +470,73 @@ async def local_pl(db=Depends(get_db), q: str = "", group: str = "", page: int =
     groups = [g[0] for g in (await db.execute(
         select(LocalPlaylist.group_name).distinct().order_by(LocalPlaylist.group_name))).all() if g[0]]
     return {"total": total or 0, "page": page, "per_page": per_page, "items": items, "groups": groups}
+
+
+# ------------------------------------------------- detail popup enrichment
+async def _source_cmd_and_portal(db, kind: str, pid: int):
+    """Return (cmd, portal_id, is_url) for the item's PRIMARY source."""
+    if kind == "live":
+        link = (await db.execute(select(LivePlaylistSource).where(
+            LivePlaylistSource.live_playlist_id == pid)
+            .order_by(LivePlaylistSource.priority))).scalars().first()
+        src = await db.get(LiveSource, link.live_source_id) if link else None
+        return (src.cmd if src else None), (src.portal_id if src else None), True
+    if kind == "vod":
+        link = (await db.execute(select(VodPlaylistSource).where(
+            VodPlaylistSource.vod_playlist_id == pid)
+            .order_by(VodPlaylistSource.priority))).scalars().first()
+        src = await db.get(VodSource, link.vod_source_id) if link else None
+        return (src.cmd if src else None), (src.portal_id if src else None), True
+    if kind == "series":
+        # first enabled season's first episode of the playlist's source
+        pl = await db.get(SeriePlaylist, pid)
+        eps = []
+        if pl:
+            season_links = (await db.execute(
+                select(SeriePlaylistSeason).where(
+                    SeriePlaylistSeason.serie_playlist_id == pid,
+                    SeriePlaylistSeason.enabled.is_(True)))).scalars().all()
+            for sl in season_links:
+                eps = (await db.execute(select(SerieEpisode).where(
+                    SerieEpisode.serie_season_id == sl.serie_season_id)
+                    .order_by(SerieEpisode.episode_number).limit(1))).scalars().all()
+                if eps:
+                    break
+        if not eps or not eps[0].cmd:
+            return None, None, True
+        season = await db.get(SerieSeason, eps[0].serie_season_id)
+        ssrc = await db.get(SerieSource, season.serie_source_id) if season else None
+        return eps[0].cmd, (ssrc.portal_id if ssrc else None), True
+    if kind == "local":
+        r = await db.get(LocalPlaylist, pid)
+        lf = await db.get(LocalFile, r.local_file_id) if r else None
+        ls = await db.get(LocalSource, lf.local_source_id) if lf else None
+        path = item_info.local_file_path(ls.directory, lf.relative_path) if ls and lf else None
+        return path, None, False
+    return None, None, True
+
+
+@router.get("/info")
+async def playlist_item_info(kind: str = "", id: int = 0, db=Depends(get_db)):  # noqa: A002
+    """Probe + TMDB info for a playlist item (detail popup enrichment)."""
+    if kind not in ("live", "vod", "series", "local"):
+        raise HTTPException(400, "kind must be live|vod|series|local")
+    models = {"live": LivePlaylist, "vod": VodPlaylist, "series": SeriePlaylist,
+              "local": LocalPlaylist}
+    row = await db.get(models[kind], id)
+    if not row:
+        raise HTTPException(404, "item not found")
+    cmd, portal_id, is_url = await _source_cmd_and_portal(db, kind, id)
+    probe = {"error": "no usable source stream"}
+    if cmd and is_url:
+        url = await item_info.playable_url(db, cmd, portal_id, kind)
+        if url:
+            probe = await item_info.probe_target(url, is_url=True)
+    elif cmd:
+        probe = await item_info.probe_target(cmd, is_url=False)
+    tmdb = await item_info.enrich(row.custom_name, getattr(row, "year", None),
+                                  "vod" if kind == "vod" else ("series" if kind == "series" else kind))
+    return {"probe": probe, "tmdb": tmdb, "source_cmd": cmd}
 
 
 @router.put("/local/{pid}")

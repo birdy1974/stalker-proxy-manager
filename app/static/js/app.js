@@ -97,6 +97,7 @@ class DataTable {
   }
   _build() {
     this.host.innerHTML = "";
+    this._textFilters = [];
     this.toolbar = el("div", { class: "d-flex flex-wrap align-items-center gap-2 mb-2" });
     this.spinner = el("div", { class: "loading-bar mb-1", style: "display:none" });
     this.tableHost = el("div", { class: "table-host" });
@@ -105,6 +106,7 @@ class DataTable {
     this.pager = el("div", { class: "d-flex flex-wrap align-items-center gap-2 mt-2 small" });
     this.host.append(this.toolbar, this.spinner, this.tableHost, this.pager);
     if (this.opts.extraHeader) this.toolbar.append(this.opts.extraHeader);
+    this._buildHead();
   }
   params() {
     const p = new URLSearchParams({ page: this.state.page, per_page: this.state.per_page });
@@ -129,14 +131,14 @@ class DataTable {
     } catch (e) { /* toast already shown */ }
     this.spinner.style.display = "none";
   }
-  _render() {
+  _buildHead() {
     const o = this.opts;
-    this.table.innerHTML = "";
-    /* header + filter rows */
+    /* header + filter rows are built ONCE (never re-created on reload), so
+       typing into a filter never loses focus */
     const htr = el("tr"), ftr = el("tr", { class: "filters" });
     if (o.selectable) {
       const cb = el("input", { type: "checkbox", class: "form-check-input" });
-      cb.checked = this.items.length > 0 && this.items.every(r => this.selected.has(r.id));
+      this._selAll = cb;
       cb.addEventListener("change", () => {
         this.items.forEach(r => cb.checked ? this.selected.add(r.id) : this.selected.delete(r.id));
         this._renderBody(); o.onSelection?.(this.selected);
@@ -149,8 +151,8 @@ class DataTable {
       const th = el("th", { class: c.sort ? "sortable" : "", style: c.width ? `width:${c.width}` : "" });
       th.append(el("span", { html: esc(c.label) }));
       if (c.sort) {
-        const cur = this.state.sort === c.sort ? (this.state.direction === "asc" ? " ▲" : " ▼") : "";
-        th.append(el("span", { class: "text-accent", html: cur }));
+        c._ind = el("span", { class: "text-accent" });
+        th.append(c._ind);
         th.addEventListener("click", () => {
           if (this.state.sort === c.sort) this.state.direction = this.state.direction === "asc" ? "desc" : "asc";
           else { this.state.sort = c.sort; this.state.direction = "asc"; }
@@ -162,29 +164,37 @@ class DataTable {
       if (c.filter) {
         if (c.filter.type === "select") {
           const fk = c.filter.param || c.key;
-          const s = el("select", { class: "form-select form-select-sm" }, el("option", { value: "" }, c.filter.placeholder || "All"));
-          const fill = (opts) => { for (const op of opts) s.append(el("option", { value: op.v ?? op }, op.l ?? op)); if (this._pendingFilter?.[fk]) { s.value = this._pendingFilter[fk]; } };
-          if (c.filter.optionsLoader) { c.filter.optionsLoader(fill, this); if (c.filter.options) fill(c.filter.options); }
-          else fill(c.filter.options || []);
-          s.value = this.state.filters[fk] ?? "";
-          s.addEventListener("change", () => { this.state.filters[fk] = s.value; this.state.page = 1; this.reload(); });
-          fth.append(s);
+          const sel = el("select", { class: "form-select form-select-sm" }, el("option", { value: "" }, c.filter.placeholder || "All"));
+          c._sel = sel;
+          c._fill = (opts) => {
+            const cur = this.state.filters[fk] ?? "";
+            sel.innerHTML = ""; sel.append(el("option", { value: "" }, c.filter.placeholder || "All"));
+            for (const op of opts) sel.append(el("option", { value: String(op.v ?? op) }, op.l ?? op));
+            if (cur && ![...sel.options].some(x => x.value === cur)) sel.append(el("option", { value: cur }, cur));
+            sel.value = cur;
+          };
+          if (c.filter.optionsLoader) { c.filter.optionsLoader(c._fill, this); if (c.filter.options) c._fill(c.filter.options); }
+          else c._fill(c.filter.options || []);
+          sel.value = this.state.filters[fk] ?? "";
+          sel.addEventListener("change", () => { this.state.filters[fk] = sel.value; this.state.page = 1; this.reload(); });
+          fth.append(sel);
         } else {
-          /* text filters: live-update the list WHILE TYPING (debounced), case-
-             insensitive server-side; focus + caret are restored after the
-             debounced reload re-renders the table */
+          /* text filters update the visible rows INSTANTLY while typing
+             (client-side, case-insensitive), then the debounced server reload
+             confirms with the full, paginated result */
           const fk = c.filter.param || c.key;
           const inp = el("input", { class: "form-control form-control-sm", placeholder: c.filter.placeholder || "filter…" });
           inp.value = this.state.filters[fk] ?? "";
           inp.dataset.filterKey = fk;
+          inp.dataset.colIdx = o.columns.indexOf(c);
+          this._textFilters.push({ inp, fk });
           let t; inp.addEventListener("input", () => {
+            this.state.filters[fk] = inp.value;
+            this._clientFilter();
             clearTimeout(t);
-            t = setTimeout(() => {
-              this.state.filters[fk] = inp.value; this.state.page = 1;
-              this._refocus = { key: fk, caret: inp.selectionStart };
-              this.reload();
-            }, 300);
+            t = setTimeout(() => { this.state.page = 1; this.reload(); }, 250);
           });
+          inp.dataset.filterKey = fk;
           fth.append(inp);
         }
       }
@@ -192,18 +202,41 @@ class DataTable {
     }
     const thead = el("thead"); thead.append(htr, ftr); this.table.append(thead);
     this.tbody = el("tbody"); this.table.append(this.tbody);
+  }
+  /* instantaneous visual feedback for text filters: hide/show rows of the
+     CURRENT page based on all active text filter values. Server reload follows. */
+  _clientFilter() {
+    if (!this.tbody) return;
+    const offset = (this.opts.selectable ? 1 : 0) + (this.opts.dnd ? 1 : 0);
+    const active = (this._textFilters || []).filter(x => x.inp.value.trim() !== "");
+    for (const tr of this.tbody.children) {
+      let show = true;
+      for (const f of active) {
+        const cell = tr.children[offset + (+f.inp.dataset.colIdx)];
+        const txt = (cell?.textContent || "").toLowerCase();
+        if (!txt.includes(f.inp.value.trim().toLowerCase())) { show = false; break; }
+      }
+      tr.style.display = show ? "" : "none";
+    }
+  }
+  _updateSortInd() {
+    for (const c of this.opts.columns) {
+      if (c._ind) c._ind.innerHTML = this.state.sort === c.sort
+        ? (this.state.direction === "asc" ? " ▲" : " ▼") : "";
+    }
+  }
+  _render() {
+    this._updateSortInd();
+    /* select filters with dynamic loaders (e.g. group lists) refresh their
+       options from the freshly loaded data, keeping the current value */
+    for (const c of this.opts.columns)
+      if (c.filter?.type === "select" && c.filter.optionsLoader && c._fill)
+        c.filter.optionsLoader(c._fill, this);
+    if (this._selAll) this._selAll.checked =
+      this.items.length > 0 && this.items.every(r => this.selected.has(r.id));
     this._renderBody();
     this._renderPager();
-    /* live filter typing: restore focus/caret lost through the re-render */
-    if (this._refocus) {
-      const inp = ftr.querySelector(`input[data-filter-key="${this._refocus.key}"]`);
-      if (inp) {
-        inp.focus();
-        if (inp.setSelectionRange && this._refocus.caret != null)
-          inp.setSelectionRange(this._refocus.caret, this._refocus.caret);
-      }
-      this._refocus = null;
-    }
+    this._clientFilter();
   }
   _renderBody() {
     const o = this.opts; this.tbody.innerHTML = "";
@@ -264,6 +297,46 @@ class DataTable {
     p.append(el("span", { class: "ms-2 text-muted" }, `${this.total.toLocaleString()} items`), jump, per);
   }
 }
+
+/* ----------------------------------------------- detail-popup helpers
+ * Shared by Input Sources and Playlist Builder popup enrichment:
+ * - fmtDur(seconds) -> "h:mm:ss" / "m:ss"
+ * - probeHtml(probe) -> table with codec/resolution/ratio/fps/bitrate/audio
+ * - tmdbHtml(tmdb)  -> TMDB block, or a hint when no key is configured */
+const fmtDur = (sec) => {
+  if (sec == null) return "?";
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), x = Math.floor(sec % 60);
+  return h ? `${h}:${String(m).padStart(2, "0")}:${String(x).padStart(2, "0")}` : `${m}:${String(x).padStart(2, "0")}`;
+};
+const probeHtml = (pr) => {
+  if (!pr) return "";
+  if (pr.error) return `<span class="text-danger small">${esc(pr.error)}</span>`;
+  const v = pr.video, aud = (pr.audio || []).map(a =>
+    [esc(a.codec), a.rate_hz ? `${a.rate_hz / 1000} kHz` : "", esc(a.channels || ""),
+     a.kbps ? `@ ${a.kbps} kbps` : ""].filter(Boolean).join(" ")).join(" · ");
+  return `<table class="table table-sm mb-0 small">
+    ${v ? `<tr><td class="muted-label" style="width:120px">Video</td><td>${v.width}×${v.height}${v.ratio ? ` (${v.ratio})` : ""} · ${esc(v.codec)}${v.kbps ? ` @ ${v.kbps} kbps` : ""}${v.fps ? ` · ${v.fps} fps` : ""}</td></tr>` : ""}
+    ${aud ? `<tr><td class="muted-label">Audio</td><td>${aud}</td></tr>` : ""}
+    ${pr.duration_s ? `<tr><td class="muted-label">Duration</td><td>${fmtDur(pr.duration_s)}</td></tr>` : ""}
+    ${pr.overall_kbps ? `<tr><td class="muted-label">Overall</td><td>${pr.overall_kbps} kbps</td></tr>` : ""}
+  </table>`;
+};
+const tmdbHtml = (t) => !t
+  ? `<span class="text-muted small">No TMDB hit (set the TMDB API key in Settings → TMDB for enrichment).</span>`
+  : `<div class="small">
+      <div class="mb-1">${t.tagline ? `<i>${esc(t.tagline)}</i><br>` : ""}
+      ${(t.genres || []).map(g => `<span class="badge text-bg-light me-1">${esc(g)}</span>`).join("")}
+      ${t.vote_average ? `<span class="badge text-bg-warning me-1">★ ${Number(t.vote_average).toFixed(1)}</span>` : ""}
+      ${t.status ? `<span class="badge text-bg-secondary">${esc(t.status)}</span>` : ""}</div>
+      ${t.overview ? `<div class="mb-1">${esc(t.overview)}</div>` : ""}
+      <table class="table table-sm mb-0">
+        ${t.title ? `<tr><td class="muted-label" style="width:120px">TMDB</td><td>${esc(t.title)}${t.original_title && t.original_title !== t.title ? ` (${esc(t.original_title)})` : ""} ${t.tmdb_id ? `<a href="https://www.themoviedb.org/${t.type}/${t.tmdb_id}" target="_blank" rel="noopener">↗</a>` : ""}</td></tr>` : ""}
+        ${t.release_date ? `<tr><td class="muted-label">Released</td><td>${esc(t.release_date)}</td></tr>` : ""}
+        ${t.runtime_min ? `<tr><td class="muted-label">Runtime</td><td>${t.runtime_min} min</td></tr>` : ""}
+        ${t.director ? `<tr><td class="muted-label">Director</td><td>${esc(t.director)}</td></tr>` : ""}
+        ${(t.cast || []).length ? `<tr><td class="muted-label">Cast</td><td>${esc(t.cast.join(", "))}</td></tr>` : ""}
+        ${t.seasons_count ? `<tr><td class="muted-label">Seasons/Eps.</td><td>${t.seasons_count} / ${t.episodes_count ?? "?"}</td></tr>` : ""}
+      </table></div>`;
 
 /* ------------------------------------------------------------- player */
 /* HLS -> hls.js; MPEG-TS (what Stalker proxies output) -> mpegts.js (G5). */

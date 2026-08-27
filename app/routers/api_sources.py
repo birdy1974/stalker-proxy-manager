@@ -24,6 +24,7 @@ from ..models import (
     SerieEpisode, SerieGenre, SerieSeason, SerieSource, VodGenre, VodSource,
 )
 from ..security import require_admin
+from ..services import item_info
 from ..services.db_logging import db_log
 
 router = APIRouter(prefix="/api/sources", tags=["sources"], dependencies=[Depends(require_admin)])
@@ -155,6 +156,43 @@ async def series_detail(sid: int, db=Depends(get_db)):
                             "episodes_fetched": sn.episodes_fetched})
     d.update({"description": r.description, "seasons": out_seasons})
     return {"item": d}
+
+
+@router.get("/media-info")
+async def sources_media_info(kind: str = "", id: int = 0, db=Depends(get_db)):  # noqa: A002
+    """Lazy probe + TMDB for a SOURCE item (kept off the fast detail payload
+    so the popup opens instantly; GUI fetches this right after)."""
+    if kind == "vod":
+        r = await db.get(VodSource, id)
+        if not r:
+            raise HTTPException(404, "vod not found")
+        url = await item_info.playable_url(db, r.cmd or "", r.portal_id, "vod")
+        probe = await item_info.probe_target(url, is_url=True) if url else \
+            {"error": "no playable URL in cmd"}
+        return {"probe": probe, "tmdb": await item_info.enrich(r.original_name, r.year, "vod")}
+    if kind == "series":
+        r = await db.get(SerieSource, id)
+        if not r:
+            raise HTTPException(404, "series not found")
+        ep = (await db.execute(select(SerieEpisode)
+                               .join(SerieSeason, SerieEpisode.serie_season_id == SerieSeason.id)
+                               .where(SerieSeason.serie_source_id == id)
+                               .order_by(SerieSeason.season_number,
+                                         SerieEpisode.episode_number).limit(1))).scalars().first()
+        url = await item_info.playable_url(db, ep.cmd or "", r.portal_id, "series") if ep else None
+        probe = await item_info.probe_target(url, is_url=True) if url else \
+            {"error": "seasons/episodes not fetched yet (enable the series, then Fetch)"
+             if not ep else "no playable URL in cmd"}
+        return {"probe": probe, "tmdb": await item_info.enrich(r.original_name, r.year, "series")}
+    if kind == "live":
+        r = await db.get(LiveSource, id)
+        if not r:
+            raise HTTPException(404, "channel not found")
+        url = await item_info.playable_url(db, r.cmd or "", r.portal_id, "live")
+        probe = await item_info.probe_target(url, is_url=True) if url else \
+            {"error": "no playable URL in cmd"}
+        return {"probe": probe, "tmdb": None}
+    raise HTTPException(400, "kind must be live|vod|series")
 
 
 # ------------------------------------------------------------------ toggles

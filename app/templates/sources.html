@@ -102,11 +102,21 @@ async function vodDetail(row) {
         <p class="small">${esc(item.description || "No description from portal.")}</p>
         ${item.director ? `<div class="small"><b>Director:</b> ${esc(item.director)}</div>` : ""}
         ${item.actors ? `<div class="small"><b>Cast:</b> ${esc(item.actors)}</div>` : ""}
-        <div class="small text-muted mt-2">TMDB enrichment: Phase 3</div>
+        <div class="muted-label mt-2">Stream info (probe)</div>
+        <div class="probe-box"><span class="text-muted small">probing the primary source stream…</span></div>
+        <div class="muted-label mt-2">TMDB</div>
+        <div class="tmdb-box"><span class="text-muted small">looking up…</span></div>
       </div>
     </div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: "VOD details", body, footer, size: "lg" });
+  { const mediaKind = "vod"; /* after open: load probe + TMDB lazily (endpoints are slow by nature) */
+  api(`/api/sources/media-info?kind=${mediaKind}&id=${item.id}`).then(d => {
+    body.querySelector(".probe-box").innerHTML = probeHtml(d.probe);
+    body.querySelector(".tmdb-box").innerHTML = tmdbHtml(d.tmdb);
+  }).catch(() => {
+    body.querySelector(".probe-box").innerHTML = '<span class="text-danger small">probe failed</span>';
+  }); }
   footer.append(mBtn("Close", "btn-outline-secondary", m.close),
     mBtn("Play test", "btn-outline-primary", () => playInModal(`/preview/vod/${item.id}.ts`, item.name), "bi-play-btn"),
     mBtn(item.enabled ? "Disable" : "Enable in output", "btn-accent", async () => {
@@ -132,10 +142,21 @@ async function seriesDetail(row) {
             <span>${esc(s.name || "Season " + s.season_number)}</span>
             <span class="text-muted">${s.episode_count} episodes ${s.episodes_fetched ? "" : "· pending fetch"}</span>
           </label>`).join("") : '<div class="small text-muted">seasons not fetched yet (they arrive after the series item is enabled + next fetch)</div>'}
+        <div class="muted-label mt-2">Stream info (first episode probe)</div>
+        <div class="probe-box"><span class="text-muted small">probing the first playable episode…</span></div>
+        <div class="muted-label mt-2">TMDB</div>
+        <div class="tmdb-box"><span class="text-muted small">looking up…</span></div>
       </div>
     </div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: "Series details", body, footer, size: "lg" });
+  { const mediaKind = "series"; /* after open: load probe + TMDB lazily (endpoints are slow by nature) */
+  api(`/api/sources/media-info?kind=${mediaKind}&id=${item.id}`).then(d => {
+    body.querySelector(".probe-box").innerHTML = probeHtml(d.probe);
+    body.querySelector(".tmdb-box").innerHTML = tmdbHtml(d.tmdb);
+  }).catch(() => {
+    body.querySelector(".probe-box").innerHTML = '<span class="text-danger small">probe failed</span>';
+  }); }
   footer.append(mBtn("Close", "btn-outline-secondary", m.close));
 }
 

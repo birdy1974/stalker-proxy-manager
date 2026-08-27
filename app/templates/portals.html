@@ -127,7 +127,8 @@ async function editPortal(id) {
           <input class="form-control form-control-sm" style="max-width:260px" id="genre-q-${k}" placeholder="filter genres…">
           <span class="small text-muted ms-auto" id="genre-count-${k}"></span>
         </div>
-        <div class="border rounded p-2" style="max-height:260px;overflow:auto" id="genre-list-${k}"></div>
+        <!-- multi-column genre list (long genre catalogs stay compact) -->
+        <div class="border rounded p-2 genre-grid" style="max-height:260px;overflow:auto" id="genre-list-${k}"></div>
       </div>`).join("")}`;
   const footer = el("div", { class: "d-flex gap-2 w-100" });
   const m = openModal({ title: id ? `Edit portal: ${p.name}` : "Add portal", body, footer, size: "xl" });

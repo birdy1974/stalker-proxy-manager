@@ -95,6 +95,11 @@ enable_chunk live 40
 enable_chunk vod 14
 enable_chunk series 10
 
+# -- 4b. fetch pass 3: seasons/episodes need the series ENABLED at fetch time -
+curl -sf -X POST "$BASE/api/portals/$PORTAL_ID/fetch" >/dev/null
+wait_job_done || echo "seed-demo: WARN pass 3 slow"
+echo "seed-demo: fetch pass 3 done (seasons/episodes for enabled series)"
+
 # -- 5. build the output playlist --------------------------------------------
 # live: 10 custom channels, every 3rd gets a second source as fallback demo
 curl -sf "$BASE/api/sources/live?per_page=40&enabled=true" | python3 -c '
@@ -143,6 +148,8 @@ if [[ -n "$FF" ]]; then
         -t 20 -c:v libx264 -pix_fmt yuv420p -c:a aac "$MDIR/demo/demo-card.ts" >/dev/null 2>&1 || true
   "$FF" -nostdin -y -f lavfi -i "testsrc=size=1280x720:rate=25" -f lavfi -i "sine=frequency=660:sample_rate=48000" \
         -t 20 -c:v libx264 -pix_fmt yuv420p -c:a aac "$MDIR/demo/patterns-720p.ts" >/dev/null 2>&1 || true
+  "$FF" -nostdin -y -f lavfi -i "testsrc=size=1920x1080:rate=50" -f lavfi -i "sine=frequency=520:sample_rate=48000" \
+        -t 20 -c:v libx264 -pix_fmt yuv420p -c:a aac "$MDIR/demo/intro-1080p50.mp4" >/dev/null 2>&1 || true
   if [[ -s "$MDIR/demo/demo-card.ts" ]]; then
     curl -sf -X POST "$BASE/api/sources/local/dirs" -H 'Content-Type: application/json' \
       -d "{\"directory\": \"$MDIR\", \"recursive\": true}" >/dev/null && echo "seed-demo: local dir added"
@@ -161,6 +168,13 @@ print(f"seed-demo: {len(ids)} local files added to playlist")
   fi
 else
   echo "seed-demo: no ffmpeg binary found — skipping local demo files"
+fi
+
+# -- 7. demo output user (shows the M3U/Xtream URLs on the Users page) -------
+if ! curl -sf "$BASE/api/users" | grep -q '"name":"demo"'; then
+  curl -sf -X POST "$BASE/api/users" -H 'Content-Type: application/json' -d '{
+    "name": "demo", "password": "demo123", "m3u_enabled": true,
+    "xtream_enabled": true, "enabled": true, "max_connections": 2}' >/dev/null     && echo "seed-demo: demo user created (demo / demo123)"
 fi
 
 echo "seed-demo: DONE"
