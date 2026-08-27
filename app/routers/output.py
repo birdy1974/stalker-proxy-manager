@@ -16,7 +16,7 @@ Streams honour per-user max_connections and group filters.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse, StreamingResponse
+from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
 from ..config import OUTPUT_BASE_URL
 from ..database import get_db
@@ -84,7 +84,11 @@ async def player_api(request: Request, username: str = "", password: str = "",
     if action == "get_vod_streams":
         return await xtream_vod(user)
     if action == "get_vod_info":
-        return {"info": {}, "movie_data": {"stream_id": vod_id}}
+        from ..services.playlist_gen import xtream_vod_info
+        info = await xtream_vod_info(user, vod_id)
+        if info is None:
+            raise HTTPException(404, "vod not found")
+        return info
     if action == "get_series":
         return await xtream_series(user)
     if action == "get_series_categories":
@@ -97,12 +101,15 @@ async def player_api(request: Request, username: str = "", password: str = "",
     raise HTTPException(404, f"unknown action {action}")
 
 
-@router.get("/xmltv.php", response_class=PlainTextResponse)
-@router.get("/epg.xml", response_class=PlainTextResponse)
-async def xmltv(u: str = "", p: str = "", username: str = "", password: str = ""):
-    """Merged external EPG is Phase 3; serve a valid empty XMLTV for now."""
-    await _authed(u or username, p or password, "xtream")
-    return '<?xml version="1.0" encoding="UTF-8"?><tv generator-info-name="stalker-proxy-manager"></tv>'
+@router.get("/xmltv.php")
+@router.get("/epg.xml")
+async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", password: str = ""):
+    """Merged XMLTV: the user's visible live channels + programmes of all
+    enabled EPG sources (auto-matched or manually assigned tvg-ids)."""
+    from ..services import epg as epg_svc
+    user = await _authed(u or username, p or password, "xtream")
+    xml = await epg_svc.build_xmltv(base_url_of(request), user)
+    return Response(xml, media_type="application/xml")
 
 
 # ---------------------------------------------------------------- streaming

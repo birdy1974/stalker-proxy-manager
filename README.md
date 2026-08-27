@@ -2,7 +2,7 @@
 
 Turn MAC-based **Stalker/Ministra portal** accounts into clean, stable **M3U playlists and Xtream Codes API** output — with an ordered fallback chain across portals & MAC addresses per channel, optional **Intel Quick Sync hardware transcoding** (tuned for the Synology DS918+), a persistent config database, and a modern single-port web GUI.
 
-> Phase 2 deliverable: core proxy + transcoding + fallback engine, complete GUI, config persistence, outputs. Phase 3 (EPG auto-matching from rytec sources, tv-logos GitHub logo matcher, TMDB popups, final Xtream polish) lands next.
+> Phase 3 delivered: Phase-2 engine + GUI, plus real EPG ingestion/matching with merged `/xmltv.php`, tv-logos auto-matching, TMDB metadata popups, and final Xtream output polish.
 
 ---
 
@@ -140,12 +140,28 @@ SPM_ADMIN_PASSWORD=admin SPM_MOCK_PORTAL=1 \
 python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8880
 ```
 
-## Phase 3 (planned)
+## Phase 3 (done)
 
-- EPG auto-match (rytec xmltv sources) with manual override + real `/xmltv.php`
-- Logo auto-match from the tv-logos GitHub repo (tree index + `?raw=true` URLs)
-- TMDB popups for VOD/series metadata
-- Xtream output completeness (timeshift flags, series artwork variants)
+- **EPG auto-match**: add rytec/xmltv sources (plain XML, `.gz`, `.xz`) in Settings
+  → they are downloaded server-side, every `<channel>` is indexed, playlist
+  channels get fuzzy-matched automatically (empty `epg_id` only — manual
+  overrides in the channel editor are never touched), and programmes of matched
+  channels are ingested (now-6h … +7d window, pruned automatically).
+- **Merged XMLTV output**: `/xmltv.php?u=…&p=…` and `/epg.xml` now serve a real
+  XMLTV document containing exactly the channels the authenticated user can see,
+  with `<icon>`s and all ingested programmes (+48h). The M3U `url-tvg` attribute
+  already points there.
+- **tv-logos matcher**: one GitHub tree call is cached as an index of the
+  configured `logo_country` folder (+`countries/all` fallback); channel names are
+  fuzzy-matched to logo filenames and the best raw.githubusercontent URL is
+  written to the channel logo (Settings → Channel logos).
+- **TMDB popups** for VOD/series metadata (GUI detail dialogs).
+- **Xtream completeness**: real `get_vod_info` (playlist row + portal-source
+  fallback), `timeshift` on live streams, episode `movie_image`+`tmdb_id`.
+- **Mock end-to-end**: `/mock/epg.xml` ships a generated XMLTV feed for the mock
+  portal channels so the whole EPG flow is demoable without internet access.
+- **Config portability**: backup export now also carries `epg_sources`
+  (import merges them, duplicates skipped).
 
 ---
 

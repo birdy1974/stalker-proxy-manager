@@ -75,6 +75,35 @@ async def suggest(q: str = "", kind: str = "live", db=Depends(get_db)):
     return {"items": out, "query": q, "kind": kind}
 
 
+# ---------------------------------------------------------------- tv-logos (Phase 3)
+@router.post("/live/auto-logos")
+async def auto_logos_endpoint():
+    """Fuzzy-match every live playlist channel against the tv-logo/tv-logos
+    repo index and write matched logo URLs (admin-triggered, single pass)."""
+    from ..services import logos as logos_svc
+    try:
+        return await logos_svc.auto_logos()
+    except Exception as exc:  # noqa: BLE001 - report to GUI instead of 500
+        return {"ok": False, "error": str(exc)}
+
+
+@router.post("/logos/refresh-index")
+async def refresh_logo_index():
+    from ..services import logos as logos_svc
+    try:
+        return await logos_svc.refresh_index()
+    except Exception as exc:  # noqa: BLE001 - report to GUI instead of 500
+        return {"ok": False, "error": str(exc)}
+
+
+@router.get("/logos/suggest")
+async def logo_suggest(name: str = ""):
+    """Single-logo suggestion for the custom-channel editor."""
+    from ..services import logos as logos_svc
+    url = await logos_svc.suggest_logo(name)
+    return {"name": name, "logo": url}
+
+
 # ----------------------------------------------------------------- live CRUD
 async def _chain(db, playlist_id: int, link_model, src_model, fk_name: str):
     rows = (await db.execute(select(link_model).where(link_model.live_playlist_id == playlist_id)

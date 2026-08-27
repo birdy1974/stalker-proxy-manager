@@ -246,6 +246,17 @@ async def import_config(payload: dict, db=Depends(get_db)):
         db.add(Portal(**p))
         applied["imported"] += 1
 
+    for e in data.get("epg_sources", []):
+        url = (e.get("url") or "").strip()
+        if not url:
+            continue
+        exists = await db.scalar(select(EpgSource).where(EpgSource.url == url))
+        if exists:
+            applied["skipped"].append(f"epg:{url}")
+            continue
+        db.add(EpgSource(url=url, enabled=bool(e.get("enabled", True))))
+        applied["imported"] += 1
+
     for k, v in (data.get("settings") or {}).items():
         row = await db.get(Setting, k)
         if row is None:

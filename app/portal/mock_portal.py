@@ -28,7 +28,7 @@ import random
 import time
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..config import FFMPEG_BIN
 
@@ -309,6 +309,33 @@ async def portal_php(request: Request,
                      "duration": "01:00:00"}])
 
     return JSONResponse({"js": {"error": f"unknown mock call {type}/{action}"}}, status_code=404)
+
+
+@router.get("/mock/epg.xml")
+async def mock_epg_xml():
+    """Tiny XMLTV demo source so Phase-3 EPG ingest/match/output is verifiable
+    end-to-end against the built-in mock portal (channels + 6h of programmes)."""
+    from xml.sax.saxutils import escape as _e
+
+    names = [n for names in _LIVE_NAMES.values() for n in names]
+    now = int(time.time() // 3600 * 3600)          # align to full hour
+    L = ['<?xml version="1.0" encoding="UTF-8"?>', '<tv generator-info-name="mock-portal">']
+    for n in names:
+        cid = _e(n.lower().replace(" ", "-"))
+        L.append(f'  <channel id="{cid}"><display-name>{_e(n)}</display-name></channel>')
+    for n in names:
+        cid = _e(n.lower().replace(" ", "-"))
+        for h in range(-1, 6):
+            st, en = now + h * 3600, now + (h + 1) * 3600
+            fmt = time.strftime
+            L.append(
+                f'  <programme start="{fmt("%Y%m%d%H%M%S", time.gmtime(st))} +0000" '
+                f'stop="{fmt("%Y%m%d%H%M%S", time.gmtime(en))} +0000" channel="{cid}">'
+                f'<title>{_e(n)} demo show {h if h >= 0 else "prev"}</title>'
+                f'<desc>Automatically generated mock programme for {_e(n)}.</desc>'
+                f'<category>{_e("Demo")}</category></programme>')
+    L.append("</tv>")
+    return Response("\n".join(L) + "\n", media_type="application/xml")
 
 
 # ---------------------------------------------------------------------------

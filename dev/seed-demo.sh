@@ -177,4 +177,17 @@ if ! curl -sf "$BASE/api/users" | grep -q '"name":"demo"'; then
     "xtream_enabled": true, "enabled": true, "max_connections": 2}' >/dev/null     && echo "seed-demo: demo user created (demo / demo123)"
 fi
 
+# -- 8. mock EPG source (Phase 3 end-to-end demo) ------------------------------
+if ! curl -sf "$BASE/api/epg" | grep -q '"mock/epg.xml"'; then
+  curl -sf -X POST "$BASE/api/epg/sources" -H 'Content-Type: application/json' \
+    -d "{\"url\": \"$BASE/mock/epg.xml\"}" >/dev/null \
+    && echo "seed-demo: mock EPG source added ($BASE/mock/epg.xml)"
+fi
+curl -sf -X POST "$BASE/api/epg/refresh" >/dev/null || true
+sleep 3
+EPG_STATS=$(curl -sf "$BASE/api/epg" | python3 -c '
+import json,sys; d=json.load(sys.stdin)
+print(f"{d.get(\"matched\",0)}/{d.get(\"playlist_channels\",0)} channels matched, {d.get(\"programmes\",0)} programmes")' 2>/dev/null || echo "?")
+echo "seed-demo: EPG state: $EPG_STATS"
+
 echo "seed-demo: DONE"

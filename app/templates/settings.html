@@ -16,7 +16,27 @@
           <button class="btn btn-outline-secondary" id="epg-add">Add</button>
         </div>
         <div id="epg-list"></div>
-        <div class="small text-muted">Ingest, channel matching and merged <code>/epg.xml</code> + <code>xmltv.php</code> output arrive in Phase 3.</div>
+        <div class="d-flex flex-wrap gap-2 mt-2">
+          <button class="btn btn-sm btn-outline-secondary" id="epg-refresh"><i class="bi bi-arrow-repeat"></i> Refresh all</button>
+          <button class="btn btn-sm btn-outline-secondary" id="epg-match"><i class="bi bi-magic"></i> Match channels</button>
+          <span class="small text-muted align-self-center" id="epg-status"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header"><i class="bi bi-image"></i> Channel logos (tv-logos)</div>
+      <div class="card-body p-2">
+        <div class="small text-muted mb-2">
+          Matches live playlist channel names against the
+          <a href="https://github.com/tv-logo/tv-logos" target="_blank">tv-logo/tv-logos</a>
+          index of the configured <code>logo_country</code> folder.
+        </div>
+        <div class="d-flex flex-wrap gap-2">
+          <button class="btn btn-sm btn-outline-secondary" id="logo-index"><i class="bi bi-arrow-repeat"></i> Rebuild logo index</button>
+          <button class="btn btn-sm btn-accent" id="logo-auto"><i class="bi bi-magic"></i> Auto-match all logos</button>
+          <span class="small text-muted align-self-center" id="logo-status"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -79,21 +99,48 @@ $("#set-save").addEventListener("click", async () => {
   toast("settings saved", "ok");
 });
 async function loadEpg() {
-  const d = await api("/api/epg-sources");
-  $("#epg-list").innerHTML = d.items.length ? d.items.map(e => `
+  const d = await api("/api/epg");
+  $("#epg-list").innerHTML = d.sources.length ? d.sources.map(e => `
     <div class="d-flex align-items-center gap-2 border-bottom py-1">
       <div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${e.enabled ? "checked" : ""}
-        onchange="api('/api/epg-sources/toggle',{method:'POST',body:{ids:[${e.id}],enabled:this.checked}})"></div>
+        onchange="api('/api/epg/sources/${e.id}',{method:'PATCH',body:{enabled:this.checked}}).then(loadEpg)"></div>
       <span class="small mono flex-grow-1">${esc(e.url)}</span>
-      <span class="small text-muted">${e.last_fetch ? "fetched " + e.last_fetch.slice(0, 10) : "not fetched"}</span>
-      <button class="btn btn-sm btn-outline-danger" onclick="api('/api/epg-sources/${e.id}',{method:'DELETE'}).then(loadEpg)"><i class="bi bi-trash"></i></button>
+      <span class="small text-muted">${e.status ? esc(e.status) : (e.last_fetch ? "fetched " + e.last_fetch.slice(0, 16) : "not fetched")}</span>
+      <button class="btn btn-sm btn-outline-secondary" title="refresh now"
+        onclick="api('/api/epg/sources/${e.id}/refresh',{method:'POST'}).then(loadEpg)"><i class="bi bi-arrow-repeat"></i></button>
+      <button class="btn btn-sm btn-outline-danger" onclick="api('/api/epg/sources/${e.id}',{method:'DELETE'}).then(loadEpg)"><i class="bi bi-trash"></i></button>
     </div>`).join("") : '<div class="small text-muted">No EPG sources. Try http://www.xmltvepg.nl/rytecNL_Basic.xz</div>';
 }
 $("#epg-add").addEventListener("click", async () => {
   const url = $("#epg-url").value.trim(); if (!url) return;
-  await api("/api/epg-sources", { method: "POST", body: { url } });
+  await api("/api/epg/sources", { method: "POST", body: { url } });
   $("#epg-url").value = ""; loadEpg();
 });
+$("#epg-refresh").addEventListener("click", async () => {
+  const r = await api("/api/epg/refresh", { method: "POST" });
+  toast(r.started ? "EPG refresh started (watch the logs/db)" : (r.error || "busy"), r.started ? "ok" : "warn");
+});
+$("#epg-match").addEventListener("click", async () => {
+  const r = await api("/api/epg/match", { method: "POST" });
+  toast(`auto-match done: ${r.matched} channels matched`, "ok"); loadEpgStatus();
+});
+$("#logo-index").addEventListener("click", async () => {
+  const r = await api("/api/playlist/logos/refresh-index", { method: "POST" });
+  $("#logo-status").textContent = r.ok ? `index: ${r.count} logos (${r.country})` : (r.error || "failed");
+});
+$("#logo-auto").addEventListener("click", async () => {
+  const r = await api("/api/playlist/live/auto-logos", { method: "POST" });
+  $("#logo-status").textContent = r.ok ? `${r.set}/${r.checked} channels got a logo` : (r.error || "failed");
+  if (r.ok) toast(`auto-logo pass done: ${r.set} logos set`, "ok");
+});
+async function loadEpgStatus() {
+  try {
+    const d = await api("/api/epg");
+    $("#epg-status").textContent =
+      `${d.epg_channels} EPG channels · ${d.programmes} programmes · ${d.matched}/${d.playlist_channels} matched` +
+      (d.refresh_running ? " · refreshing…" : "");
+  } catch (_) { /* keep silent */ }
+}
 $("#import-file").addEventListener("change", async (e) => {
   const f = e.target.files[0]; if (!f) return;
   try {
@@ -104,13 +151,13 @@ $("#import-file").addEventListener("change", async (e) => {
   e.target.value = "";
 });
 (async () => {
-  await loadSettings(); await loadEpg();
+  await loadSettings(); await loadEpg(); await loadEpgStatus();
   const d = await api("/api/dashboard");
   $("#runtime-info").innerHTML =
     `portals: ${d.stats.portals} · live ${d.stats.live_enabled}/${d.stats.live_available} · ` +
     `vod ${d.stats.vod_enabled}/${d.stats.vod_available} · series ${d.stats.series_enabled}/${d.stats.series_available}` +
     `<br>active streams: ${d.streams.length} · templates: ${d.stats.ffmpeg_templates} · users: ${d.stats.users}` +
-    `<br>GUI phase: <b>2</b> (core streaming live; EPG/logo/TMDB matching in Phase 3)`;
+    `<br>GUI phase: <b>3</b> (EPG ingest + /xmltv.php, tv-logos matching, TMDB popups)`;
 })();
 </script>
 {% endblock %}

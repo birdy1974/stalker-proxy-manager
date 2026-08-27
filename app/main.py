@@ -65,12 +65,13 @@ app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=SESSION_MAX
                    same_site="lax", https_only=False)
 
 # --------------------------------------------------------------- sub-routers
-from .routers import api_ffmpeg, api_misc, api_playlist, api_portals, api_sources, api_users, output, web  # noqa: E402
+from .routers import (api_ffmpeg, api_epg, api_misc, api_playlist, api_portals,  # noqa: E402
+                      api_sources, api_users, output, web)
 
 app.include_router(web.router)
 app.include_router(output.router)
 for r in (api_portals.router, api_sources.router, api_playlist.router,
-          api_ffmpeg.router, api_users.router, api_misc.router):
+          api_ffmpeg.router, api_users.router, api_misc.router, api_epg.router):
     app.include_router(r)
 
 if MOCK_PORTAL_ENABLED:
@@ -114,6 +115,10 @@ async def startup() -> None:
     if SKIP_LOGIN:
         await db_log("ERROR", "boot",
                      "*** LOGIN DISABLED (SPM_SKIP_LOGIN=1) - mockup/preview mode ***")
+    # Phase 3: background EPG refresher (checks due sources hourly)
+    from .services.epg import epg_scheduler
+    import asyncio
+    asyncio.create_task(epg_scheduler())
 
 
 async def _hardware_sanity() -> None:

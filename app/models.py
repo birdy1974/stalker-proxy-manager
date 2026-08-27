@@ -449,6 +449,38 @@ class EpgSource(Base):
     channel_count: Mapped[int | None] = mapped_column(Integer)
 
 
+class EpgChannel(Base):
+    """Parsed <channel> entries of all enabled EPG sources (Phase 3)."""
+    __tablename__ = "epg_channels"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    epg_source_id: Mapped[int] = mapped_column(ForeignKey("epg_sources.id"), index=True)
+    tvg_id: Mapped[str] = mapped_column(String(200), index=True)         # XMLTV channel id
+    name: Mapped[str] = mapped_column(String(300))                       # display-name
+    icon: Mapped[str | None] = mapped_column(String(600))
+    __table_args__ = (Index("ix_epg_channels_uniq", "epg_source_id", "tvg_id", unique=True),)
+
+
+class EpgProgramme(Base):
+    """Programme rows for the channels we actually output (bounded on purpose:
+    only tvg_ids referenced by live_playlist.epg_id are ingested)."""
+    __tablename__ = "epg_programmes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    tvg_id: Mapped[str] = mapped_column(String(200), index=True)
+    start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    stop_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    title: Mapped[str] = mapped_column(String(400))
+    sub_title: Mapped[str | None] = mapped_column(String(400))
+    desc: Mapped[str | None] = mapped_column(Text)
+    category: Mapped[str | None] = mapped_column(String(200))
+    icon: Mapped[str | None] = mapped_column(String(600))
+    __table_args__ = (
+        Index("ix_epg_prog_tvg_start", "tvg_id", "start_ts"),
+        UniqueConstraint("tvg_id", "start_ts", "title", name="uq_epg_prog_natural"),
+    )
+
+
 class Log(Base):
     """Persistent info/warning/error feed (dashboard messages pane)."""
 

@@ -21,7 +21,7 @@ from ..database import SessionLocal
 from ..models import (
     LivePlaylist, LocalFile, LocalPlaylist, LocalSource, SerieEpisode,
     SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource, User,
-    VodPlaylist, Setting,
+    VodPlaylist, VodSource, Setting,
 )
 
 
@@ -215,7 +215,7 @@ async def xtream_live(user: User, base_url: str) -> list[dict]:
             "stream_id": it.id, "stream_icon": it.logo or "", "epg_channel_id": it.epg_id or "",
             "added": "0", "category_id": cats.get(it.group_name or "Live", "1"),
             "custom_sid": "", "tv_archive": 0, "direct_source": "",
-            "tv_archive_duration": 0,
+            "tv_archive_duration": 0, "timeshift": "", "is_adult": 0,
         })
     return out
 
@@ -233,6 +233,37 @@ async def xtream_vod(user: User) -> list[dict]:
         "category_id": cats.get(it.group_name or "VOD", "1"),
         "container_extension": "ts", "custom_sid": "", "direct_source": "",
     } for it in items if _allowed(it.group_name, groups["vod"])]
+
+
+async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
+    """Real get_vod_info answer (Phase 3): metadata from the playlist row with
+    the portal source as fallback (poster/plot/year/rating may live on either)."""
+    groups = _groups(user)
+    async with SessionLocal() as s:
+        it = await s.get(VodPlaylist, vod_id)
+        if not it or not it.enabled or not _allowed(it.group_name, groups["vod"]):
+            return None
+        src = await s.get(VodSource, it.vod_source_id)
+    poster = it.poster or (src.poster if src else "") or it.logo or ""
+    plot = it.overview or (src.description if src else "") or ""
+    rating = it.rating or (src.rating if src else "") or ""
+    year = it.year or (src.year if src else "") or ""
+    cats = {c["category_name"]: c["category_id"] for c in await xtream_categories(user, "vod")}
+    info = {
+        "kinopoisk_url": "", "tmdb_id": str(it.tmdb_id or ""),
+        "name": it.custom_name, "o_name": src.original_name if src else it.custom_name,
+        "cover_big": poster, "movie_image": poster, "releasedate": year,
+        "episode_run_time": 0, "youtube_trailer": "", "director": "",
+        "actors": "", "cast": "", "description": plot, "plot": plot,
+        "age": "", "mpaa_rating": "", "rating_count_kinopoisk": 0,
+        "country": "", "genre": it.group_name or "", "backdrop_path": [poster] if poster else [],
+        "duration_secs": 0, "duration": src.duration if src and src.duration else "",
+        "video": [], "audio": [], "bitrate": 0, "rating": rating,
+    }
+    return {"info": info,
+            "movie_data": {"stream_id": it.id, "name": it.custom_name, "added": "0",
+                           "category_id": cats.get(it.group_name or "VOD", "1"),
+                           "container_extension": "ts", "custom_sid": "", "direct_source": ""}}
 
 
 async def xtream_series(user: User) -> list[dict]:
@@ -282,6 +313,8 @@ async def xtream_series_info(user: User, series_id: int) -> dict | None:
                     "title": ep.name or f"Episode {ep.episode_number}",
                     "container_extension": "ts",
                     "info": {"duration": (ep.duration or "42:00"),
+                             "movie_image": sp.poster or "",
+                             "tmdb_id": str(sp.tmdb_id or "") if sp.tmdb_id else "",
                              "video": {}, "audio": {}, "bitrate": 0},
                     "custom_sid": "", "added": "0", "season": season.season_number,
                     "direct_source": "",
