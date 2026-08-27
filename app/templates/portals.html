@@ -94,13 +94,7 @@ async function editPortal(id) {
   const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "" };
   const body = el("div");
   body.innerHTML = `
-    <ul class="nav nav-tabs nav-subtabs mb-2">
-      <li class="nav-item"><a class="nav-link active" data-tab="general">General</a></li>
-      <li class="nav-item"><a class="nav-link" data-tab="live">1 · Live</a></li>
-      <li class="nav-item"><a class="nav-link" data-tab="vod">2 · VOD</a></li>
-      <li class="nav-item"><a class="nav-link" data-tab="series">3 · Series</a></li>
-    </ul>
-    <div data-pane="general">
+    <div>
       <div class="row g-2">
         <div class="col-md-6"><label class="muted-label">Portal name</label>
           <input class="form-control form-control-sm" id="p-name" value="${esc(p.name)}"></div>
@@ -121,40 +115,36 @@ async function editPortal(id) {
       </div>
       <div class="small text-muted mt-2">Fetch order: genres → items of ENABLED genres → series seasons/episodes. Only enabled genres are fetched.</div>
     </div>
+    <ul class="nav nav-tabs nav-subtabs mt-3 mb-2">
+      <li class="nav-item"><a class="nav-link active" data-tab="live">1 · Live</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="vod">2 · VOD</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="series">3 · Series</a></li>
+    </ul>
     ${["live", "vod", "series"].map(k => `
-      <div data-pane="${k}" class="d-none">
+      <div data-pane="${k}" class="${k === "live" ? "" : "d-none"}">
         <div class="d-flex gap-2 align-items-center mb-2">
-          <div class="input-group input-group-sm" style="max-width:420px">
-            <span class="input-group-text">${k === "live" ? "Genres" : k === "vod" ? "VOD genres" : "Series genres"}</span>
-            <select class="form-select" id="genre-bulk-${k}">
-              <option value="enable">Enable selected genres below</option><option value="disable">Disable selected</option>
-            </select>
-            <button class="btn btn-outline-secondary" id="genre-apply-${k}">Apply</button>
-          </div>
-          <label class="small mb-0"><input type="checkbox" id="genre-all-${k}"> all</label>
-          <input class="form-control form-control-sm ms-auto" style="max-width:220px" id="items-q-${k}" placeholder="filter stored ${k} items…">
+          <input class="form-control form-control-sm" style="max-width:260px" id="genre-q-${k}" placeholder="filter genres…">
+          <span class="small text-muted ms-auto" id="genre-count-${k}"></span>
         </div>
-        <div class="border rounded p-2 mb-2" style="max-height:210px;overflow:auto" id="genre-list-${k}"></div>
-        <div class="muted-label mb-1">Stored ${k} items (database — fetching happens after Save via “Fetch”)</div>
-        <div class="border rounded" style="max-height:230px;overflow:auto"><table class="table table-sm table-spm mb-0"><thead style="position:sticky;top:0;background:#f9fafb"><tr><th>Name</th></tr></thead><tbody id="items-list-${k}"><tr><td class="text-muted small p-2">—</td></tr></tbody></table></div>
+        <div class="border rounded p-2" style="max-height:260px;overflow:auto" id="genre-list-${k}"></div>
       </div>`).join("")}`;
   const footer = el("div", { class: "d-flex gap-2 w-100" });
   const m = openModal({ title: id ? `Edit portal: ${p.name}` : "Add portal", body, footer, size: "xl" });
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
                 mBtn("Save", "btn-accent", () => savePortal(id, m), "bi-check2"));
 
-  /* tab switching (buttons, no backdrop close - per spec) */
+  /* sub-tab switching: general stays visible, only the 3 genre panes toggle */
   $$(".nav-link", body).forEach(a => a.addEventListener("click", (e) => {
     e.preventDefault();
     $$(".nav-link", body).forEach(x => x.classList.remove("active"));
     a.classList.add("active");
     $$("[data-pane]", body).forEach(pn => pn.classList.toggle("d-none", pn.dataset.pane !== a.dataset.tab));
-    if (id) loadGenres(id, a.dataset.tab), loadItems(id, a.dataset.tab);
+    if (id) loadGenres(id, a.dataset.tab);
   }));
 
   if (id) {
     $("#p-resolve-btn", body).setAttribute("data-id", id);
-    loadGenres(id, "live"); loadItems(id, "live");
+    loadGenres(id, "live");
   }
   $("#p-resolve-btn", body).addEventListener("click", async () => {
     const pid = $("#p-resolve-btn", body).dataset.id || id;
@@ -172,15 +162,16 @@ async function editPortal(id) {
     toast(`fetch job ${r.job.id} started`, "ok"); pollJobs();
   });
   for (const k of ["live", "vod", "series"]) {
-    $(`#genre-apply-${k}`, body)?.addEventListener("click", async () => {
-      const ids = $$(`#genre-list-${k} input:checked`, body).map(i => +i.value);
-      if (!ids.length) return toast("no genres selected", "warn");
-      await api(`/api/portals/${id}/genres/toggle`, { method: "POST",
-        body: { kind: k, ids, enabled: $(`#genre-bulk-${k}`, body).value === "enable" } });
-      loadGenres(id, k); toast("genres updated", "ok");
+    /* left-aligned textbox filters the genre list (client-side, case-insensitive) */
+    $(`#genre-q-${k}`, body)?.addEventListener("input", (e) => {
+      const q = e.target.value.toLowerCase();
+      $$(`#genre-list-${k} label`, body).forEach(lb =>
+        lb.style.display = (lb.dataset.name || "").includes(q) ? "" : "none");
+      const all = $$(`#genre-list-${k} label`, body).length,
+            vis = $$(`#genre-list-${k} label`, body).filter(lb => lb.style.display !== "none").length;
+      const cnt = $(`#genre-count-${k}`, body);
+      if (cnt) cnt.textContent = q ? `${vis}/${all}` : `${all}`;
     });
-    $(`#genre-all-${k}`, body)?.addEventListener("change", (e) =>
-      $$(`#genre-list-${k} input`, body).forEach(i => i.checked = e.target.checked));
   }
 }
 
@@ -190,22 +181,21 @@ async function loadGenres(pid, kind) {
   const host = $(`#genre-list-${kind}`);
   if (!host) return;
   const rows = d[kind] || [];
+  /* one switch per genre, applied immediately (no bulk selection/apply) */
   host.innerHTML = rows.length ? rows.map(g => `
-    <label class="d-flex align-items-center gap-2 small mb-1">
-      <input type="checkbox" value="${g.id}" ${g.enabled ? "checked" : ""}>
+    <label class="d-flex align-items-center gap-2 small mb-1" data-name="${esc(g.name.toLowerCase())}">
+      <span class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox"
+        value="${g.id}" ${g.enabled ? "checked" : ""}></span>
       <span class="flex-grow-1">${esc(g.name)}</span>
       <span class="text-muted">${g.item_count ?? "?"} items ${g.fetched ? "· fetched" : ""}</span>
     </label>`).join("") : '<div class="text-muted small p-1">No genres fetched yet — press “Fetch / refresh content”.</div>';
-}
-
-async function loadItems(pid, kind, q = "") {
-  if (!["live", "vod", "series"].includes(kind)) return;
-  const tb = $(`#items-list-${kind}`);
-  if (!tb) return;
-  const d = await api(`/api/portals/${pid}/items?kind=${kind}&per_page=100&q=${encodeURIComponent($( `#items-q-${kind}`)?.value || q)}`);
-  tb.innerHTML = d.items.length
-    ? d.items.map(i => `<tr><td>${esc(i.name)} ${i.enabled ? '<span class="badge st-online ms-1">on</span>' : ""}</td></tr>`).join("")
-    : '<tr><td class="text-muted small p-2">nothing fetched yet</td></tr>';
+  $$(`input[type=checkbox]`, host).forEach(cb => cb.addEventListener("change", async () => {
+    await api(`/api/portals/${pid}/genres/toggle`, { method: "POST",
+      body: { kind, ids: [+cb.value], enabled: cb.checked } });
+    toast(`genre ${cb.checked ? "enabled" : "disabled"} — use Fetch to (un)load its items`, "ok");
+  }));
+  const q = $(`#genre-q-${kind}`); if (q && q.value) q.dispatchEvent(new Event("input"));
+  const cnt = $(`#genre-count-${kind}`); if (cnt) cnt.textContent = `${rows.length}`;
 }
 
 async function savePortal(id, m) {
