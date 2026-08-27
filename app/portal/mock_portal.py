@@ -239,7 +239,12 @@ async def portal_php(request: Request,
         return guard
     mac, err = _auth(request)
     if err is not None:
+        # log the resolution so CI / docker logs show WHY a handshake failed
+        # (e.g. mac missing/unknown) instead of failing silently in grep.
+        log.info("mock portal: type=%s action=%s mac=%s -> HTTP %d",
+                 type, action, mac or "-", err.status_code)
         return err
+    log.info("mock portal: type=%s action=%s mac=%s -> ok", type, action, mac or "-")
     qp = request.query_params
 
     if type == "stb" and action == "handshake":

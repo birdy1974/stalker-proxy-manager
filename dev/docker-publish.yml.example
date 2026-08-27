@@ -62,15 +62,7 @@ jobs:
       - name: Build (local)
         run: docker build -t spm-smoke .
       - name: Run with mock portal + hit health routes
-        run: |
-          docker run -d --name spm -p 8880:8880 \
-            -e SPM_MOCK_PORTAL=1 -e SPM_ADMIN_PASSWORD=ci spm-smoke
-          for i in $(seq 1 30); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8880/login || true)
-            [ "$code" = "200" ] && break
-            sleep 2
-          done
-          [ "$code" = "200" ] || { docker logs spm; exit 1; }
-          curl -sf "http://127.0.0.1:8880/mock/c/portal.php?type=stb&action=handshake&mac=00:1A:79:AA:AA:01" | grep -q token
-          docker logs spm | grep -q "Stalker Proxy Manager"
-          echo "smoke OK"
+        # dev/smoke.sh is verbose and self-diagnosing: it prints every probe,
+        # cleans up the container (also on failure) and dumps container state
+        # + logs when a check fails.
+        run: bash dev/smoke.sh

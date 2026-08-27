@@ -13,6 +13,7 @@ Everything is also mirrored to stdout, so Portainer shows the full story.
 from __future__ import annotations
 
 import logging
+import os
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -28,7 +29,24 @@ from .services.db_logging import cleanup_logs, db_log
 from .services.ffmpeg_templates import default_presets
 from .services.stream_manager import MANAGER
 
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+# Request log (uvicorn.access) is ON by default so `docker logs` shows exactly
+# what the GUI/STB/smoke-test requested and what status it got. High-volume
+# media paths are filtered out; set SPM_ACCESS_LOG=0 to disable entirely.
+class _AccessFilter(logging.Filter):
+    _NOISY = ("/play/", "/mock/ts/", "/mock/vod/")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            return True
+        return not any(p in msg for p in self._NOISY)
+
+
+if os.environ.get("SPM_ACCESS_LOG", "1") == "1":
+    logging.getLogger("uvicorn.access").addFilter(_AccessFilter())
+else:
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(title="Stalker Proxy Manager", version="2.0.0-phase2",
               docs_url=None, redoc_url=None, openapi_url=None)
