@@ -251,10 +251,12 @@ async def portal_php(request: Request):  # noqa: A002
     # token (the known-MAC allowlist + bearer check apply to the calls after
     # the handshake). This is the canonical STB/smoke-test flow:
     #   ?type=stb&action=handshake&mac=00:1A:79:AA:AA:01
-    if type == "stb" and action == "handshake":
+    # We also accept type=stb with a missing/extra action (some emulators drop
+    # or rename params), so a handshake is never rejected by param shape.
+    if type == "stb" and (action == "handshake" or not action):
         token = "mock-" + (mac.replace(":", "") if mac else "000000000000")
-        log.info("mock portal: type=%s action=%s mac=%s -> handshake token issued",
-                 type, action, mac or "-")
+        log.info("mock portal: query=%s mac=%s -> handshake token issued",
+                 request.url.query or "-", mac or "-")
         return _js({"token": token})
 
     mac, err = _auth(request)
