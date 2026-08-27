@@ -1,0 +1,340 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-header pb-0">
+    <ul class="nav nav-tabs card-header-tabs nav-subtabs" id="pl-tabs">
+      <li class="nav-item"><a class="nav-link active" data-tab="live"><i class="bi bi-tv"></i> Live</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="vod"><i class="bi bi-film"></i> VOD</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="series"><i class="bi bi-collection"></i> Series</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="local"><i class="bi bi-folder2-open"></i> Local files</a></li>
+    </ul>
+  </div>
+  <div class="card-body p-2">
+    <div id="pl-live"></div>
+    <div id="pl-vod" class="d-none"></div>
+    <div id="pl-series" class="d-none"></div>
+    <div id="pl-local" class="d-none"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let TEMPLATES = [];
+async function loadTemplates() {
+  TEMPLATES = (await api("/api/ffmpeg")).items.filter(t => t.enabled);
+}
+const tplOptions = (selected) =>
+  `<option value="">(default template)</option>` +
+  TEMPLATES.map(t => `<option value="${t.id}" ${t.id === selected ? "selected" : ""}>${esc(t.name)}</option>`).join("");
+
+/* ============================ LIVE builder ============================ */
+let liveTable;
+function chainHtml(chain) {
+  if (!chain.length) return '<span class="badge st-error">no source!</span>';
+  return chain.map((c, i) => `
+    <div class="small"><span class="badge ${i === 0 ? "text-bg-success" : "text-bg-secondary"}">${i + 1}</span>
+      ${esc(c.name)} <span class="text-muted">@ ${esc(c.portal)}</span></div>`).join("");
+}
+function liveBuilder() {
+  const bar = el("div", { class: "d-flex flex-wrap gap-2 align-items-center" });
+  bar.append(
+    mBtn("Add custom channel", "btn-accent", () => editCustomChannel(null), "bi-plus-circle"),
+    mBtn("Assign group…", "btn-outline-secondary", () => bulkAssign("group"), "bi-tags"),
+    mBtn("Assign template…", "btn-outline-secondary", () => bulkAssign("template"), "bi-gear"),
+    mBtn("Enable", "btn-outline-success", () => bulkAssign("enable"), "bi-check2"),
+    mBtn("Disable", "btn-outline-secondary", () => bulkAssign("disable"), "bi-x"),
+    el("a", { class: "btn btn-sm btn-outline-secondary", href: "/api/export?section=live_playlist" }, "⤓ Export"),
+    el("span", { class: "small text-muted ms-auto" }, "Drag rows to reorder (only while sorted by Order)."));
+  liveTable = new DataTable($("#pl-live"), {
+    selectable: true, defaultSort: "order", extraHeader: bar,
+    server: async (q) => await api("/api/playlist/live?" + q),
+    columns: [
+      { key: "order", label: "Ord", sort: "order", width: "52px" },
+      { key: "custom_name", label: "Custom name", sort: "name", filter: { type: "text", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
+      { key: "group_name", label: "Group", sort: "group", filter: { type: "select", optionsLoader: (fill, t) => t.lastData?.groups && fill(t.lastData.groups.map(g => ({ v: g, l: g }))) }, render: r => esc(r.group_name || "") },
+      { key: "chain", label: "Source chain (1=primary, then fallbacks)", render: r => chainHtml(r.chain) },
+      { key: "epg_id", label: "EPG id", render: r => `<span class="mono small">${esc(r.epg_id || "")}</span>` },
+      { key: "logo", label: "Logo", render: r => r.logo ? `<img class="logo-thumb" loading="lazy" src="${esc(r.logo)}" onerror="this.style.opacity=.2">` : "" },
+      { key: "template", label: "FFmpeg tpl", render: r => `<span class="small">${esc(r.template || "(default)")}</span>` },
+      { key: "enabled", label: "On", width: "36px", render: r => `<span class="badge ${r.enabled ? "st-online" : "st-unknown"}">${r.enabled ? "on" : "off"}</span>` },
+      { key: "test", label: "", width: "36px", render: r => `<button class="btn btn-sm btn-outline-secondary" title="Play proxied stream" onclick="event.stopPropagation();playTest(${r.id},'live')"><i class="bi bi-play-btn"></i></button>` },
+      { key: "actions", label: "", width: "70px", render: r => `
+        <button class="btn btn-sm btn-outline-secondary" onclick="editCustomChannel(${r.id})"><i class="bi bi-pencil"></i></button>
+        <button class="btn btn-sm btn-outline-danger" onclick="delCustom(${r.id})"><i class="bi bi-trash"></i></button>` },
+    ],
+    dnd: { onReorder: async (ids) => {
+      await api("/api/playlist/live/order", { method: "POST",
+        body: { items: ids.map((id, i) => ({ id, order: i + 1 })) } });
+      toast("order saved", "ok");
+    } },
+    emptyText: "No custom channels yet. Click 'Add custom channel'. Sources come from enabled live channels (Input Sources tab).",
+  });
+}
+window.playTest = (id, kind) => {
+  /* ask for a user: admin preview runs through user creds; offer default quick-play without user (admin session preview) */
+  playInModal(`/preview-play/${kind}/${id}.ts`, `${kind} #${id}`);
+};
+window.delCustom = (id) => confirmDialog({ title: "Delete custom channel", body: "Remove this channel from the final playlist?",
+  okText: "Delete", okClass: "btn-danger",
+  onOk: async () => { await api(`/api/playlist/live/${id}`, { method: "DELETE" }); liveTable.reload(); } });
+
+/* ---------------- Add / edit custom channel modal ---------------- */
+async function editCustomChannel(id) {
+  const row = id ? liveTable.items.find(x => x.id === id) : null;
+  let chain = row ? row.chain.map(c => ({ id: c.source_id, name: c.name, portal: c.portal })) : [];
+  const body = el("div");
+  body.innerHTML = `
+    <div class="row g-2">
+      <div class="col-md-6">
+        <label class="muted-label">Custom channel name (typing filters candidates below)</label>
+        <input class="form-control form-control-sm" id="cc-name" value="${esc(row?.custom_name || "")}" autocomplete="off">
+      </div>
+      <div class="col-md-3"><label class="muted-label">Group (editable)</label>
+        <input class="form-control form-control-sm" id="cc-group" value="${esc(row?.group_name || "")}"></div>
+      <div class="col-md-3"><label class="muted-label">EPG id (tvg-id)</label>
+        <input class="form-control form-control-sm mono" id="cc-epg" value="${esc(row?.epg_id || "")}"></div>
+      <div class="col-md-3"><label class="muted-label">FFmpeg template</label>
+        <select class="form-select form-select-sm" id="cc-tpl">${tplOptions(row?.ffmpeg_template_id)}</select></div>
+      <div class="col-md-3"><label class="muted-label">Channel number (opt)</label>
+        <input class="form-control form-control-sm" id="cc-number" value="${row?.number ?? ""}"></div>
+      <div class="col-md-6">
+        <label class="muted-label">Logo URL</label>
+        <div class="input-group input-group-sm">
+          <input class="form-control" id="cc-logo" value="${esc(row?.logo || "")}">
+          <button class="btn btn-outline-secondary" id="cc-logo-suggest">Suggest</button>
+        </div>
+        <div id="cc-logo-cand" class="d-flex gap-2 mt-1 flex-wrap"></div>
+      </div>
+    </div>
+    <hr class="my-2">
+    <div class="row g-2">
+      <div class="col-md-6">
+        <div class="d-flex justify-content-between"><span class="muted-label">Matching source channels (click → add to chain)</span>
+          <span class="small text-muted" id="cc-count"></span></div>
+        <div id="cc-cand" class="border rounded p-1" style="max-height:220px;overflow:auto"></div>
+      </div>
+      <div class="col-md-6">
+        <div class="muted-label">Fallback chain (order = priority; first = primary)</div>
+        <div id="cc-chain" class="border rounded p-1" style="max-height:220px;overflow:auto"></div>
+      </div>
+    </div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: row ? `Edit channel: ${row.custom_name}` : "Add custom channel", body, footer, size: "xl" });
+
+  const candBox = $("#cc-cand", body), chainBox = $("#cc-chain", body);
+  const renderChain = () => {
+    chainBox.innerHTML = chain.length ? "" : '<div class="small text-muted p-2">empty — click candidates on the left</div>';
+    chain.forEach((c, i) => {
+      const r = el("div", { class: "d-flex align-items-center gap-1 small mb-1 border-bottom pb-1" });
+      r.innerHTML = `<span class="badge ${i === 0 ? "text-bg-success" : "text-bg-secondary"}">${i + 1}</span>
+        <span class="flex-grow-1">${esc(c.name)} <span class="text-muted">@ ${esc(c.portal)}</span></span>`;
+      const mk = (t, fn) => { const b = el("button", { class: "btn btn-xs btn-outline-secondary py-0 px-1", html: t, type: "button" }); b.addEventListener("click", fn); return b; };
+      r.append(mk("↑", () => { if (i > 0) [chain[i - 1], chain[i]] = [chain[i], chain[i - 1]], renderChain(); }),
+               mk("↓", () => { if (i < chain.length - 1) [chain[i + 1], chain[i]] = [chain[i], chain[i + 1]], renderChain(); }),
+               mk("✕", () => { chain.splice(i, 1); renderChain(); }));
+      chainBox.append(r);
+    });
+  };
+  let deb;
+  $("#cc-name", body).addEventListener("input", () => { clearTimeout(deb); deb = setTimeout(loadCand, 250); });
+  async function loadCand() {
+    const q = $("#cc-name", body).value;
+    const d = await api(`/api/playlist/suggest?kind=live&q=${encodeURIComponent(q)}`);
+    $("#cc-count", body).textContent = q ? `${d.items.length} matches` : `all enabled (${d.items.length})`;
+    candBox.innerHTML = d.items.length ? "" : '<div class="small text-muted p-2">no close match — showing nothing; clear the name to list all enabled channels</div>';
+    for (const c of d.items) {
+      const b = el("button", { class: "btn btn-sm btn-light w-100 text-start mb-1 small", type: "button" });
+      b.innerHTML = `${esc(c.name)} <span class="text-muted">@ ${esc(c.portal)}</span>`;
+      b.addEventListener("click", () => {
+        if (chain.some(x => x.id === c.id)) return toast("already in chain", "warn");
+        chain.push(c); renderChain();
+        /* keep additive UX - a fresh "same-name different-portal" offers itself
+           as next fallback candidate automatically (cool trick of fuzzy match) */
+      });
+      candBox.append(b);
+    }
+    /* logo candidates: portal logos of top matches (spec: portal first) */
+    const logos = [...new Set(d.items.map(x => x.logo).filter(Boolean))].slice(0, 6);
+    const lc = $("#cc-logo-cand", body); lc.innerHTML = logos.map(u =>
+      `<img src="${esc(u)}" class="logo-thumb border rounded p-1" style="cursor:pointer;height:30px" title="use this logo"
+        onclick="document.querySelector('#cc-logo').value='${esc(u)}'">`).join("");
+  }
+  $("#cc-logo-suggest", body).addEventListener("click", loadCand);
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
+    mBtn("Save", "btn-accent", async () => {
+      const payload = {
+        custom_name: $("#cc-name", body).value.trim(),
+        group_name: $("#cc-group", body).value.trim(),
+        epg_id: $("#cc-epg", body).value.trim(),
+        logo: $("#cc-logo", body).value.trim(),
+        ffmpeg_template_id: +$("#cc-tpl", body).value || null,
+        number: +$("#cc-number", body).value || null,
+        source_ids: chain.map(c => c.id),
+      };
+      if (!payload.custom_name) return toast("name required", "warn");
+      if (!payload.source_ids.length) return toast("add at least one source to the chain", "warn");
+      if (row) await api(`/api/playlist/live/${row.id}`, { method: "PUT", body: payload });
+      else await api("/api/playlist/live", { method: "POST", body: payload });
+      toast("channel saved", "ok"); m.close(); liveTable.reload();
+    }, "bi-check2"));
+  renderChain(); loadCand();
+}
+
+function bulkAssign(what) {
+  const ids = [...liveTable.selected];
+  if (!ids.length) return toast("select channels first", "warn");
+  const body = el("div");
+  if (what === "group") body.innerHTML = `<label class="muted-label">Group name</label><input class="form-control" id="ba-val">`;
+  else if (what === "template") body.innerHTML = `<label class="muted-label">FFmpeg template</label><select class="form-select" id="ba-val">${tplOptions()}</select>`;
+  else return bulkQuick(what === "enable");
+  confirmDialog({ title: what === "group" ? "Assign group" : "Assign template", body, okText: "Apply to " + ids.length + " channels",
+    onOk: async () => {
+      const v = body.querySelector("#ba-val").value;
+      await api("/api/playlist/live/bulk", { method: "POST", body: { ids, ...(what === "group" ? { group_name: v } : { ffmpeg_template_id: +v || null }) } });
+      toast("bulk update applied", "ok"); liveTable.reload();
+    } });
+}
+async function bulkQuick(enabled) {
+  const ids = [...liveTable.selected];
+  await api("/api/playlist/live/bulk", { method: "POST", body: { ids, enabled } });
+  toast("updated", "ok"); liveTable.reload();
+}
+
+/* ============================ VOD builder ============================ */
+let vodTable;
+function vodBuilder() {
+  vodTable = new DataTable($("#pl-vod"), {
+    selectable: true, defaultSort: "order",
+    server: async (q) => await api("/api/playlist/vod?" + q),
+    columns: [
+      { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="api('/api/playlist/vod/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
+      { key: "poster", label: "", width: "44px", render: r => r.poster ? `<img class="poster-thumb" src="${esc(r.poster)}" loading="lazy">` : "" },
+      { key: "custom_name", label: "Title", sort: "name", filter: { type: "text", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
+      { key: "group_name", label: "Group", sort: "group", render: r => esc(r.group_name || "") },
+      { key: "year", label: "Year", width: "56px" },
+      { key: "template", label: "FFmpeg tpl", render: r => esc(r.template || "(default)") },
+      { key: "chain", label: "Sources", render: chainHtml },
+      { key: "actions", label: "", width: "100px", render: r => `
+        <button class="btn btn-sm btn-outline-secondary" title="Edit" onclick="editVod(${r.id})"><i class="bi bi-pencil"></i></button>
+        <button class="btn btn-sm btn-outline-secondary" title="Play" onclick="playTest(${r.id},'vod')"><i class="bi bi-play-btn"></i></button>
+        <button class="btn btn-sm btn-outline-danger" title="Delete" onclick="api('/api/playlist/vod/${r.id}',{method:'DELETE'}).then(()=>vodTable.reload())"><i class="bi bi-trash"></i></button>` },
+    ],
+    emptyText: "VOD playlist empty. Enable VOD items in Input Sources → VOD, they'll appear here after being added (auto on enable).",
+  });
+}
+window.editVod = async (id) => {
+  const row = vodTable.items.find(x => x.id === id);
+  const body = el("div");
+  body.innerHTML = `
+    <div class="row g-2">
+      <div class="col-md-6"><label class="muted-label">Custom title</label><input class="form-control form-control-sm" id="v-name" value="${esc(row.custom_name)}"></div>
+      <div class="col-md-4"><label class="muted-label">Group</label><input class="form-control form-control-sm" id="v-group" value="${esc(row.group_name || "")}"></div>
+      <div class="col-md-4"><label class="muted-label">FFmpeg template</label><select class="form-select form-select-sm" id="v-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
+    </div><div class="small text-muted mt-2">Logo/poster: automatic (portal/TMDB) per Phase-1 decision Q1=C.</div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: "Edit VOD item", body, footer, size: "lg" });
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
+    mBtn("Save", "btn-accent", async () => {
+      await api(`/api/playlist/vod/${id}`, { method: "PUT", body: { custom_name: $("#v-name", body).value, group_name: $("#v-group", body).value, ffmpeg_template_id: +$("#v-tpl", body).value || null } });
+      toast("saved", "ok"); m.close(); vodTable.reload();
+    }));
+};
+
+/* ============================ SERIES builder ============================ */
+let seriesTable;
+function seriesBuilder() {
+  seriesTable = new DataTable($("#pl-series"), {
+    selectable: true, defaultSort: "order",
+    server: async (q) => await api("/api/playlist/series?" + q),
+    columns: [
+      { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="api('/api/playlist/series/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
+      { key: "poster", label: "", width: "44px", render: r => r.poster ? `<img class="poster-thumb" src="${esc(r.poster)}" loading="lazy">` : "" },
+      { key: "custom_name", label: "Series", sort: "name", filter: { type: "text", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
+      { key: "group_name", label: "Group", sort: "group", render: r => esc(r.group_name || "") },
+      { key: "seasons", label: "Seasons in output", render: r => r.seasons.map(s => `
+          <span class="badge ${s.enabled ? "st-online" : "st-unknown"} me-1" style="cursor:pointer" title="toggle season"
+            onclick="togglePlSeason(${r.id}, ${s.link_id}, ${s.enabled ? "false" : "true"})">S${String(s.season_number).padStart(2, "0")}</span>`).join("") +
+        `<div class="small text-muted">${r.enabled_episode_count} episodes total</div>` },
+      { key: "template", label: "FFmpeg tpl", render: r => esc(r.template || "(default)") },
+      { key: "actions", label: "", width: "100px", render: r => `
+        <button class="btn btn-sm btn-outline-secondary" title="Edit" onclick="editSeries(${r.id})"><i class="bi bi-pencil"></i></button>
+        <button class="btn btn-sm btn-outline-danger" title="Delete" onclick="api('/api/playlist/series/${r.id}',{method:'DELETE'}).then(()=>seriesTable.reload())"><i class="bi bi-trash"></i></button>` },
+    ],
+    emptyText: "Series playlist empty. Enable series in Input Sources → Series.",
+  });
+}
+window.togglePlSeason = async (pid, linkId, enabled) => {
+  await api(`/api/playlist/series/${pid}`, { method: "PUT", body: { seasons: [{ link_id: linkId, enabled }] } });
+  seriesTable.reload();
+};
+window.editSeries = async (id) => {
+  const row = seriesTable.items.find(x => x.id === id);
+  const body = el("div");
+  body.innerHTML = `
+    <div class="row g-2">
+      <div class="col-md-6"><label class="muted-label">Custom title</label><input class="form-control form-control-sm" id="s-name" value="${esc(row.custom_name)}"></div>
+      <div class="col-md-4"><label class="muted-label">Group</label><input class="form-control form-control-sm" id="s-group" value="${esc(row.group_name || "")}"></div>
+      <div class="col-md-4"><label class="muted-label">FFmpeg template</label><select class="form-select form-select-sm" id="s-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
+    </div>
+    <div class="muted-label mt-2">Enabled seasons</div>
+    <div>${row.seasons.map(s => `<label class="me-2 small"><input type="checkbox" class="s-season" data-link="${s.link_id}" ${s.enabled ? "checked" : ""}> ${esc(s.name || "S" + s.season_number)}</label>`).join("")}</div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: "Edit series", body, footer, size: "lg" });
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
+    mBtn("Save", "btn-accent", async () => {
+      const seasons = $$(".s-season", body).map(i => ({ link_id: +i.dataset.link, enabled: i.checked }));
+      await api(`/api/playlist/series/${id}`, { method: "PUT", body: { custom_name: $("#s-name", body).value, group_name: $("#s-group", body).value, ffmpeg_template_id: +$("#s-tpl", body).value || null, seasons } });
+      toast("saved", "ok"); m.close(); seriesTable.reload();
+    }));
+};
+
+/* ============================ LOCAL builder ============================ */
+let localTable;
+function localBuilder() {
+  localTable = new DataTable($("#pl-local"), {
+    selectable: true, defaultSort: "order",
+    server: async (q) => await api("/api/playlist/local?" + q),
+    columns: [
+      { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="api('/api/playlist/local/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
+      { key: "custom_name", label: "Name", sort: "name", filter: { type: "text", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name || "")}</b><div class="small text-muted mono">${esc(r.file)}</div>` },
+      { key: "group_name", label: "Group", render: r => esc(r.group_name) },
+      { key: "template", label: "FFmpeg tpl", render: r => esc(r.template || "(default)") },
+      { key: "actions", label: "", width: "70px", render: r => `
+        <button class="btn btn-sm btn-outline-secondary" onclick="editLocal(${r.id})"><i class="bi bi-pencil"></i></button>
+        <button class="btn btn-sm btn-outline-danger" onclick="api('/api/playlist/local/${r.id}',{method:'DELETE'}).then(()=>localTable.reload())"><i class="bi bi-trash"></i></button>` },
+    ],
+    emptyText: "Local playlist empty. Files enabled under Input Sources → Local appear here automatically after enabling.",
+  });
+}
+window.editLocal = (id) => {
+  const row = localTable.items.find(x => x.id === id);
+  const body = el("div");
+  body.innerHTML = `<div class="row g-2">
+      <div class="col-md-6"><label class="muted-label">Name</label><input class="form-control form-control-sm" id="l-name" value="${esc(row.custom_name || "")}"></div>
+      <div class="col-md-3"><label class="muted-label">Group</label><input class="form-control form-control-sm" id="l-group" value="${esc(row.group_name)}"></div>
+      <div class="col-md-3"><label class="muted-label">FFmpeg template</label><select class="form-select form-select-sm" id="l-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
+    </div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: "Edit local item", body, footer, size: "lg" });
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
+    mBtn("Save", "btn-accent", async () => {
+      await api(`/api/playlist/local/${id}`, { method: "PUT", body: { custom_name: $("#l-name", body).value, group_name: $("#l-group", body).value, ffmpeg_template_id: +$("#l-tpl", body).value || null } });
+      m.close(); localTable.reload();
+    }));
+};
+
+/* ---------------- boot ---------------- */
+(async () => {
+  await loadTemplates();
+  liveBuilder(); vodBuilder(); seriesBuilder(); localBuilder();
+  $$("#pl-tabs .nav-link").forEach(a => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    $$("#pl-tabs .nav-link").forEach(x => x.classList.remove("active"));
+    a.classList.add("active");
+    for (const k of ["live", "vod", "series", "local"])
+      $("#pl-" + k).classList.toggle("d-none", k !== a.dataset.tab);
+  }));
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3 mb-3" id="stats"><!-- stat cards injected --></div>
+
+<div class="row g-3">
+  <div class="col-xl-7">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-activity"></i> Active streams</span>
+        <div>
+          <button class="btn btn-sm btn-outline-danger" id="kill-all"><i class="bi bi-stop-circle"></i> Kill all</button>
+          <button class="btn btn-sm btn-outline-secondary" id="reload-streams"><i class="bi bi-arrow-clockwise"></i></button>
+        </div>
+      </div>
+      <div class="card-body p-2"><div id="streams-table"></div></div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header"><i class="bi bi-list-task"></i> Background jobs</div>
+      <div class="card-body p-2"><div id="jobs-box" class="p-2 small"></div></div>
+    </div>
+  </div>
+
+  <div class="col-xl-5">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-lightning-charge"></i> Quick actions</div>
+      <div class="card-body d-flex flex-wrap gap-2">
+        <a class="btn btn-sm btn-accent" href="/portals"><i class="bi bi-plus-circle"></i> Add portal</a>
+        <a class="btn btn-sm btn-outline-secondary" href="/portals"><i class="bi bi-cloud-download"></i> Fetch channels</a>
+        <a class="btn btn-sm btn-outline-secondary" href="/playlist"><i class="bi bi-pencil-square"></i> Edit playlist</a>
+        <a class="btn btn-sm btn-outline-secondary" href="/users"><i class="bi bi-person-plus"></i> Xtream users</a>
+        <a class="btn btn-sm btn-outline-secondary" href="/settings"><i class="bi bi-download"></i> Backup / restore</a>
+      </div>
+      <div class="card-footer small text-muted" id="mock-hint"></div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-journal-text"></i> Messages</span>
+        <div class="d-flex gap-1">
+          <select class="form-select form-select-sm" id="log-level" style="width:110px">
+            <option value="">All levels</option><option>INFO</option><option>WARNING</option><option>ERROR</option><option>DEBUG</option>
+          </select>
+          <select class="form-select form-select-sm" id="log-module" style="width:130px"><option value="">All modules</option></select>
+          <input class="form-control form-control-sm" id="log-q" placeholder="text filter…" style="width:130px">
+        </div>
+      </div>
+      <div class="card-body p-2"><div id="logs-table"></div></div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const STAT_CARDS = [
+  ["portals", "Portals"], ["live", "Live ch (en/av)"], ["vod", "VOD (en/av)"],
+  ["series", "Series (en/av)"], ["playlist_items", "Playlist items"],
+  ["ffmpeg_templates", "FFmpeg tpl"], ["users", "Users"], ["__streams", "Active streams"],
+];
+function card(label, value, sub="") {
+  return `<div class="col-6 col-md-3 col-xxl"><div class="card stat"><div class="card-body py-2 px-3">
+    <div class="num">${value}</div><div class="lbl">${label}</div>
+    <div class="small text-muted">${sub}</div></div></div></div>`;
+}
+async function refreshStats() {
+  const d = await api("/api/dashboard");
+  const s = d.stats;
+  $("#stats").innerHTML =
+    card("Portals", s.portals, s.portals_enabled + " enabled") +
+    card("Live channels", `${s.live_enabled}/${s.live_available}`, "enabled / available") +
+    card("VOD", `${s.vod_enabled}/${s.vod_available}`, "enabled / available") +
+    card("Series", `${s.series_enabled}/${s.series_available}`, "enabled / available") +
+    card("Playlist items", s.playlist_items) +
+    card("FFmpeg templates", s.ffmpeg_templates, "enabled") +
+    card("Users", s.users) +
+    card("Active streams", d.streams.length);
+  $("#mock-hint").innerHTML = {% if mock_enabled %}`<b>Demo tip:</b> add portal <span class="mono">{{ mock_portal_url }}</span> with MAC <span class="mono">{{ mock_macs }}</span> to try the full flow without a real portal. The Mock Control there simulates offline/busy portals so you can watch fallback work.`{% else %}""{% endif %};
+  renderJobs(d.jobs);
+  if (!window._streamsTable) makeStreamsTable(); else window._streamsTable.reload();
+}
+function renderJobs(jobs) {
+  const box = $("#jobs-box");
+  if (!jobs.length) { box.innerHTML = '<span class="text-muted">No jobs running.</span>'; return; }
+  box.innerHTML = jobs.map(j => `
+    <div class="d-flex align-items-center gap-2 border-bottom py-1">
+      <span class="badge text-bg-${j.status === "running" ? "primary" : j.status === "done" ? "success" : j.status === "error" ? "danger" : "secondary"}">${j.status}</span>
+      <span class="flex-grow-1">${esc(j.kind)} · portal #${j.portal_id} · ${esc(j.stage)} ${esc(j.detail)}</span>
+      <span class="text-muted">${j.done_items}${j.total_items ? "/" + j.total_items : ""} items</span>
+      ${j.status === "running" || j.status === "queued" ? `<button class="btn btn-sm btn-outline-danger" onclick="api('/api/portals/jobs/${j.id}/cancel',{method:'POST'}).then(()=>toast('cancel requested','warn'))">✕</button>` : ""}
+    </div>`).join("");
+}
+function makeStreamsTable() {
+  window._streamsTable = new DataTable($("#streams-table"), {
+    perPageDefault: 10,
+    server: async (q) => await api("/api/streams", {}),
+    columns: [
+      { key: "item_name", label: "Item", render: r => `<b>${esc(r.item_name)}</b><div class="small text-muted">${esc(r.kind)}</div>` },
+      { key: "user_name", label: "User", render: r => esc(r.user_name || "admin") },
+      { key: "portal_name", label: "Portal / MAC", render: r => `<div>${esc(r.portal_name || "-")}</div><div class="small mono text-muted">${esc(r.mac || "")}</div>` },
+      { key: "template_name", label: "Template", render: r => `<span class="small">${esc(r.template_name)}</span>` },
+      { key: "started", label: "Active since", render: r => { const s = Math.round(Date.now()/1000 - r.started); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")} min`; } },
+      { key: "bytes_sent", label: "Data", render: r => (r.bytes_sent/1048576).toFixed(1) + " MB" },
+      { key: "id", label: "", render: r => `<button class="btn btn-sm btn-outline-danger" onclick="api('/api/streams/${r.id}/kill',{method:'POST'}).then(()=>{toast('stream killed','warn');refreshStats();})"><i class='bi bi-x-lg'></i></button>` },
+    ],
+    emptyText: "No active streams. Open a channel from the playlist output to see it here.",
+  });
+}
+/* logs mini-table */
+let logsTable;
+$("#log-level").addEventListener("change", () => { logsTable.state.filters.level = $("#log-level").value; logsTable.state.page = 1; logsTable.reload(); });
+$("#log-module").addEventListener("change", () => { logsTable.state.filters.module = $("#log-module").value; logsTable.state.page = 1; logsTable.reload(); });
+$("#log-q").addEventListener("input", () => { clearTimeout(window._lt); window._lt = setTimeout(() => { logsTable.state.filters.q = $("#log-q").value; logsTable.state.page = 1; logsTable.reload(); }, 400); });
+logsTable = new DataTable($("#logs-table"), {
+  perPageDefault: 12,
+  server: async (q) => {
+    const d = await api("/api/logs?" + q);
+    const sel = $("#log-module");
+    if (sel.options.length <= 1) d.modules.forEach(m => sel.append(el("option", {}, m)));
+    return d;
+  },
+  columns: [
+    { key: "ts", label: "Time", render: r => `<span class="small text-muted">${(r.ts||"").replace("T"," ").slice(0,19)}</span>` },
+    { key: "level", label: "Level", render: r => `<b class="log-${r.level}">${r.level}</b>` },
+    { key: "module", label: "Module", render: r => `<span class="small">${esc(r.module)}</span>` },
+    { key: "message", label: "Message", render: r => `<span style="white-space:normal">${esc(r.message)}</span>` },
+  ],
+  emptyText: "no log messages yet",
+});
+$("#kill-all").addEventListener("click", () => confirmDialog({ title: "Kill all streams", body: "Stop ALL active streams?", okText: "Kill all", okClass: "btn-danger", onOk: async () => { const r = await api("/api/streams/kill-all", { method: "POST" }); toast(`${r.killed} streams killed`, "warn"); refreshStats(); } }));
+$("#reload-streams").addEventListener("click", refreshStats);
+refreshStats();
+setInterval(refreshStats, 10000);
+</script>
+{% endblock %}

@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-gear-wide-connected"></i> Templates</span>
+        <button class="btn btn-sm btn-accent" id="tpl-new"><i class="bi bi-plus-circle"></i> New</button>
+      </div>
+      <div class="card-body p-1" id="tpl-list" style="max-height:calc(100vh - 220px);overflow:auto"></div>
+    </div>
+  </div>
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span id="ed-title">Template editor</span>
+        <span class="small text-muted">fields ⇄ command stay in sync automatically</span>
+      </div>
+      <div class="card-body">
+        <div class="row g-2">
+          <div class="col-md-6">
+            <div class="row g-2">
+              <div class="col-8"><label class="muted-label">Name</label><input class="form-control form-control-sm" id="f-name"></div>
+              <div class="col-4 d-flex align-items-end"><div class="form-check form-switch">
+                <input class="form-check-input ff-field" type="checkbox" id="f-enabled"><label class="form-check-label small">enabled</label></div></div>
+              <div class="col-4"><label class="muted-label">Hardware</label>
+                <select class="form-select form-select-sm ff-field" id="f-hw_accel">
+                  <option value="none">none (CPU)</option><option value="vaapi">VAAPI (Intel)</option><option value="qsv">Quick Sync (QSV)</option>
+                </select></div>
+              <div class="col-4"><label class="muted-label">Device</label>
+                <select class="form-select form-select-sm ff-field" id="f-device">
+                  <option>/dev/dri/renderD128</option><option>/dev/dri/renderD129</option>
+                </select></div>
+              <div class="col-4"><label class="muted-label">Resolution</label>
+                <select class="form-select form-select-sm ff-field" id="f-resolution">
+                  <option>source</option><option>360p</option><option>480p</option><option>576p</option>
+                  <option selected>720p</option><option>1080p</option><option>1440p</option><option>2160p</option>
+                </select></div>
+              <div class="col-4"><label class="muted-label">Aspect</label>
+                <select class="form-select form-select-sm ff-field" id="f-aspect"><option>16:9</option><option>4:3</option><option>21:9</option></select></div>
+              <div class="col-4"><label class="muted-label">Video codec</label>
+                <select class="form-select form-select-sm ff-field" id="f-video_codec">
+                  <option value="copy">copy (passthrough)</option><option>libx264</option><option>libx265</option>
+                  <option value="h264_vaapi">h264_vaapi (QSync/VAAPI)</option><option value="hevc_vaapi">hevc_vaapi</option>
+                  <option value="h264_qsv">h264_qsv</option><option value="hevc_qsv">hevc_qsv</option>
+                </select></div>
+              <div class="col-4"><label class="muted-label">Bitrate</label>
+                <select class="form-select form-select-sm ff-field" id="f-video_bitrate">
+                  <option>500k</option><option>750k</option><option selected>1000k</option><option>1500k</option>
+                  <option>2500k</option><option>4000k</option><option>6000k</option>
+                </select></div>
+              <div class="col-4"><label class="muted-label">Maxrate</label>
+                <select class="form-select form-select-sm ff-field" id="f-maxrate">
+                  <option value="">—</option><option>750k</option><option selected>1200k</option><option>1800k</option><option>3000k</option><option>4800k</option><option>8000k</option>
+                </select></div>
+              <div class="col-4"><label class="muted-label">Bufsize</label>
+                <select class="form-select form-select-sm ff-field" id="f-bufsize">
+                  <option value="">—</option><option selected>1800k</option><option>2700k</option><option>4500k</option><option>7200k</option>
+                </select></div>
+              <div class="col-3"><label class="muted-label">FPS</label>
+                <select class="form-select form-select-sm ff-field" id="f-fps"><option value="">src</option><option selected>25</option><option>30</option><option>50</option></select></div>
+              <div class="col-3"><label class="muted-label">GOP</label><input class="form-control form-control-sm ff-field" id="f-gop" value="50"></div>
+              <div class="col-3"><label class="muted-label">Profile</label>
+                <select class="form-select form-select-sm ff-field" id="f-profile"><option>high</option><option>main</option><option>baseline</option></select></div>
+              <div class="col-3"><label class="muted-label">Level</label>
+                <select class="form-select form-select-sm ff-field" id="f-level"><option>4.1</option><option>4.0</option><option>3.1</option><option>5.1</option></select></div>
+              <div class="col-4"><label class="muted-label">Audio codec</label>
+                <select class="form-select form-select-sm ff-field" id="f-audio_codec"><option>aac</option><option>ac3</option><option>mp3</option><option value="copy">copy</option><option value="none">none</option></select></div>
+              <div class="col-3"><label class="muted-label">Audio bitrate</label>
+                <select class="form-select form-select-sm ff-field" id="f-audio_bitrate"><option>96k</option><option selected>128k</option><option>160k</option><option>192k</option></select></div>
+              <div class="col-2"><label class="muted-label">Channels</label>
+                <select class="form-select form-select-sm ff-field" id="f-audio_channels"><option selected>2</option><option>1</option><option>6</option></select></div>
+              <div class="col-3"><label class="muted-label">Sample rate</label>
+                <select class="form-select form-select-sm ff-field" id="f-audio_rate"><option selected>48000</option><option>44100</option></select></div>
+              <div class="col-4"><label class="muted-label">Output</label>
+                <select class="form-select form-select-sm ff-field" id="f-output_format"><option value="mpegts">MPEG-TS (pipe)</option><option value="hls">HLS (files)</option></select></div>
+              <div class="col-6"><label class="muted-label">Extra input flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_input"></div>
+              <div class="col-6"><label class="muted-label">Extra output flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_output"></div>
+            </div>
+          </div>
+          <div class="col-md-6">
+            <label class="muted-label">Full ffmpeg command (edit freely — fields update on the fly)</label>
+            <textarea class="form-control ff-edit mono" id="f-command" spellcheck="false"></textarea>
+            <div class="d-flex align-items-center gap-2 mt-1">
+              <span class="small" id="sync-state"></span>
+              <button class="btn btn-sm btn-outline-secondary ms-auto" id="btn-test-cmd">Validate syntax</button>
+            </div>
+            <div class="small text-muted mt-2">The literal <code>&lt;url&gt;</code> is replaced with the real stream at runtime.
+              Reference DS918+ command (spec) is the “VAAPI 720p ~1M” preset.</div>
+          </div>
+        </div>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <button class="btn btn-sm btn-accent" id="tpl-save"><i class="bi bi-check2"></i> Save template</button>
+        <button class="btn btn-sm btn-outline-danger" id="tpl-delete"><i class="bi bi-trash"></i> Delete</button>
+        <a class="btn btn-sm btn-outline-secondary ms-auto" href="/api/export?section=ffmpeg"><i class="bi bi-download"></i> Export all</a>
+        <button class="btn btn-sm btn-outline-secondary" id="tpl-import"><i class="bi bi-upload"></i> Import</button>
+        <input type="file" id="tpl-import-file" accept="application/json" class="d-none">
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","video_codec","video_bitrate",
+  "maxrate","bufsize","fps","gop","profile","level","audio_codec","audio_bitrate","audio_channels",
+  "audio_rate","output_format","extra_input","extra_output"];
+let current = null, templates = [];
+
+function readFields() {
+  const o = {};
+  for (const k of FIELD_IDS) {
+    const n = $("#f-" + k);
+    o[k] = n.type === "checkbox" ? n.checked : n.value;
+  }
+  return o;
+}
+function writeFields(t) {
+  for (const k of FIELD_IDS) if (t[k] !== undefined && t[k] !== null) {
+    const n = $("#f-" + k);
+    if (n.type === "checkbox") n.checked = !!t[k]; else n.value = t[k];
+    if (n.tagName === "SELECT" && n.value !== String(t[k])) {
+      n.append(el("option", { value: t[k], selected: "" }, t[k]));   // keep unknown custom values
+    }
+  }
+}
+
+/* fields -> command */
+let syncTimer;
+async function fieldsToCommand() {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    const o = readFields();
+    const r = await api("/api/ffmpeg/build", { method: "POST", body: o });
+    $("#f-command").value = r.command;
+    $("#sync-state").innerHTML = '<span class="text-success">fields → command</span>';
+    if (current) current.command_source = "fields";
+  }, 200);
+}
+/* command -> fields */
+let parseTimer;
+$("#f-command").addEventListener("input", () => {
+  clearTimeout(parseTimer);
+  parseTimer = setTimeout(async () => {
+    const r = await api("/api/ffmpeg/parse", { method: "POST", body: { command: $("#f-command").value } });
+    writeFields(r.options);
+    $("#sync-state").innerHTML = '<span class="text-success">command → fields</span>' +
+      (r.warnings.length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
+    if (current) current.command_source = "manual";
+  }, 350);
+});
+$$(".ff-field").forEach(n => n.addEventListener("change", fieldsToCommand));
+$$(".ff-field").forEach(n => n.addEventListener("input", fieldsToCommand));
+
+async function loadList() {
+  templates = (await api("/api/ffmpeg")).items;
+  const host = $("#tpl-list"); host.innerHTML = "";
+  for (const t of templates) {
+    const b = el("button", { class: "btn btn-sm w-100 text-start mb-1 " + (current?.id === t.id ? "btn-accent" : "btn-light") });
+    b.innerHTML = `<div class="d-flex justify-content-between"><span>${esc(t.name)} ${t.is_default ? '<span class="badge text-bg-dark">default</span>' : ""}</span>
+      <span class="badge ${t.enabled ? "st-online" : "st-unknown"}">${t.enabled ? "on" : "off"}</span></div>
+      <div class="small text-muted">${esc(t.hw_accel)} · ${esc(t.video_codec)} · ${esc(t.resolution)} · ${esc(t.audio_codec)}</div>`;
+    b.addEventListener("click", () => selectTemplate(t.id));
+    host.append(b);
+  }
+}
+async function selectTemplate(id) {
+  current = templates.find(t => t.id === id);
+  $("#ed-title").textContent = "Edit template: " + current.name;
+  writeFields(current);
+  $("#f-command").value = current.command || "";
+  $("#sync-state").textContent = "";
+}
+$("#tpl-new").addEventListener("click", () => {
+  current = null; $("#ed-title").textContent = "New template (unsaved)";
+  writeFields({ name: "New template", enabled: true, hw_accel: "vaapi" });
+  fieldsToCommand();
+});
+$("#tpl-save").addEventListener("click", async () => {
+  const body = { ...readFields(), command: $("#f-command").value,
+                 command_source: current?.command_source || "fields" };
+  if (!body.name.trim()) return toast("name required", "warn");
+  if (current) { await api(`/api/ffmpeg/${current.id}`, { method: "PUT", body }); }
+  else { const r = await api("/api/ffmpeg", { method: "POST", body }); body.id = r.item.id; }
+  toast("template saved", "ok"); await loadList();
+  if (current) selectTemplate(current.id); else { const last = templates[templates.length - 1]; if (last) selectTemplate(last.id); }
+});
+$("#tpl-delete").addEventListener("click", () => {
+  if (!current) return toast("nothing selected", "warn");
+  confirmDialog({ title: "Delete template", body: `Delete <b>${esc(current.name)}</b>? Channels using it fall back to the default template.`,
+    okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/ffmpeg/${current.id}`, { method: "DELETE" }); current = null; loadList(); } });
+});
+$("#btn-test-cmd").addEventListener("click", () => {
+  const cmd = $("#f-command").value.trim();
+  const ok = cmd.startsWith("ffmpeg") && cmd.includes("<url>");
+  toast(ok ? "looks valid (starts with ffmpeg, contains <url>)" : "command must start with 'ffmpeg' and contain <url>", ok ? "ok" : "warn");
+});
+$("#tpl-import").addEventListener("click", () => $("#tpl-import-file").click());
+$("#tpl-import-file").addEventListener("change", async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const data = JSON.parse(await f.text());
+  const r = await api("/api/import", { method: "POST", body: { mode: "merge", data } });
+  toast(`imported ${r.imported}, skipped ${r.skipped.length}`, "ok"); loadList(); e.target.value = "";
+});
+loadList().then(() => { if (templates.length) selectTemplate(templates[0].id); });
+</script>
+{% endblock %}

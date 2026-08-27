@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-sliders"></i> General settings</div>
+      <div class="card-body" id="settings-form"><div class="text-muted small">loading…</div></div>
+      <div class="card-footer"><button class="btn btn-sm btn-accent" id="set-save"><i class="bi bi-check2"></i> Save settings</button></div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header"><i class="bi bi-calendar3"></i> External EPG sources</div>
+      <div class="card-body p-2">
+        <div class="input-group input-group-sm mb-2">
+          <input class="form-control" id="epg-url" placeholder="http://www.xmltvepg.nl/rytecNL_Basic.xz">
+          <button class="btn btn-outline-secondary" id="epg-add">Add</button>
+        </div>
+        <div id="epg-list"></div>
+        <div class="small text-muted">Ingest, channel matching and merged <code>/epg.xml</code> + <code>xmltv.php</code> output arrive in Phase 3.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-6">
+    <div class="card">
+      <div class="card-header"><i class="bi bi-download"></i> Backup / restore</div>
+      <div class="card-body">
+        <div class="d-flex flex-wrap gap-2 mb-3">
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=all"><i class="bi bi-download"></i> Full backup (all)</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=portals">Portals</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=ffmpeg">FFmpeg</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=users">Users</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=settings">Settings</a>
+        </div>
+        <label class="muted-label">Import (merge; duplicates are skipped)</label>
+        <input class="form-control form-control-sm" type="file" id="import-file" accept="application/json">
+        <div class="small text-muted mt-1" id="import-result"></div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header"><i class="bi bi-info-circle"></i> Runtime info</div>
+      <div class="card-body small mono" id="runtime-info">loading…</div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const SETTING_DEFS = [
+  ["playlist_url_format", "Playlist URL format", "text", "{base}/play/{type}/{id}.ts?u={u}&p={p}"],
+  ["output_base_url", "Public base URL override (reverse proxy/NAT)", "text", ""],
+  ["fallback_strategy", "Fallback order strategy", ["macs_first", "portal_first"], "macs_first"],
+  ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
+  ["epg_refresh_hours", "EPG refresh interval (hours)", "number", 24],
+  ["logo_country", "Logo country folder (tv-logos)", "text", "netherlands"],
+  ["tmdb_api_key", "TMDB API key (Phase 3)", "text", ""],
+];
+async function loadSettings() {
+  const { settings } = await api("/api/settings");
+  const host = $("#settings-form");
+  host.innerHTML = SETTING_DEFS.map(([k, label, type, def]) => {
+    const v = settings[k] ?? def;
+    if (Array.isArray(type))
+      return `<div class="mb-2"><label class="muted-label">${label}</label>
+        <select class="form-select form-select-sm set-field" data-key="${k}" data-kind="str">
+          ${type.map(o => `<option ${o === v ? "selected" : ""}>${o}</option>`).join("")}
+        </select><div class="small text-muted">${k === "fallback_strategy" ? "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately" : ""}</div></div>`;
+    return `<div class="mb-2"><label class="muted-label">${label}</label>
+      <input class="form-control form-control-sm set-field" data-key="${k}" data-kind="${type === "number" ? "num" : "str"}"
+             type="${type}" value="${esc(v)}"></div>`;
+  }).join("");
+}
+$("#set-save").addEventListener("click", async () => {
+  const payload = {};
+  $$(".set-field").forEach(n => payload[n.dataset.key] = n.dataset.kind === "num" ? +n.value : n.value);
+  await api("/api/settings", { method: "POST", body: payload });
+  toast("settings saved", "ok");
+});
+async function loadEpg() {
+  const d = await api("/api/epg-sources");
+  $("#epg-list").innerHTML = d.items.length ? d.items.map(e => `
+    <div class="d-flex align-items-center gap-2 border-bottom py-1">
+      <div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${e.enabled ? "checked" : ""}
+        onchange="api('/api/epg-sources/toggle',{method:'POST',body:{ids:[${e.id}],enabled:this.checked}})"></div>
+      <span class="small mono flex-grow-1">${esc(e.url)}</span>
+      <span class="small text-muted">${e.last_fetch ? "fetched " + e.last_fetch.slice(0, 10) : "not fetched"}</span>
+      <button class="btn btn-sm btn-outline-danger" onclick="api('/api/epg-sources/${e.id}',{method:'DELETE'}).then(loadEpg)"><i class="bi bi-trash"></i></button>
+    </div>`).join("") : '<div class="small text-muted">No EPG sources. Try http://www.xmltvepg.nl/rytecNL_Basic.xz</div>';
+}
+$("#epg-add").addEventListener("click", async () => {
+  const url = $("#epg-url").value.trim(); if (!url) return;
+  await api("/api/epg-sources", { method: "POST", body: { url } });
+  $("#epg-url").value = ""; loadEpg();
+});
+$("#import-file").addEventListener("change", async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  try {
+    const data = JSON.parse(await f.text());
+    const r = await api("/api/import", { method: "POST", body: { mode: "merge", data } });
+    $("#import-result").innerHTML = `<span class="text-success">imported ${r.imported}, skipped ${r.skipped.length}</span>`;
+  } catch (err) { $("#import-result").textContent = "invalid file: " + err.message; }
+  e.target.value = "";
+});
+(async () => {
+  await loadSettings(); await loadEpg();
+  const d = await api("/api/dashboard");
+  $("#runtime-info").innerHTML =
+    `portals: ${d.stats.portals} · live ${d.stats.live_enabled}/${d.stats.live_available} · ` +
+    `vod ${d.stats.vod_enabled}/${d.stats.vod_available} · series ${d.stats.series_enabled}/${d.stats.series_available}` +
+    `<br>active streams: ${d.streams.length} · templates: ${d.stats.ffmpeg_templates} · users: ${d.stats.users}` +
+    `<br>GUI phase: <b>2</b> (core streaming live; EPG/logo/TMDB matching in Phase 3)`;
+})();
+</script>
+{% endblock %}
