@@ -53,7 +53,7 @@ function sourceTable(kind, hostSel) {
       { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'${kind}',ids:[${r.id}],enabled:this.checked}})"></div>` },
       { key: "number", label: "#", sort: "id", width: "50px", render: r => esc(r.number || "") },
       { key: "logo", label: "Logo", width: "70px", render: r => r.logo ? `<img class="logo-thumb" loading="lazy" src="${esc(r.logo)}" onerror="this.style.display='none'">` : "" },
-      { key: "name", label: "Channel", sort: "name", filter: { type: "text", placeholder: "name…" }, render: r => esc(r.name) },
+      { key: "name", label: "Channel", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => esc(r.name) },
       { key: "portal_id", label: "Portal", sort: "portal", filter: { type: "select", options: PORTALS }, render: r => esc(r.portal) },
       { key: "genre_id", label: "Genre", filter: { type: "select", options: GENRES.live, placeholder: "enabled genres" }, render: r => esc(r.genre) },
       { key: "play", label: "", width: "40px", render: r => `<button class="btn btn-sm btn-outline-secondary" title="Test stream (original)" onclick="event.stopPropagation();playInModal('/preview/live/${r.id}.ts',${JSON.stringify(r.name).replace(/"/g, '&quot;')})"><i class="bi bi-play-btn"></i></button>` },
@@ -62,7 +62,7 @@ function sourceTable(kind, hostSel) {
       { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'vod',ids:[${r.id}],enabled:this.checked}})"></div>` },
       { key: "position", label: "Pos", sort: "id", width: "55px", render: r => r.position ?? "" },
       { key: "poster", label: "Poster", width: "48px", render: r => r.poster ? `<img class="poster-thumb" loading="lazy" src="${esc(r.poster)}" onerror="this.src='/static/css/../css/none'">` : "" },
-      { key: "name", label: "Title", sort: "name", filter: { type: "text", placeholder: "title…" }, render: r => esc(r.name) },
+      { key: "name", label: "Title", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => esc(r.name) },
       { key: "year", label: "Year", width: "60px" },
       { key: "rating", label: "★", width: "50px" },
       { key: "portal_id", label: "Portal", sort: "portal", filter: { type: "select", options: PORTALS }, render: r => esc(r.portal) },
@@ -72,7 +72,7 @@ function sourceTable(kind, hostSel) {
     series: [
       { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'series',ids:[${r.id}],enabled:this.checked}})"></div>` },
       { key: "poster", label: "Poster", width: "48px", render: r => r.poster ? `<img class="poster-thumb" loading="lazy" src="${esc(r.poster)}">` : "" },
-      { key: "name", label: "Series", sort: "name", filter: { type: "text", placeholder: "title…" }, render: r => esc(r.name) },
+      { key: "name", label: "Series", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => esc(r.name) },
       { key: "year", label: "Year", width: "60px" },
       { key: "portal_id", label: "Portal", sort: "portal", filter: { type: "select", options: PORTALS }, render: r => esc(r.portal) },
       { key: "genre_id", label: "Genre", filter: { type: "select", options: GENRES.series, placeholder: "enabled genres" }, render: r => esc(r.genre) },
@@ -153,7 +153,7 @@ function localTab(hostSel) {
     server: async (q) => await api("/api/sources/local/dirs?" + q),
     columns: [
       { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="api('/api/sources/local/dirs/toggle',{method:'POST',body:{ids:[${r.id}],enabled:this.checked}})"></div>` },
-      { key: "directory", label: "Directory", sort: "directory", filter: { type: "text", placeholder: "path…" }, render: r => `<span class="mono small">${esc(r.directory)}</span>` },
+      { key: "directory", label: "Directory", sort: "directory", filter: { type: "text", param: "q", placeholder: "path…" }, render: r => `<span class="mono small">${esc(r.directory)}</span>` },
       { key: "file_count", label: "Files", width: "60px" },
       { key: "actions", label: "", width: "70px", render: r => `
         <button class="btn btn-sm btn-outline-secondary" title="Edit" onclick="editDir(${r.id}, '${esc(r.directory).replace(/'/g, "\\'")}')"><i class="bi bi-pencil"></i></button>
@@ -181,7 +181,7 @@ function localTab(hostSel) {
     server: async (q) => await api("/api/sources/local/files?" + q),
     columns: [
       { key: "enabled", label: "On", width: "36px", render: r => `<span class="badge ${r.enabled ? "st-online" : "st-unknown"}">${r.enabled ? "on" : "off"}</span>` },
-      { key: "filename", label: "Filename", sort: "filename", filter: { type: "text", placeholder: "file…" }, render: r => esc(r.filename) },
+      { key: "filename", label: "Filename", sort: "filename", filter: { type: "text", param: "q", placeholder: "file…" }, render: r => esc(r.filename) },
       { key: "relative_path", label: "Path", sort: "path", render: r => `<span class="mono small text-muted">${esc(r.relative_path)}</span>` },
       { key: "size_bytes", label: "Size", render: r => r.size_bytes ? (r.size_bytes / 1048576).toFixed(0) + " MB" : "" },
     ],

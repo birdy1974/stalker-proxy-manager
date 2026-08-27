@@ -44,13 +44,24 @@ MOCK_MACS = {
     "00:1A:79:BB:BB:01": {"phone": "2024-01-01 00:00:00"},   # expired on purpose
 }
 
-LIVE_GENRES = {"1": "News", "2": "Sport", "3": "Kids"}
+LIVE_GENRES = {"1": "News", "2": "Sport", "3": "Kids", "4": "Movies & Series",
+               "5": "Documentary", "6": "Music", "7": "Regional",
+               "8": "Entertainment", "9": "International", "10": "Lifestyle"}
 _LIVE_NAMES = {
     "1": ["NPO 1", "NPO 2", "RTL Nieuws", "BBC News"],
     "2": ["ESPN", "Ziggo Sport", "Eurosport 1", "Sky Sports"],
     "3": ["Cartoon Network", "Nickelodeon", "Baby TV", "Boomerang"],
+    # generated extra channels so lists/filters/pagination are visibly exercised
+    "4": [f"Cinema {n}" for n in ("One", "Two", "HD", "Extra")],
+    "5": [f"Docu {n}" for n in ("World", "Wild", "History", "24")],
+    "6": [f"Music {n}" for n in ("Hits", "Classic", "Live", "TV")],
+    "7": [f"Region {n}" for n in ("NH", "Brabant", "Limburg", "Randstad")],
+    "8": [f"Fun {n}" for n in ("TV", "Prime", "XL", "Late")],
+    "9": [f"World {n}" for n in ("Europe", "Asia", "US", "Global")],
+    "10": [f"Life {n}" for n in ("Style", "Home", "Travel", "Food")],
 }
-VOD_GENRES = {"11": "Action", "12": "Comedy"}
+VOD_GENRES = {"11": "Action", "12": "Comedy", "13": "Thriller", "14": "SciFi",
+              "15": "Family", "16": "Drama"}
 _VOD_NAMES = {
     "11": ["Mock Runner 2049", "Fast & Curious", "The Cache", "Proxy Hard", "Stream Club",
            "比特率 故事", "Null Island", "The Fallback", "Data Moon", "Kernel Panic",
@@ -58,11 +69,26 @@ _VOD_NAMES = {
     "12": ["Funny Packets", "The Jitter", "Latency Blues", "Buffer Day", "Ping Pong",
            "Two Tickets", "LOL Sprintf", "Comedy of Errors", "The Reboot", "Macro Hard",
            "Patch Adams Family", "Click Wars"],
+    "13": [f"The {n}" for n in ("Silent Handshake", "Fourth Mac", "Dead Timeout",
+                                  "Retry Loop", "Cold Proxy", "Null Session")],
+    "14": [f"{n}" for n in ("Star Packets", "Galactic Buffer", "The Uplink",
+                            "Probe", "Encoded", "Bitstream")],
+    "15": [f"{n}" for n in ("Family Bandwidth", "The Little Stream", "Packets for Kids",
+                            "Movie Night", "Grandma's Playlist", "Story Time TV")],
+    "16": [f"{n}" for n in ("The Encoder's Wife", "Last Token", "Rain on the Dish",
+                            "The Long Reconnect", "Broken Chain", "A Quiet Stream")],
 }
-SERIE_GENRES = {"21": "SciFi", "22": "Drama"}
+SERIE_GENRES = {"21": "SciFi", "22": "Drama", "23": "Comedy", "24": "Crime",
+                "25": "Documentary"}
 _SERIE_NAMES = {
     "21": ["Portal Quest", "The Token", "Bandwidth", "Handshakers", "Streamfall", "M3U Cubs"],
     "22": ["The Resolver", "Silent Packets", "Ashes of GPIO", "NVR Diaries", "Episodes", "Fallout LAN"],
+    "23": [f"{n}" for n in ("Buffer Brothers", "The Latency Show", "Office Streams",
+                            "Uploads", "Bit Jokes", "Frame Drops")],
+    "24": [f"{n}" for n in ("MAC Address", "The Proxy Murders", "Cold Stream",
+                            "Evidence Packets", "Wireshark Unit", "The Sniffer")],
+    "25": [f"{n}" for n in ("How Streams Work", "Planet Fiber", "The Codec Story",
+                            "Networks of Europe", "Inside the CDN", "Digital Rivers")],
 }
 
 PAGE_SIZE = 14  # exactly what real portals use

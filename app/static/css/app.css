@@ -33,7 +33,7 @@ body { background: var(--spm-bg); }
 .table-spm .filters input, .table-spm .filters select { font-size: .75rem; padding: .1rem .3rem; height: 26px; }
 
 .row-drag { cursor: grab; color: #9ca3af; }
-tr.dragging { opacity: .4; }
+tr.dragging, div.dragging { opacity: .4; }
 
 .badge-status { font-weight: 500; min-width: 72px; }
 .st-online { background: #d1fae5; color: #065f46; }

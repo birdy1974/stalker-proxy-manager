@@ -207,6 +207,36 @@ async def live_bulk(payload: dict, db=Depends(get_db)):
     return {"ok": True, "count": len(rows)}
 
 
+async def _bulk_assign(db, model, payload) -> int:
+    """Same semantics as /api/playlist/live/bulk for vod/series/local rows."""
+    ids = [int(x) for x in payload.get("ids", [])]
+    rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
+    for r in rows:
+        if "group_name" in payload:
+            r.group_name = payload["group_name"]
+        if "ffmpeg_template_id" in payload:
+            r.ffmpeg_template_id = payload["ffmpeg_template_id"] or None
+        if "enabled" in payload:
+            r.enabled = bool(payload["enabled"])
+    await db.commit()
+    return len(rows)
+
+
+@router.post("/vod/bulk")
+async def vod_bulk(payload: dict, db=Depends(get_db)):
+    return {"ok": True, "count": await _bulk_assign(db, VodPlaylist, payload)}
+
+
+@router.post("/series/bulk")
+async def series_bulk(payload: dict, db=Depends(get_db)):
+    return {"ok": True, "count": await _bulk_assign(db, SeriePlaylist, payload)}
+
+
+@router.post("/local/bulk")
+async def local_bulk(payload: dict, db=Depends(get_db)):
+    return {"ok": True, "count": await _bulk_assign(db, LocalPlaylist, payload)}
+
+
 # ----------------------------------------------------------------- vod / series / local
 async def _map_chain(db, model_pl, link_model, src_model, link_fk, src_fk, pl_id):
     rows = (await db.execute(select(link_model).where(src_fk == pl_id)
@@ -308,7 +338,8 @@ async def vod_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1
         chain = await _map_chain(db, VodPlaylist, VodPlaylistSource, VodSource,
                                  VodPlaylistSource, VodPlaylistSource.vod_playlist_id, r.id)
         items.append({"id": r.id, "custom_name": r.custom_name, "group_name": r.group_name,
-                      "poster": r.poster, "year": r.year, "enabled": r.enabled,
+                      "poster": r.poster, "year": r.year, "rating": r.rating,
+                      "overview": r.overview, "enabled": r.enabled,
                       "order": r.order, "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""), "chain": chain})
     return {"total": total, "page": page, "per_page": per_page, "items": items, "groups": groups}
@@ -347,6 +378,18 @@ async def series_pl(db=Depends(get_db), q: str = "", group: str = "", page: int 
                                                q, group, {}, page, per_page, sort, direction)
     items = []
     for r in rows:
+        # read-repair: seasons fetched AFTER the item was added to the playlist
+        # must still get a link row (defaults to on/off following the source season)
+        src_seasons = (await db.execute(select(SerieSeason).where(
+            SerieSeason.serie_source_id == r.serie_source_id))).scalars().all()
+        for sn in src_seasons:
+            if (await db.execute(select(SeriePlaylistSeason).where(
+                    SeriePlaylistSeason.serie_playlist_id == r.id,
+                    SeriePlaylistSeason.serie_season_id == sn.id))).scalar_one_or_none() is None:
+                db.add(SeriePlaylistSeason(serie_playlist_id=r.id, serie_season_id=sn.id,
+                                           enabled=sn.enabled))
+        if src_seasons:
+            await db.commit()
         seasons = (await db.execute(
             select(SeriePlaylistSeason, SerieSeason)
             .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
@@ -358,7 +401,8 @@ async def series_pl(db=Depends(get_db), q: str = "", group: str = "", page: int 
                 n_eps += await db.scalar(select(func.count()).select_from(SerieEpisode).where(
                     SerieEpisode.serie_season_id == sn.id)) or 0
         items.append({"id": r.id, "custom_name": r.custom_name, "group_name": r.group_name,
-                      "poster": r.poster, "year": r.year, "enabled": r.enabled,
+                      "poster": r.poster, "year": r.year, "rating": r.rating,
+                      "overview": r.overview, "enabled": r.enabled,
                       "order": r.order, "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""),
                       "seasons": [{"link_id": pls.id, "season_id": sn.id,
@@ -417,8 +461,11 @@ async def local_pl(db=Depends(get_db), q: str = "", group: str = "", page: int =
                       "group_name": r.group_name, "enabled": r.enabled, "order": r.order,
                       "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""),
-                      "file": (f"{ls.directory}/{lf.relative_path}" if ls and lf else "?")})
-    return {"total": total or 0, "page": page, "per_page": per_page, "items": items}
+                      "file": (f"{ls.directory}/{lf.relative_path}" if ls and lf else "?"),
+                      "size_bytes": lf.size_bytes if lf else 0})
+    groups = [g[0] for g in (await db.execute(
+        select(LocalPlaylist.group_name).distinct().order_by(LocalPlaylist.group_name))).all() if g[0]]
+    return {"total": total or 0, "page": page, "per_page": per_page, "items": items, "groups": groups}
 
 
 @router.put("/local/{pid}")

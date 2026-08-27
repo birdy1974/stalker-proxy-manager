@@ -109,7 +109,14 @@ class DataTable {
   params() {
     const p = new URLSearchParams({ page: this.state.page, per_page: this.state.per_page });
     if (this.state.sort) { p.set("sort", this.state.sort); p.set("direction", this.state.direction); }
-    for (const [k, v] of Object.entries(this.state.filters)) if (v !== "" && v != null) p.set(k, v);
+    /* filters may carry a server-side param override (e.g. textbox -> "q"),
+       otherwise the column key itself is sent */
+    for (const c of this.opts.columns) {
+      if (!c.filter) continue;
+      const k = c.filter.param || c.key;
+      const v = this.state.filters[k] ?? "";
+      if (v !== "" && v != null) p.set(k, v);
+    }
     return p.toString();
   }
   async reload() {
@@ -154,17 +161,30 @@ class DataTable {
       const fth = el("th");
       if (c.filter) {
         if (c.filter.type === "select") {
+          const fk = c.filter.param || c.key;
           const s = el("select", { class: "form-select form-select-sm" }, el("option", { value: "" }, c.filter.placeholder || "All"));
-          const fill = (opts) => { for (const op of opts) s.append(el("option", { value: op.v ?? op }, op.l ?? op)); if (this._pendingFilter?.[c.key]) { s.value = this._pendingFilter[c.key]; } };
+          const fill = (opts) => { for (const op of opts) s.append(el("option", { value: op.v ?? op }, op.l ?? op)); if (this._pendingFilter?.[fk]) { s.value = this._pendingFilter[fk]; } };
           if (c.filter.optionsLoader) { c.filter.optionsLoader(fill, this); if (c.filter.options) fill(c.filter.options); }
           else fill(c.filter.options || []);
-          s.value = this.state.filters[c.key] ?? "";
-          s.addEventListener("change", () => { this.state.filters[c.key] = s.value; this.state.page = 1; this.reload(); });
+          s.value = this.state.filters[fk] ?? "";
+          s.addEventListener("change", () => { this.state.filters[fk] = s.value; this.state.page = 1; this.reload(); });
           fth.append(s);
         } else {
+          /* text filters: live-update the list WHILE TYPING (debounced), case-
+             insensitive server-side; focus + caret are restored after the
+             debounced reload re-renders the table */
+          const fk = c.filter.param || c.key;
           const inp = el("input", { class: "form-control form-control-sm", placeholder: c.filter.placeholder || "filter…" });
-          inp.value = this.state.filters[c.key] ?? "";
-          let t; inp.addEventListener("input", () => { clearTimeout(t); t = setTimeout(() => { this.state.filters[c.key] = inp.value; this.state.page = 1; this.reload(); }, 350); });
+          inp.value = this.state.filters[fk] ?? "";
+          inp.dataset.filterKey = fk;
+          let t; inp.addEventListener("input", () => {
+            clearTimeout(t);
+            t = setTimeout(() => {
+              this.state.filters[fk] = inp.value; this.state.page = 1;
+              this._refocus = { key: fk, caret: inp.selectionStart };
+              this.reload();
+            }, 300);
+          });
           fth.append(inp);
         }
       }
@@ -174,6 +194,16 @@ class DataTable {
     this.tbody = el("tbody"); this.table.append(this.tbody);
     this._renderBody();
     this._renderPager();
+    /* live filter typing: restore focus/caret lost through the re-render */
+    if (this._refocus) {
+      const inp = ftr.querySelector(`input[data-filter-key="${this._refocus.key}"]`);
+      if (inp) {
+        inp.focus();
+        if (inp.setSelectionRange && this._refocus.caret != null)
+          inp.setSelectionRange(this._refocus.caret, this._refocus.caret);
+      }
+      this._refocus = null;
+    }
   }
   _renderBody() {
     const o = this.opts; this.tbody.innerHTML = "";
