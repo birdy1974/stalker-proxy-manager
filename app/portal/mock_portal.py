@@ -214,8 +214,9 @@ async def _guard(request: Request):
 
 
 def _auth(request: Request) -> tuple[str, JSONResponse | None]:
-    """Validate mac cookie + bearer token; also enforce the busy-MAC demo."""
-    mac = request.cookies.get("mac", "")
+    """Validate mac (cookie or query param, like real STB handshakes) + bearer token;
+    also enforce the busy-MAC demo."""
+    mac = request.cookies.get("mac", "") or request.query_params.get("mac", "")
     if mac not in MOCK_MACS:
         return mac, JSONResponse({"js": {"error": "unknown mac"}}, status_code=403)
     action = request.query_params.get("action", "")
