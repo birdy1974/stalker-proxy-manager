@@ -27,7 +27,7 @@ import logging
 import random
 import time
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from ..config import FFMPEG_BIN
@@ -213,15 +213,17 @@ async def _guard(request: Request):
     return None
 
 
+def _portal_mac(request: Request) -> str:
+    """Real STBs send the mac as cookie or as query param - accept both."""
+    return request.cookies.get("mac", "") or request.query_params.get("mac", "") or ""
+
+
 def _auth(request: Request) -> tuple[str, JSONResponse | None]:
-    """Validate mac (cookie or query param, like real STB handshakes) + bearer token;
-    also enforce the busy-MAC demo."""
-    mac = request.cookies.get("mac", "") or request.query_params.get("mac", "")
+    """Post-handshake authorization: known mac + the bearer token that the
+    handshake issued. The handshake itself is permissive (see portal_php)."""
+    mac = _portal_mac(request)
     if mac not in MOCK_MACS:
         return mac, JSONResponse({"js": {"error": "unknown mac"}}, status_code=403)
-    action = request.query_params.get("action", "")
-    if action == "handshake":
-        return mac, None
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer mock-" + mac.replace(":", "")):
         return mac, JSONResponse({"js": {"error": "token"}}, status_code=401)
@@ -232,24 +234,37 @@ def _auth(request: Request) -> tuple[str, JSONResponse | None]:
 # The portal itself
 # ---------------------------------------------------------------------------
 @router.api_route("/mock/c/portal.php", methods=["GET"])
-async def portal_php(request: Request,
-                     type: str = Query(""), action: str = Query("")):  # noqa: A002
+async def portal_php(request: Request):  # noqa: A002
+    # type/action are read straight from the query string (no FastAPI schema
+    # validation): portals/emulators send arbitrary extra params and the mock
+    # must never answer 422 for the canonical handshake shape.
+    qp = request.query_params
+    type = qp.get("type", "")  # noqa: A002
+    action = qp.get("action", "")
+
     guard = await _guard(request)
     if guard is not None:
         return guard
+    mac = _portal_mac(request)
+
+    # Handshake is deliberately permissive, like real portals: ANY mac gets a
+    # token (the known-MAC allowlist + bearer check apply to the calls after
+    # the handshake). This is the canonical STB/smoke-test flow:
+    #   ?type=stb&action=handshake&mac=00:1A:79:AA:AA:01
+    if type == "stb" and action == "handshake":
+        token = "mock-" + (mac.replace(":", "") if mac else "000000000000")
+        log.info("mock portal: type=%s action=%s mac=%s -> handshake token issued",
+                 type, action, mac or "-")
+        return _js({"token": token})
+
     mac, err = _auth(request)
     if err is not None:
-        # log the resolution so CI / docker logs show WHY a handshake failed
-        # (e.g. mac missing/unknown) instead of failing silently in grep.
+        # log the resolution so CI / docker logs show WHY a call failed
+        # instead of failing silently in grep.
         log.info("mock portal: type=%s action=%s mac=%s -> HTTP %d",
                  type, action, mac or "-", err.status_code)
         return err
     log.info("mock portal: type=%s action=%s mac=%s -> ok", type, action, mac or "-")
-    qp = request.query_params
-
-    if type == "stb" and action == "handshake":
-        token = "mock-" + mac.replace(":", "")
-        return _js({"token": token})
     if type == "stb" and action == "get_profile":
         return _js({"mac": mac, "locale": "en_GB.utf8", "hd": 1, "ver": "MockPortal 1.0"})
     if type == "account_info" and action == "get_main_info":
