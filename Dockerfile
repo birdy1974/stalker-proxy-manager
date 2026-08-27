@@ -14,12 +14,20 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
 # ffmpeg + Intel media drivers (i915 Gen9/iHD) + Intel VA-API runtime.
-# intel-media-va-driver-non-free is needed for full H.264 encode on Apollo Lake.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# intel-media-va-driver-non-free is required for full H.264/HEVC encode on
+# Apollo Lake (the free driver only decodes). It lives in the `non-free` apt
+# component, which the base slim image does not enable — so we add it first.
+RUN set -eux; \
+    [ -f /etc/apt/sources.list.d/debian.sources ] || exit 1; \
+    sed -i -E 's/^Components: main( non-free-firmware)?$/Components: main non-free\1/' \
+        /etc/apt/sources.list.d/debian.sources; \
+    echo 'APT::Get::Update::SourceListWarnings::NonFreeFirmware "false";' \
+        > /etc/apt/apt.conf.d/no-bookworm-firmware.conf; \
+    apt-get update \
+    && apt-get install -y --no-install-recommends \
         ffmpeg \
         vainfo \
-        intel-media-va-driver \
-        libva-intel-driver \
+        intel-media-va-driver-non-free \
         libva2 \
         ca-certificates \
         curl \
