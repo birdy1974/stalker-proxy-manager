@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex gap-2 align-items-center">
+    <span><i class="bi bi-people"></i> Users (M3U / Xtream output consumers)</span>
+    <button class="btn btn-sm btn-accent ms-auto" id="u-add"><i class="bi bi-person-plus"></i> Add user</button>
+  </div>
+  <div class="card-body p-2"><div id="users-table"></div></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let table, GROUPS = { live: [], vod: [], series: [], local: [] };
+function make() {
+  table = new DataTable($("#users-table"), {
+    server: async () => {
+      const d = await api("/api/users");
+      GROUPS = d.groups_available;
+      return { total: d.items.length, items: d.items };
+    },
+    columns: [
+      { key: "enabled", label: "On", width: "36px", render: r => `<span class="badge ${r.enabled ? "st-online" : "st-unknown"}">${r.enabled ? "on" : "off"}</span>` },
+      { key: "name", label: "User", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono">${esc(r.password)}</div>` },
+      { key: "access", label: "Access", render: r => `${r.m3u_enabled ? '<span class="badge st-online me-1">m3u</span>' : ""}${r.xtream_enabled ? '<span class="badge st-online">xtream</span>' : ""}` },
+      { key: "expire_date", label: "Expires", render: r => esc(r.expire_date || "—") },
+      { key: "max_connections", label: "Max conn", width: "80px" },
+      { key: "groups", label: "Group whitelist", render: r => Object.entries(r.groups || {}).filter(([k, v]) => v.length).map(([k, v]) => `<span class="badge text-bg-light me-1">${k}: ${v.length}</span>`).join("") || '<span class="text-muted small">all groups</span>' },
+      { key: "links", label: "Output — M3U URL / Xtream login", render: r => `
+        <div class="d-flex gap-1 align-items-center">
+          <span class="muted-label mb-0" style="width:40px">M3U</span>
+          <input class="form-control form-control-sm mono" style="max-width:380px" readonly
+            value="${esc(r.m3u_url)}" onclick="event.stopPropagation();this.select()">
+          <button class="btn btn-sm btn-outline-secondary" title="copy M3U URL"
+            onclick="event.stopPropagation();navigator.clipboard.writeText('${esc(r.m3u_url)}');toast('M3U URL copied','ok')"><i class="bi bi-clipboard"></i></button>
+          <button class="btn btn-sm btn-outline-secondary" title="all output URLs (get.php, player_api, EPG)"
+            onclick="event.stopPropagation();showLinks(${r.id})"><i class="bi bi-link-45deg"></i></button>
+        </div>
+        <div class="small text-muted mono mt-1">Xtream: ${esc(r.xtream.url)} · ${esc(r.name)} / ${esc(r.password)}</div>` },
+      { key: "actions", label: "", render: r => `
+        <button class="btn btn-sm btn-outline-secondary" onclick="editUser(${r.id})"><i class="bi bi-pencil"></i></button>
+        <button class="btn btn-sm btn-outline-danger" onclick="delUser(${r.id})"><i class="bi bi-trash"></i></button>` },
+    ],
+    emptyText: "No users yet — create one to get M3U/Xtream URLs.",
+  });
+}
+window.showLinks = (id) => {
+  const u = table.items.find(x => x.id === id);
+  const body = el("div");
+  body.innerHTML = `
+    <div class="muted-label">M3U playlist URL</div>
+    <div class="input-group input-group-sm mb-3"><input class="form-control mono" readonly value="${esc(u.m3u_url)}"><button class="btn btn-outline-secondary" onclick="navigator.clipboard.writeText('${esc(u.m3u_url)}');toast('copied','ok')">copy</button></div>
+    <div class="muted-label">Xtream Codes API login</div>
+    <table class="table table-sm small">
+      <tr><td class="text-muted" style="width:130px">Server URL</td><td class="mono">${esc(u.xtream.url)}</td></tr>
+      <tr><td class="text-muted">Username</td><td class="mono">${esc(u.name)}</td></tr>
+      <tr><td class="text-muted">Password</td><td class="mono">${esc(u.password)}</td></tr>
+      <tr><td class="text-muted">player_api</td><td class="mono">${esc(u.xtream.player_api)}</td></tr>
+      <tr><td class="text-muted">get.php</td><td class="mono small">${esc(u.xtream.get_php)}</td></tr>
+      <tr><td class="text-muted">EPG (xmltv)</td><td class="mono small">${esc(u.xtream.url)}/xmltv.php?username=${esc(u.name)}&password=${esc(u.password)}</td></tr>
+    </table>`;
+  const footer = el("div");
+  const m = openModal({ title: `Output for ${u.name}`, body, footer, size: "lg" });
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close));
+};
+window.editUser = (id) => {
+  const u = id ? table.items.find(x => x.id === id) : { name: "", password: "", m3u_enabled: true, xtream_enabled: true, expire_date: "", max_connections: 1, enabled: true, groups: {} };
+  const body = el("div");
+  const grpChk = (kind) => (GROUPS[kind] || []).map(g => {
+    const cur = (u.groups?.[kind] || []).map(x => x.toLowerCase());
+    return `<label class="d-block small"><input type="checkbox" class="g-${kind}" value="${esc(g)}" ${cur.includes(g.toLowerCase()) ? "checked" : ""}> ${esc(g)}</label>`;
+  }).join("") || '<div class="small text-muted">no groups exist yet</div>';
+  body.innerHTML = `
+    <div class="row g-2">
+      <div class="col-md-4"><label class="muted-label">Username</label><input class="form-control form-control-sm" id="u-name" value="${esc(u.name)}" ${id ? "disabled" : ""}></div>
+      <div class="col-md-4"><label class="muted-label">Password</label><input class="form-control form-control-sm mono" id="u-pass" value="${esc(u.password)}"></div>
+      <div class="col-md-2"><label class="muted-label">Max conn.</label><input class="form-control form-control-sm" type="number" min="1" id="u-max" value="${u.max_connections}"></div>
+      <div class="col-md-2"><label class="muted-label">Expires</label><input class="form-control form-control-sm" type="date" id="u-exp" value="${esc(u.expire_date || "")}"></div>
+      <div class="col-12 d-flex gap-3">
+        <label class="small"><input type="checkbox" id="u-m3u" ${u.m3u_enabled ? "checked" : ""}> M3U playlist</label>
+        <label class="small"><input type="checkbox" id="u-xtream" ${u.xtream_enabled ? "checked" : ""}> Xtream API</label>
+        <label class="small"><input type="checkbox" id="u-enabled" ${u.enabled ? "checked" : ""}> Active</label>
+      </div>
+    </div>
+    <hr class="my-2">
+    <div class="small text-muted mb-1">Group whitelist — empty type = ALL groups of that type allowed</div>
+    <div class="row g-2">
+      ${["live", "vod", "series", "local"].map(k => `<div class="col-md-3">
+        <div class="d-flex justify-content-between align-items-center">
+          <span class="muted-label mb-0">${k}</span>
+          <label class="small mb-0 user-select-none"><input type="checkbox" class="sa-${k}" title="select all ${k} groups"> all</label>
+        </div>
+        <div class="border rounded p-1" style="max-height:150px;overflow:auto">${grpChk(k)}</div></div>`).join("")}
+    </div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: id ? "Edit user" : "Add user", body, footer, size: "xl" });
+  /* select-all toggles per content type (kept in sync with individual boxes) */
+  for (const k of ["live", "vod", "series", "local"]) {
+    const boxes = $$( ".g-" + k, body), sa = $(".sa-" + k, body);
+    if (!sa) continue;
+    const sync = () => sa.checked = boxes.length > 0 && boxes.every(b => b.checked);
+    sa.checked = boxes.length > 0 && boxes.every(b => b.checked);
+    sa.addEventListener("change", () => boxes.forEach(b => { b.checked = sa.checked; }));
+    boxes.forEach(b => b.addEventListener("change", sync));
+  }
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
+    mBtn("Save", "btn-accent", async () => {
+      const groups = {};
+      for (const k of ["live", "vod", "series", "local"]) groups[k] = $$(".g-" + k, body).filter(i => i.checked).map(i => i.value);
+      const payload = { name: $("#u-name", body).value.trim(), password: $("#u-pass", body).value,
+        m3u_enabled: $("#u-m3u", body).checked, xtream_enabled: $("#u-xtream", body).checked,
+        enabled: $("#u-enabled", body).checked, max_connections: +$("#u-max", body).value || 1,
+        expire_date: $("#u-exp", body).value || null, groups };
+      if (id) await api(`/api/users/${id}`, { method: "PUT", body: payload });
+      else await api("/api/users", { method: "POST", body: payload });
+      toast("user saved", "ok"); m.close(); table.reload();
+    }));
+};
+window.delUser = (id) => confirmDialog({ title: "Delete user", body: "Delete this user? Their streams keep playing until stopped, but URLs stop working immediately.",
+  okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/users/${id}`, { method: "DELETE" }); table.reload(); } });
+$("#u-add").addEventListener("click", () => editUser(null));
+make();
+</script>
+{% endblock %}

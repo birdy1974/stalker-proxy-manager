@@ -1,0 +1,328 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <div class="card-header d-flex flex-wrap gap-2 align-items-center">
+    <span><i class="bi bi-hdd-network"></i> Portals</span>
+    <div class="ms-auto d-flex flex-wrap gap-1">
+      <button class="btn btn-sm btn-accent" id="btn-add"><i class="bi bi-plus-circle"></i> Add portal</button>
+      <button class="btn btn-sm btn-outline-secondary" id="btn-test-sel"><i class="bi bi-plug"></i> Test selected</button>
+      <button class="btn btn-sm btn-outline-secondary" id="btn-test-all"><i class="bi bi-plug-fill"></i> Test all</button>
+      <button class="btn btn-sm btn-outline-danger" id="btn-del-sel"><i class="bi bi-trash"></i> Delete selected</button>
+      <span class="vr mx-1"></span>
+      <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=portals"><i class="bi bi-download"></i> Export</a>
+      <button class="btn btn-sm btn-outline-secondary" id="btn-import"><i class="bi bi-upload"></i> Import</button>
+      {% if mock_enabled %}<button class="btn btn-sm btn-outline-warning" id="btn-mock"><i class="bi bi-bug"></i> Mock control</button>{% endif %}
+      <button class="btn btn-sm btn-outline-secondary" id="btn-reload"><i class="bi bi-arrow-clockwise"></i></button>
+    </div>
+  </div>
+  <div class="card-body p-2">
+    <div id="portals-table"></div>
+    <div class="muted-label mt-2">Fetch history / running jobs</div>
+    <div id="jobs-box" class="small"></div>
+  </div>
+</div>
+<input type="file" id="import-file" accept="application/json" class="d-none">
+{% endblock %}
+
+{% block scripts %}
+<script>
+/* ============================= portals table ============================= */
+let table;
+function statusBadge(m) {
+  const cls = { online: "st-online", offline: "st-offline", unauthorized: "st-unauthorized", expired: "st-expired", error: "st-error" }[m.status] || "st-unknown";
+  return `<span class="badge badge-status ${cls}">${m.online ? "online" : m.status}</span>`;
+}
+function makeTable() {
+  table = new DataTable($("#portals-table"), {
+    selectable: true,
+    server: async () => {
+      const d = await api("/api/portals");
+      renderJobs(d.jobs);
+      return { total: d.items.length, items: d.items };
+    },
+    columns: [
+      { key: "enabled", label: "On", width: "40px", render: r =>
+        `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""}
+          onchange="api('/api/portals/${r.id}',{method:'PUT',body:{enabled:this.checked}}).then(()=>toast('portal ${r.enabled ? "disabled" : "enabled"}','ok'))"></div>` },
+      { key: "name", label: "Portal", sort: "name", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono">${esc(r.base_url)}</div>`,
+        filter: { type: "text", placeholder: "name…" } },
+      { key: "resolved_path", label: "Resolved path", render: r => r.resolved_url ? `<span class="badge text-bg-light mono">${esc(r.resolved_path || "?")}</span>` : '<span class="text-muted small">not resolved</span>' },
+      { key: "macs", label: "MAC addresses", render: r => r.macs.map(m => `
+          <div class="d-flex align-items-center gap-2 mb-1">
+            <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
+            <span class="small text-muted">${esc(m.expire_date || "")}</span>
+            <button class="btn btn-xs btn-outline-danger py-0 px-1" title="delete mac"
+              onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
+          </div>`).join("") || '<span class="text-muted small">none</span>' },
+      { key: "actions", label: "Actions", render: r => `
+        <div class="btn-group btn-group-sm">
+          <button class="btn btn-outline-secondary" title="Edit / genres / content" onclick="editPortal(${r.id})"><i class="bi bi-pencil"></i></button>
+          <button class="btn btn-outline-secondary" title="Resolve URL" onclick="resolvePortal(${r.id})"><i class="bi bi-signpost-split"></i></button>
+          <button class="btn btn-outline-secondary" title="Fetch content" onclick="fetchPortal(${r.id})"><i class="bi bi-cloud-download"></i></button>
+          <button class="btn btn-outline-danger" title="Delete" onclick="deletePortal(${r.id})"><i class="bi bi-trash"></i></button>
+        </div>` },
+    ],
+    emptyText: "No portals yet — click 'Add portal'. " + ({{ mock_enabled|tojson }} ? "Demo portal: " + {{ mock_portal_url|tojson }} + "  MACs: " + {{ mock_macs|tojson }} : ""),
+  });
+  table.state.filters = {}; // server fn ignores; client-side filter for name:
+}
+/* client-side portal name filter: reuse the text filter input */
+function hookClientFilter() {
+  const inp = $("#portals-table thead .filters input");
+  if (!inp || inp._hooked) return; inp._hooked = true;
+  inp.addEventListener("input", () => {
+    const q = inp.value.toLowerCase();
+    $$("#portals-table tbody tr").forEach(tr => {
+      tr.style.display = tr.textContent.toLowerCase().includes(q) ? "" : "none";
+    });
+  });
+}
+const _origReload = null;
+
+function renderJobs(jobs) {
+  const box = $("#jobs-box");
+  if (!jobs.length) { box.innerHTML = ""; return; }
+  box.innerHTML = jobs.map(j => `
+    <div class="d-flex align-items-center gap-2 border rounded px-2 py-1 mb-1 bg-light">
+      <span class="badge text-bg-${j.status === "running" ? "primary" : j.status === "done" ? "success" : j.status === "error" ? "danger" : "secondary"}">${j.status}</span>
+      <span class="flex-grow-1">fetch · portal #${j.portal_id} — <b>${esc(j.stage)}</b> ${esc(j.detail)} — ${j.done_items}${j.total_items ? "/" + j.total_items : ""} items</span>
+      ${(j.status === "running" || j.status === "queued") ? `<button class="btn btn-sm btn-outline-danger" onclick="api('/api/portals/jobs/${j.id}/cancel',{method:'POST'}).then(()=>toast('cancel requested','warn'))">cancel</button>` : ""}
+    </div>`).join("");
+}
+
+/* ============================= add / edit modal ============================= */
+async function editPortal(id) {
+  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "" };
+  const body = el("div");
+  body.innerHTML = `
+    <div>
+      <div class="row g-2">
+        <div class="col-md-6"><label class="muted-label">Portal name</label>
+          <input class="form-control form-control-sm" id="p-name" value="${esc(p.name)}"></div>
+        <div class="col-md-6"><label class="muted-label">URL (any path style: /c/, /portal.php, /stalker_portal/c/…)</label>
+          <div class="input-group input-group-sm"><input class="form-control" id="p-url" value="${esc(p.base_url)}" placeholder="http://host:port/c/">
+          <button class="btn btn-outline-secondary" id="p-resolve-btn" ${id ? `data-id="${id}"` : "disabled"}>Resolve</button></div>
+          <div class="small text-muted" id="p-resolve-out"></div></div>
+        <div class="col-12"><label class="muted-label">MAC addresses (comma, semicolon, space or one per line)</label>
+          <textarea class="form-control mono" id="p-macs" rows="3">${esc(Array.isArray(p.macs) ? p.macs.map(m => m.mac).join(", ") : p.macs)}</textarea></div>
+        <div class="col-md-4"><label class="muted-label">HTTP proxy (optional)</label>
+          <input class="form-control form-control-sm" id="p-proxy" value="${esc(p.proxy_url || "")}" placeholder="http://ip:port"></div>
+        <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" id="p-enabled" ${p.enabled ? "checked" : ""}>
+          <label class="form-check-label">Portal enabled</label></div></div>
+        <div class="col-md-4 d-flex align-items-end justify-content-end">
+          <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch / refresh content</button>
+        </div>
+      </div>
+      <div class="small text-muted mt-2">Fetch order: genres → items of ENABLED genres → series seasons/episodes. Only enabled genres are fetched.</div>
+    </div>
+    <ul class="nav nav-tabs nav-subtabs mt-3 mb-2">
+      <li class="nav-item"><a class="nav-link active" data-tab="live">1 · Live</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="vod">2 · VOD</a></li>
+      <li class="nav-item"><a class="nav-link" data-tab="series">3 · Series</a></li>
+    </ul>
+    ${["live", "vod", "series"].map(k => `
+      <div data-pane="${k}" class="${k === "live" ? "" : "d-none"}">
+        <div class="d-flex gap-2 align-items-center mb-2">
+          <input class="form-control form-control-sm" style="max-width:260px" id="genre-q-${k}" placeholder="filter genres…">
+          <span class="small text-muted ms-auto" id="genre-count-${k}"></span>
+        </div>
+        <!-- multi-column genre list (long genre catalogs stay compact) -->
+        <div class="border rounded p-2 genre-grid" style="max-height:260px;overflow:auto" id="genre-list-${k}"></div>
+      </div>`).join("")}`;
+  const footer = el("div", { class: "d-flex gap-2 w-100" });
+  const m = openModal({ title: id ? `Edit portal: ${p.name}` : "Add portal", body, footer, size: "xl" });
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
+                mBtn("Save", "btn-accent", () => savePortal(id, m), "bi-check2"));
+
+  /* sub-tab switching: general stays visible, only the 3 genre panes toggle */
+  $$(".nav-link", body).forEach(a => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    $$(".nav-link", body).forEach(x => x.classList.remove("active"));
+    a.classList.add("active");
+    $$("[data-pane]", body).forEach(pn => pn.classList.toggle("d-none", pn.dataset.pane !== a.dataset.tab));
+    if (id) loadGenres(id, a.dataset.tab);
+  }));
+
+  if (id) {
+    $("#p-resolve-btn", body).setAttribute("data-id", id);
+    loadGenres(id, "live");
+  }
+  $("#p-resolve-btn", body).addEventListener("click", async () => {
+    const pid = $("#p-resolve-btn", body).dataset.id || id;
+    if (!pid) { toast("Save the portal first, then resolve.", "warn"); return; }
+    $("#p-resolve-out", body).textContent = "probing paths…";
+    const r = await api(`/api/portals/${pid}/resolve`, { method: "POST" });
+    $("#p-resolve-out", body).innerHTML = r.ok
+      ? `<span class="text-success">OK → ${esc(r.resolved_url)}</span>`
+      : `<span class="text-danger">failed: ${esc(r.error)}</span>` +
+        `<details class="mt-1"><summary class="small">probe log</summary><pre class="mono small">${r.attempts.map(esc).join("\n")}</pre></details>`;
+  });
+  $("#p-fetch-btn", body).addEventListener("click", async () => {
+    if (!id) return;
+    const r = await api(`/api/portals/${id}/fetch`, { method: "POST" });
+    toast(`fetch job ${r.job.id} started`, "ok"); pollJobs();
+  });
+  for (const k of ["live", "vod", "series"]) {
+    /* left-aligned textbox filters the genre list (client-side, case-insensitive) */
+    $(`#genre-q-${k}`, body)?.addEventListener("input", (e) => {
+      const q = e.target.value.toLowerCase();
+      $$(`#genre-list-${k} label`, body).forEach(lb =>
+        lb.style.display = (lb.dataset.name || "").includes(q) ? "" : "none");
+      const all = $$(`#genre-list-${k} label`, body).length,
+            vis = $$(`#genre-list-${k} label`, body).filter(lb => lb.style.display !== "none").length;
+      const cnt = $(`#genre-count-${k}`, body);
+      if (cnt) cnt.textContent = q ? `${vis}/${all}` : `${all}`;
+    });
+  }
+}
+
+async function loadGenres(pid, kind) {
+  if (!["live", "vod", "series"].includes(kind)) return;
+  const d = await api(`/api/portals/${pid}/genres`);
+  const host = $(`#genre-list-${kind}`);
+  if (!host) return;
+  const rows = d[kind] || [];
+  /* one switch per genre, applied immediately (no bulk selection/apply) */
+  host.innerHTML = rows.length ? rows.map(g => `
+    <label class="d-flex align-items-center gap-2 small mb-1" data-name="${esc(g.name.toLowerCase())}">
+      <span class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox"
+        value="${g.id}" ${g.enabled ? "checked" : ""}></span>
+      <span class="flex-grow-1">${esc(g.name)}</span>
+      <span class="text-muted">${g.item_count ?? "?"} items ${g.fetched ? "· fetched" : ""}</span>
+    </label>`).join("") : '<div class="text-muted small p-1">No genres fetched yet — press “Fetch / refresh content”.</div>';
+  $$(`input[type=checkbox]`, host).forEach(cb => cb.addEventListener("change", async () => {
+    await api(`/api/portals/${pid}/genres/toggle`, { method: "POST",
+      body: { kind, ids: [+cb.value], enabled: cb.checked } });
+    toast(`genre ${cb.checked ? "enabled" : "disabled"} — use Fetch to (un)load its items`, "ok");
+  }));
+  const q = $(`#genre-q-${kind}`); if (q && q.value) q.dispatchEvent(new Event("input"));
+  const cnt = $(`#genre-count-${kind}`); if (cnt) cnt.textContent = `${rows.length}`;
+}
+
+async function savePortal(id, m) {
+  const body = {
+    name: $("#p-name").value.trim(), base_url: $("#p-url").value.trim(),
+    macs: $("#p-macs").value, enabled: $("#p-enabled").checked,
+    proxy_url: $("#p-proxy").value.trim() || null,
+  };
+  if (!body.name || !body.base_url) return toast("name and URL are required", "warn");
+  if (id) await api(`/api/portals/${id}`, { method: "PUT", body });
+  else await api("/api/portals", { method: "POST", body });
+  toast("portal saved — use Fetch to load content", "ok");
+  m.close(); table.reload();
+}
+
+/* ============================= actions ============================= */
+async function resolvePortal(id) {
+  toast("resolving portal…", "info");
+  const r = await api(`/api/portals/${id}/resolve`, { method: "POST" });
+  r.ok ? toast(`resolved: ${r.resolved_url}`, "ok") : toast("resolve failed — see logs", "error");
+  table.reload();
+}
+async function fetchPortal(id) {
+  const r = await api(`/api/portals/${id}/fetch`, { method: "POST" });
+  toast(`fetch job started (${r.job.id})`, "ok"); pollJobs();
+}
+function delMac(pid, mac) {
+  const p = table.items.find(x => x.id === pid);
+  const left = p.macs.filter(m => m.mac !== mac).map(m => m.mac).join(", ");
+  confirmDialog({ title: "Delete MAC", body: `Remove <span class="mono">${esc(mac)}</span> from <b>${esc(p.name)}</b>?`,
+    okText: "Delete", okClass: "btn-danger",
+    onOk: async () => { await api(`/api/portals/${pid}`, { method: "PUT", body: { macs: left } }); table.reload(); } });
+}
+async function deletePortal(id) {
+  const p = table.items.find(x => x.id === id);
+  const chk = await api(`/api/portals/${id}/delete-check`);
+  if (!chk.in_use) {
+    return confirmDialog({ title: "Delete portal", okText: "Delete", okClass: "btn-danger",
+      body: `Delete <b>${esc(p.name)}</b>? All its MACs, genres, sources and playlist references are removed permanently.`,
+      onOk: async () => { await api(`/api/portals/${id}`, { method: "DELETE" }); toast("portal deleted", "warn"); table.reload(); } });
+  }
+  /* in use as fallback -> warn + offer replace (spec G-flow) */
+  const uses = [...chk.usage.live, ...chk.usage.vod, ...chk.usage.series];
+  const body = el("div");
+  body.innerHTML = `
+    <div class="alert alert-warning py-2 small mb-2"><b>${uses.length}</b> playlist fallback reference(s) point at this portal:</div>
+    <div class="border rounded p-2 small mb-2" style="max-height:160px;overflow:auto">
+      ${uses.slice(0, 40).map(u => `<div>· ${esc(u.name)} <span class="text-muted">(priority ${u.priority})</span></div>`).join("")}
+      ${uses.length > 40 ? `<div class="text-muted">…and ${uses.length - 40} more</div>` : ""}</div>
+    <label class="muted-label">Action</label>
+    <select class="form-select form-select-sm" id="del-mode">
+      <option value="remove">Delete portal and REMOVE these references</option>
+      <option value="replace">Delete portal and TRY to replace with similar sources from another portal</option>
+    </select>
+    <div id="del-repl" class="mt-2 d-none"><label class="muted-label">Replacement portal</label>
+      <select class="form-select form-select-sm" id="del-repl-id">
+        ${chk.replacement_candidates.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}
+      </select><div class="small text-muted">Best-effort case-insensitive name match.</div></div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: `Portal in use: ${p.name}`, body, footer, size: "lg" });
+  body.querySelector("#del-mode").addEventListener("change", (e) =>
+    body.querySelector("#del-repl").classList.toggle("d-none", e.target.value !== "replace"));
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close));
+  footer.append(mBtn("Delete portal", "btn-danger", async () => {
+    const mode = body.querySelector("#del-mode").value;
+    const repl = mode === "replace" ? +body.querySelector("#del-repl-id").value : null;
+    const q = repl ? `?replacement_portal_id=${repl}` : "";
+    const r = await api(`/api/portals/${id}${q}`, { method: "DELETE" });
+    toast(`portal deleted${r.repointed ? `, ${r.repointed} fallbacks repointed` : ""}`, "warn");
+    m.close(); table.reload();
+  }));
+}
+
+/* test + import + mock control */
+$("#btn-test-sel").addEventListener("click", async () => {
+  const ids = [...table.selected]; if (!ids.length) return toast("select portals first", "warn");
+  toast("testing selected portals…"); await api("/api/portals/test-batch", { method: "POST", body: { ids } }); table.reload();
+});
+$("#btn-test-all").addEventListener("click", async () => {
+  toast("testing all portals…"); await api("/api/portals/test-batch", { method: "POST", body: { ids: [] } }); table.reload();
+});
+$("#btn-del-sel").addEventListener("click", async () => {
+  const ids = [...table.selected]; if (!ids.length) return toast("select portals first", "warn");
+  confirmDialog({ title: "Delete portals", body: `Delete ${ids.length} portal(s)? Fallback usage is checked per portal.`, okText: "Delete", okClass: "btn-danger",
+    onOk: async () => { for (const id of ids) { try { await api(`/api/portals/${id}`, { method: "DELETE" }); } catch (e) {} } table.reload(); } });
+});
+$("#btn-add").addEventListener("click", () => editPortal(null));
+$("#btn-reload").addEventListener("click", () => table.reload());
+$("#btn-import").addEventListener("click", () => $("#import-file").click());
+$("#import-file").addEventListener("change", async (e) => {
+  const f = e.target.files[0]; if (!f) return;
+  const data = JSON.parse(await f.text());
+  const r = await api("/api/import", { method: "POST", body: { mode: "merge", data } });
+  toast(`import: ${r.imported} imported, ${r.skipped.length} skipped`, "ok"); table.reload();
+  e.target.value = "";
+});
+{% if mock_enabled %}
+$("#btn-mock").addEventListener("click", async () => {
+  const st = (await api("/mock/_state")).state;
+  const body = el("div");
+  body.innerHTML = `
+    <div class="form-check form-switch mb-2"><input class="form-check-input" id="mc-off" ${st.offline ? "checked" : ""} type="checkbox"><label class="form-check-label">Portal OFFLINE (all mock calls fail)</label></div>
+    <div class="form-check form-switch mb-2"><input class="form-check-input" id="mc-slow" ${st.slow ? "checked" : ""} type="checkbox"><label class="form-check-label">Slow responses (+3s latency)</label></div>
+    <label class="muted-label">Max concurrent streams per MAC</label>
+    <select class="form-select form-select-sm" id="mc-max" style="width:120px"><option value="0" ${st.max_per_mac==0?"selected":""}>0 (always busy)</option><option value="1" ${st.max_per_mac==1?"selected":""}>1</option><option value="3" ${st.max_per_mac==3?"selected":""}>3</option></select>
+    <div class="small text-muted mt-2">Current usage: ${Object.entries(st.usage).map(([m, n]) => m.split(":").slice(-2).join(":") + "→" + n).join(", ") || "none"}</div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: "Mock portal control (test fallback)", body, footer, size: "md" });
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close),
+    mBtn("Apply", "btn-accent", async () => {
+      await api("/mock/_control", { method: "POST", body: { offline: $("#mc-off", body).checked, slow: $("#mc-slow", body).checked, max_per_mac: +$("#mc-max", body).value } });
+      toast("mock portal updated", "ok"); m.close();
+    }));
+});
+{% endif %}
+
+let jobTimer = null;
+async function pollJobs() {
+  if (jobTimer) clearInterval(jobTimer);
+  jobTimer = setInterval(async () => {
+    const d = await api("/api/portals"); renderJobs(d.jobs);
+    if (!d.jobs.some(j => j.status === "running" || j.status === "queued")) { clearInterval(jobTimer); jobTimer = null; table.reload(); }
+  }, 1500);
+}
+makeTable();
+setTimeout(hookClientFilter, 400);
+</script>
+{% endblock %}

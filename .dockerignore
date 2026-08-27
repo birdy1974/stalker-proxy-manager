@@ -1,0 +1,12 @@
+.git
+.github
+docs
+data/
+media/
+*.db
+__pycache__/
+*.pyc
+.venv/
+.env
+tests/__pycache__/
+specs.prompt

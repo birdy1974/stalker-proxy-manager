@@ -1,0 +1,65 @@
+# ============================================================================
+# Stalker Proxy Manager - reference deployment
+# ----------------------------------------------------------------------------
+# * app:      everything in one container (GUI + streams + outputs on :8880)
+# * postgres: config database (SQLAlchemy async; SQLite fallback if unset)
+# * /dev/dri: Intel Quick Sync device for VAAPI transcoding (DS918+)
+# ============================================================================
+
+name: stalker-proxy-manager
+
+services:
+  app:
+    build: .
+    image: stalker-proxy-manager:latest
+    container_name: stalker-proxy-manager
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPM_DATA_DIR: /config
+      SPM_MEDIA_ROOT: /media
+      SPM_DATABASE_URL: postgresql+asyncpg://spm:spm@postgres:5432/stalker_proxy_manager
+      SPM_ADMIN_USERNAME: ${SPM_ADMIN_USERNAME:-admin}
+      SPM_ADMIN_PASSWORD: ${SPM_ADMIN_PASSWORD:?Set SPM_ADMIN_PASSWORD in .env}
+      SPM_VAAPI_DEVICE: /dev/dri/renderD128
+      SPM_MOCK_PORTAL: ${SPM_MOCK_PORTAL:-0}
+      TZ: ${TZ:-Europe/Amsterdam}
+    ports:
+      - "8880:8880"
+    devices:
+      # Intel Quick Sync (Synology DS918+ / Apollo Lake). Remove this block to
+      # run without hardware transcoding (copy + software templates still work).
+      - /dev/dri:/dev/dri
+    volumes:
+      - app-data:/config
+      - ./media:/media         # drop local video files for the "local files" output here
+    networks: [spm]
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: stalker-proxy-manager-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: stalker_proxy_manager
+      POSTGRES_USER: spm
+      POSTGRES_PASSWORD: spm
+      TZ: ${TZ:-Europe/Amsterdam}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks: [spm]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spm -d stalker_proxy_manager"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    expose:
+      - "5432"
+
+networks:
+  spm:
+
+volumes:
+  app-data:
+  pg-data:
