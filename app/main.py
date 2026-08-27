@@ -110,6 +110,10 @@ async def startup() -> None:
     await db_log("INFO", "boot",
                  f"Stalker Proxy Manager v2.0.0-phase2 started on port {HTTP_PORT} "
                  f"(mock portal: {'on' if MOCK_PORTAL_ENABLED else 'off'})")
+    from .config import SKIP_LOGIN
+    if SKIP_LOGIN:
+        await db_log("ERROR", "boot",
+                     "*** LOGIN DISABLED (SPM_SKIP_LOGIN=1) - mockup/preview mode ***")
 
 
 async def _hardware_sanity() -> None:

@@ -60,7 +60,7 @@ DATABASE_URL = os.environ.get(
 # ---------------------------------------------------------------------------
 # Admin GUI authentication (Phase-1 decision Q5: login required)
 # ---------------------------------------------------------------------------
-ADMIN_USERNAME = os.environ.get("SPM_ADMIN_USER", "admin")
+ADMIN_USERNAME = os.environ.get("SPM_ADMIN_USERNAME") or os.environ.get("SPM_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("SPM_ADMIN_PASSWORD", "admin")  # change via env!
 SECRET_KEY = os.environ.get("SPM_SECRET_KEY", "change-me-in-production-please")
 SESSION_MAX_AGE = int(os.environ.get("SPM_SESSION_MAX_AGE", str(60 * 60 * 12)))  # 12h
@@ -115,6 +115,10 @@ FALLBACK_STRATEGY = os.environ.get("SPM_FALLBACK_STRATEGY", "macs_first")  # or 
 # Real Stalker portals typically block datacenter IPs, so this is also our
 # development/CI target.
 MOCK_PORTAL_ENABLED = os.environ.get("SPM_MOCK_PORTAL", "1") == "1"
+
+# MOCKUP/DEV ONLY: bypass GUI admin login entirely (for sandbox previews &
+# early UI testing). NEVER default-on; production images must not set this.
+SKIP_LOGIN = os.environ.get("SPM_SKIP_LOGIN", "0") == "1"
 
 LOG_LEVEL = os.environ.get("SPM_LOG_LEVEL", "INFO").upper()
 logging.basicConfig(

@@ -27,14 +27,21 @@ PAGES = {
 }
 
 
+# browser redirect target "/" (dispatched by main.py::root_dispatch); with
+# SKIP_LOGIN active we never show the login form at all.
+from ..config import SKIP_LOGIN  # noqa: E402
+
+
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request):
+    if SKIP_LOGIN:
+        return RedirectResponse("/dashboard", status_code=303)
     return templates.TemplateResponse(request, "login.html", {"error": ""})
 
 
 @router.post("/login")
 async def login_submit(request: Request, username: str = Form(""), password: str = Form("")):
-    if check_credentials(username, password):
+    if SKIP_LOGIN or check_credentials(username, password):
         request.session["admin"] = username
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(request, "login.html",
