@@ -159,7 +159,103 @@ function bulkBar(kind, getTable, { allowGroup = true } = {}) {
   };
   bar.append(mBtn("Assign template…", "btn-outline-secondary", mkAssign("template"), "bi-gear"));
   if (allowGroup) bar.append(mBtn("Assign group…", "btn-outline-secondary", mkAssign("group"), "bi-tags"));
+  bar.append(mBtn("Remove", "btn-outline-danger", () => {
+    const ids = [...table().selected];
+    if (!ids.length) return toast("select rows first", "warn");
+    confirmDialog({ title: "Remove from playlist", okText: `Remove ${ids.length}`, okClass: "btn-danger",
+      body: `Remove ${ids.length} ${kind} row(s) from the playlist? The sources themselves stay untouched in Input Sources.`,
+      onOk: async () => {
+        await api(`/api/playlist/${kind}/bulk`, { method: "POST", body: { ids, delete: true } });
+        toast(`removed ${ids.length} row(s)`, "ok"); table().reload();
+      } });
+  }, "bi-trash"));
   return bar;
+}
+
+/* toolbar shared by the vod/series/local tabs: bulk add first, then bulk edit */
+function builderBar(kind, getTable, primary) {
+  const bar = el("div", { class: "d-flex flex-wrap gap-2 align-items-center" });
+  bar.append(mBtn("Add from sources…", primary ? "btn-accent" : "btn-outline-secondary",
+    () => addSourcesDialog(kind, () => getTable().reload()), "bi-plus-circle"),
+    bulkBar(kind, getTable));
+  return bar;
+}
+
+/* ==================== add from sources (bulk, group access) ====================
+   Picking a whole genre/group and pushing it into the playlist with ONE request
+   beats adding items one by one - one transaction server-side, one round trip. */
+const ADD_LABEL = { live: "channels", vod: "VOD items", series: "series", local: "local files" };
+function addSourcesDialog(kind, onDone) {
+  const body = el("div");
+  const host = el("div");
+  const state = { onlyMissing: true };
+  const missing = el("input", { type: "checkbox", class: "form-check-input" });
+  missing.checked = true;
+  missing.addEventListener("change", () => { state.onlyMissing = missing.checked; table.reload(); });
+  const hint = el("label", { class: "small text-muted d-flex align-items-center gap-1" },
+    missing, "hide items already in the playlist");
+  const selAll = mBtn("Select all matching", "btn-outline-secondary", async () => {
+    const p = new URLSearchParams(table.params());
+    p.set("per_page", "500");
+    p.set("only_missing", state.onlyMissing ? "true" : "false");
+    let page = 1, seen = 0;                       // walk the pages: a group can hold thousands
+    for (; page <= 40; page++) {
+      p.set("page", String(page));
+      const d = await api(`/api/playlist/candidates?kind=${kind}&${p.toString()}`);
+      d.items.forEach(r => table.selected.add(r.id));
+      seen += d.items.length;
+      if (!d.items.length || seen >= (d.total || 0)) break;
+    }
+    table.reload(); updateCount();
+    toast(`${table.selected.size} selected`, "ok");
+  }, "bi-check-all");
+  const clear = mBtn("Clear selection", "btn-outline-secondary", () => {
+    table.selected.clear(); table.reload(); updateCount();
+  }, "bi-x");
+  const bar = el("div", { class: "d-flex flex-wrap gap-2 align-items-center mb-2" }, selAll, clear, hint);
+  body.append(bar, host);
+
+  const countLbl = el("span", { class: "small text-muted me-auto" });
+  const updateCount = () => { countLbl.textContent = `${table.selected.size} selected`; };
+
+  const table = new DataTable(host, {
+    selectable: true, perPageDefault: 10, defaultSort: "name",
+    server: async (p) => {
+      const q = new URLSearchParams(p);
+      q.set("only_missing", state.onlyMissing ? "true" : "false");
+      return await api(`/api/playlist/candidates?kind=${kind}&${q.toString()}`);
+    },
+    columns: [
+      { key: "name", label: "Name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" },
+        render: r => `<b>${esc(r.name)}</b>` },
+      { key: "group", label: kind === "local" ? "Directory" : "Group",
+        filter: { type: "select", param: "group", placeholder: "all groups",
+                  optionsLoader: async (fill) => {
+                    const d = await api(`/api/playlist/candidates?kind=${kind}&per_page=5&only_missing=false`);
+                    fill((d.groups || []).map(g => ({ v: g, l: g })));
+                  } },
+        render: r => `<span class="small">${esc(r.group || "")}</span>` },
+      { key: "year", label: "Year", width: "64px", render: r => esc(r.year || "") },
+      { key: "in_playlist", label: "In playlist", width: "90px",
+        render: r => r.in_playlist ? '<span class="badge st-online">yes</span>' : "" },
+    ],
+    onSelection: () => updateCount(),
+    emptyText: "No matching sources. Enable items under Input Sources first.",
+  });
+
+  const footer = el("div", { class: "d-flex gap-2 align-items-center" });
+  const okBtn = mBtn(`Add to ${kind === "live" ? "playlist as channels" : "playlist"}`, "btn-accent",
+    async () => {
+      const ids = [...table.selected];
+      if (!ids.length) return toast("select rows first", "warn");
+      const res = await api("/api/playlist/add-sources", { method: "POST", body: { kind, ids } });
+      toast(`added ${res.added} ${ADD_LABEL[kind]}` +
+            (res.existed ? ` (${res.existed} already there)` : ""), "ok");
+      m.close(); onDone?.();
+    }, "bi-plus-circle");
+  footer.append(countLbl, okBtn, mBtn("Close", "btn-outline-secondary", () => m.close()));
+  const m = openModal({ title: `Add ${ADD_LABEL[kind]} from sources`, body, footer, size: "xl" });
+  updateCount();
 }
 
 /* ============================ LIVE builder ============================ */
@@ -168,7 +264,7 @@ function liveBuilder() {
   const bar = el("div", { class: "d-flex flex-wrap gap-2 align-items-center" });
   bar.append(
     mBtn("Add custom channel", "btn-accent", () => editCustomChannel(null), "bi-plus-circle"),
-    bulkBar("live", () => liveTable),
+    builderBar("live", () => liveTable, false),
     el("a", { class: "btn btn-sm btn-outline-secondary", href: "/api/export?section=live_playlist" }, "⤓ Export"),
     el("span", { class: "small text-muted ms-auto" }, "Drag rows to reorder (only while sorted by Order)."));
   liveTable = new DataTable($("#pl-live"), {
@@ -193,7 +289,7 @@ function liveBuilder() {
         body: { items: ids.map((id, i) => ({ id, order: i + 1 })) } });
       toast("order saved", "ok");
     } },
-    emptyText: "No custom channels yet. Click 'Add custom channel'. Sources come from enabled live channels (Input Sources tab).",
+    emptyText: "No custom channels yet. Click 'Add custom channel' (or 'Add from sources…' to turn a whole group of enabled channels into channels at once).",
   });
   PL_TABLES.live = liveTable;
 }
@@ -319,7 +415,7 @@ async function editCustomChannel(id) {
 let vodTable;
 function vodBuilder() {
   vodTable = new DataTable($("#pl-vod"), {
-    selectable: true, defaultSort: "order", extraHeader: bulkBar("vod", () => vodTable),
+    selectable: true, defaultSort: "order", extraHeader: builderBar("vod", () => vodTable, true),
     server: async (q) => await api("/api/playlist/vod?" + q),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/vod/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
@@ -335,7 +431,7 @@ function vodBuilder() {
         <button class="btn btn-sm btn-outline-secondary" title="Play" onclick="playTest(${r.id},'vod')"><i class="bi bi-play-btn"></i></button>
         <button class="btn btn-sm btn-outline-danger" title="Delete" onclick="api('/api/playlist/vod/${r.id}',{method:'DELETE'}).then(()=>vodTable.reload())"><i class="bi bi-trash"></i></button>` },
     ],
-    emptyText: "VOD playlist empty. Enable VOD items in Input Sources → VOD, they'll appear here after being added (auto on enable).",
+    emptyText: "VOD playlist empty. Enable VOD items under Input Sources → VOD (they are added automatically) or use 'Add from sources…' to push a whole group in one go.",
   });
   PL_TABLES.vod = vodTable;
 }
@@ -369,7 +465,7 @@ window.editVod = async (id) => {
 let seriesTable;
 function seriesBuilder() {
   seriesTable = new DataTable($("#pl-series"), {
-    selectable: true, defaultSort: "order", extraHeader: bulkBar("series", () => seriesTable),
+    selectable: true, defaultSort: "order", extraHeader: builderBar("series", () => seriesTable, true),
     server: async (q) => await api("/api/playlist/series?" + q),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/series/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
@@ -386,7 +482,7 @@ function seriesBuilder() {
         <button class="btn btn-sm btn-outline-secondary" title="Edit" onclick="editSeries(${r.id})"><i class="bi bi-pencil"></i></button>
         <button class="btn btn-sm btn-outline-danger" title="Delete" onclick="api('/api/playlist/series/${r.id}',{method:'DELETE'}).then(()=>seriesTable.reload())"><i class="bi bi-trash"></i></button>` },
     ],
-    emptyText: "Series playlist empty. Enable series in Input Sources → Series.",
+    emptyText: "Series playlist empty. Enable series under Input Sources → Series (they are added automatically) or use 'Add from sources…' to push a whole group in one go.",
   });
   PL_TABLES.series = seriesTable;
 }
@@ -427,7 +523,7 @@ window.editSeries = async (id) => {
 let localTable;
 function localBuilder() {
   localTable = new DataTable($("#pl-local"), {
-    selectable: true, defaultSort: "order", extraHeader: bulkBar("local", () => localTable),
+    selectable: true, defaultSort: "order", extraHeader: builderBar("local", () => localTable, true),
     server: async (q) => await api("/api/playlist/local?" + q),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/local/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
@@ -439,7 +535,7 @@ function localBuilder() {
         <button class="btn btn-sm btn-outline-secondary" title="Edit" onclick="editLocal(${r.id})"><i class="bi bi-pencil"></i></button>
         <button class="btn btn-sm btn-outline-danger" title="Delete" onclick="api('/api/playlist/local/${r.id}',{method:'DELETE'}).then(()=>localTable.reload())"><i class="bi bi-trash"></i></button>` },
     ],
-    emptyText: "Local playlist empty. Files enabled under Input Sources → Local appear here automatically after enabling.",
+    emptyText: "Local playlist empty. Scan a directory under Input Sources → Local (files are added automatically) or use 'Add from sources…' to add a whole directory in one go.",
   });
   PL_TABLES.local = localTable;
 }

@@ -18,14 +18,16 @@ from sqlalchemy import func, select
 
 from ..database import get_db
 from ..models import (
-    FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource, LocalFile,
-    LocalPlaylist, LocalSource, Portal, SerieEpisode, SerieGenre, SeriePlaylist,
+    FFmpegTemplate, LiveGenre, LivePlaylist, LivePlaylistSource, LiveSource,
+    LocalFile, LocalPlaylist, LocalSource, Portal, SerieEpisode, SerieGenre,
+    SeriePlaylist,
     SeriePlaylistSeason, SeriePlaylistSource, SerieSeason, SerieSource,
     VodGenre, VodPlaylist, VodPlaylistSource, VodSource,
 )
 from ..security import require_admin
 from ..services import item_info
 from ..services.db_logging import db_log
+from ..services.playlist_sync import ADD_KINDS, add_sources
 
 router = APIRouter(prefix="/api/playlist", tags=["playlist"], dependencies=[Depends(require_admin)])
 
@@ -229,6 +231,11 @@ async def live_bulk(payload: dict, db=Depends(get_db)):
     """Assign group and/or ffmpeg template to MANY channels in one go (spec)."""
     ids = [int(x) for x in payload.get("ids", [])]
     rows = (await db.execute(select(LivePlaylist).where(LivePlaylist.id.in_(ids)))).scalars().all()
+    if payload.get("delete"):                     # "remove from playlist" in bulk
+        for r in rows:
+            await db.delete(r)
+        await db.commit()
+        return {"ok": True, "count": len(rows), "deleted": len(rows)}
     for r in rows:
         if "group_name" in payload:
             r.group_name = payload["group_name"]
@@ -244,6 +251,11 @@ async def _bulk_assign(db, model, payload) -> int:
     """Same semantics as /api/playlist/live/bulk for vod/series/local rows."""
     ids = [int(x) for x in payload.get("ids", [])]
     rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
+    if payload.get("delete"):                     # "remove from playlist" in bulk
+        for r in rows:
+            await db.delete(r)
+        await db.commit()
+        return len(rows)
     for r in rows:
         if "group_name" in payload:
             r.group_name = payload["group_name"]
@@ -257,17 +269,20 @@ async def _bulk_assign(db, model, payload) -> int:
 
 @router.post("/vod/bulk")
 async def vod_bulk(payload: dict, db=Depends(get_db)):
-    return {"ok": True, "count": await _bulk_assign(db, VodPlaylist, payload)}
+    n = await _bulk_assign(db, VodPlaylist, payload)
+    return {"ok": True, "count": n, **({"deleted": n} if payload.get("delete") else {})}
 
 
 @router.post("/series/bulk")
 async def series_bulk(payload: dict, db=Depends(get_db)):
-    return {"ok": True, "count": await _bulk_assign(db, SeriePlaylist, payload)}
+    n = await _bulk_assign(db, SeriePlaylist, payload)
+    return {"ok": True, "count": n, **({"deleted": n} if payload.get("delete") else {})}
 
 
 @router.post("/local/bulk")
 async def local_bulk(payload: dict, db=Depends(get_db)):
-    return {"ok": True, "count": await _bulk_assign(db, LocalPlaylist, payload)}
+    n = await _bulk_assign(db, LocalPlaylist, payload)
+    return {"ok": True, "count": n, **({"deleted": n} if payload.get("delete") else {})}
 
 
 # ----------------------------------------------------------------- vod / series / local
@@ -339,6 +354,103 @@ async def add_from_source(payload: dict, db=Depends(get_db)):
         await db.commit()
         return {"ok": True, "id": r.id}
     raise HTTPException(400, "kind must be vod|series|localfile")
+
+
+@router.get("/candidates")
+async def candidates(kind: str = "vod", q: str = "", group: str = "",
+                     only_missing: bool = True, enabled_only: bool = True,
+                     page: int = 1, per_page: int = 25, db=Depends(get_db)):
+    """
+    Sources that can be pushed into the playlist, with an `in_playlist` flag.
+
+    Backs the Playlist Builder's "Add from sources" dialog: filter by name and
+    group, hide what is already in the playlist, select the whole (filtered)
+    set and add it with ONE /add-sources call - group access instead of 1 by 1.
+    """
+    per_page = min(max(per_page, 5), 500)
+    if kind == "live":
+        src, genre, fk = LiveSource, LiveGenre, LiveSource.live_genre_id
+        name_col = LiveSource.original_name
+        used_model, used_col = LivePlaylistSource, LivePlaylistSource.live_source_id
+        used_extra = (LivePlaylistSource.priority == 1,)
+    elif kind == "vod":
+        src, genre, fk = VodSource, VodGenre, VodSource.vod_genre_id
+        name_col = VodSource.original_name
+        used_model, used_col = VodPlaylist, VodPlaylist.vod_source_id
+        used_extra = ()
+    elif kind == "series":
+        src, genre, fk = SerieSource, SerieGenre, SerieSource.serie_genre_id
+        name_col = SerieSource.original_name
+        used_model, used_col = SeriePlaylist, SeriePlaylist.serie_source_id
+        used_extra = ()
+    elif kind == "local":
+        src, genre, fk = LocalFile, LocalSource, LocalFile.local_source_id
+        name_col = LocalFile.filename
+        used_model, used_col = LocalPlaylist, LocalPlaylist.local_file_id
+        used_extra = ()
+    else:
+        raise HTTPException(400, f"kind must be one of {', '.join(ADD_KINDS)}")
+
+    # label column = genre name (portal kinds) or the scanned directory (local)
+    label_col = LocalSource.directory if kind == "local" else genre.name
+    stmt = select(src, label_col).outerjoin(genre, genre.id == fk)
+    if q:
+        stmt = stmt.where(name_col.ilike(f"%{q}%"))
+    if group:
+        stmt = stmt.where(label_col == group)
+    if enabled_only and hasattr(src, "enabled"):
+        stmt = stmt.where(src.enabled.is_(True))
+    if only_missing:
+        stmt = stmt.where(~src.id.in_(select(used_col).where(*used_extra) if used_extra
+                                      else select(used_col)))
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
+    rows = (await db.execute(stmt.order_by(name_col).offset(
+        (page - 1) * per_page).limit(per_page))).all()
+
+    items = [{"id": r.id,
+              "name": (r.original_name if hasattr(r, "original_name") else r.filename),
+              "group": gname or getattr(r, "genre", None) or getattr(r, "directory", None) or "",
+              "poster": getattr(r, "poster", None), "year": getattr(r, "year", None),
+              "enabled": getattr(r, "enabled", True), "in_playlist": False}
+             for r, gname in rows]
+    if not only_missing and items:                 # flag what is already there
+        have = {x[0] for x in (await db.execute(
+            select(used_col).where(used_col.in_([i["id"] for i in items]), *used_extra))).all()}
+        for i in items:
+            i["in_playlist"] = i["id"] in have
+    groups = [g[0] for g in (await db.execute(
+        select(label_col).distinct().order_by(label_col))).all() if g[0]]
+    return {"total": total or 0, "page": page, "per_page": per_page,
+            "items": items, "groups": groups}
+
+
+@router.post("/add-sources")
+async def add_sources_bulk(payload: dict, db=Depends(get_db)):
+    """
+    Add MANY sources to the playlist in ONE transaction.
+
+    "Group access instead of one by one": the Playlist Builder dialog selects a
+    whole genre/group (or an arbitrary selection) and pushes it in a single
+    request - one transaction, one commit, instead of one round trip per item.
+    Existing rows are never touched and are reported as `existed`.
+    """
+    kind = payload.get("kind")
+    ids = [int(x) for x in payload.get("ids", []) if str(x).strip()]
+    if kind not in ADD_KINDS:
+        raise HTTPException(400, f"kind must be one of {', '.join(ADD_KINDS)}")
+    if not ids:
+        raise HTTPException(400, "no source ids given")
+    group = (payload.get("group_name") or "").strip() or None
+    try:
+        res = await add_sources(db, kind, ids, group)
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - report to the GUI, keep the session clean
+        await db.rollback()
+        raise HTTPException(400, f"bulk add failed: {exc}") from exc
+    await db_log("INFO", "playlist",
+                 f"added {res['added']} {kind} item(s) to the playlist"
+                 + (f" ({res['existed']} already there)" if res.get("existed") else ""))
+    return {"ok": True, **res}
 
 
 async def _pl_list(db, model, src_model, src_fk_name, q, group, filters, page, per_page,

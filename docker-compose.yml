@@ -18,6 +18,17 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      # Run as this uid/gid - MUST match the owner of the ./media bind mount,
+      # otherwise the app cannot list it ("PermissionError: ... '/media'").
+      # Find the values on the host:  stat -c '%u:%g' ./media   (or: id <user>)
+      PUID: ${PUID:-2000}
+      PGID: ${PGID:-2000}
+      # Uncomment if the media tree itself (not just the mount point) has the
+      # wrong owner - slow on huge libraries.
+      # SPM_CHOWN_MEDIA: recursive
+      # Uncomment to keep Quick Sync working: joins the group owning
+      # /dev/dri/renderD128 (on by default).
+      # SPM_AUTO_DRI_GROUP: "1"
       SPM_DATA_DIR: /config
       SPM_MEDIA_ROOT: /media
       SPM_DATABASE_URL: postgresql+asyncpg://spm:spm@postgres:5432/stalker_proxy_manager

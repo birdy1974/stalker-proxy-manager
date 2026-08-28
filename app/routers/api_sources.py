@@ -19,6 +19,9 @@ from sqlalchemy import func, or_, select
 
 from ..config import MEDIA_ROOT
 from ..database import get_db
+from ..services.permissions import describe_access, permission_hint
+from ..services.playlist_sync import (SYNC_KINDS, add_sources,
+                                        sync_sources)
 from ..models import (
     LiveGenre, LiveSource, LocalFile, LocalPlaylist, LocalSource, Portal,
     SerieEpisode, SerieGenre, SerieSeason, SerieSource, VodGenre, VodSource,
@@ -203,13 +206,22 @@ async def toggle(payload: dict, db=Depends(get_db)):
     if model is None:
         raise HTTPException(400, "kind must be live|vod|series")
     ids = payload.get("ids", [])
+    enabled = bool(payload.get("enabled"))
     rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
     for r in rows:
-        r.enabled = bool(payload.get("enabled"))
+        r.enabled = enabled
+    # mirror the switch into the output playlist (vod/series; live channels are
+    # curated custom channels and are added explicitly from the Playlist tab)
+    synced = {}
+    if payload.get("kind") in SYNC_KINDS:
+        synced = await sync_sources(db, payload["kind"], [r.id for r in rows], enabled)
     await db.commit()
     await db_log("INFO", "sources",
-                 f"{payload['kind']}: {len(rows)} items -> enabled={bool(payload.get('enabled'))}")
-    return {"ok": True, "count": len(rows)}
+                 f"{payload['kind']}: {len(rows)} items -> enabled={enabled}"
+                 + (f" (playlist: +{synced.get('created', 0)} new, "
+                    f"{synced.get('enabled', 0)} re-enabled, "
+                    f"{synced.get('disabled', 0)} switched off)" if synced else ""))
+    return {"ok": True, "count": len(rows), "playlist": synced}
 
 
 @router.post("/series/seasons/toggle")
@@ -271,12 +283,33 @@ async def del_local_dir(did: int, db=Depends(get_db)):
 
 @router.post("/local/dirs/toggle")
 async def toggle_local_dirs(payload: dict, db=Depends(get_db)):
+    enabled = bool(payload.get("enabled"))
     rows = (await db.execute(select(LocalSource).where(
         LocalSource.id.in_(payload.get("ids", []))))).scalars().all()
     for r in rows:
-        r.enabled = bool(payload.get("enabled"))
+        r.enabled = enabled
+    # local files inherit the switch: mirror the whole directory into the Local
+    # playlist in one go (bulk, single transaction)
+    synced = {}
+    if rows:
+        file_ids = (await db.execute(select(LocalFile.id).where(
+            LocalFile.local_source_id.in_([r.id for r in rows])))).scalars().all()
+        synced = await sync_sources(db, "local", file_ids, enabled)
     await db.commit()
-    return {"ok": True, "count": len(rows)}
+    return {"ok": True, "count": len(rows), "playlist": synced}
+
+
+@router.post("/local/files/toggle")
+async def toggle_local_files(payload: dict, db=Depends(get_db)):
+    """Enable/disable individual scanned files (also syncs the Local playlist)."""
+    enabled = bool(payload.get("enabled"))
+    rows = (await db.execute(select(LocalFile).where(
+        LocalFile.id.in_(payload.get("ids", []))))).scalars().all()
+    for r in rows:
+        r.enabled = enabled
+    synced = await sync_sources(db, "local", [r.id for r in rows], enabled)
+    await db.commit()
+    return {"ok": True, "count": len(rows), "playlist": synced}
 
 
 @router.post("/local/scan")
@@ -287,15 +320,34 @@ async def scan_local(payload: dict, db=Depends(get_db)):
     if ids:
         stmt = stmt.where(LocalSource.id.in_(ids))
     dirs = (await db.execute(stmt)).scalars().all()
-    total_new, total_seen = 0, 0
+    total_new, total_seen, total_skipped = 0, 0, 0
+    added_to_playlist = 0
     for d in dirs:
         base = Path(d.directory)
         if not base.is_absolute():
             base = MEDIA_ROOT / d.directory
-        if not base.exists():
+        try:
+            is_dir = base.is_dir()        # raises PermissionError, not False
+        except PermissionError:
+            await db_log("ERROR", "local", permission_hint(base))
+            continue
+        if not is_dir:
             await db_log("ERROR", "local", f"directory not accessible: {base}")
             continue
-        walker = os.walk(base) if d.recursive else [(str(base), [], os.listdir(base))]
+        # os.walk() swallows unreadable sub-directories by default; collect them
+        # instead so the log and the GUI say why a scan came back empty
+        # (almost always: the mount is owned by another uid -> PUID/PGID).
+        skipped: list[str] = []
+
+        def _walk_error(err: OSError) -> None:
+            skipped.append(str(getattr(err, "filename", base)))
+
+        try:
+            walker = (os.walk(base, onerror=_walk_error) if d.recursive
+                      else [(str(base), [], os.listdir(base))])
+        except PermissionError:
+            await db_log("ERROR", "local", permission_hint(base))
+            continue
         n_new = 0
         for root, _, files in walker:
             for fn in files:
@@ -307,16 +359,37 @@ async def scan_local(payload: dict, db=Depends(get_db)):
                     LocalFile.local_source_id == d.id, LocalFile.relative_path == rel))
                 if exists:
                     continue
-                st = os.stat(os.path.join(root, fn))
+                try:
+                    st = os.stat(os.path.join(root, fn))
+                except OSError as e:                      # unreadable file: skip, keep scanning
+                    skipped.append(f"{os.path.join(root, fn)} ({e.strerror})")
+                    continue
                 db.add(LocalFile(local_source_id=d.id, relative_path=rel, filename=fn,
                                  size_bytes=st.st_size,
                                  mtime=datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()))
                 n_new += 1
+        if skipped:
+            total_skipped += len(skipped)
+            await db_log("ERROR", "local",
+                         f"{len(skipped)} path(s) skipped while scanning {base}, "
+                         f"first: {skipped[0]} - {permission_hint(base)}")
         d.last_scan = datetime.now(timezone.utc)
         await db.commit()
         total_new += n_new
         await db_log("INFO", "local", f"scanned {base}: {n_new} new video files")
-    return {"ok": True, "new": total_new, "seen": total_seen}
+    # newly found files belong in the Local playlist straight away (bulk insert:
+    # only rows that do not exist yet are created, nothing is switched off)
+    if dirs:
+        file_ids = (await db.execute(select(LocalFile.id).where(
+            LocalFile.local_source_id.in_([d.id for d in dirs])))).scalars().all()
+        add = await add_sources(db, "local", file_ids)
+        await db.commit()
+        added_to_playlist = add["added"]
+        if add["added"]:
+            await db_log("INFO", "local",
+                         f"{add['added']} file(s) added to the Local playlist")
+    return {"ok": True, "new": total_new, "seen": total_seen, "skipped": total_skipped,
+            "playlist_added": added_to_playlist}
 
 
 @router.get("/local/files")
@@ -349,8 +422,18 @@ async def browse(path: str = ""):
     base = base.resolve()
     if not str(base).startswith(str(MEDIA_ROOT.resolve())) and base != Path("/"):
         raise HTTPException(403, "outside media root")
-    if not base.exists() or not base.is_dir():
+    try:
+        # NB: Path.is_dir()/exists() raise PermissionError (not False) when a
+        # parent directory is not searchable - the same PUID/PGID situation.
+        is_dir = base.is_dir()
+    except PermissionError:
+        raise HTTPException(403, permission_hint(base))
+    if not is_dir:
         raise HTTPException(404, "directory not found")
-    items = sorted([{"name": e.name, "path": str(e)}
-                    for e in base.iterdir() if e.is_dir()], key=lambda x: x["name"].lower())
+    try:
+        items = sorted([{"name": e.name, "path": str(e)}
+                        for e in base.iterdir() if e.is_dir()], key=lambda x: x["name"].lower())
+    except PermissionError:
+        # host mount owned by another uid -> clean 403 with the fix, not a 500
+        raise HTTPException(403, permission_hint(base))
     return {"path": str(base), "parent": str(base.parent), "dirs": items}

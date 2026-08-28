@@ -17,6 +17,7 @@ docker compose up -d --build
 - GUI: **http://<host>:8880** (login admin / your password)
 - Postgres 16 runs in its own container next to the app (state in named volumes).
 - Quick Sync: `/dev/dri` is passed through by default (DS918+).
+- Binding `./media` from the host? Set `PUID`/`PGID` in `.env` to that folder's owner, otherwise the app cannot list it — see [Permissions](#permissions-running-as-your-own-user-puid--pgid).
 
 Pre-built image (built by GitHub Actions on every release):
 
@@ -29,6 +30,8 @@ docker run -d --name stalker-proxy-manager \
   ghcr.io/birdy1974/stalker-proxy-manager:latest
 ```
 (The plain `docker run` form uses the embedded **SQLite** database — fine for small setups. Compose + Postgres is the reference deployment.)
+
+Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here — mount a host directory instead (`-v /volume1/video:/media`) and you must add `-e PUID=$(stat -c %u /volume1/video) -e PGID=$(stat -c %g /volume1/video)`.
 
 ---
 
@@ -44,8 +47,86 @@ docker run -d --name stalker-proxy-manager \
 | `SPM_MOCK_PORTAL` | `0` | `1` boots a built-in demo portal (test data, busy-MAC emulation) |
 | `SPM_LOG_LEVEL` | `INFO` | Python log level (all records go to container stdout) |
 | `SPM_SKIP_LOGIN` | `0` | **Mockup/preview only**: bypass admin login (`*** LOGIN DISABLED ***` banner in log). Never set on a real deployment |
+| `PUID` / `PGID` | `2000` / `2000` | uid/gid the app runs as — must match the owner of your `./media` bind mount (see below) |
+| `SPM_SKIP_CHOWN` | `0` | `1` = never chown `/config` at boot (read-only or root-squashed NFS/SMB mounts) |
+| `SPM_CHOWN_MEDIA` | `0` | `1` = also chown the media mount point, `recursive` = the whole media tree (slow on big libraries) |
+| `SPM_CHOWN_EXTRA` | *(empty)* | extra paths to chown at boot, space separated |
+| `SPM_AUTO_DRI_GROUP` | `1` | join the group that owns `/dev/dri/renderD128`, so Quick Sync keeps working with a custom `PUID` |
+| `SPM_EXTRA_GROUPS` | *(empty)* | extra group ids for the app user, comma separated (e.g. `44,989`) |
 
 Everything else (portals, MACs, channels, templates, users, EPG sources, settings) is configured in the GUI and persisted in the database.
+
+---
+
+## Permissions: running as your own user (`PUID` / `PGID`)
+
+The image ships a built-in unprivileged account `spm` (**uid/gid 2000**). A
+host folder bind-mounted into the container keeps its **host** ownership, so if
+`./media` belongs to your NAS/desktop user the app cannot list it — the Sources
+→ *Local* directory browser then dies with:
+
+```
+PermissionError: [Errno 13] Permission denied: '/media'
+```
+
+Fix: tell the container which ids to run as (same idea as the linuxserver.io
+images). The entrypoint moves the `spm` account to those ids, chowns the state
+volume and joins the group owning the VAAPI render node before it drops
+privileges and execs uvicorn.
+
+```bash
+stat -c '%u:%g' ./media          # -> e.g. 1026:100   (or: id your-user)
+```
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    environment:
+      PUID: 1026        # or from .env:  PUID: ${PUID:-2000}
+      PGID: 100
+```
+
+```bash
+docker compose up -d             # entrypoint re-applies ids + ownership
+```
+
+Notes:
+
+- Values are numeric (a user/group **name** that exists *inside* the image also
+  works). Invalid values fall back to `2000` with a warning in the log.
+- `PUID=0` runs the app as **root** (privileges are not dropped) — debugging
+  only, never for a real deployment.
+- The container starts as root for a few milliseconds, then execs the app as
+  `PUID:PGID` (PID 1 stays the app, so `docker stop` and signals work). With a
+  `user:` / `--user` override you are not root, so ids are applied by Docker
+  instead and the entrypoint simply execs the CMD. Because the container's
+  default user is root again, `docker exec` gives you a **root** shell — add
+  `-u spm` (or `-u $PUID:$PGID`) to poke around as the app itself.
+- `/config` is chowned recursively at boot (it is the container's own state).
+  The **media mount is never chowned** unless you ask for it: rewriting the
+  ownership of your media library is not something a container should do
+  silently. Use `SPM_CHOWN_MEDIA=1` (mount point only) or
+  `SPM_CHOWN_MEDIA=recursive` if the tree itself has the wrong owner, and
+  `SPM_SKIP_CHOWN=1` to skip chowning entirely.
+- Boot diagnostics go to stdout, so `docker logs stalker-proxy-manager | grep
+  entrypoint` tells you exactly what the app can see:
+
+```
+[entrypoint] spm: uid 2000 -> 1026
+[entrypoint] joining group 44 (owner of /dev/dri/renderD128)
+[entrypoint] chown -R 1026:100 /config
+[entrypoint] running as uid=1026 gid=100 groups=100,44; /config -> read+write
+[entrypoint] /media -> read+write
+```
+
+and, when the ids do not match:
+
+```
+[entrypoint] WARNING: the app user cannot read /media
+[entrypoint] WARNING: fix: set PUID/PGID in docker-compose.yml to the owner of that mount
+[entrypoint] WARNING:      (on the host:  stat -c '%u:%g' <media dir>   or   id <your user>)
+```
 
 ---
 
@@ -87,6 +168,8 @@ Shipped presets:
 
 Verify acceleration inside the container with `vainfo -a` (should list EGL/VA-API entrypoints for the iHD driver).
 
+**Identity of the outgoing ffmpeg request:** for `http(s)` inputs the manager injects `-user_agent "<MAG200 UA>"` and `-referer "<stream origin>/"` in front of `-i` — unless the template sets them itself. ffmpeg would otherwise announce itself as `Lavf/61.x` and send no referer, which plenty of panels (and the CDNs in front of them) answer with **403/405** on an otherwise perfectly valid token.
+
 At boot the app performs a **hardware sanity check**: if the default template needs VAAPI/QSV but the device is absent, the default degrades to *Copy* with a warning in the log — streams never die silently.
 
 ---
@@ -95,7 +178,8 @@ At boot the app performs a **hardware sanity check**: if the default template ne
 
 - Every MAC streams **at most one channel at a time** (typical Stalker limit); occupancy is tracked centrally, busy MACs are skipped instantly.
 - Per play request the ordered chain is walked (source priority → MAC order); a `global setting` decides whether *all MACs of a portal are tried before moving to the next portal*.
-- No data within 12 s (configurable) or an ffmpeg exit → next step; when the chain exhausts, the client gets a clean end-of-stream and the GUI log shows every step.
+- No data within 12 s (configurable) or an ffmpeg exit → next step; when the chain exhausts, the client gets a clean end-of-stream and the GUI log shows every step. An ffmpeg that dies *before* the first byte (bad URL, 405, missing GPU) is detected immediately — the log then says `ffmpeg exited rc=8 before sending data` instead of a misleading "no data within 12s", so you do not wait 12 s per dead source.
+- **Link repair:** some panels rebuild the `create_link` answer instead of echoing it and lose parameters on the way (`&stream=392166` → `&stream=`). The request is stripped of its stale `play_token` before asking, and the answer is repaired against the request (missing/blanked parameters restored, the fresh token always wins). See `dev/check-links.py`.
 - Client disconnects (and the Dashboard *kill* button) deterministically free the MAC and kill ffmpeg via a disconnect watchdog.
 
 ---
@@ -116,11 +200,35 @@ Every subsystem writes **detailed entries** (module-tagged: portals, fetch, stre
 
 ---
 
+## When a channel stays black
+
+Every step of a play request is logged, so start with:
+
+```bash
+docker logs stalker-proxy-manager 2>&1 \
+  | grep -E "create_link|ffmpeg exited|playing via|no data|fallback"
+```
+
+| Log line | Meaning | What to do |
+|---|---|---|
+| `create_link -> http://…&stream=392166&…&play_token=***` | the resolved URL (token masked) | copy it and `curl -I` it inside the container: that is exactly what ffmpeg is given |
+| `create_link: portal dropped parameters -> repaired from cmd` | the panel rebuilt its answer and lost a parameter (`&stream=392166` → `&stream=`) — it was restored from the stored cmd | informational; if it appears on every play, re-fetch the source so the stored cmd is clean |
+| `[ffmpeg] … HTTP error 405 Method Not Allowed` / `Error opening input file …&stream=&…` | ffmpeg was handed an incomplete URL | update to a build with the link repair, or re-fetch the sources |
+| `[stream] ffmpeg exited rc=8 before sending data` | ffmpeg could not open the source at all (dead link, 403/405, template needs a GPU that is not mapped) | read the `[ffmpeg]` line just above it — it carries ffmpeg's stderr tail |
+| `[stream] no data within 12s from portal/mac` | the portal accepted the request but sends nothing (MAC busy *on the panel*, expired account, IP/geo block) | *Check Portal* in the GUI; try another MAC of the same portal |
+| `[output] user … exceeded max_connections` | a previous stream of that user was still counted when the player reconnected | raise `max_connections` for that user; the slot frees as soon as the disconnect watchdog notices the client is gone (≤0.5 s) |
+
+Two things the proxy does for you here: the outgoing `create_link` cmd is stripped of its stale `play_token` (panels that receive their own token back tend to mangle the answer), and ffmpeg gets the MAG user-agent plus a referer for `http(s)` inputs, because `Lavf/61.x` is refused by quite a few panels with a 403/405.
+
+---
+
 ## Development scripts (`dev/`)
 
 | Script | What it does |
 |---|---|
 | `bash dev/smoke.sh` | Runs the freshly built image with `SPM_MOCK_PORTAL=1` and checks: GUI answers `/login` (200), mock handshake returns a token, the boot marker is in the container log **and on container stdout** (the single-stream rule above). This is what the `docker` workflow's smoke job runs. `SPM_SMOKE_IMAGE` / `SPM_SMOKE_NAME` / `SPM_SMOKE_PORT` override it for a local run against any port. |
+| `bash dev/smoke-puid.sh` | Bind-mounts a directory owned by a foreign uid (mode 750) and checks both sides of the PUID/PGID story: **without** `PUID`/`PGID` the app must *not* be able to list `/media`, **with** them it must (and PID 1 must run as those ids, `/config` must be chowned to them). Needs root/sudo; skips itself otherwise. `SPM_SMOKE_PUID_IMAGE` / `SPM_TEST_UID` override. |
+| `python3 dev/check-links.py` | Pins the Stalker `create_link` URL rules (prefix stripping, stale-token removal, repair of a mangled answer) without needing pytest — run it after touching `app/portal/client.py`. |
 | `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies `dev/docker-publish.yml.example` is byte-identical to the real workflow. Run it before pushing anything under `.github/workflows/`. |
 | `bash dev/seed-demo.sh [BASE_URL]` | Seeds a *running* instance with a full demo setup against the built-in mock portal (portal → genres → live/VOD/series → users). Idempotent; dev/mockup use (`SPM_SKIP_LOGIN=1`), default base `http://127.0.0.1:8880`. |
 
