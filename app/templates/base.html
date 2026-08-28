@@ -27,6 +27,11 @@
         <li class="nav-item"><a class="nav-link {{ 'active' if active=='users' }}" href="/users"><i class="bi bi-people"></i> Users</a></li>
         <li class="nav-item"><a class="nav-link {{ 'active' if active=='settings' }}" href="/settings"><i class="bi bi-sliders"></i> Settings</a></li>
       </ul>
+      <a href="/" id="api-indicator" class="btn btn-sm btn-outline-light me-2 d-flex align-items-center gap-1"
+         title="API status: serving requests / active streams. Click for the dashboard.">
+        <span id="api-led" class="rounded-circle d-inline-block" style="width:.55rem;height:.55rem;background:#6c757d"></span>
+        <span class="small" id="api-indicator-text">API …</span>
+      </a>
       <span class="navbar-text text-white-50 small me-3"><i class="bi bi-person-circle"></i> {{ admin }}</span>
       <a class="btn btn-sm btn-outline-light" href="/logout"><i class="bi bi-box-arrow-right"></i></a>
     </div>
@@ -44,6 +49,27 @@
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.13/dist/hls.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
 <script src="/static/js/app.js"></script>
+<script>
+/* Live API indicator: green = serving requests, grey = idle, red = 5xx seen. */
+(async function apiIndicator() {
+  const led = document.getElementById("api-led"), txt = document.getElementById("api-indicator-text");
+  async function tick() {
+    try {
+      const r = await fetch("/api/dashboard", { credentials: "same-origin" });
+      if (!r.ok) throw new Error(r.status);
+      const a = (await r.json()).api;
+      const busy = a.requests_last_minute > 0;
+      led.style.background = a.errors_total ? "#dc3545" : busy ? "#198754" : "#6c757d";
+      txt.textContent = "API " + (busy ? "serving" : "idle") + " · " + a.streams_active + " stream" + (a.streams_active === 1 ? "" : "s");
+    } catch (e) {
+      led.style.background = "#dc3545";
+      txt.textContent = "API unreachable";
+    }
+  }
+  tick();
+  setInterval(tick, 10000);
+})();
+</script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

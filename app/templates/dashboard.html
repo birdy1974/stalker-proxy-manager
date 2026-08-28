@@ -23,6 +23,24 @@
 
   <div class="col-xl-5">
     <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-broadcast"></i> API status</span>
+        <span id="api-dot" class="badge text-bg-secondary">…</span>
+      </div>
+      <div class="card-body py-2">
+        <div class="row small g-1" id="api-summary"></div>
+        <div class="muted-label mt-2">Requests per endpoint (top 8)</div>
+        <div id="api-paths" class="small"></div>
+        <div class="muted-label mt-2">Last requests</div>
+        <div id="api-recent" class="small mono" style="max-height:150px;overflow:auto"></div>
+      </div>
+      <div class="card-footer small text-muted">
+        Every request is also written to stdout as <span class="mono">[spm.api]</span> —
+        <span class="mono">docker logs stalker-proxy-manager | grep spm.api</span>
+      </div>
+    </div>
+
+    <div class="card mt-3">
       <div class="card-header"><i class="bi bi-lightning-charge"></i> Quick actions</div>
       <div class="card-body d-flex flex-wrap gap-2">
         <a class="btn btn-sm btn-accent" href="/portals"><i class="bi bi-plus-circle"></i> Add portal</a>
@@ -76,8 +94,37 @@ async function refreshStats() {
     card("Users", s.users) +
     card("Active streams", d.streams.length);
   $("#mock-hint").innerHTML = {% if mock_enabled %}`<b>Demo tip:</b> add portal <span class="mono">{{ mock_portal_url }}</span> with MAC <span class="mono">{{ mock_macs }}</span> to try the full flow without a real portal. The Mock Control there simulates offline/busy portals so you can watch fallback work.`{% else %}""{% endif %};
+  renderApi(d.api);
   renderJobs(d.jobs);
   if (!window._streamsTable) makeStreamsTable(); else window._streamsTable.reload();
+}
+function fmtUptime(sec) {
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
+  return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${sec % 60}s`;
+}
+function renderApi(a) {
+  if (!a) return;
+  const dot = $("#api-dot");
+  dot.textContent = a.requests_last_minute ? "serving" : "idle";
+  dot.className = "badge text-bg-" + (a.requests_last_minute ? "success" : "secondary");
+  const cell = (v, l) => `<div class="col-6"><b>${v}</b> <span class="text-muted">${l}</span></div>`;
+  $("#api-summary").innerHTML =
+    cell(a.requests_total, "requests total") +
+    cell(a.requests_last_minute, "in last minute") +
+    cell(a.streams_active, "active streams") +
+    cell(a.errors_total, "5xx responses") +
+    cell(fmtUptime(a.uptime_s), "uptime") +
+    cell(a.slowest_ms + " ms", "slowest first byte");
+  const users = (a.streams_per_user || []).map(u => `${esc(u.user)}: ${u.streams}`).join(" · ");
+  if (users) $("#api-summary").innerHTML += `<div class="col-12 text-muted">connections — ${users}</div>`;
+  $("#api-paths").innerHTML = (a.top_paths || []).map(p =>
+    `<div class="d-flex justify-content-between border-bottom"><span class="mono">${esc(p.path)}</span><span class="text-muted">${p.hits}</span></div>`
+  ).join("") || '<span class="text-muted">none yet</span>';
+  $("#api-recent").innerHTML = (a.recent || []).slice(0, 12).map(r =>
+    `<div class="text-nowrap"><span class="text-muted">${new Date(r.t * 1000).toTimeString().slice(0, 8)}</span> ` +
+    `<b class="log-${r.status >= 500 ? "ERROR" : r.status >= 400 ? "WARNING" : "INFO"}">${r.status}</b> ` +
+    `${esc(r.method)} ${esc(r.raw_path)} <span class="text-muted">${r.ms}ms</span></div>`
+  ).join("") || '<span class="text-muted">none yet</span>';
 }
 function renderJobs(jobs) {
   const box = $("#jobs-box");

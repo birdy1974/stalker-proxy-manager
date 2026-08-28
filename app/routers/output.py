@@ -125,10 +125,9 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     if handle.dead:
         raise HTTPException(404, f"{label}: no available source (all busy or unreachable)")
     # watchdog lives until the stream deregisters (normal end) or the client
-    # disappears (then it kills the stream; see watch_disconnect)
-    import asyncio
-    asyncio.get_running_loop().create_task(
-        MANAGER.watch_disconnect(request, handle))
+    # disappears (then it kills the stream; see watch_disconnect). watch() keeps
+    # a strong reference, so the task cannot be garbage-collected mid-flight.
+    MANAGER.watch(request, handle)
     return StreamingResponse(gen, media_type="video/mp2t",
                              headers={"Cache-Control": "no-store",
                                       "X-SPM-Stream": handle.id})
@@ -228,8 +227,6 @@ async def preview(kind: str, sid: int, request: Request, db=Depends(get_db)):
     handle, gen = await MANAGER._open_preview(src, portal, list(macs), kind=link_kind, name=name)
     if handle.dead:
         raise HTTPException(404, "preview failed: no data from source")
-    import asyncio
-    asyncio.get_running_loop().create_task(
-        MANAGER.watch_disconnect(request, handle))
+    MANAGER.watch(request, handle)
     return StreamingResponse(gen, media_type="video/mp2t",
                              headers={"Cache-Control": "no-store"})

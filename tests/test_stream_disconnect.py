@@ -231,9 +231,9 @@ async def _slow_body():
 async def test_deregister_deletes_row_even_when_its_task_is_cancelled(pool_errors):
     """`_deregister` runs from the pump's finally, i.e. inside a dying task."""
     h = _handle(id="cancel-me")
-    MANAGER.streams[h.id] = h
+    MANAGER.streams[h.id] = h          # the registry IS the connection count now
     MANAGER.mac_locks[1] = h.id
-    MANAGER.user_counts["tester"] = 1
+    assert MANAGER.user_stream_count("tester") == 1
     async with SessionLocal() as s:
         s.add(ActiveStream(id=h.id, kind="live", item_name=h.item_name,
                            user_name="tester", template_name="Copy"))

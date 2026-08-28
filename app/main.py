@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -21,10 +22,11 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from starlette.middleware.sessions import SessionMiddleware
 
-from .config import (HTTP_PORT, LOG_LEVEL, MOCK_PORTAL_ENABLED, SECRET_KEY,
-                     SESSION_MAX_AGE, log)
+from .config import (ACCESS_LOG, ACCESS_LOG_SKIP, HTTP_PORT, LOG_LEVEL,
+                     MOCK_PORTAL_ENABLED, SECRET_KEY, SESSION_MAX_AGE, log)
 from .database import SessionLocal, init_db
 from .models import FFmpegTemplate, Setting
+from .services import api_stats
 from .services.db_logging import cleanup_logs, db_log, stop_log_writer
 from .services.ffmpeg_templates import default_presets
 from .services.stream_manager import MANAGER
@@ -46,6 +48,10 @@ for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
 # actually matter here, so they stay at WARNING. Meaningful events are logged
 # explicitly (module-tagged, and mirrored into the GUI log pane) instead.
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+# Strong references to the app's own background tasks: asyncio only keeps weak
+# ones, so an unheld task can be garbage-collected mid-flight.
+_bg: set = set()
 
 app = FastAPI(title="Stalker Proxy Manager", version="2.0.0-phase2",
               docs_url=None, redoc_url=None, openapi_url=None)
@@ -80,6 +86,39 @@ async def root_dispatch(request: Request):
 
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=SESSION_MAX_AGE,
                    same_site="lax", https_only=False)
+
+_api_log = logging.getLogger("spm.api")
+
+
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    """
+    One stdout line per request + the counters behind the dashboard's API card.
+
+    uvicorn's access log is deliberately at WARNING (see the note above), which
+    is why the container log used to show nothing at all about API traffic.
+    This replaces it with the app's own format - method, path, status, time to
+    first byte - on stdout, where `docker logs` and the GUI log pane both look.
+
+    For streaming responses the response object is returned as soon as the
+    first byte is on its way, so `ms` is time-to-first-byte, not stream
+    duration; the stream manager logs start/stop separately.
+    """
+    started = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        ms = (time.perf_counter() - started) * 1000.0
+        path = request.url.path
+        api_stats.record(request.method, path, status, ms,
+                         request.client.host if request.client else "")
+        if ACCESS_LOG and not path.startswith(ACCESS_LOG_SKIP):
+            qs = f"?{request.url.query}" if request.url.query else ""
+            _api_log.info("%s %s%s -> %d (%.0f ms)",
+                          request.method, path, qs[:120], status, ms)
 
 # --------------------------------------------------------------- sub-routers
 from .routers import (api_ffmpeg, api_epg, api_misc, api_playlist, api_portals,  # noqa: E402
@@ -136,6 +175,9 @@ async def startup() -> None:
     from .services.epg import epg_scheduler
     import asyncio
     asyncio.create_task(epg_scheduler())
+    # Reaps streams whose teardown was lost, so a MAC or a user's connection
+    # slot can never stay occupied until the next restart.
+    _bg.add(asyncio.create_task(MANAGER.reap_dead(), name="spm-stream-reaper"))
 
 
 @app.on_event("shutdown")

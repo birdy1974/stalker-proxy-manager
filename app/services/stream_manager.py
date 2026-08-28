@@ -81,18 +81,37 @@ class StreamHandle:
                 "url": self.url, "pid": self.proc.pid if self.proc else None}
 
 
+# How long a handle may sit in the registry with its ffmpeg process gone and no
+# new bytes before the reaper concludes the teardown was lost and frees it.
+# Must exceed STREAM_START_TIMEOUT + the stall window, otherwise the reaper
+# would kill a stream that is legitimately walking its fallback chain.
+REAP_GRACE = 45.0
+
+
 class StreamManager:
     def __init__(self) -> None:
         self.streams: dict[str, StreamHandle] = {}
         self.mac_locks: dict[int, str] = {}                 # mac_id -> stream_id
-        self.user_counts: dict[str, int] = {}               # username -> open streams
+        self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
+        self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
 
     # ------------------------------------------------------------- registry
     def list(self) -> list[dict]:
         return [h.public() for h in self.streams.values()]
 
     def user_stream_count(self, username: str | None) -> int:
-        return self.user_counts.get(username or "-", 0)
+        """
+        Open streams for a user, derived from the live registry.
+
+        This used to be a separate counter incremented in `_register` and
+        decremented in `_deregister`. Every missed decrement (a generator parked
+        at `yield` that never got finalised, a watchdog task that was garbage
+        collected) permanently consumed one of the user's slots, so after a
+        while every play request answered "exceeded max_connections" until the
+        container was restarted. A derived count cannot drift.
+        """
+        key = username or "-"
+        return sum(1 for h in self.streams.values() if (h.user_name or "-") == key)
 
     def can_open_for(self, username: str | None, max_conn: int | None) -> bool:
         if max_conn is None or max_conn <= 0:
@@ -116,7 +135,6 @@ class StreamManager:
 
     async def _register(self, h: StreamHandle) -> None:
         self.streams[h.id] = h
-        self.user_counts[h.user_name or "-"] = self.user_stream_count(h.user_name) + 1
         try:
             await run_uncancelled(self._insert_row(h), what="active_streams insert")
         except Exception:  # noqa: BLE001
@@ -129,8 +147,7 @@ class StreamManager:
         # "max connections reached" or a MAC locked).
         h.dead = True
         self.streams.pop(h.id, None)
-        key = h.user_name or "-"
-        self.user_counts[key] = max(0, self.user_counts.get(key, 1) - 1)
+        self._proc_gone_since.pop(h.id, None)
         for mac_id, sid in list(self.mac_locks.items()):
             if sid == h.id:
                 del self.mac_locks[mac_id]
@@ -172,6 +189,57 @@ class StreamManager:
         for sid in list(self.streams):
             await self.kill(sid)
         return n
+
+    def watch(self, request, handle: StreamHandle) -> asyncio.Task:
+        """
+        Start the disconnect watchdog and KEEP A REFERENCE to it.
+
+        `asyncio.create_task()` only leaves a weak reference behind: a task
+        nobody holds can be garbage-collected mid-flight and stop silently.
+        That is exactly what the watchdog needs to survive, because it is the
+        thing that releases the MAC lock and the user's connection slot when a
+        player disappears without a clean socket close.
+        """
+        task = asyncio.get_running_loop().create_task(
+            self.watch_disconnect(request, handle),
+            name=f"watch-{handle.id[:8]}")
+        self._watchers.add(task)
+        task.add_done_callback(self._watchers.discard)
+        return task
+
+    async def reap_dead(self, interval: float = 10.0) -> None:
+        """
+        Safety net for lost teardowns.
+
+        The pump's `finally` and the watchdog cover the normal paths, but a
+        generator can be parked at `yield` and never finalised (no `aclose()`
+        from Starlette, client behind a buffering proxy). Such a handle stays in
+        the registry forever and permanently occupies a MAC and a connection
+        slot. Anything whose ffmpeg process is gone and stays gone for
+        REAP_GRACE without producing bytes is finished by definition, so free
+        it here.
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                now = time.time()
+                for h in list(self.streams.values()):
+                    gone = h.dead or (h.proc is not None and h.proc.returncode is not None)
+                    if not gone:
+                        self._proc_gone_since.pop(h.id, None)
+                        continue
+                    since = self._proc_gone_since.setdefault(h.id, now)
+                    if now - since < REAP_GRACE:
+                        continue
+                    self._proc_gone_since.pop(h.id, None)
+                    await db_log("WARNING", "stream",
+                                 f"[{h.item_name}] teardown was lost (process gone "
+                                 f">{REAP_GRACE:.0f}s) -> freeing slot/MAC")
+                    await self._deregister(h)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the reaper must never die
+                log.exception("reaper sweep failed")
 
     async def watch_disconnect(self, request, handle: StreamHandle,
                                interval: float = 0.5) -> None:

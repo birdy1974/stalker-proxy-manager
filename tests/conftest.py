@@ -15,6 +15,7 @@ os.environ["SPM_DATA_DIR"] = _DATA
 os.environ["SPM_DATABASE_URL"] = f"sqlite+aiosqlite:///{pathlib.Path(_DATA, 'spm.db').as_posix()}"
 os.environ["SPM_MOCK_PORTAL"] = "0"
 os.environ["SPM_ADMIN_PASSWORD"] = "test-admin"
+os.environ["SPM_SKIP_LOGIN"] = "1"   # the API tests call admin endpoints directly
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 

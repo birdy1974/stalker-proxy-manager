@@ -125,6 +125,16 @@ MOCK_PORTAL_ENABLED = os.environ.get("SPM_MOCK_PORTAL", "1") == "1"
 SKIP_LOGIN = os.environ.get("SPM_SKIP_LOGIN", "0") == "1"
 
 LOG_LEVEL = os.environ.get("SPM_LOG_LEVEL", "INFO").upper()
+
+# One INFO line per HTTP request on stdout, so `docker logs` shows what the API
+# is doing (uvicorn's own access log stays at WARNING - see main.py). Streams
+# are one long request each, so this stays readable even under load.
+ACCESS_LOG = os.environ.get("SPM_ACCESS_LOG", "1") == "1"
+# Paths that are pure noise and never worth a line.
+ACCESS_LOG_SKIP = tuple(
+    p.strip()
+    for p in os.environ.get("SPM_ACCESS_LOG_SKIP", "/static/,/favicon.ico").split(",")
+    if p.strip())
 # EVERY log record goes to stdout - on purpose, and it is load-bearing:
 # the Docker logging driver keeps a container's stdout and stderr apart, and
 # the CLI re-emits them on *its own* stdout/stderr. So `docker logs spm | grep
