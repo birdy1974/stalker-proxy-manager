@@ -255,9 +255,13 @@ class DataTable {
         tr.append(el("td", {}, cb));
       }
       for (const c of o.columns) {
-        const td = el("td", { title: typeof c.render === "function" ? "" : row[c.key] });
+        const td = el("td", { class: c.class || "" });
         const v = c.render ? c.render(row) : row[c.key];
         if (v instanceof Node) td.append(v); else td.innerHTML = v ?? "";
+        // Cells are ellipsised by CSS, so every one of them needs a tooltip or
+        // long titles (VOD especially) become unreadable with no way to see the
+        // rest. Columns with a render() used to get title="" - i.e. nothing.
+        td.title = c.title ? String(c.title(row)) : (td.textContent || "").trim().replace(/\s+/g, " ");
         tr.append(td);
       }
       this.tbody.append(tr);

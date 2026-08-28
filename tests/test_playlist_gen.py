@@ -175,6 +175,33 @@ async def test_empty_whitelist_means_all_groups_allowed():
     assert "Home video" in text
 
 
+async def test_full_titles_reach_the_playlist_and_carry_tvg_name():
+    """
+    "VOD title not complete in playlist": the m3u always carried the whole
+    `custom_name` after the comma, but VOD/series/local entries had no
+    `tvg-name`, and plenty of players prefer that attribute and otherwise fall
+    back to the URL. Both halves are pinned here.
+    """
+    long_title = "Man of War (2026) [1080p] Extended Director's Cut, uncut"
+    await _seed(0)                                   # gives us the user row
+    async with SessionLocal() as s:
+        from app.models import Portal, VodPlaylist, VodSource
+        portal = Portal(name="t", base_url="http://p.invalid")
+        s.add(portal); await s.flush()
+        src = VodSource(portal_id=portal.id, portal_item_id="long", original_name=long_title)
+        s.add(src); await s.flush()
+        s.add(VodPlaylist(vod_source_id=src.id, custom_name=long_title, group_name="Action"))
+        await s.commit()
+        user = await s.get(User, 1)
+
+    text = await build_m3u(BASE, user)
+    lines = [ln for ln in text.splitlines() if long_title in ln]
+    assert lines, "the full title is missing from the playlist"
+    extinf = [ln for ln in lines if ln.startswith("#EXTINF")][0]
+    assert extinf.endswith("," + long_title), f"title truncated after the comma: {extinf!r}"
+    assert f'tvg-name="{long_title}"' in extinf, f"no tvg-name: {extinf!r}"
+
+
 async def test_every_entry_has_a_matching_playable_url():
     await _seed(3)
     async with SessionLocal() as s:

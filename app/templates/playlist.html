@@ -273,7 +273,7 @@ function liveBuilder() {
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/live/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
       { key: "order", label: "Ord", sort: "order", width: "52px" },
-      { key: "custom_name", label: "Custom name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
+      { key: "custom_name", class: "col-name", label: "Custom name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("live", r) },
       { key: "chain", label: "Source chain (1=primary, then fallbacks)", render: r => chainHtml(r.chain) },
       { key: "epg_id", label: "EPG id", render: r => `<span class="mono small">${esc(r.epg_id || "")}</span>` },
@@ -420,7 +420,7 @@ function vodBuilder() {
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/vod/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
       { key: "poster", label: "", width: "44px", render: r => r.poster ? `<img class="poster-thumb" src="${esc(r.poster)}" loading="lazy">` : "" },
-      { key: "custom_name", label: "Title", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
+      { key: "custom_name", class: "col-name", label: "Title", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("vod", r) },
       { key: "year", label: "Year", width: "56px" },
       { key: "template", label: "FFmpeg tpl", render: r => tplInlineCell("vod", r) },
@@ -470,7 +470,7 @@ function seriesBuilder() {
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/series/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
       { key: "poster", label: "", width: "44px", render: r => r.poster ? `<img class="poster-thumb" src="${esc(r.poster)}" loading="lazy">` : "" },
-      { key: "custom_name", label: "Series", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
+      { key: "custom_name", class: "col-name", label: "Series", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("series", r) },
       { key: "seasons", label: "Seasons in output", render: r => r.seasons.map(s => `
           <span class="badge ${s.enabled ? "st-online" : "st-unknown"} me-1" style="cursor:pointer" title="toggle season"
@@ -527,7 +527,7 @@ function localBuilder() {
     server: async (q) => await api("/api/playlist/local?" + q),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/local/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
-      { key: "custom_name", label: "Name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name || "")}</b><div class="small text-muted mono">${esc(r.file)}</div>` },
+      { key: "custom_name", class: "col-name", label: "Name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name || "")}</b><div class="small text-muted mono">${esc(r.file)}</div>` },
       { key: "group_name", label: "Group", filter: groupFilterLoader, render: r => groupCell("local", r) },
       { key: "template", label: "FFmpeg tpl", render: r => tplInlineCell("local", r) },
       { key: "actions", label: "", width: "110px", render: r => `

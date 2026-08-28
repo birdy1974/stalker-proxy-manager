@@ -128,7 +128,11 @@ async def build_m3u(base_url: str, user: User) -> str:
         for it in vods:
             if not _allowed(it.group_name, groups["vod"]):
                 continue
-            attr = (f'tvg-logo="{it.poster or it.logo or ""}" '
+            # tvg-name matters: several players (and all Xtream clients) prefer
+            # it over the text after the comma, and without it they fall back to
+            # the URL - which is how titles end up looking "not complete".
+            attr = (f'tvg-name="{it.custom_name}" '
+                    f'tvg-logo="{it.poster or it.logo or ""}" '
                     f'group-title="{it.group_name or "VOD"}"')
             lines.append(f"#EXTINF:-1 {attr},{it.custom_name}")
             lines.append(f"{base_url}/play/vod/{it.id}.ts?u={u}&p={p}")
@@ -163,7 +167,8 @@ async def build_m3u(base_url: str, user: User) -> str:
             for sp_id, season_id, season_number in [r for r in season_rows if r[0] == sp.id]:
                 for ep_id, ep_num in eps_by_season.get(season_id, []):
                     name = f"{sp.custom_name} S{season_number:02d}E{ep_num:02d}"
-                    attr = (f'tvg-logo="{sp.poster or sp.logo or ""}" '
+                    attr = (f'tvg-name="{name}" '
+                            f'tvg-logo="{sp.poster or sp.logo or ""}" '
                             f'group-title="Series: {sp.group_name or sp.custom_name}"')
                     lines.append(f"#EXTINF:-1 {attr},{name}")
                     lines.append(f"{base_url}/play/episode/{ep_id}.ts?u={u}&p={p}")
@@ -184,7 +189,8 @@ async def build_m3u(base_url: str, user: User) -> str:
             if not lf:
                 continue
             name = it.custom_name or lf.filename
-            lines.append(f'#EXTINF:-1 group-title="{it.group_name or "vod-local"}",{name}')
+            lines.append(f'#EXTINF:-1 tvg-name="{name}" '
+                         f'group-title="{it.group_name or "vod-local"}",{name}')
             lines.append(f"{base_url}/play/local/{it.id}.ts?u={u}&p={p}")
 
     return "\n".join(lines) + "\n"
