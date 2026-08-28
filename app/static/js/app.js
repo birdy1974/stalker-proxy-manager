@@ -377,6 +377,25 @@ function playInModal(url, title) {
   });
   m.footer.append(mBtn("Stop & Close", "btn-outline-secondary", m.close, "bi-stop-circle"));
 
+  // The preview runs the source through an FFmpeg template, same as the real
+  // output. If it stays black on copy (HEVC / AC3 / anything MediaSource cannot
+  // take), retry through a transcode template instead of guessing.
+  if (/^\/preview\//.test(url)) {
+    const sel = el("select", { class: "form-select form-select-sm w-auto d-inline-block ms-2" });
+    sel.append(el("option", { value: "" }, "default template"));
+    const go = el("button", { class: "btn btn-sm btn-outline-primary ms-1" }, "Retry with");
+    m.footer.append(el("span", { class: "small text-muted ms-2" }, "FFmpeg template:"), sel, go);
+    api("/api/ffmpeg").then(r => (r.items || []).forEach(t =>
+      sel.append(el("option", { value: t.id }, `${t.name}${t.is_default ? " (default)" : ""}`))
+    )).catch(() => sel.remove());
+    go.addEventListener("click", () => {
+      const id = sel.value;
+      const next = id ? `${url.split("?")[0]}?tpl=${id}` : url.split("?")[0];
+      m.close();
+      playInModal(next, title);
+    });
+  }
+
   const isHls = /\.m3u8(\?|$)/i.test(url);
   const haveHls = !!(window.Hls && window.Hls.isSupported && window.Hls.isSupported());
   const haveTs = !!(window.mpegts && window.mpegts.isSupported && window.mpegts.isSupported());

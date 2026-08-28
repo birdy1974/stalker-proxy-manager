@@ -57,6 +57,17 @@ _NETONLY_OPTS = re.compile(
 _NET_SCHEMES = ("http://", "https://")
 
 
+class _WithTemplate:
+    """Wrap a source so _template_for picks an explicitly chosen template."""
+
+    def __init__(self, src, template_id: int) -> None:
+        self._src = src
+        self.ffmpeg_template_id = template_id
+
+    def __getattr__(self, item):
+        return getattr(self._src, item)
+
+
 @dataclass
 class StreamHandle:
     """One client-visible stream (dashboard row + kill target)."""
@@ -484,19 +495,24 @@ class StreamManager:
             return chain, name, pl
 
     async def _open_preview(self, src, portal, macs, kind: str = "live",
-                            name: str | None = None):
+                            name: str | None = None, template_id: int | None = None):
         """
         Throwaway stream straight from an ORIGINAL source (GUI 'test stream').
-        Passthrough copy command; no playlist involvement; full fallback over
-        the portal's MACs still applies.
+        No playlist involvement; full fallback over the portal's MACs applies.
+
+        Uses the same template resolution as the real pipeline, so what you
+        preview is what your viewers get. It used to hardcode `-c copy`, which
+        meant a HEVC or AC3 stream stayed black in the preview even when a
+        working VAAPI/QSV transcode template would have played it fine - the
+        preview disagreed with reality in exactly the case that matters.
+        Pass template_id to force a specific one.
         """
-        command = (f"ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 "
-                   f"-reconnect_streamed 1 -reconnect_delay_max 5 -i {URL_PLACEHOLDER} "
-                   f"-map 0:v:0 -map 0:a:0? -sn -dn -c copy -f mpegts pipe:1")
+        probe = src if template_id is None else _WithTemplate(src, template_id)
+        tpl_name, command = await self._template_for(probe)
         h = StreamHandle(id=uuid.uuid4().hex, kind="preview",
                          item_name=name or getattr(src, "original_name", None)
                          or getattr(src, "name", "preview"),
-                         user_name="admin", template_name="(preview copy)", command=command)
+                         user_name="admin", template_name=tpl_name, command=command)
         gen = self._pump(h, [(src, portal, macs)], "live" if kind == "live" else "vod")
         return h, gen
 

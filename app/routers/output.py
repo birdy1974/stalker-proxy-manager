@@ -257,7 +257,8 @@ async def admin_play(kind: str, pid: int, request: Request, mode: str = ""):
 
 # ---------------------------------------------------------------- preview
 @router.get("/preview/{kind}/{sid}.ts")
-async def preview(kind: str, sid: int, request: Request, db=Depends(get_db)):
+async def preview(kind: str, sid: int, request: Request, db=Depends(get_db),
+                  tpl: int | None = Query(None)):
     """
     Web-player probe of ORIGINAL source streams (spec: test before playlist).
     Admin-session OR valid user credentials both work. Uses the stream
@@ -294,7 +295,8 @@ async def preview(kind: str, sid: int, request: Request, db=Depends(get_db)):
     if not portal or not macs:
         raise HTTPException(404, "no portal/mac for this source")
     name = getattr(src, "original_name", None) or getattr(src, "name", "preview")
-    handle, gen = await MANAGER._open_preview(src, portal, list(macs), kind=link_kind, name=name)
+    handle, gen = await MANAGER._open_preview(src, portal, list(macs), kind=link_kind,
+                                              name=name, template_id=tpl)
     if handle.dead:
         raise HTTPException(404, "preview failed: no data from source")
     MANAGER.watch(request, handle)
