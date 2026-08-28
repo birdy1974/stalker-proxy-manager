@@ -34,13 +34,29 @@ _QUEUE_MAX = 2000          # bounded: a wedged database must not eat all memory
 _BATCH_MAX = 50            # rows per INSERT/COMMIT
 _writer: asyncio.Task | None = None
 _queue: asyncio.Queue | None = None
+_loop: asyncio.AbstractEventLoop | None = None
 _dropped = 0
 
 
 def _q() -> asyncio.Queue:
-    global _queue
+    """
+    The drain queue, bound to the loop that is running right now.
+
+    asyncio.Queue remembers the loop it was first used on and refuses to work
+    from any other one, so a second loop (a script that calls asyncio.run()
+    more than once, `uvicorn --reload`) would break every later write. Starting
+    over costs the rows still queued on the dead loop - which nothing could
+    have drained anyway - and keeps logging alive.
+    """
+    global _queue, _loop, _writer
+    loop = asyncio.get_running_loop()
     if _queue is None:
-        _queue = asyncio.Queue(maxsize=_QUEUE_MAX)
+        _queue, _loop = asyncio.Queue(maxsize=_QUEUE_MAX), loop
+    elif _loop is not loop:
+        lost = _queue.qsize()
+        _queue, _loop, _writer = asyncio.Queue(maxsize=_QUEUE_MAX), loop, None
+        if lost:
+            pylog.warning("event loop changed: %d queued log row(s) dropped", lost)
     return _queue
 
 
@@ -71,12 +87,17 @@ async def _writer_loop() -> None:
                 q.task_done()
 
 
-def _enqueue(level: str, module: str, message: str) -> None:
-    """Never blocks, never raises, never touches the caller's DB connection."""
+def _ensure_writer() -> None:
+    """(Re)start the drain task - lazily on first use, and again if it died."""
     global _writer
-    q = _q()
     if _writer is None or _writer.done():
         _writer = spawn(_writer_loop(), name="spm-log-writer")
+
+
+def _enqueue(level: str, module: str, message: str) -> None:
+    """Never blocks, never raises, never touches the caller's DB connection."""
+    q = _q()
+    _ensure_writer()
     try:
         q.put_nowait((level, module, message))
     except asyncio.QueueFull:
@@ -97,12 +118,16 @@ async def db_log(level: str, module: str, message: str) -> None:
 
 async def flush_logs(timeout: float = 10.0) -> None:
     """Wait until every queued row is committed (shutdown, tests, exports)."""
-    if _queue is None or _queue.empty():
+    q = _q()
+    if q.empty():
         return
+    # Without a live drain task `join()` could only ever time out, so bring it
+    # back first: a writer that died must not cost a stall plus lost rows.
+    _ensure_writer()
     try:
-        await asyncio.wait_for(_queue.join(), timeout)
+        await asyncio.wait_for(q.join(), timeout)
     except asyncio.TimeoutError:
-        pylog.warning("log queue still has %d row(s) after %.0fs", _queue.qsize(), timeout)
+        pylog.warning("log queue still has %d row(s) after %.0fs", q.qsize(), timeout)
     except Exception:  # noqa: BLE001 - flushing must never break shutdown
         pylog.exception("flushing the log queue failed")
 

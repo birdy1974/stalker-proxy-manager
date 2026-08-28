@@ -274,6 +274,31 @@ async def test_db_log_persists_when_the_caller_is_cancelled(pool_errors):
     assert pool_errors == []
 
 
+async def test_log_writer_restarts_if_it_dies(pool_errors):
+    """A dead drain task must not cost a shutdown stall plus lost rows."""
+    from app.services import db_logging
+
+    await db_log("INFO", "stream", "before the writer died")
+    await flush_logs()
+    assert db_logging._writer is not None
+    db_logging._writer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await db_logging._writer
+
+    await db_log("INFO", "stream", "after the writer died")
+    await flush_logs(timeout=5)
+
+    msgs = [r for r in (await _all_logs())]
+    assert "after the writer died" in msgs, f"row lost after the writer died: {msgs}"
+    assert "before the writer died" in msgs
+    assert pool_errors == []
+
+
+async def _all_logs() -> list[str]:
+    async with SessionLocal() as s:
+        return list((await s.execute(select(Log.message).order_by(Log.id))).scalars().all())
+
+
 async def test_run_uncancelled_gets_work_through_repeated_cancellation():
     """
     The core primitive. anyio re-delivers cancellation on every loop turn, so a
