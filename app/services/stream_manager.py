@@ -41,7 +41,7 @@ from ..models import (
     SeriePlaylistSource, SerieSeason, SerieSource, VodPlaylist, VodPlaylistSource,
     VodSource,
 )
-from ..portal.client import PortalError, StalkerClient
+from ..portal.client import MAG_UA, PortalError, StalkerClient
 from .db_logging import db_log
 from .ffmpeg_templates import URL_PLACEHOLDER
 
@@ -52,7 +52,8 @@ CHUNK = 64 * 1024
 # input options that only exist for network protocols (stripped for file://)
 _NETONLY_OPTS = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout|user_agent|headers|http_proxy"
-    r"|seekable|multiple_requests)\b\s*(?:\S+)?")
+    r"|seekable|multiple_requests|referer)\b\s*(?:\S+)?")
+_NET_SCHEMES = ("http://", "https://")
 
 
 @dataclass
@@ -112,6 +113,10 @@ class StreamManager:
             log.exception("active_streams insert failed")
 
     async def _deregister(self, h: StreamHandle) -> None:
+        # In-memory state first, DB second: the connection slot and the MAC
+        # lock must be free the moment we know the stream is gone, even when
+        # the database is slow (a stalled commit must never keep a user at
+        # "max connections reached" or a MAC locked).
         h.dead = True
         self.streams.pop(h.id, None)
         key = h.user_name or "-"
@@ -132,7 +137,6 @@ class StreamManager:
             return False
         if h.dead:
             return True
-        await db_log("WARNING", "stream", f"stream '{h.item_name}' killed (user/disconnect)")
         h.dead = True
         if h.proc and h.proc.returncode is None:
             try:
@@ -144,7 +148,10 @@ class StreamManager:
         # vanished, so only an actively-running task (watchdog/API) can
         # release registry + MAC locks deterministically. `_deregister` is
         # idempotent, the pump's finally will simply no-op afterwards.
+        # Release BEFORE logging: the log write goes to the database, and a
+        # slow database must not delay freeing the user's connection slot.
         await self._deregister(h)
+        await db_log("WARNING", "stream", f"stream '{h.item_name}' killed (user/disconnect)")
         return True
 
     async def kill_all(self) -> int:
@@ -182,8 +189,69 @@ class StreamManager:
             log.exception("disconnect watchdog crashed for %s", handle.id)
 
     # --------------------------------------------------------- ffmpeg spawn
+    @staticmethod
+    def _network_identity(cmd_text: str, url: str) -> str:
+        """
+        Give ffmpeg the identity of the STB it is impersonating.
+
+        ffmpeg announces itself as "Lavf/61.x" and sends no Referer; plenty of
+        Stalker panels - and the CDNs in front of them - answer that with 403
+        or 405 ("Method Not Allowed") on an otherwise perfectly valid link.
+        Inject the MAG user-agent and the stream's own origin unless the
+        template already says otherwise (user edits always win).
+        """
+        if not url.lower().startswith(_NET_SCHEMES):
+            return cmd_text
+        add: list[str] = []
+        if "-user_agent" not in cmd_text:
+            add.append(f'-user_agent "{MAG_UA}"')
+        if "-referer" not in cmd_text and "-headers" not in cmd_text:
+            origin = url.split("://", 1)[-1].split("/", 1)[0]
+            add.append(f'-referer "{url.split("://", 1)[0]}://{origin}/"')
+        if not add:
+            return cmd_text
+        # options belong directly in front of the input they apply to
+        return re.sub(rf"\s-i\s+{re.escape(url)}",
+                      lambda m: " " + " ".join(add) + m.group(0),
+                      cmd_text, count=1)
+
+    async def _first_bytes(self, proc) -> bytes:
+        """
+        Wait for the first chunk - but only until ffmpeg dies, not until the
+        start timeout expires. A process that exits before sending a byte will
+        never send one, so falling back immediately is both faster (no 12 s
+        wait per dead source) and honest in the log.
+        """
+        read_t = asyncio.ensure_future(proc.stdout.read(CHUNK))
+        exit_t = asyncio.ensure_future(proc.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {read_t, exit_t}, timeout=STREAM_START_TIMEOUT,
+                return_when=asyncio.FIRST_COMPLETED)
+        except Exception:  # noqa: BLE001 - never let the wait break the pump
+            done = set()
+        if read_t in done:
+            try:
+                data = read_t.result() or b""
+            except Exception:  # noqa: BLE001
+                data = b""
+            if data:
+                exit_t.cancel()
+                return data
+            # EOF without a single byte: ffmpeg is gone. Give the exit waiter
+            # a moment so the log can name the real reason (rc=8 -> HTTP 405,
+            # rc=1 -> bad template, ...) instead of a bogus "no data within 12s".
+            try:
+                await asyncio.wait_for(exit_t, 1.0)
+            except Exception:  # noqa: BLE001
+                exit_t.cancel()
+            return b""
+        read_t.cancel()
+        exit_t.cancel()
+        return b""
+
     async def _spawn(self, cmd_template: str, url: str) -> asyncio.subprocess.Process | None:
-        cmd_text = cmd_template.replace(URL_PLACEHOLDER, url)
+        cmd_text = self._network_identity(cmd_template.replace(URL_PLACEHOLDER, url), url)
         # Network-source options do not exist for file:// inputs and make
         # ffmpeg abort with "Option reconnect not found". Strip them for
         # local-file playback.
@@ -494,16 +562,18 @@ class StreamManager:
                     if not registered:
                         await self._register(h)
                         registered = True
-                    try:
-                        first = await asyncio.wait_for(proc.stdout.read(CHUNK),
-                                                       STREAM_START_TIMEOUT)
-                    except asyncio.TimeoutError:
-                        first = b""
+                    first = await self._first_bytes(proc)
                     if not first:
-                        pass  # diagnosis was: GPU template used without /dev/dri (fixed via _hardware_sanity)
-                        await db_log("WARNING", "stream",
-                                     f"[{h.item_name}] no data within {STREAM_START_TIMEOUT}s from "
-                                     f"{portal.name}/{mac_row.mac} -> fallback")
+                        if proc.returncode is None:
+                            await db_log("WARNING", "stream",
+                                         f"[{h.item_name}] no data within {STREAM_START_TIMEOUT}s from "
+                                         f"{portal.name}/{mac_row.mac} -> fallback")
+                        else:
+                            # ffmpeg is gone and will never send a byte: say so
+                            # (the [ffmpeg] log line has the stderr tail)
+                            await db_log("WARNING", "stream",
+                                         f"[{h.item_name}] ffmpeg exited rc={proc.returncode} before sending "
+                                         f"data ({portal.name}/{mac_row.mac}) -> fallback")
                         await self._kill_quiet(proc)
                         self.mac_locks.pop(mac_row.id, None)
                         continue

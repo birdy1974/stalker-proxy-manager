@@ -18,6 +18,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
 
@@ -29,6 +30,111 @@ MAG_UA = (
     "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
     "(KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2721 Safari/533.3"
 )
+
+# ---------------------------------------------------------------------------
+# link helpers (see create_link)
+# ---------------------------------------------------------------------------
+# Per-session, single-use parameters. A cmd carrying one of these is an ALREADY
+# RESOLVED link: handing it back to create_link makes some portals rebuild the
+# URL from partial state - observed in the wild:
+#     request   ...&stream=392166&extension=ts&play_token=<old>
+#     answer    ...&stream=&extension=ts&play_token=<new>       <- id gone!
+# so they are stripped before asking for a link, and the fresh token from the
+# answer is merged into the URL we asked for instead of trusting the answer.
+VOLATILE_PARAMS = frozenset({
+    "play_token", "token", "tok", "auth", "auth_key", "authkey", "key",
+    "signature", "sig", "sign", "session", "sess", "st", "e", "exp",
+    "expires", "expire", "md5", "hash",
+})
+URL_SCHEMES = ("http://", "https://", "rtsp://", "rtsps://", "rtmp://",
+               "rtmps://", "udp://", "rtp://", "mms://")
+
+
+def extract_url(raw: Any) -> str:
+    """
+    Pick the stream URL out of a portal cmd.
+
+    Portals are creative here: 'ffmpeg http://…', 'ffrt http://…', the bare
+    URL, the whole cmd percent-encoded, or the URL followed by extra ffmpeg
+    arguments. Returns '' when no URL is recognisable.
+    """
+    text = str(raw or "").strip().strip("\"'")
+    if not text:
+        return ""
+    # some panels return the cmd fully percent-encoded ('ffmpeg http%3A%2F%2F…')
+    if "://" not in text and "%3a%2f%2f" in text.lower():
+        text = unquote(text)
+    for tok in text.split():
+        candidate = tok.strip("\"'")
+        if candidate.lower().startswith(URL_SCHEMES):
+            return candidate
+    return ""
+
+
+def strip_volatile(url: str) -> str:
+    """Remove single-use token parameters from a URL (keeps everything else)."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    kept = [(k, v) for k, v in pairs if k.lower() not in VOLATILE_PARAMS]
+    if len(kept) == len(pairs):
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(kept, safe=":"), parts.fragment))
+
+
+def sanitize_cmd(cmd: Any) -> str:
+    """Version of `cmd` that is safe to send to create_link (no stale token)."""
+    text = str(cmd or "").strip()
+    url = extract_url(text)
+    if not url:
+        return text
+    cleaned = strip_volatile(url)
+    return text.replace(url, cleaned) if cleaned != url else text
+
+
+def merge_link(answer: str, requested: str) -> str:
+    """
+    Repair an answer that lost parts of the request.
+
+    Some portals rebuild the link instead of echoing it and drop or blank
+    parameters while doing so ('&stream=392166' -> '&stream='), which leaves
+    ffmpeg with an unplayable URL and the player with an empty response.
+    Same scheme/host/path only: request parameters are restored (blanked or
+    missing ones), while everything the portal added - above all the fresh
+    play_token - wins.
+    """
+    if not requested:
+        return answer
+    req, got = urlsplit(requested), urlsplit(answer)
+    if req.netloc != got.netloc or req.path != got.path:
+        return answer                      # different server: nothing to repair
+    req_pairs = parse_qsl(req.query, keep_blank_values=True)
+    got_pairs = parse_qsl(got.query, keep_blank_values=True)
+    got_map = dict(got_pairs)
+    merged: list[tuple[str, str]] = []
+    req_keys = {k for k, _ in req_pairs}
+    for k, v in req_pairs:
+        if k.lower() in VOLATILE_PARAMS:
+            continue                       # token always comes from the answer
+        merged.append((k, got_map[k] or v if k in got_map else v))
+    for k, v in got_pairs:                 # fresh token + anything extra
+        if k.lower() in VOLATILE_PARAMS or k not in req_keys:
+            merged.append((k, v))
+    return urlunsplit((got.scheme, got.netloc, got.path,
+                       urlencode(merged, safe=":"), got.fragment))
+
+
+def mask_token(url: str) -> str:
+    """URL with volatile values masked - safe to write to the log."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    masked = [(k, "***" if k.lower() in VOLATILE_PARAMS else v) for k, v in pairs]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(masked, safe=":"), parts.fragment))
 
 
 class PortalError(RuntimeError):
@@ -257,20 +363,44 @@ class StalkerClient:
 
     # ---------------------------------------------------------------- links
     async def create_link(self, cmd: str, kind: str = "itv") -> str:
-        """Resolve a portal `cmd` to a playable stream URL."""
+        """
+        Resolve a portal `cmd` to a playable stream URL.
+
+        Two steps that matter on real panels (both learned the hard way):
+
+        1. the outgoing cmd is stripped of volatile parameters. Many portals
+           store - and we therefore keep - an already tokenised link; handing
+           that back makes some panels rebuild the URL and lose the stream id.
+        2. the answer is repaired against the request, so a portal that drops
+           or blanks parameters still yields a complete URL (fresh token is
+           always taken from the answer).
+        """
         type_ = {"live": "itv", "itv": "itv", "vod": "vod", "series": "vod", "episode": "vod"}.get(kind, "itv")
+        raw_cmd = str(cmd or "").strip()
+        requested = extract_url(raw_cmd)
+        out_cmd = sanitize_cmd(raw_cmd)
+        if out_cmd != raw_cmd:
+            log.debug("create_link: stripped stale token from cmd")
         data = await self._get({
-            "type": type_, "action": "create_link", "cmd": cmd, "series": "0",
+            "type": type_, "action": "create_link", "cmd": out_cmd, "series": "0",
             "forced_storage": "false", "disable_ad": "false", "download": "false",
             "force_ch_link_check": "false", "JsHttpRequest": "1-xml",
         })
         js = data.get("js")
+        raw = ""
         if isinstance(js, dict):
-            raw = js.get("cmd") or js.get("url") or ""
-            link = str(raw).split()[-1] if raw else ""     # cmds look like: ffmpeg http://...
-            if link.startswith("http"):
-                return link
-        raise PortalError(f"create_link returned no usable url for cmd={cmd!r}")
+            raw = js.get("cmd") or js.get("url") or js.get("link") or ""
+        elif isinstance(js, str):
+            raw = js
+        link = extract_url(raw)
+        if not link:
+            raise PortalError(f"create_link returned no usable url for cmd={cmd!r}")
+        repaired = merge_link(link, requested)
+        if repaired != link:
+            log.info("create_link: portal dropped parameters -> repaired from cmd")
+        log.debug("create_link -> %s", repaired)
+        log.info("create_link -> %s", mask_token(repaired))
+        return repaired
 
     # ------------------------------------------------------------------ epg
     async def short_epg(self, ch_id: str) -> list[dict]:

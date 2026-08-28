@@ -1,4 +1,15 @@
 # Build + push the all-in-one image to GHCR on every release / main push.
+#
+# INSTALL NOTE ---------------------------------------------------------------
+# GitHub denies App commits that touch .github/workflows, so CI changes made by
+# the assistant land here first. Install them with
+#
+#   cp dev/docker-publish.yml.example .github/workflows/docker-publish.yml
+#
+# Until that is done `bash dev/check-yaml.sh` reports this file as drifting -
+# expected, and exactly what the check is for: it compares the template with
+# the installed workflow so a forgotten install cannot go unnoticed.
+# ---------------------------------------------------------------------------
 name: docker
 
 on:
@@ -58,6 +69,15 @@ jobs:
   # and it cleans up after itself) - keep it there, not inline: an inline
   # `docker logs | grep -q` is exactly the trap that made this job fail for
   # six runs (see the script header for why it merges the log streams).
+  # Pure-python checks that need no image: the Stalker link helpers decide
+  # whether a channel plays at all, so their rules are pinned in CI too.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stalker link helpers (create_link parsing/repair)
+        run: python3 dev/check-links.py
+
   smoke:
     runs-on: ubuntu-latest
     needs: build
