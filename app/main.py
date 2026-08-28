@@ -25,7 +25,7 @@ from .config import (HTTP_PORT, LOG_LEVEL, MOCK_PORTAL_ENABLED, SECRET_KEY,
                      SESSION_MAX_AGE, log)
 from .database import SessionLocal, init_db
 from .models import FFmpegTemplate, Setting
-from .services.db_logging import cleanup_logs, db_log
+from .services.db_logging import cleanup_logs, db_log, stop_log_writer
 from .services.ffmpeg_templates import default_presets
 from .services.stream_manager import MANAGER
 
@@ -136,6 +136,13 @@ async def startup() -> None:
     from .services.epg import epg_scheduler
     import asyncio
     asyncio.create_task(epg_scheduler())
+
+
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    # Log rows live on a queue drained by a writer task; the pool is torn down
+    # right after this, so anything still queued has to be committed now.
+    await stop_log_writer()
 
 
 async def _hardware_sanity() -> None:

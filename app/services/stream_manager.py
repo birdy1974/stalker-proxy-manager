@@ -34,7 +34,7 @@ from sqlalchemy import delete, select
 
 from ..config import (FALLBACK_STRATEGY, FFMPEG_BIN, MEDIA_ROOT,
                       STREAM_START_TIMEOUT)
-from ..database import SessionLocal
+from ..database import SessionLocal, run_uncancelled
 from ..models import (
     ActiveStream, FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource,
     LocalFile, LocalPlaylist, MacAddress, Portal, SerieEpisode, SeriePlaylist,
@@ -99,16 +99,26 @@ class StreamManager:
             return True
         return self.user_stream_count(username) < max_conn
 
+    @staticmethod
+    async def _insert_row(h: StreamHandle) -> None:
+        async with SessionLocal() as s:
+            s.add(ActiveStream(id=h.id, kind=h.kind, item_name=h.item_name,
+                               user_name=h.user_name, portal_name=h.portal_name or None,
+                               mac=h.mac or None, template_name=h.template_name,
+                               pid=h.proc.pid if h.proc else None))
+            await s.commit()
+
+    @staticmethod
+    async def _delete_row(stream_id: str) -> None:
+        async with SessionLocal() as s:
+            await s.execute(delete(ActiveStream).where(ActiveStream.id == stream_id))
+            await s.commit()
+
     async def _register(self, h: StreamHandle) -> None:
         self.streams[h.id] = h
         self.user_counts[h.user_name or "-"] = self.user_stream_count(h.user_name) + 1
         try:
-            async with SessionLocal() as s:
-                s.add(ActiveStream(id=h.id, kind=h.kind, item_name=h.item_name,
-                                   user_name=h.user_name, portal_name=h.portal_name or None,
-                                   mac=h.mac or None, template_name=h.template_name,
-                                   pid=h.proc.pid if h.proc else None))
-                await s.commit()
+            await run_uncancelled(self._insert_row(h), what="active_streams insert")
         except Exception:  # noqa: BLE001
             log.exception("active_streams insert failed")
 
@@ -124,10 +134,13 @@ class StreamManager:
         for mac_id, sid in list(self.mac_locks.items()):
             if sid == h.id:
                 del self.mac_locks[mac_id]
+        # The DELETE is what removes the dashboard row, and deregistration
+        # normally runs from the pump's finally - i.e. inside the request task
+        # that is being cancelled right now. Left unshielded it dies halfway,
+        # SQLAlchemy drops the pooled connection, and the row stays behind as a
+        # ghost until the next container start.
         try:
-            async with SessionLocal() as s:
-                await s.execute(delete(ActiveStream).where(ActiveStream.id == h.id))
-                await s.commit()
+            await run_uncancelled(self._delete_row(h.id), what="active_streams delete")
         except Exception:  # noqa: BLE001
             pass
 
@@ -601,10 +614,18 @@ class StreamManager:
                          f"{''.join(traceback.format_exception(exc))[-1200:]}")
         finally:
             if registered or h.proc:
-                await self._kill_quiet(h.proc)
-                await self._deregister(h)
-                await db_log("INFO", "stream",
-                             f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
+                # One shielded unit, not three sequential awaits: this runs
+                # while the client's request task is being cancelled, and every
+                # step (proc.wait, the active_streams DELETE, the log write)
+                # awaits something a cancellation would abort halfway.
+                await run_uncancelled(self._finish(h), what="stream teardown")
+
+    async def _finish(self, h: StreamHandle) -> None:
+        """Complete stream teardown, run outside the dying request's scope."""
+        await self._kill_quiet(h.proc)
+        await self._deregister(h)
+        await db_log("INFO", "stream",
+                     f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
 
     async def _read_proc(self, h: StreamHandle, proc):
         """Yield bytes with stall detection until EOF/death/kill."""

@@ -196,6 +196,25 @@ Tip: the GUI shows the ready-to-copy mock portal URL/MACs in the Portals tab whe
 
 Every subsystem writes **detailed entries** (module-tagged: portals, fetch, stream, ffmpeg, …) both to the **GUI → logs pane** (level filtering) and to **stdout** (visible in Portainer). ffmpeg's stderr tail is captured on failures. Active stream rows show live throughput; a stream monitor persists recent finished/killed streams.
 
+**Client disconnects are not errors.** A player that switches channel closes the
+socket, and uvicorn/Starlette then cancel the *whole* request task - anyio keeps
+re-delivering that cancellation every event-loop turn until the task is gone.
+Anything awaited during teardown used to be interrupted halfway, which produced
+
+```
+ERROR [sqlalchemy.pool] Exception terminating connection <AdaptedConnection ...>
+asyncio.exceptions.CancelledError: Cancelled via cancel scope ... by
+<Task pending name='Task-158' coro=<RequestResponseCycle.run_asgi() ...>
+```
+
+and silently dropped the teardown writes (an `active_streams` row left behind as
+a ghost on the dashboard, and no "stopped after N MB" line). Stream teardown now
+runs through `app.database.run_uncancelled()`, log rows go through a writer task
+instead of a session in the caller's task, and sessions hand their connection
+back under a shield. If a client disconnects *while a query is in flight* the
+connection cannot be trusted and is discarded - that is correct, and it is
+logged as a single INFO line, not a traceback.
+
 **Single-stream rule (do not break it):** *every* record - ours and uvicorn's - is written to **stdout** (`app/config.py` sets the root handler, `app/main.py` re-attaches uvicorn's handlers). The Docker logging driver keeps a container's stdout and stderr apart and `docker logs` re-emits them on *its own* two streams, so anything logged on stderr is invisible to `docker logs <c> | grep …` - which is precisely how the CI smoke test managed to fail six runs in a row while the app was healthy. `dev/smoke.sh` therefore asserts that the boot marker is present **on stdout**; keep that check honest by fixing the logging instead of muting uvicorn's output.
 
 ---
@@ -266,6 +285,14 @@ Single-process by design (MAC locks and stream registry are in-memory; the datab
 pip install -r requirements.txt
 SPM_ADMIN_PASSWORD=admin SPM_MOCK_PORTAL=1 \
 python3 -m uvicorn app.main:app --host 0.0.0.0 --port 8880
+```
+
+Tests (no Docker, no portal, no ffmpeg required - the streaming tests substitute
+a real subprocess for the ffmpeg binary and keep the rest of the pipeline real):
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest          # or: python -m pytest -v tests/test_stream_disconnect.py
 ```
 
 ## Phase 3 (done)
