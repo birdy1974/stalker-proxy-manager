@@ -213,22 +213,65 @@ async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
     as a WHOLE (one SELECT + one COMMIT per page instead of one round trip per
     item). Returns (n, total).
     """
+    from ..config import FETCH_PAGE_CONCURRENCY
+
     inserted, total = 0, 0
-    for page in range(1, budget + 1):
+    job.detail = f"{genre_name}: page 1"
+    first = await fetch_page(1)
+    total = first.total
+    pages = [first]
+
+    # Page 1 tells us the total, so the rest can go out concurrently instead of
+    # one ~1s round trip at a time. Bounded: panels rate-limit, and every page
+    # shares one portal session now.
+    if total and len(first.items) >= 14:
+        last_page = min(budget, -(-total // 14))
+        remaining = list(range(2, last_page + 1))
+        for start in range(0, len(remaining), FETCH_PAGE_CONCURRENCY):
+            if job._cancel.is_set():
+                break
+            batch = remaining[start:start + FETCH_PAGE_CONCURRENCY]
+            job.detail = f"{genre_name}: pages {batch[0]}-{batch[-1]}"
+            got = await asyncio.gather(*(fetch_page(pg) for pg in batch),
+                                       return_exceptions=True)
+            stop = False
+            for pg, res in zip(batch, got):
+                if isinstance(res, Exception):
+                    await db_log("WARNING", "fetch",
+                                 f"[{portal_name}] {genre_name}: page {pg} failed "
+                                 f"({type(res).__name__}: {res}) - skipping")
+                    continue
+                pages.append(res)
+                if len(res.items) < 14:          # short page = end of list
+                    stop = True
+            if stop:
+                break
+    elif not total and len(first.items) >= 14:
+        # Portal did not report a total: fall back to walking pages serially.
+        for page in range(2, budget + 1):
+            if job._cancel.is_set():
+                break
+            job.detail = f"{genre_name}: page {page}"
+            try:
+                data = await fetch_page(page)
+            except Exception as exc:  # noqa: BLE001
+                await db_log("WARNING", "fetch",
+                             f"[{portal_name}] {genre_name}: page {page} failed "
+                             f"({type(exc).__name__}: {exc}) - stopping")
+                break
+            pages.append(data)
+            if len(data.items) < 14:
+                break
+
+    # asyncio.gather returns results in submission order, so `pages` is already
+    # in page order and `order` stays stable without re-sorting.
+    for data in pages:
         if job._cancel.is_set():
             break
-        job.detail = f"{genre_name}: page {page}"
-        data = await fetch_page(page)
-        if page == 1:
-            total = data.total
         if data.items:
             await upsert_many(data.items)
             inserted += len(data.items)
         job.done_items += len(data.items)
-        if len(data.items) < 14:                      # short page = end of list
-            break
-        if total and page * 14 >= total:
-            break
     await db_log("INFO", "fetch",
                  f"[{portal_name}] {genre_name}: {inserted} items (portal total: {total or '?'})")
     return inserted, total

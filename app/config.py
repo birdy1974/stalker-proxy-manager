@@ -109,6 +109,10 @@ STREAM_START_TIMEOUT = float(os.environ.get("SPM_STREAM_START_TIMEOUT", "12"))
 PORTAL_HTTP_TIMEOUT = float(os.environ.get("SPM_PORTAL_HTTP_TIMEOUT", "10"))
 # Pages fetched per genre per batch (portal pages are ~14 items; 30 pages ~= 420 items).
 FETCH_PAGE_BUDGET = int(os.environ.get("SPM_FETCH_PAGE_BUDGET", "30"))
+# Pages fetched at once once the portal has told us the total. Portals answer
+# ~1s/page, so a 30-page genre is ~30s serially. 4 is what crispy-stalker uses
+# as DEFAULT_CONCURRENCY; keep it modest - panels rate-limit aggressively.
+FETCH_PAGE_CONCURRENCY = max(1, int(os.environ.get("SPM_FETCH_PAGE_CONCURRENCY", "4")))
 # Global fallback strategy (spec): try all MACs of a portal first, or hop portals directly.
 FALLBACK_STRATEGY = os.environ.get("SPM_FALLBACK_STRATEGY", "macs_first")  # or portal_first
 
