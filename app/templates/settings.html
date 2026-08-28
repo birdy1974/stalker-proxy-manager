@@ -72,6 +72,7 @@ const SETTING_DEFS = [
   ["playlist_url_format", "Playlist URL format", "text", "{base}/play/{type}/{id}.ts?u={u}&p={p}"],
   ["output_base_url", "Public base URL override (reverse proxy/NAT)", "text", ""],
   ["fallback_strategy", "Fallback order strategy", ["macs_first", "portal_first"], "macs_first"],
+  ["stream_mode", "Stream output mode", ["proxy", "redirect"], "proxy"],
   ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
   ["epg_refresh_hours", "EPG refresh interval (hours)", "number", 24],
   ["logo_country", "Logo country folder (tv-logos)", "text", "netherlands"],
@@ -86,7 +87,7 @@ async function loadSettings() {
       return `<div class="mb-2"><label class="muted-label">${label}</label>
         <select class="form-select form-select-sm set-field" data-key="${k}" data-kind="str">
           ${type.map(o => `<option ${o === v ? "selected" : ""}>${o}</option>`).join("")}
-        </select><div class="small text-muted">${k === "fallback_strategy" ? "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately" : ""}</div></div>`;
+        </select><div class="small text-muted">${k === "fallback_strategy" ? "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately" : k === "stream_mode" ? "proxy = stream through ffmpeg (transcode or copy) - mid-stream fallback works. redirect = send the player straight to the portal's CDN: instant start and no CPU, but no fallback and no rewriting. Per-request override: add &mode=redirect or &mode=proxy to a /play/ URL." : ""}</div></div>`;
     return `<div class="mb-2"><label class="muted-label">${label}</label>
       <input class="form-control form-control-sm set-field" data-key="${k}" data-kind="${type === "number" ? "num" : "str"}"
              type="${type}" value="${esc(v)}"></div>`;

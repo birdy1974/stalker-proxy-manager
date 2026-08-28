@@ -113,9 +113,35 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
 
 
 # ---------------------------------------------------------------- streaming
+async def _stream_mode(explicit: str) -> str:
+    """`proxy` (ffmpeg in the middle) or `redirect` (302 to the panel's CDN)."""
+    if explicit in ("proxy", "redirect"):
+        return explicit
+    from ..services.playlist_gen import get_setting
+    mode = await get_setting("stream_mode", "proxy")
+    return mode if mode in ("proxy", "redirect") else "proxy"
+
+
 async def _stream_response(kind: str, ref_id: int, user: User | None, label: str,
-                            request: Request) -> StreamingResponse:
-    """Open the stream via the manager and wrap it in a StreamingResponse."""
+                            request: Request, mode: str = ""):
+    """
+    Serve a stream: either proxied through ffmpeg (default) or redirected
+    straight to the resolved portal URL.
+
+    Redirect skips ffmpeg entirely - instant start, no CPU, works for panels
+    whose stream ffmpeg refuses to remux - at the cost of mid-stream fallback
+    and transport-stream rewriting. Local files can never be redirected (the
+    client cannot see our filesystem), so they always proxy.
+    """
+    if await _stream_mode(mode) == "redirect" and kind != "local":
+        from fastapi.responses import RedirectResponse
+        url, item_name = await MANAGER.resolve(kind, ref_id)
+        if url:
+            await db_log("INFO", "output",
+                         f"[{item_name}] redirect mode -> sending client to the source")
+            return RedirectResponse(url, status_code=302)
+        raise HTTPException(502, f"{label}: no source produced a link to redirect to")
+
     if not MANAGER.can_open_for(user.name if user else None,
                                 user.max_connections if user else None):
         await db_log("WARNING", "output",
@@ -134,55 +160,56 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
 
 
 @router.api_route("/play/live/{pid}.ts", methods=["GET", "HEAD"])
-async def play_live(request: Request, pid: int, u: str = "", p: str = ""):
+async def play_live(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("live", pid, user, f"live #{pid}", request)
+    return await _stream_response("live", pid, user, f"live #{pid}", request, mode)
 
 
 @router.get("/play/vod/{pid}.ts")
-async def play_vod(request: Request, pid: int, u: str = "", p: str = ""):
+async def play_vod(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("vod", pid, user, f"vod #{pid}", request)
+    return await _stream_response("vod", pid, user, f"vod #{pid}", request, mode)
 
 
 @router.get("/play/episode/{eid}.ts")
-async def play_episode(request: Request, eid: int, u: str = "", p: str = ""):
+async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("episode", eid, user, f"episode #{eid}", request)
+    return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode)
 
 
 @router.get("/play/local/{pid}.ts")
-async def play_local(request: Request, pid: int, u: str = "", p: str = ""):
+async def play_local(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("local", pid, user, f"local #{pid}", request)
+    # local files are never redirectable: the client cannot see our filesystem
+    return await _stream_response("local", pid, user, f"local #{pid}", request, "proxy")
 
 
 # Xtream-style stream URLs -----------------------------------------------
 @router.get("/live/{u}/{p}/{sid}.ts")
-async def xlive(request: Request, sid: int, u: str, p: str):
-    return await play_live(request, sid, u, p)
+async def xlive(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_live(request, sid, u, p, mode)
 
 
 @router.get("/movie/{u}/{p}/{sid}.ts")
-async def xmovie(request: Request, sid: int, u: str, p: str):
-    return await play_vod(request, sid, u, p)
+async def xmovie(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_vod(request, sid, u, p, mode)
 
 
 @router.get("/series/{u}/{p}/{sid}.ts")
-async def xseries(request: Request, sid: int, u: str, p: str):
-    return await play_episode(request, sid, u, p)
+async def xseries(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_episode(request, sid, u, p, mode)
 
 
 # -------------------------------------------------- admin quick-play (GUI)
 @router.get("/preview-play/{kind}/{pid}.ts")
-async def admin_play(kind: str, pid: int, request: Request):
+async def admin_play(kind: str, pid: int, request: Request, mode: str = ""):
     """Play a PLAYLIST item from the GUI with the admin session (no user creds),
     through the *real* pipeline - template, fallback chain, MAC tracking."""
     from ..security import require_admin
     require_admin(request)
     if kind not in ("live", "vod", "episode", "local"):
         raise HTTPException(400, "kind must be live|vod|episode|local")
-    return await _stream_response(kind, pid, None, f"{kind} #{pid}", request)
+    return await _stream_response(kind, pid, None, f"{kind} #{pid}", request, mode)
 
 
 # ---------------------------------------------------------------- preview

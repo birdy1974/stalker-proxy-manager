@@ -516,6 +516,68 @@ class StreamManager:
             return tpl.name, (tpl.command or f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1")
 
     # ------------------------------------------------------------ the pump
+    async def resolve(self, kind: str, ref_id: int) -> tuple[str | None, str]:
+        """
+        Resolve a playable portal URL WITHOUT starting ffmpeg.
+
+        This backs the "redirect" output mode: the player is sent straight to
+        the panel's CDN, so there is no transcode, no container CPU and no
+        ffmpeg start-up delay - the answer to "VAAPI takes three minutes to
+        start" and to "copy does not work" on panels whose stream ffmpeg will
+        not remux. The trade-off is that we cannot rewrite the transport
+        stream, and a link that dies mid-playback is not retried (the player
+        sees EOF instead of our fallback chain).
+
+        Returns (url, item_name); url is None when nothing resolved.
+        """
+        if kind == "live":
+            chain, item_name, _item = await self._live_chain(ref_id)
+            link_kind = "live"
+        elif kind == "vod":
+            chain, item_name, _item = await self._vod_chain(ref_id)
+            link_kind = "vod"
+        elif kind == "episode":
+            got = await self._episode_target(ref_id)
+            chain, item_name, _item = got if got else ([], "episode", None)
+            link_kind = "vod"
+        else:
+            raise ValueError(f"kind {kind!r} cannot be redirected (no portal URL)")
+
+        for _src, portal, macs in chain:
+            for mac_row in macs:
+                if mac_row.id in self.mac_locks:
+                    continue                      # occupied by one of our own pipes
+                client = StalkerClient(portal.resolved_url or portal.base_url,
+                                       mac_row.mac, mac_row.password, portal.proxy_url)
+                try:
+                    if not portal.resolved_url:
+                        from ..portal.resolver import resolve_portal
+                        res = await resolve_portal(portal.base_url, mac=mac_row.mac)
+                        if res.ok:
+                            portal.resolved_url = res.portal_url
+                            client.portal_url = res.portal_url
+                    await client.handshake()
+                    url = await client.create_link(getattr(_src, "cmd", "") or "", link_kind)
+                except PortalError as exc:
+                    await db_log("WARNING", "stream",
+                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: {exc} -> next")
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    await db_log("WARNING", "stream",
+                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
+                                 f"{type(exc).__name__}: {exc} -> next")
+                    continue
+                finally:
+                    await client.close()
+                if url:
+                    await db_log("INFO", "stream",
+                                 f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
+                                 f"(no ffmpeg)")
+                    return url, item_name
+        await db_log("ERROR", "stream",
+                     f"[{item_name}] redirect failed: no source produced a link")
+        return None, item_name
+
     async def open(self, kind: str, ref_id: int, user_name: str | None) -> tuple[StreamHandle, object]:
         """
         Build fallback chain for a playlist item and return

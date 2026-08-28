@@ -168,6 +168,18 @@ async def _run_portal_fetch(job: Job) -> None:
         if job._cancel.is_set():
             return
         await _fetch_series(job, client, job.portal_id, portal_name)
+        # Seasons arrive after the series were added to the playlist, so their
+        # link rows have to be reconciled here - otherwise the series stay in
+        # the builder but contribute no episodes to any playlist.
+        try:
+            from .playlist_sync import sync_season_links
+            async with SessionLocal() as s:
+                added = await sync_season_links(s)
+            if added:
+                await db_log("INFO", "fetch",
+                             f"[{portal_name}] linked {added} new season(s) to playlist series")
+        except Exception:  # noqa: BLE001 - never fail a fetch over bookkeeping
+            log.exception("season link sync failed")
         await db_log("INFO", "fetch", f"[{portal_name}] fetch finished: {job.done_items} items")
     finally:
         await client.close()

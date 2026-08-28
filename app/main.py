@@ -163,6 +163,7 @@ async def startup() -> None:
     await MANAGER.purge_runtime_rows()
     await cleanup_logs()
     await _seed_defaults()
+    await _heal_season_links()
     await _hardware_sanity()
     await db_log("INFO", "boot",
                  f"Stalker Proxy Manager v2.0.0-phase2 started on port {HTTP_PORT} "
@@ -185,6 +186,23 @@ async def shutdown() -> None:
     # Log rows live on a queue drained by a writer task; the pool is torn down
     # right after this, so anything still queued has to be committed now.
     await stop_log_writer()
+
+
+async def _heal_season_links() -> None:
+    """
+    One-shot reconciliation at boot: any playlist-series whose seasons were
+    fetched after it was added gets its season link rows, so it actually
+    appears in the output. Idempotent and cheap (three queries).
+    """
+    from .services.playlist_sync import sync_season_links
+    try:
+        async with SessionLocal() as s:
+            added = await sync_season_links(s)
+        if added:
+            await db_log("INFO", "boot",
+                         f"linked {added} season(s) to playlist series that had none")
+    except Exception:  # noqa: BLE001 - boot must not die on bookkeeping
+        log.exception("season link reconciliation failed")
 
 
 async def _hardware_sanity() -> None:

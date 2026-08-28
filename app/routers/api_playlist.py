@@ -515,6 +515,18 @@ async def vod_delete(pid: int, db=Depends(get_db)):
     return {"ok": True}
 
 
+@router.post("/series/sync-seasons")
+async def sync_series_seasons(db=Depends(get_db)):
+    """
+    Re-link seasons for every playlist-series. Runs automatically after each
+    portal fetch and at boot; this is the manual "I just fetched, show me the
+    seasons" button.
+    """
+    from ..services.playlist_sync import sync_season_links
+    added = await sync_season_links(db)
+    return {"ok": True, "added": added}
+
+
 @router.get("/series")
 async def series_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1,
                     per_page: int = 25, sort: str = "order", direction: str = "asc"):
