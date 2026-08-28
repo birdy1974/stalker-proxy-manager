@@ -13,6 +13,7 @@ Everything is also mirrored to stdout, so Portainer shows the full story.
 from __future__ import annotations
 
 import logging
+import sys
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -28,10 +29,22 @@ from .services.db_logging import cleanup_logs, db_log
 from .services.ffmpeg_templates import default_presets
 from .services.stream_manager import MANAGER
 
-# uvicorn's own startup/access lines are kept at WARNING: the container's
-# stdout is piped through `docker logs ... | grep -q` in CI, and any line
-# written *after* the boot marker makes grep -q close the pipe early, killing
-# the docker CLI with SIGPIPE (pipeline fails although grep matched).
+# uvicorn configures its own logging *before* it imports this module, and it
+# sends its 'default' handler to stderr (only the access log uses stdout).
+# Re-attach every uvicorn handler to stdout so the container emits ONE log
+# stream: `docker logs <c> | grep ...` then sees the whole story, and Portainer
+# keeps the true chronological order instead of splitting records over two
+# panes. (Python's own loggers are configured in config.py for the same reason.)
+for _name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for _h in logging.getLogger(_name).handlers:
+        if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler) \
+                and _h.stream is not sys.stdout:
+            _h.setStream(sys.stdout)
+
+# A media proxy answers a lot of small requests (HLS segments, previews,
+# reconnecting streams); per-request access lines drown out the messages that
+# actually matter here, so they stay at WARNING. Meaningful events are logged
+# explicitly (module-tagged, and mirrored into the GUI log pane) instead.
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 app = FastAPI(title="Stalker Proxy Manager", version="2.0.0-phase2",

@@ -255,16 +255,16 @@ async def portal_php(request: Request):  # noqa: A002
     # or rename params), so a handshake is never rejected by param shape.
     if type == "stb" and (action == "handshake" or not action):
         token = "mock-" + (mac.replace(":", "") if mac else "000000000000")
-        log.debug("mock portal: query=%s mac=%s -> handshake token issued",
+        log.info("mock portal: query=%s mac=%s -> handshake token issued",
                  request.url.query or "-", mac or "-")
         return _js({"token": token})
 
     mac, err = _auth(request)
     if err is not None:
-        # log the resolution so CI / docker logs show WHY a call failed
-        # instead of failing silently in grep.
-        log.debug("mock portal: type=%s action=%s mac=%s -> HTTP %d",
-                 type, action, mac or "-", err.status_code)
+        # log the resolution so `docker logs` shows WHY a call was rejected
+        # (unknown mac / missing token) instead of the client guessing.
+        log.warning("mock portal: type=%s action=%s mac=%s -> HTTP %d",
+                    type, action, mac or "-", err.status_code)
         return err
     log.debug("mock portal: type=%s action=%s mac=%s -> ok", type, action, mac or "-")
     if type == "stb" and action == "get_profile":
