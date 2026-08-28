@@ -17,6 +17,7 @@ from ..models import (
     LiveGenre, LivePlaylistSource, LiveSource, MacAddress, Portal, SerieGenre,
     SeriePlaylistSource, SerieSource, VodGenre, VodPlaylistSource, VodSource,
 )
+from ..portal.pool import POOL
 from ..portal.client import PortalError, StalkerClient
 from ..portal.resolver import resolve_portal
 from ..security import require_admin
@@ -237,7 +238,7 @@ async def test_portal(pid: int, db=Depends(get_db)):
         url = res.portal_url
         p.resolved_url, p.resolved_path = res.portal_url, res.path
     for m in macs:
-        client = StalkerClient(url, m.mac, m.password, p.proxy_url)
+        client = await POOL.get(url, m.mac, m.password, p.proxy_url)
         try:
             await client.handshake()
             exp = await client.account_expires()

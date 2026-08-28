@@ -5,32 +5,139 @@ AND into the `logs` table for the dashboard messages pane.
 Usage: await db_log("INFO", "portal", "portal X resolved to ...")
 Retrieval is paginated/filterable (GUI messages pane) and a retention cleanup
 runs at startup (keeps the newest N rows, default 5000).
+
+The DB half runs on a dedicated writer task, not in the caller's task:
+
+  * Stream teardown (client changed channel / player gave up) happens while the
+    ASGI request task is being cancelled, and a session closed under
+    cancellation makes SQLAlchemy log "Exception terminating connection" and
+    drop the pooled connection - and the row never lands either. Handing the
+    row to a queue costs the caller nothing and cannot be interrupted.
+  * One INSERT + COMMIT per log line, inline in the byte pump, also meant a
+    round trip to Postgres for every "fallback step" line. The writer batches.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from sqlalchemy import delete, select
 
-from ..database import SessionLocal
+from ..database import SessionLocal, run_uncancelled, spawn
 from ..models import Log
 
 pylog = logging.getLogger("spm")
 RETENTION_ROWS = 5000
 
+_QUEUE_MAX = 2000          # bounded: a wedged database must not eat all memory
+_BATCH_MAX = 50            # rows per INSERT/COMMIT
+_writer: asyncio.Task | None = None
+_queue: asyncio.Queue | None = None
+_loop: asyncio.AbstractEventLoop | None = None
+_dropped = 0
+
+
+def _q() -> asyncio.Queue:
+    """
+    The drain queue, bound to the loop that is running right now.
+
+    asyncio.Queue remembers the loop it was first used on and refuses to work
+    from any other one, so a second loop (a script that calls asyncio.run()
+    more than once, `uvicorn --reload`) would break every later write. Starting
+    over costs the rows still queued on the dead loop - which nothing could
+    have drained anyway - and keeps logging alive.
+    """
+    global _queue, _loop, _writer
+    loop = asyncio.get_running_loop()
+    if _queue is None:
+        _queue, _loop = asyncio.Queue(maxsize=_QUEUE_MAX), loop
+    elif _loop is not loop:
+        lost = _queue.qsize()
+        _queue, _loop, _writer = asyncio.Queue(maxsize=_QUEUE_MAX), loop, None
+        if lost:
+            pylog.warning("event loop changed: %d queued log row(s) dropped", lost)
+    return _queue
+
+
+async def _write_batch(batch: list[tuple[str, str, str]]) -> None:
+    try:
+        async with SessionLocal() as s:
+            s.add_all(Log(level=lvl, module=mod[:40], message=msg[:4000])
+                      for lvl, mod, msg in batch)
+            await s.commit()
+    except Exception:  # noqa: BLE001 - logging must never crash the app
+        pylog.exception("failed to persist %d log row(s)", len(batch))
+
+
+async def _writer_loop() -> None:
+    q = _q()
+    while True:
+        batch = [await q.get()]
+        try:                                   # cheap opportunistic batching
+            while len(batch) < _BATCH_MAX:
+                batch.append(q.get_nowait())
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            # shielded: a shutdown cancel must not abort the commit halfway
+            await run_uncancelled(_write_batch(batch), what="log batch commit")
+        finally:
+            for _ in batch:
+                q.task_done()
+
+
+def _ensure_writer() -> None:
+    """(Re)start the drain task - lazily on first use, and again if it died."""
+    global _writer
+    if _writer is None or _writer.done():
+        _writer = spawn(_writer_loop(), name="spm-log-writer")
+
+
+def _enqueue(level: str, module: str, message: str) -> None:
+    """Never blocks, never raises, never touches the caller's DB connection."""
+    q = _q()
+    _ensure_writer()
+    try:
+        q.put_nowait((level, module, message))
+    except asyncio.QueueFull:
+        global _dropped
+        _dropped += 1
+        if _dropped == 1 or _dropped % 200 == 0:
+            pylog.warning("log queue full (%d queued): dropped %d log row(s) so far "
+                          "- the database is not keeping up", q.qsize(), _dropped)
+
 
 async def db_log(level: str, module: str, message: str) -> None:
     level = level.upper()
     # stdout first (Portainer), always
-    getattr(pylog, {"DEBUG": "debug", "INFO": "info", "WARNING": "warning", "ERROR": "error"}.get(level, "info"))(
-        "[%s] %s", module, message)
+    getattr(pylog, {"DEBUG": "debug", "INFO": "info", "WARNING": "warning",
+                    "ERROR": "error"}.get(level, "info"))("[%s] %s", module, message)
+    _enqueue(level, module, message)
+
+
+async def flush_logs(timeout: float = 10.0) -> None:
+    """Wait until every queued row is committed (shutdown, tests, exports)."""
+    q = _q()
+    if q.empty():
+        return
+    # Without a live drain task `join()` could only ever time out, so bring it
+    # back first: a writer that died must not cost a stall plus lost rows.
+    _ensure_writer()
     try:
-        async with SessionLocal() as s:
-            s.add(Log(level=level, module=module[:40], message=message[:4000]))
-            await s.commit()
-    except Exception:  # noqa: BLE001 - logging must never crash the app
-        pylog.exception("failed to persist log row")
+        await asyncio.wait_for(q.join(), timeout)
+    except asyncio.TimeoutError:
+        pylog.warning("log queue still has %d row(s) after %.0fs", q.qsize(), timeout)
+    except Exception:  # noqa: BLE001 - flushing must never break shutdown
+        pylog.exception("flushing the log queue failed")
+
+
+async def stop_log_writer() -> None:
+    global _writer
+    await flush_logs()
+    if _writer is not None and not _writer.done():
+        _writer.cancel()
+    _writer = None
 
 
 async def cleanup_logs(keep: int = RETENTION_ROWS) -> None:

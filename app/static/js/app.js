@@ -255,9 +255,13 @@ class DataTable {
         tr.append(el("td", {}, cb));
       }
       for (const c of o.columns) {
-        const td = el("td", { title: typeof c.render === "function" ? "" : row[c.key] });
+        const td = el("td", { class: c.class || "" });
         const v = c.render ? c.render(row) : row[c.key];
         if (v instanceof Node) td.append(v); else td.innerHTML = v ?? "";
+        // Cells are ellipsised by CSS, so every one of them needs a tooltip or
+        // long titles (VOD especially) become unreadable with no way to see the
+        // rest. Columns with a render() used to get title="" - i.e. nothing.
+        td.title = c.title ? String(c.title(row)) : (td.textContent || "").trim().replace(/\s+/g, " ");
         tr.append(td);
       }
       this.tbody.append(tr);
@@ -339,22 +343,110 @@ const tmdbHtml = (t) => !t
       </table></div>`;
 
 /* ------------------------------------------------------------- player */
-/* HLS -> hls.js; MPEG-TS (what Stalker proxies output) -> mpegts.js (G5). */
+/* HLS -> hls.js; MPEG-TS (what Stalker proxies output) -> mpegts.js.
+ *
+ * The old version attached an engine and showed nothing on failure, so every
+ * problem rendered as "popup with a player, black screen": a missing library,
+ * a 404/502 from the proxy, an unplayable codec (MSE only does H.264/AAC -
+ * HEVC or AC3/E-AC3/DTS IPTV streams cannot be transmuxed in a browser), or an
+ * empty response body. All four now say what happened.
+ */
+const MSE_OK_VIDEO = /^(avc1|h264|avc)$/i;
+const MSE_OK_AUDIO = /^(mp4a|aac)$/i;
+const browserPlayable = (codec) => !codec || MSE_OK_VIDEO.test(codec) || MSE_OK_AUDIO.test(codec);
+
 function playInModal(url, title) {
   const video = el("video", { controls: "", autoplay: "", class: "w-100", style: "background:#000;max-height:65vh" });
   const status = el("div", { class: "small text-muted mt-1" }, `Source: ${url}`);
-  const body = el("div", {}, video, status);
-  let engine = null;
-  const footer = el("div");
-  const m = openModal({ title: `▶ ${title}`, body, footer, size: "xl", extraClass: "player-modal", onClose: () => { try { engine?.destroy(); } catch {} video.pause(); video.src = ""; } });
-  footer.append(mBtn("Stop & Close", "btn-outline-secondary", m.close, "bi-stop-circle"));
+  const diag = el("div", { class: "small mt-2 d-none" });
+  const body = el("div", {}, video, status, diag);
+  let engine = null, settled = false;
+
+  const say = (html, cls) => {
+    diag.className = `small mt-2 alert ${cls || "alert-warning"} mb-0 py-2`;
+    diag.innerHTML = html;
+  };
+  const ok = (txt) => { if (!settled) { settled = true; status.textContent = txt; } };
+  const fail = (why, hint) => say(
+    `<div><b>Not playing:</b> ${esc(why)}</div>` +
+    (hint ? `<div class="mt-1 text-muted">${hint}</div>` : ""), "alert-warning");
+
+  const m = openModal({
+    title: `▶ ${title}`, body, footer: el("div"), size: "xl", extraClass: "player-modal",
+    onClose: () => { try { engine?.destroy(); } catch {} video.pause(); video.src = ""; },
+  });
+  m.footer.append(mBtn("Stop & Close", "btn-outline-secondary", m.close, "bi-stop-circle"));
+
+  // The preview runs the source through an FFmpeg template, same as the real
+  // output. If it stays black on copy (HEVC / AC3 / anything MediaSource cannot
+  // take), retry through a transcode template instead of guessing.
+  if (/^\/preview\//.test(url)) {
+    const sel = el("select", { class: "form-select form-select-sm w-auto d-inline-block ms-2" });
+    sel.append(el("option", { value: "" }, "default template"));
+    const go = el("button", { class: "btn btn-sm btn-outline-primary ms-1" }, "Retry with");
+    m.footer.append(el("span", { class: "small text-muted ms-2" }, "FFmpeg template:"), sel, go);
+    api("/api/ffmpeg").then(r => (r.items || []).forEach(t =>
+      sel.append(el("option", { value: t.id }, `${t.name}${t.is_default ? " (default)" : ""}`))
+    )).catch(() => sel.remove());
+    go.addEventListener("click", () => {
+      const id = sel.value;
+      const next = id ? `${url.split("?")[0]}?tpl=${id}` : url.split("?")[0];
+      m.close();
+      playInModal(next, title);
+    });
+  }
+
+  const isHls = /\.m3u8(\?|$)/i.test(url);
+  const haveHls = !!(window.Hls && window.Hls.isSupported && window.Hls.isSupported());
+  const haveTs = !!(window.mpegts && window.mpegts.isSupported && window.mpegts.isSupported());
+
+  if (isHls && !haveHls)
+    return fail("hls.js is unavailable or this browser has no MediaSource support.",
+                "Use Chrome/Edge/Firefox, or switch the output format to MPEG-TS in FFmpeg → template.");
+  if (!isHls && !haveTs)
+    return fail("mpegts.js is unavailable or this browser has no MediaSource support.",
+                "The player library is served from /static/vendor/ - a blocked or stale " +
+                "static mount leaves the popup with nothing to decode the transport stream.");
+
+  video.addEventListener("playing", () => ok(`▶ playing · ${url}`));
+  video.addEventListener("error", () => fail(
+    `the <video> element rejected the stream (code ${video.error?.code ?? "?"}).`,
+    "Usually an unsupported codec after transmux - see the stream probe for the " +
+    "video/audio codec, or pick a transcode template instead of copy."));
+  video.addEventListener("stalled", () => {
+    if (!settled) say("Waiting for data - the proxy has not produced any yet.", "alert-secondary");
+  });
+
   try {
-    if (/\.m3u8(\?|$)/i.test(url) && window.Hls?.isSupported()) {
-      engine = new Hls(); engine.loadSource(url); engine.attachMedia(video);
-    } else if (window.mpegts?.isSupported()) {
-      engine = mpegts.createPlayer({ type: "mpegts", isLive: true, url });
-      engine.attachMediaElement(video); engine.load(); engine.play().catch(() => {});
-    } else video.src = url;
-  } catch (e) { video.src = url; }
+    if (isHls) {
+      engine = new Hls({ enableWorker: true, lowLatencyMode: true });
+      engine.on(Hls.Events.ERROR, (_e, d) => {
+        if (d.fatal) fail(`HLS ${d.type}: ${d.details}`,
+                          "A fatal HLS error means the variant playlist or segments are not " +
+                          "reaching the player - check the proxy log for the stream.");
+      });
+      engine.on(Hls.Events.MANIFEST_PARSED, () => ok(`▶ playing · ${url}`));
+      engine.loadSource(url); engine.attachMedia(video);
+    } else {
+      engine = mpegts.createPlayer({ type: "mpegts", isLive: true, url },
+                                   { enableStashBuffer: false, stashInitialSize: 384 });
+      engine.on(mpegts.Events.ERROR, (type, detail, info) => fail(
+        `${type}${detail ? " / " + detail : ""}${info && info.msg ? ": " + info.msg : ""}`,
+        "mpegts.js transmuxes MPEG-TS into fMP4 for MediaSource, which only accepts " +
+        "H.264 video and AAC audio. A HEVC, MPEG-2 video or AC3/E-AC3/DTS audio stream " +
+        "will stay black on copy - use a transcode template that converts it."));
+      engine.on(mpegts.Events.MEDIA_INFO, (mi) => {
+        const v = mi.videoCodec || "", a = mi.audioCodec || "";
+        const bad = [v, a].filter(c => c && !browserPlayable(c));
+        if (bad.length) say(`Codec ${bad.join(", ")} is not playable through MediaSource. ` +
+          "Switch this item to a transcode template (H.264 + AAC) instead of copy.", "alert-danger");
+        else if (!settled) status.textContent = `▶ ${v || "?"} / ${a || "?"} · ${url}`;
+      });
+      engine.attachMediaElement(video); engine.load();
+      engine.play().catch((e) => { if (!settled) say("Autoplay blocked - press play. " + (e || ""), "alert-secondary"); });
+    }
+  } catch (e) {
+    fail(`player setup threw ${e && e.message ? e.message : e}.`, "");
+  }
   return m;
 }

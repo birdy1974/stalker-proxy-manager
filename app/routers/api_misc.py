@@ -19,6 +19,7 @@ from ..models import (
 )
 from ..security import require_admin
 from ..services.db_logging import db_log
+from ..services import api_stats
 from ..services.fetch_jobs import list_jobs
 from ..services.stream_manager import MANAGER
 
@@ -46,7 +47,18 @@ async def dashboard(db=Depends(get_db)):
         "users": await cnt(User),
         "local_files": await cnt(LocalFile),
     }
-    return {"stats": stats, "streams": MANAGER.list(), "jobs": list_jobs()[:5]}
+    streams = MANAGER.list()
+    # who is using the API right now, per user (drives the "connections" card)
+    per_user: dict[str, int] = {}
+    for st in streams:
+        per_user[st["user_name"] or "-"] = per_user.get(st["user_name"] or "-", 0) + 1
+    api = api_stats.snapshot()
+    api["streams_active"] = len(streams)
+    from ..portal.pool import POOL
+    api["portal_sessions"] = POOL.stats()
+    api["streams_per_user"] = [{"user": k, "streams": v}
+                               for k, v in sorted(per_user.items(), key=lambda kv: -kv[1])]
+    return {"stats": stats, "streams": streams, "jobs": list_jobs()[:5], "api": api}
 
 
 @router.get("/streams")
@@ -91,6 +103,10 @@ async def logs(db=Depends(get_db), level: str = "", module: str = "", q: str = "
 DEFAULT_SETTINGS = {
     "playlist_url_format": "{base}/play/{type}/{id}.ts?u={u}&p={p}",
     "fallback_strategy": "macs_first",          # macs_first | portal_first (spec option)
+    # proxy = ffmpeg in the middle (transcode/copy, mid-stream fallback works)
+    # redirect = 302 the player straight to the panel's CDN (instant start, no
+    #            CPU, but no fallback and no transport-stream rewriting)
+    "stream_mode": "proxy",
     "epg_refresh_hours": 24,
     "logo_country": "netherlands",
     "tmdb_api_key": "",

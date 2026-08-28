@@ -34,13 +34,14 @@ from sqlalchemy import delete, select
 
 from ..config import (FALLBACK_STRATEGY, FFMPEG_BIN, MEDIA_ROOT,
                       STREAM_START_TIMEOUT)
-from ..database import SessionLocal
+from ..database import SessionLocal, run_uncancelled
 from ..models import (
     ActiveStream, FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource,
     LocalFile, LocalPlaylist, MacAddress, Portal, SerieEpisode, SeriePlaylist,
     SeriePlaylistSource, SerieSeason, SerieSource, VodPlaylist, VodPlaylistSource,
     VodSource,
 )
+from ..portal.pool import POOL
 from ..portal.client import MAG_UA, PortalError, StalkerClient
 from .db_logging import db_log
 from .ffmpeg_templates import URL_PLACEHOLDER
@@ -54,6 +55,17 @@ _NETONLY_OPTS = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout|user_agent|headers|http_proxy"
     r"|seekable|multiple_requests|referer)\b\s*(?:\S+)?")
 _NET_SCHEMES = ("http://", "https://")
+
+
+class _WithTemplate:
+    """Wrap a source so _template_for picks an explicitly chosen template."""
+
+    def __init__(self, src, template_id: int) -> None:
+        self._src = src
+        self.ffmpeg_template_id = template_id
+
+    def __getattr__(self, item):
+        return getattr(self._src, item)
 
 
 @dataclass
@@ -81,34 +93,62 @@ class StreamHandle:
                 "url": self.url, "pid": self.proc.pid if self.proc else None}
 
 
+# How long a handle may sit in the registry with its ffmpeg process gone and no
+# new bytes before the reaper concludes the teardown was lost and frees it.
+# Must exceed STREAM_START_TIMEOUT + the stall window, otherwise the reaper
+# would kill a stream that is legitimately walking its fallback chain.
+REAP_GRACE = 45.0
+
+
 class StreamManager:
     def __init__(self) -> None:
         self.streams: dict[str, StreamHandle] = {}
         self.mac_locks: dict[int, str] = {}                 # mac_id -> stream_id
-        self.user_counts: dict[str, int] = {}               # username -> open streams
+        self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
+        self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
 
     # ------------------------------------------------------------- registry
     def list(self) -> list[dict]:
         return [h.public() for h in self.streams.values()]
 
     def user_stream_count(self, username: str | None) -> int:
-        return self.user_counts.get(username or "-", 0)
+        """
+        Open streams for a user, derived from the live registry.
+
+        This used to be a separate counter incremented in `_register` and
+        decremented in `_deregister`. Every missed decrement (a generator parked
+        at `yield` that never got finalised, a watchdog task that was garbage
+        collected) permanently consumed one of the user's slots, so after a
+        while every play request answered "exceeded max_connections" until the
+        container was restarted. A derived count cannot drift.
+        """
+        key = username or "-"
+        return sum(1 for h in self.streams.values() if (h.user_name or "-") == key)
 
     def can_open_for(self, username: str | None, max_conn: int | None) -> bool:
         if max_conn is None or max_conn <= 0:
             return True
         return self.user_stream_count(username) < max_conn
 
+    @staticmethod
+    async def _insert_row(h: StreamHandle) -> None:
+        async with SessionLocal() as s:
+            s.add(ActiveStream(id=h.id, kind=h.kind, item_name=h.item_name,
+                               user_name=h.user_name, portal_name=h.portal_name or None,
+                               mac=h.mac or None, template_name=h.template_name,
+                               pid=h.proc.pid if h.proc else None))
+            await s.commit()
+
+    @staticmethod
+    async def _delete_row(stream_id: str) -> None:
+        async with SessionLocal() as s:
+            await s.execute(delete(ActiveStream).where(ActiveStream.id == stream_id))
+            await s.commit()
+
     async def _register(self, h: StreamHandle) -> None:
         self.streams[h.id] = h
-        self.user_counts[h.user_name or "-"] = self.user_stream_count(h.user_name) + 1
         try:
-            async with SessionLocal() as s:
-                s.add(ActiveStream(id=h.id, kind=h.kind, item_name=h.item_name,
-                                   user_name=h.user_name, portal_name=h.portal_name or None,
-                                   mac=h.mac or None, template_name=h.template_name,
-                                   pid=h.proc.pid if h.proc else None))
-                await s.commit()
+            await run_uncancelled(self._insert_row(h), what="active_streams insert")
         except Exception:  # noqa: BLE001
             log.exception("active_streams insert failed")
 
@@ -119,15 +159,17 @@ class StreamManager:
         # "max connections reached" or a MAC locked).
         h.dead = True
         self.streams.pop(h.id, None)
-        key = h.user_name or "-"
-        self.user_counts[key] = max(0, self.user_counts.get(key, 1) - 1)
+        self._proc_gone_since.pop(h.id, None)
         for mac_id, sid in list(self.mac_locks.items()):
             if sid == h.id:
                 del self.mac_locks[mac_id]
+        # The DELETE is what removes the dashboard row, and deregistration
+        # normally runs from the pump's finally - i.e. inside the request task
+        # that is being cancelled right now. Left unshielded it dies halfway,
+        # SQLAlchemy drops the pooled connection, and the row stays behind as a
+        # ghost until the next container start.
         try:
-            async with SessionLocal() as s:
-                await s.execute(delete(ActiveStream).where(ActiveStream.id == h.id))
-                await s.commit()
+            await run_uncancelled(self._delete_row(h.id), what="active_streams delete")
         except Exception:  # noqa: BLE001
             pass
 
@@ -159,6 +201,57 @@ class StreamManager:
         for sid in list(self.streams):
             await self.kill(sid)
         return n
+
+    def watch(self, request, handle: StreamHandle) -> asyncio.Task:
+        """
+        Start the disconnect watchdog and KEEP A REFERENCE to it.
+
+        `asyncio.create_task()` only leaves a weak reference behind: a task
+        nobody holds can be garbage-collected mid-flight and stop silently.
+        That is exactly what the watchdog needs to survive, because it is the
+        thing that releases the MAC lock and the user's connection slot when a
+        player disappears without a clean socket close.
+        """
+        task = asyncio.get_running_loop().create_task(
+            self.watch_disconnect(request, handle),
+            name=f"watch-{handle.id[:8]}")
+        self._watchers.add(task)
+        task.add_done_callback(self._watchers.discard)
+        return task
+
+    async def reap_dead(self, interval: float = 10.0) -> None:
+        """
+        Safety net for lost teardowns.
+
+        The pump's `finally` and the watchdog cover the normal paths, but a
+        generator can be parked at `yield` and never finalised (no `aclose()`
+        from Starlette, client behind a buffering proxy). Such a handle stays in
+        the registry forever and permanently occupies a MAC and a connection
+        slot. Anything whose ffmpeg process is gone and stays gone for
+        REAP_GRACE without producing bytes is finished by definition, so free
+        it here.
+        """
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                now = time.time()
+                for h in list(self.streams.values()):
+                    gone = h.dead or (h.proc is not None and h.proc.returncode is not None)
+                    if not gone:
+                        self._proc_gone_since.pop(h.id, None)
+                        continue
+                    since = self._proc_gone_since.setdefault(h.id, now)
+                    if now - since < REAP_GRACE:
+                        continue
+                    self._proc_gone_since.pop(h.id, None)
+                    await db_log("WARNING", "stream",
+                                 f"[{h.item_name}] teardown was lost (process gone "
+                                 f">{REAP_GRACE:.0f}s) -> freeing slot/MAC")
+                    await self._deregister(h)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - the reaper must never die
+                log.exception("reaper sweep failed")
 
     async def watch_disconnect(self, request, handle: StreamHandle,
                                interval: float = 0.5) -> None:
@@ -402,19 +495,24 @@ class StreamManager:
             return chain, name, pl
 
     async def _open_preview(self, src, portal, macs, kind: str = "live",
-                            name: str | None = None):
+                            name: str | None = None, template_id: int | None = None):
         """
         Throwaway stream straight from an ORIGINAL source (GUI 'test stream').
-        Passthrough copy command; no playlist involvement; full fallback over
-        the portal's MACs still applies.
+        No playlist involvement; full fallback over the portal's MACs applies.
+
+        Uses the same template resolution as the real pipeline, so what you
+        preview is what your viewers get. It used to hardcode `-c copy`, which
+        meant a HEVC or AC3 stream stayed black in the preview even when a
+        working VAAPI/QSV transcode template would have played it fine - the
+        preview disagreed with reality in exactly the case that matters.
+        Pass template_id to force a specific one.
         """
-        command = (f"ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 "
-                   f"-reconnect_streamed 1 -reconnect_delay_max 5 -i {URL_PLACEHOLDER} "
-                   f"-map 0:v:0 -map 0:a:0? -sn -dn -c copy -f mpegts pipe:1")
+        probe = src if template_id is None else _WithTemplate(src, template_id)
+        tpl_name, command = await self._template_for(probe)
         h = StreamHandle(id=uuid.uuid4().hex, kind="preview",
                          item_name=name or getattr(src, "original_name", None)
                          or getattr(src, "name", "preview"),
-                         user_name="admin", template_name="(preview copy)", command=command)
+                         user_name="admin", template_name=tpl_name, command=command)
         gen = self._pump(h, [(src, portal, macs)], "live" if kind == "live" else "vod")
         return h, gen
 
@@ -435,6 +533,69 @@ class StreamManager:
             return tpl.name, (tpl.command or f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1")
 
     # ------------------------------------------------------------ the pump
+    async def resolve(self, kind: str, ref_id: int) -> tuple[str | None, str]:
+        """
+        Resolve a playable portal URL WITHOUT starting ffmpeg.
+
+        This backs the "redirect" output mode: the player is sent straight to
+        the panel's CDN, so there is no transcode, no container CPU and no
+        ffmpeg start-up delay - the answer to "VAAPI takes three minutes to
+        start" and to "copy does not work" on panels whose stream ffmpeg will
+        not remux. The trade-off is that we cannot rewrite the transport
+        stream, and a link that dies mid-playback is not retried (the player
+        sees EOF instead of our fallback chain).
+
+        Returns (url, item_name); url is None when nothing resolved.
+        """
+        if kind == "live":
+            chain, item_name, _item = await self._live_chain(ref_id)
+            link_kind = "live"
+        elif kind == "vod":
+            chain, item_name, _item = await self._vod_chain(ref_id)
+            link_kind = "vod"
+        elif kind == "episode":
+            got = await self._episode_target(ref_id)
+            chain, item_name, _item = got if got else ([], "episode", None)
+            link_kind = "vod"
+        else:
+            raise ValueError(f"kind {kind!r} cannot be redirected (no portal URL)")
+
+        for _src, portal, macs in chain:
+            for mac_row in macs:
+                if mac_row.id in self.mac_locks:
+                    continue                      # occupied by one of our own pipes
+                client = await POOL.get(portal.resolved_url or portal.base_url,
+                                        mac_row.mac, mac_row.password, portal.proxy_url)
+                try:
+                    if not portal.resolved_url:
+                        from ..portal.resolver import resolve_portal
+                        res = await resolve_portal(portal.base_url, mac=mac_row.mac)
+                        if res.ok:
+                            portal.resolved_url = res.portal_url
+                            client.portal_url = res.portal_url
+                            client.invalidate()   # token was for the old URL
+                    await client.ensure_auth()
+                    url = await client.create_link(getattr(_src, "cmd", "") or "", link_kind)
+                except PortalError as exc:
+                    await db_log("WARNING", "stream",
+                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: {exc} -> next")
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    await db_log("WARNING", "stream",
+                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
+                                 f"{type(exc).__name__}: {exc} -> next")
+                    continue
+                finally:
+                    await client.close()
+                if url:
+                    await db_log("INFO", "stream",
+                                 f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
+                                 f"(no ffmpeg)")
+                    return url, item_name
+        await db_log("ERROR", "stream",
+                     f"[{item_name}] redirect failed: no source produced a link")
+        return None, item_name
+
     async def open(self, kind: str, ref_id: int, user_name: str | None) -> tuple[StreamHandle, object]:
         """
         Build fallback chain for a playlist item and return
@@ -524,8 +685,8 @@ class StreamManager:
                     await db_log("INFO", "stream",
                                  f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
                                  f"portal '{portal.name}' mac {mac_row.mac}")
-                    client = StalkerClient(portal.resolved_url or portal.base_url,
-                                           mac_row.mac, mac_row.password, portal.proxy_url)
+                    client = await POOL.get(portal.resolved_url or portal.base_url,
+                                     mac_row.mac, mac_row.password, portal.proxy_url)
                     url = None
                     try:
                         if not portal.resolved_url:
@@ -534,7 +695,8 @@ class StreamManager:
                             if res.ok:
                                 portal.resolved_url = res.portal_url
                                 client.portal_url = res.portal_url
-                        await client.handshake()
+                                client.invalidate()   # token was for the old URL
+                        await client.ensure_auth()
                         link_kind = "live" if kind == "live" else "vod"
                         url = await client.create_link(getattr(src, "cmd", "") or "", link_kind)
                     except PortalError as exc:
@@ -601,10 +763,18 @@ class StreamManager:
                          f"{''.join(traceback.format_exception(exc))[-1200:]}")
         finally:
             if registered or h.proc:
-                await self._kill_quiet(h.proc)
-                await self._deregister(h)
-                await db_log("INFO", "stream",
-                             f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
+                # One shielded unit, not three sequential awaits: this runs
+                # while the client's request task is being cancelled, and every
+                # step (proc.wait, the active_streams DELETE, the log write)
+                # awaits something a cancellation would abort halfway.
+                await run_uncancelled(self._finish(h), what="stream teardown")
+
+    async def _finish(self, h: StreamHandle) -> None:
+        """Complete stream teardown, run outside the dying request's scope."""
+        await self._kill_quiet(h.proc)
+        await self._deregister(h)
+        await db_log("INFO", "stream",
+                     f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
 
     async def _read_proc(self, h: StreamHandle, proc):
         """Yield bytes with stall detection until EOF/death/kill."""

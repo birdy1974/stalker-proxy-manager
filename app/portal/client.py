@@ -17,6 +17,8 @@ hardened with the Phase-1 findings and the quirks you reported):
 from __future__ import annotations
 
 import asyncio
+import os
+import time
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -25,6 +27,12 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 import httpx
 
 from ..config import PORTAL_HTTP_TIMEOUT
+
+# How long we keep a handshake token before refreshing it. Portals normally
+# accept one for ~3600s (crispy-stalker uses exactly that); staying just under
+# the limit avoids both 401 re-handshake round trips and handing out a token
+# the panel is about to reject.
+TOKEN_VALIDITY = float(os.environ.get("SPM_TOKEN_VALIDITY", "3000"))
 
 log = logging.getLogger("spm.portal")
 
@@ -163,8 +171,22 @@ class StalkerClient:
         self.proxy = proxy
         self.timeout = timeout
         self._token: str | None = None
+        self._token_at: float = 0.0        # monotonic time of the last handshake
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()  # serialize token refresh
+        # Set by the pool: a shared client's connection is not owned by the
+        # caller, so its close() must not tear down anyone else's session.
+        self.shared = False
+
+    def _token_stale(self) -> bool:
+        """
+        Portal tokens are typically valid ~3600s (crispy-stalker uses exactly
+        that). Refreshing proactively, just under the limit, is far cheaper than
+        the 401 -> re-handshake -> retry round trip, and it is what lets one
+        session be reused across many requests.
+        """
+        return self._token is not None and \
+            (time.monotonic() - self._token_at) > TOKEN_VALIDITY
 
     # ------------------------------------------------------------------ http
     async def _http(self) -> httpx.AsyncClient:
@@ -181,6 +203,14 @@ class StalkerClient:
         return self._client
 
     async def close(self) -> None:
+        """Close our own connection. A no-op for pooled (shared) clients."""
+        if self.shared:
+            return
+        await self._aclose()
+
+    async def _aclose(self) -> None:
+        """Really close, shared or not - used by the pool and at shutdown."""
+        self._token, self._token_at = None, 0.0
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -188,8 +218,10 @@ class StalkerClient:
     async def _get(self, params: dict, *, retried: bool = False) -> Any:
         """Single GET with token auth + one re-handshake retry."""
         http = await self._http()
-        if self._token is None:
-            await self.handshake()
+        if self._token is None or self._token_stale():
+            async with self._lock:
+                if self._token is None or self._token_stale():
+                    await self.handshake()
         log.debug("GET %s params=%s", self.portal_url, {k: v for k, v in params.items() if k != "JsHttpRequest"})
         try:
             r = await http.get(self.portal_url, params=params)
@@ -210,6 +242,24 @@ class StalkerClient:
         except Exception as exc:  # noqa: BLE001
             raise PortalError(f"invalid JSON payload ({len(r.content)} bytes)") from exc
 
+    async def ensure_auth(self) -> None:
+        """
+        Handshake only when we do not already hold a usable token.
+
+        The stream and preview paths used to call handshake() unconditionally
+        on every request, which threw away the cached token: measured against
+        the mock portal that was 1.00 handshakes per create_link. Callers that
+        do not need a *fresh* identity should use this.
+        """
+        if self._token is None or self._token_stale():
+            async with self._lock:
+                if self._token is None or self._token_stale():
+                    await self.handshake()
+
+    def invalidate(self) -> None:
+        """Drop the token - call after the portal URL changed under us."""
+        self._token, self._token_at = None, 0.0
+
     # ------------------------------------------------------------- handshake
     async def handshake(self) -> str:
         http = await self._http()
@@ -226,6 +276,7 @@ class StalkerClient:
         except Exception as exc:  # noqa: BLE001
             raise PortalError("handshake: no token in reply (MAC unknown/blocked?)") from exc
         self._token = token
+        self._token_at = time.monotonic()
         # Authorization header is set per-request because httpx cookies persist
         http.headers["Authorization"] = "Bearer " + token
         log.debug("handshake ok, token=%s…", token[:8])

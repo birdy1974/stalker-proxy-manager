@@ -515,45 +515,68 @@ async def vod_delete(pid: int, db=Depends(get_db)):
     return {"ok": True}
 
 
+@router.post("/series/sync-seasons")
+async def sync_series_seasons(db=Depends(get_db)):
+    """
+    Re-link seasons for every playlist-series. Runs automatically after each
+    portal fetch and at boot; this is the manual "I just fetched, show me the
+    seasons" button.
+    """
+    from ..services.playlist_sync import sync_season_links
+    added = await sync_season_links(db)
+    return {"ok": True, "added": added}
+
+
 @router.get("/series")
 async def series_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1,
                     per_page: int = 25, sort: str = "order", direction: str = "asc"):
     per_page = min(max(per_page, 5), 500)
     total, rows, groups, tpls = await _pl_list(db, SeriePlaylist, SerieSource, "serie_source_id",
                                                q, group, {}, page, per_page, sort, direction)
+    row_ids = [r.id for r in rows]
+
+    # Read-repair for the whole page at once: seasons fetched AFTER the item was
+    # added to the playlist still need a link row. This loop used to run one
+    # SELECT per season per row plus one COUNT per enabled season, which came to
+    # 8.2 queries per item (204 for a 25-row page).
+    from ..services.playlist_sync import sync_season_links
+    if row_ids:
+        await sync_season_links(db, row_ids)
+
+    # ...then two queries for the page, whatever its size.
+    links: dict[int, list] = {}
+    if row_ids:
+        for pid, link_id, season_id, s_num, s_name, enabled in (await db.execute(
+                select(SeriePlaylistSeason.serie_playlist_id, SeriePlaylistSeason.id,
+                       SerieSeason.id, SerieSeason.season_number, SerieSeason.name,
+                       SeriePlaylistSeason.enabled)
+                .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
+                .where(SeriePlaylistSeason.serie_playlist_id.in_(row_ids))
+                .order_by(SeriePlaylistSeason.serie_playlist_id,
+                          SerieSeason.season_number))).all():
+            links.setdefault(pid, []).append((link_id, season_id, s_num, s_name, enabled))
+
+    counts: dict[int, int] = {}
+    enabled_ids = [v[1] for group in links.values() for v in group if v[4]]
+    if enabled_ids:
+        for season_id, n in (await db.execute(
+                select(SerieEpisode.serie_season_id, func.count())
+                .where(SerieEpisode.serie_season_id.in_(enabled_ids))
+                .group_by(SerieEpisode.serie_season_id))).all():
+            counts[season_id] = n
+
     items = []
     for r in rows:
-        # read-repair: seasons fetched AFTER the item was added to the playlist
-        # must still get a link row (defaults to on/off following the source season)
-        src_seasons = (await db.execute(select(SerieSeason).where(
-            SerieSeason.serie_source_id == r.serie_source_id))).scalars().all()
-        for sn in src_seasons:
-            if (await db.execute(select(SeriePlaylistSeason).where(
-                    SeriePlaylistSeason.serie_playlist_id == r.id,
-                    SeriePlaylistSeason.serie_season_id == sn.id))).scalar_one_or_none() is None:
-                db.add(SeriePlaylistSeason(serie_playlist_id=r.id, serie_season_id=sn.id,
-                                           enabled=sn.enabled))
-        if src_seasons:
-            await db.commit()
-        seasons = (await db.execute(
-            select(SeriePlaylistSeason, SerieSeason)
-            .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
-            .where(SeriePlaylistSeason.serie_playlist_id == r.id)
-            .order_by(SerieSeason.season_number))).all()
-        n_eps = 0
-        for pls, sn in seasons:
-            if pls.enabled:
-                n_eps += await db.scalar(select(func.count()).select_from(SerieEpisode).where(
-                    SerieEpisode.serie_season_id == sn.id)) or 0
+        seasons = links.get(r.id, [])
+        n_eps = sum(counts.get(v[1], 0) for v in seasons if v[4])
         items.append({"id": r.id, "custom_name": r.custom_name, "group_name": r.group_name,
                       "poster": r.poster, "year": r.year, "rating": r.rating,
                       "overview": r.overview, "enabled": r.enabled,
                       "order": r.order, "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""),
-                      "seasons": [{"link_id": pls.id, "season_id": sn.id,
-                                   "season_number": sn.season_number,
-                                   "name": sn.name, "enabled": pls.enabled}
-                                  for pls, sn in seasons],
+                        "seasons": [{"link_id": v[0], "season_id": v[1],
+                                     "season_number": v[2], "name": v[3],
+                                     "enabled": v[4]} for v in seasons],
                       "enabled_episode_count": n_eps})
     return {"total": total, "page": page, "per_page": per_page, "items": items, "groups": groups}
 

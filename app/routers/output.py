@@ -15,6 +15,9 @@ Streams honour per-user max_connections and group filters.
 
 from __future__ import annotations
 
+import asyncio
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
@@ -113,9 +116,74 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
 
 
 # ---------------------------------------------------------------- streaming
+# Answering `200 OK` + `content-type: video/mp2t` with an empty body is what a
+# browser turns into "player popup, black screen, no error anywhere" and what a
+# set-top box turns into a silent hang. We can only change the status code
+# before the first byte goes out, so peek at the first chunk and fail loudly.
+FIRST_CHUNK_TIMEOUT = float(os.environ.get("SPM_FIRST_CHUNK_TIMEOUT", "25"))
+
+
+async def _guarded(gen, label: str, item_name: str = ""):
+    """
+    Yield `gen` unchanged, but only after proving it produces at least one
+    chunk. Raises HTTPException(502) instead of streaming nothing.
+    """
+    first = None
+    try:
+        async with asyncio.timeout(FIRST_CHUNK_TIMEOUT):
+            async for chunk in gen:
+                if chunk:
+                    first = chunk
+                    break
+    except TimeoutError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - report, never swallow
+        raise HTTPException(502, f"{label}: the stream pipe failed: "
+                                 f"{type(exc).__name__}: {exc}")
+    if first is None:
+        await db_log("ERROR", "output",
+                     f"[{item_name or label}] produced no data within "
+                     f"{FIRST_CHUNK_TIMEOUT:.0f}s -> 502 (not a silent 200)")
+        raise HTTPException(502, f"{label}: the source produced no data "
+                                 f"(ffmpeg missing, template failed, or the panel "
+                                 f"returned an empty stream). Check Logs → stream.")
+
+    async def body():
+        yield first
+        async for chunk in gen:
+            yield chunk
+    return body()
+
+
+async def _stream_mode(explicit: str) -> str:
+    """`proxy` (ffmpeg in the middle) or `redirect` (302 to the panel's CDN)."""
+    if explicit in ("proxy", "redirect"):
+        return explicit
+    from ..services.playlist_gen import get_setting
+    mode = await get_setting("stream_mode", "proxy")
+    return mode if mode in ("proxy", "redirect") else "proxy"
+
+
 async def _stream_response(kind: str, ref_id: int, user: User | None, label: str,
-                            request: Request) -> StreamingResponse:
-    """Open the stream via the manager and wrap it in a StreamingResponse."""
+                            request: Request, mode: str = ""):
+    """
+    Serve a stream: either proxied through ffmpeg (default) or redirected
+    straight to the resolved portal URL.
+
+    Redirect skips ffmpeg entirely - instant start, no CPU, works for panels
+    whose stream ffmpeg refuses to remux - at the cost of mid-stream fallback
+    and transport-stream rewriting. Local files can never be redirected (the
+    client cannot see our filesystem), so they always proxy.
+    """
+    if await _stream_mode(mode) == "redirect" and kind != "local":
+        from fastapi.responses import RedirectResponse
+        url, item_name = await MANAGER.resolve(kind, ref_id)
+        if url:
+            await db_log("INFO", "output",
+                         f"[{item_name}] redirect mode -> sending client to the source")
+            return RedirectResponse(url, status_code=302)
+        raise HTTPException(502, f"{label}: no source produced a link to redirect to")
+
     if not MANAGER.can_open_for(user.name if user else None,
                                 user.max_connections if user else None):
         await db_log("WARNING", "output",
@@ -125,70 +193,72 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     if handle.dead:
         raise HTTPException(404, f"{label}: no available source (all busy or unreachable)")
     # watchdog lives until the stream deregisters (normal end) or the client
-    # disappears (then it kills the stream; see watch_disconnect)
-    import asyncio
-    asyncio.get_running_loop().create_task(
-        MANAGER.watch_disconnect(request, handle))
-    return StreamingResponse(gen, media_type="video/mp2t",
+    # disappears (then it kills the stream; see watch_disconnect). watch() keeps
+    # a strong reference, so the task cannot be garbage-collected mid-flight.
+    MANAGER.watch(request, handle)
+    body = await _guarded(gen, label, handle.item_name)
+    return StreamingResponse(body, media_type="video/mp2t",
                              headers={"Cache-Control": "no-store",
                                       "X-SPM-Stream": handle.id})
 
 
 @router.api_route("/play/live/{pid}.ts", methods=["GET", "HEAD"])
-async def play_live(request: Request, pid: int, u: str = "", p: str = ""):
+async def play_live(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("live", pid, user, f"live #{pid}", request)
+    return await _stream_response("live", pid, user, f"live #{pid}", request, mode)
 
 
 @router.get("/play/vod/{pid}.ts")
-async def play_vod(request: Request, pid: int, u: str = "", p: str = ""):
+async def play_vod(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("vod", pid, user, f"vod #{pid}", request)
+    return await _stream_response("vod", pid, user, f"vod #{pid}", request, mode)
 
 
 @router.get("/play/episode/{eid}.ts")
-async def play_episode(request: Request, eid: int, u: str = "", p: str = ""):
+async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("episode", eid, user, f"episode #{eid}", request)
+    return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode)
 
 
 @router.get("/play/local/{pid}.ts")
-async def play_local(request: Request, pid: int, u: str = "", p: str = ""):
+async def play_local(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
-    return await _stream_response("local", pid, user, f"local #{pid}", request)
+    # local files are never redirectable: the client cannot see our filesystem
+    return await _stream_response("local", pid, user, f"local #{pid}", request, "proxy")
 
 
 # Xtream-style stream URLs -----------------------------------------------
 @router.get("/live/{u}/{p}/{sid}.ts")
-async def xlive(request: Request, sid: int, u: str, p: str):
-    return await play_live(request, sid, u, p)
+async def xlive(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_live(request, sid, u, p, mode)
 
 
 @router.get("/movie/{u}/{p}/{sid}.ts")
-async def xmovie(request: Request, sid: int, u: str, p: str):
-    return await play_vod(request, sid, u, p)
+async def xmovie(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_vod(request, sid, u, p, mode)
 
 
 @router.get("/series/{u}/{p}/{sid}.ts")
-async def xseries(request: Request, sid: int, u: str, p: str):
-    return await play_episode(request, sid, u, p)
+async def xseries(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_episode(request, sid, u, p, mode)
 
 
 # -------------------------------------------------- admin quick-play (GUI)
 @router.get("/preview-play/{kind}/{pid}.ts")
-async def admin_play(kind: str, pid: int, request: Request):
+async def admin_play(kind: str, pid: int, request: Request, mode: str = ""):
     """Play a PLAYLIST item from the GUI with the admin session (no user creds),
     through the *real* pipeline - template, fallback chain, MAC tracking."""
     from ..security import require_admin
     require_admin(request)
     if kind not in ("live", "vod", "episode", "local"):
         raise HTTPException(400, "kind must be live|vod|episode|local")
-    return await _stream_response(kind, pid, None, f"{kind} #{pid}", request)
+    return await _stream_response(kind, pid, None, f"{kind} #{pid}", request, mode)
 
 
 # ---------------------------------------------------------------- preview
 @router.get("/preview/{kind}/{sid}.ts")
-async def preview(kind: str, sid: int, request: Request, db=Depends(get_db)):
+async def preview(kind: str, sid: int, request: Request, db=Depends(get_db),
+                  tpl: int | None = Query(None)):
     """
     Web-player probe of ORIGINAL source streams (spec: test before playlist).
     Admin-session OR valid user credentials both work. Uses the stream
@@ -225,11 +295,11 @@ async def preview(kind: str, sid: int, request: Request, db=Depends(get_db)):
     if not portal or not macs:
         raise HTTPException(404, "no portal/mac for this source")
     name = getattr(src, "original_name", None) or getattr(src, "name", "preview")
-    handle, gen = await MANAGER._open_preview(src, portal, list(macs), kind=link_kind, name=name)
+    handle, gen = await MANAGER._open_preview(src, portal, list(macs), kind=link_kind,
+                                              name=name, template_id=tpl)
     if handle.dead:
         raise HTTPException(404, "preview failed: no data from source")
-    import asyncio
-    asyncio.get_running_loop().create_task(
-        MANAGER.watch_disconnect(request, handle))
-    return StreamingResponse(gen, media_type="video/mp2t",
+    MANAGER.watch(request, handle)
+    body = await _guarded(gen, f"preview {kind} #{sid}", name)
+    return StreamingResponse(body, media_type="video/mp2t",
                              headers={"Cache-Control": "no-store"})

@@ -222,3 +222,58 @@ async def _known_source_count(db, kind: str, ids: list[int]) -> int:
     model = {"vod": VodSource, "series": SerieSource, "local": LocalFile,
              "live": LiveSource}[kind]
     return (await db.scalar(select(func.count()).select_from(model).where(model.id.in_(ids)))) or 0
+
+
+async def sync_season_links(db, playlist_ids: list[int] | None = None) -> int:
+    """
+    Create the `serie_playlist_seasons` rows that are missing, and report how
+    many were added.
+
+    A playlist-series only contributes episodes to the output through its
+    season link rows. Those rows used to be created in exactly two places:
+    when the series was added to the playlist, and by a read-repair inside
+    `GET /api/playlist/series` - i.e. only when someone opened the Series tab
+    in the Playlist Builder. So the normal order of operations (add series to
+    the playlist, *then* fetch its seasons) left the table empty and the series
+    silently contributed nothing to any user's playlist, with no error anywhere.
+    "There is no possibility to fetch and select seasons for series" is exactly
+    this.
+
+    Batched: three queries regardless of how many series there are.
+    """
+    from ..models import SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SerieSeason
+
+    q = select(SeriePlaylist.id, SeriePlaylist.serie_source_id)
+    if playlist_ids is not None:
+        if not playlist_ids:
+            return 0
+        q = q.where(SeriePlaylist.id.in_(playlist_ids))
+    items = (await db.execute(q)).all()
+    if not items:
+        return 0
+
+    seasons_by_src: dict[int, list] = {}
+    for src_id, season_id, enabled in (await db.execute(
+            select(SerieSeason.serie_source_id, SerieSeason.id, SerieSeason.enabled)
+            .where(SerieSeason.serie_source_id.in_({src for _, src in items})))).all():
+        seasons_by_src.setdefault(src_id, []).append((season_id, enabled))
+
+    have = set()
+    for pid, season_id in (await db.execute(
+            select(SeriePlaylistSeason.serie_playlist_id, SeriePlaylistSeason.serie_season_id)
+            .where(SeriePlaylistSeason.serie_playlist_id.in_([p for p, _ in items])))).all():
+        have.add((pid, season_id))
+
+    added = 0
+    for pid, src_id in items:
+        for season_id, enabled in seasons_by_src.get(src_id, []):
+            if (pid, season_id) in have:
+                continue
+            # follow the source season's own enabled flag, so a season switched
+            # off in Input Sources does not sneak into the output
+            db.add(SeriePlaylistSeason(serie_playlist_id=pid, serie_season_id=season_id,
+                                       enabled=bool(enabled)))
+            added += 1
+    if added:
+        await db.commit()
+    return added

@@ -109,6 +109,10 @@ STREAM_START_TIMEOUT = float(os.environ.get("SPM_STREAM_START_TIMEOUT", "12"))
 PORTAL_HTTP_TIMEOUT = float(os.environ.get("SPM_PORTAL_HTTP_TIMEOUT", "10"))
 # Pages fetched per genre per batch (portal pages are ~14 items; 30 pages ~= 420 items).
 FETCH_PAGE_BUDGET = int(os.environ.get("SPM_FETCH_PAGE_BUDGET", "30"))
+# Pages fetched at once once the portal has told us the total. Portals answer
+# ~1s/page, so a 30-page genre is ~30s serially. 4 is what crispy-stalker uses
+# as DEFAULT_CONCURRENCY; keep it modest - panels rate-limit aggressively.
+FETCH_PAGE_CONCURRENCY = max(1, int(os.environ.get("SPM_FETCH_PAGE_CONCURRENCY", "4")))
 # Global fallback strategy (spec): try all MACs of a portal first, or hop portals directly.
 FALLBACK_STRATEGY = os.environ.get("SPM_FALLBACK_STRATEGY", "macs_first")  # or portal_first
 
@@ -125,6 +129,16 @@ MOCK_PORTAL_ENABLED = os.environ.get("SPM_MOCK_PORTAL", "1") == "1"
 SKIP_LOGIN = os.environ.get("SPM_SKIP_LOGIN", "0") == "1"
 
 LOG_LEVEL = os.environ.get("SPM_LOG_LEVEL", "INFO").upper()
+
+# One INFO line per HTTP request on stdout, so `docker logs` shows what the API
+# is doing (uvicorn's own access log stays at WARNING - see main.py). Streams
+# are one long request each, so this stays readable even under load.
+ACCESS_LOG = os.environ.get("SPM_ACCESS_LOG", "1") == "1"
+# Paths that are pure noise and never worth a line.
+ACCESS_LOG_SKIP = tuple(
+    p.strip()
+    for p in os.environ.get("SPM_ACCESS_LOG_SKIP", "/static/,/favicon.ico").split(",")
+    if p.strip())
 # EVERY log record goes to stdout - on purpose, and it is load-bearing:
 # the Docker logging driver keeps a container's stdout and stderr apart, and
 # the CLI re-emits them on *its own* stdout/stderr. So `docker logs spm | grep

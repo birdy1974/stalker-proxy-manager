@@ -84,8 +84,24 @@ async def get_setting(key: str, default=None):
             return default
 
 
+def _chunked(seq: list, size: int = 800):
+    """`.in_()` batches: keeps one round trip per batch instead of per row, and
+    stays under SQLite's bound-parameter limit."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 async def build_m3u(base_url: str, user: User) -> str:
-    """Render the final per-user playlist (groups filtered per user)."""
+    """
+    Render the final per-user playlist (groups filtered per user).
+
+    Everything is read with a fixed number of queries. This used to run one
+    query per series (seasons), one per season (episodes) and one per local
+    file, so a library with a few hundred series turned a playlist request into
+    a thousand Postgres round trips - which is exactly the "VLC takes forever
+    to load the playlist" complaint, because VLC blocks on this response before
+    it shows a single channel.
+    """
     groups = _groups(user)
     u, p = quote(user.name), quote(user.password)
     lines = [f'#EXTM3U url-tvg="{base_url}/epg.xml?u={u}&p={p}" x-tvg-url="{base_url}/epg.xml?u={u}&p={p}"']
@@ -112,44 +128,69 @@ async def build_m3u(base_url: str, user: User) -> str:
         for it in vods:
             if not _allowed(it.group_name, groups["vod"]):
                 continue
-            attr = (f'tvg-logo="{it.poster or it.logo or ""}" '
+            # tvg-name matters: several players (and all Xtream clients) prefer
+            # it over the text after the comma, and without it they fall back to
+            # the URL - which is how titles end up looking "not complete".
+            attr = (f'tvg-name="{it.custom_name}" '
+                    f'tvg-logo="{it.poster or it.logo or ""}" '
                     f'group-title="{it.group_name or "VOD"}"')
             lines.append(f"#EXTINF:-1 {attr},{it.custom_name}")
             lines.append(f"{base_url}/play/vod/{it.id}.ts?u={u}&p={p}")
 
         # ---- series: one m3u entry per episode of enabled seasons ------
+        # Filter by the user's group whitelist FIRST, then fetch seasons and
+        # episodes for the visible series in two queries total.
         series = (await s.execute(select(SeriePlaylist).where(SeriePlaylist.enabled.is_(True))
                                   .order_by(SeriePlaylist.order, SeriePlaylist.id))).scalars().all()
-        for sp in series:
-            if not _allowed(sp.group_name, groups["series"]):
-                continue
-            season_rows = (await s.execute(
-                select(SeriePlaylistSeason, SerieSeason)
+        visible = [sp for sp in series if _allowed(sp.group_name, groups["series"])]
+
+        season_rows: list = []
+        for batch in _chunked([sp.id for sp in visible]):
+            season_rows += (await s.execute(
+                select(SeriePlaylistSeason.serie_playlist_id, SerieSeason.id,
+                       SerieSeason.season_number)
                 .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
-                .where(SeriePlaylistSeason.serie_playlist_id == sp.id,
-                       SeriePlaylistSeason.enabled.is_(True)))).all()
-            for _, season in season_rows:
-                eps = (await s.execute(select(SerieEpisode).where(
-                    SerieEpisode.serie_season_id == season.id)
-                    .order_by(SerieEpisode.episode_number))).scalars().all()
-                for ep in eps:
-                    name = f"{sp.custom_name} S{season.season_number:02d}E{ep.episode_number:02d}"
-                    attr = (f'tvg-logo="{sp.poster or sp.logo or ""}" '
+                .where(SeriePlaylistSeason.serie_playlist_id.in_(batch),
+                       SeriePlaylistSeason.enabled.is_(True))
+                .order_by(SerieSeason.season_number))).all()
+
+        eps_by_season: dict[int, list] = {}
+        for batch in _chunked([r[1] for r in season_rows]):
+            for season_id, ep_id, ep_num in (await s.execute(
+                    select(SerieEpisode.serie_season_id, SerieEpisode.id,
+                           SerieEpisode.episode_number)
+                    .where(SerieEpisode.serie_season_id.in_(batch))
+                    .order_by(SerieEpisode.episode_number))).all():
+                eps_by_season.setdefault(season_id, []).append((ep_id, ep_num))
+
+        for sp in visible:
+            for sp_id, season_id, season_number in [r for r in season_rows if r[0] == sp.id]:
+                for ep_id, ep_num in eps_by_season.get(season_id, []):
+                    name = f"{sp.custom_name} S{season_number:02d}E{ep_num:02d}"
+                    attr = (f'tvg-name="{name}" '
+                            f'tvg-logo="{sp.poster or sp.logo or ""}" '
                             f'group-title="Series: {sp.group_name or sp.custom_name}"')
                     lines.append(f"#EXTINF:-1 {attr},{name}")
-                    lines.append(f"{base_url}/play/episode/{ep.id}.ts?u={u}&p={p}")
+                    lines.append(f"{base_url}/play/episode/{ep_id}.ts?u={u}&p={p}")
 
         # ---- local files ------------------------------------------------
         locals_ = (await s.execute(select(LocalPlaylist).where(LocalPlaylist.enabled.is_(True))
                                    .order_by(LocalPlaylist.order, LocalPlaylist.id))).scalars().all()
+        files: dict[int, LocalFile] = {}
+        wanted = [it.local_file_id for it in locals_ if it.local_file_id]
+        for batch in _chunked(wanted):
+            for f in (await s.execute(select(LocalFile).where(
+                    LocalFile.id.in_(batch)))).scalars().all():
+                files[f.id] = f
         for it in locals_:
             if not _allowed(it.group_name, groups["local"]):
                 continue
-            lf = await s.get(LocalFile, it.local_file_id)
+            lf = files.get(it.local_file_id)
             if not lf:
                 continue
             name = it.custom_name or lf.filename
-            lines.append(f'#EXTINF:-1 group-title="{it.group_name or "vod-local"}",{name}')
+            lines.append(f'#EXTINF:-1 tvg-name="{name}" '
+                         f'group-title="{it.group_name or "vod-local"}",{name}')
             lines.append(f"{base_url}/play/local/{it.id}.ts?u={u}&p={p}")
 
     return "\n".join(lines) + "\n"

@@ -12,7 +12,7 @@ import os
 from sqlalchemy import select
 
 from ..models import MacAddress, Portal
-from ..portal.client import StalkerClient
+from ..portal.pool import POOL
 from .probe import probe_media
 from .tmdb import tmdb_lookup
 
@@ -33,14 +33,16 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str) -> str | None:
         mac = (await db.execute(select(MacAddress).where(
             MacAddress.portal_id == portal.id).order_by(MacAddress.order))).scalars().first()
         if mac:
-            client = StalkerClient(portal.resolved_url, mac.mac, mac.password)
+            # Pooled: do NOT handshake here. create_link() authenticates lazily
+            # and reuses the cached token, so a detail popup costs no extra
+            # portal round trip once a session already exists.
+            client = await POOL.get(portal.resolved_url, mac.mac, mac.password)
             try:
-                await client.handshake()
                 return await client.create_link(cmd, kind)
             except Exception:  # noqa: BLE001 - fall through to raw cmd
                 pass
             finally:
-                await client.close()
+                await client.close()      # no-op for a pooled client
     return cmd_to_url(cmd)
 
 
