@@ -19,13 +19,25 @@
     <button class="navbar-toggler" data-bs-toggle="collapse" data-bs-target="#nav"><span class="navbar-toggler-icon"></span></button>
     <div class="collapse navbar-collapse" id="nav">
       <ul class="navbar-nav me-auto">
-        <li class="nav-item"><a class="nav-link {{ 'active' if active=='dashboard' }}" href="/"><i class="bi bi-speedometer2"></i> Dashboard</a></li>
-        <li class="nav-item"><a class="nav-link {{ 'active' if active=='portals' }}" href="/portals"><i class="bi bi-hdd-network"></i> Portals</a></li>
-        <li class="nav-item"><a class="nav-link {{ 'active' if active=='sources' }}" href="/sources"><i class="bi bi-collection-play"></i> Input Sources</a></li>
-        <li class="nav-item"><a class="nav-link {{ 'active' if active=='playlist' }}" href="/playlist"><i class="bi bi-list-check"></i> Playlist Builder</a></li>
-        <li class="nav-item"><a class="nav-link {{ 'active' if active=='ffmpeg' }}" href="/ffmpeg"><i class="bi bi-gear-wide-connected"></i> FFmpeg</a></li>
-        <li class="nav-item"><a class="nav-link {{ 'active' if active=='users' }}" href="/users"><i class="bi bi-people"></i> Users</a></li>
-        <li class="nav-item"><a class="nav-link {{ 'active' if active=='settings' }}" href="/settings"><i class="bi bi-sliders"></i> Settings</a></li>
+        <li class="nav-item"><a class="nav-link {{ 'active' if active=='dashboard' }}" href="/"
+              title="Overview: portals, streams, API activity and logs"><i class="bi bi-speedometer2"></i> Dashboard</a></li>
+        <li class="navbar-divider" aria-hidden="true"></li>
+        {# --- stage 1: get content in -------------------------------------- #}
+        <li class="nav-item"><a class="nav-link {{ 'active' if active=='portals' }}" href="/portals"
+              title="Step 1 - add Stalker portals and their MAC addresses, then fetch channels, VOD and series"><i class="bi bi-hdd-network"></i> 1. Portals</a></li>
+        <li class="nav-item"><a class="nav-link {{ 'active' if active=='sources' }}" href="/sources"
+              title="Step 2 - pick which fetched items, genres and local folders are usable"><i class="bi bi-collection-play"></i> 2. Input Sources</a></li>
+        <li class="nav-item"><a class="nav-link {{ 'active' if active=='playlist' }}" href="/playlist"
+              title="Step 3 - arrange them into the per-user playlist: names, groups, seasons, order"><i class="bi bi-list-check"></i> 3. Playlist</a></li>
+        <li class="navbar-divider" aria-hidden="true"></li>
+        {# --- stage 2: how it is served ------------------------------------ #}
+        <li class="nav-item"><a class="nav-link {{ 'active' if active=='ffmpeg' }}" href="/ffmpeg"
+              title="Output: transcode templates (VAAPI / QSV / copy) and the redirect-vs-proxy mode"><i class="bi bi-gear-wide-connected"></i> Output / FFmpeg</a></li>
+        <li class="nav-item"><a class="nav-link {{ 'active' if active=='users' }}" href="/users"
+              title="Accounts: credentials, connection limits, expiry, m3u and xtream access"><i class="bi bi-people"></i> Users</a></li>
+        <li class="navbar-divider" aria-hidden="true"></li>
+        <li class="nav-item"><a class="nav-link {{ 'active' if active=='settings' }}" href="/settings"
+              title="Global settings: output base URL, stream mode, fallback order, EPG, TMDB"><i class="bi bi-sliders"></i> Settings</a></li>
       </ul>
       <a href="/" id="api-indicator" class="btn btn-sm btn-outline-light me-2 d-flex align-items-center gap-1"
          title="API status: serving requests / active streams. Click for the dashboard.">

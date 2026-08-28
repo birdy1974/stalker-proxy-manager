@@ -12,7 +12,15 @@
   <div class="card-body p-2">
     <div id="pl-live"></div>
     <div id="pl-vod" class="d-none"></div>
-    <div id="pl-series" class="d-none"></div>
+    <div id="pl-series" class="d-none">
+      <div class="d-flex align-items-center gap-2 px-1 pt-1 pb-2">
+        <button class="btn btn-sm btn-outline-secondary" id="sync-seasons">
+          <i class="bi bi-arrow-repeat"></i> Re-link seasons</button>
+        <span class="small text-muted">Seasons fetched after a series was added are linked
+          automatically; use this if you fetched moments ago.</span>
+      </div>
+      <div id="pl-series-table"></div>
+    </div>
     <div id="pl-local" class="d-none"></div>
   </div>
 </div>
@@ -464,7 +472,7 @@ window.editVod = async (id) => {
 /* ============================ SERIES builder ============================ */
 let seriesTable;
 function seriesBuilder() {
-  seriesTable = new DataTable($("#pl-series"), {
+  seriesTable = new DataTable($("#pl-series-table"), {
     selectable: true, defaultSort: "order", extraHeader: builderBar("series", () => seriesTable, true),
     server: async (q) => await api("/api/playlist/series?" + q),
     columns: [
@@ -573,5 +581,17 @@ window.editLocal = (id) => {
       $("#pl-" + k).classList.toggle("d-none", k !== a.dataset.tab);
   }));
 })();
+document.addEventListener("DOMContentLoaded", () => {
+  const b = document.getElementById("sync-seasons");
+  if (b) b.addEventListener("click", async () => {
+    b.disabled = true;
+    try {
+      const r = await api("/api/playlist/series/sync-seasons", { method: "POST" });
+      toast(r.added ? `linked ${r.added} season(s)` : "seasons already linked", "ok");
+      seriesTable && seriesTable.refresh();
+    } catch (e) { toast("sync failed: " + e, "err"); }
+    finally { b.disabled = false; }
+  });
+});
 </script>
 {% endblock %}
