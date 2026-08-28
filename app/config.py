@@ -17,6 +17,9 @@ import logging
 import sys
 from pathlib import Path
 
+from .services.permissions import (current_ids, describe_access,
+                                   is_readable_dir, permission_hint)
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -137,6 +140,12 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("spm.config")
-log.info("DATA_DIR=%s MEDIA_ROOT=%s", DATA_DIR, MEDIA_ROOT)
+log.info("process runs as %s", current_ids())
+log.info("DATA_DIR=%s (%s) MEDIA_ROOT=%s (%s)", DATA_DIR, describe_access(DATA_DIR),
+         MEDIA_ROOT, describe_access(MEDIA_ROOT))
+if not is_readable_dir(MEDIA_ROOT):
+    # the classic bind-mount trap: the host folder belongs to another user, so
+    # the app can stat it but not list it -> "PermissionError: '/media'" later.
+    log.warning("MEDIA_ROOT %s is not readable - %s", MEDIA_ROOT, permission_hint(MEDIA_ROOT))
 log.info("DATABASE_URL=%s", DATABASE_URL.split("@")[-1] if "@" in DATABASE_URL else DATABASE_URL)
 log.info("FFMPEG_BIN=%s VAAPI_DEVICE=%s (exists=%s)", FFMPEG_BIN, VAAPI_DEVICE, Path(VAAPI_DEVICE).exists())

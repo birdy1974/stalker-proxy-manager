@@ -41,14 +41,23 @@ RUN pip install --no-cache-dir -r requirements.txt
 # application code (templates + static assets included)
 COPY app ./app
 
+# PUID/PGID entrypoint: starts as root, moves the app account to the ids that
+# own your bind mounts, then execs the CMD as that user (see README).
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+
 # runtime layout: /config = sqlite DB + settings, /media = local video files
 RUN useradd -r -u 2000 -m spm \
     && mkdir -p /config /media \
     && chown -R spm:spm /config /media /app
 
-USER spm
-
-ENV SPM_DATA_DIR=/config \
+# NOTE: there is deliberately no `USER spm` here. The entrypoint has to start
+# as root to apply PUID/PGID and to chown the state volume; it drops privileges
+# (setpriv/gosu/su) before exec'ing the CMD, so the app itself never runs as
+# root unless you ask for it with PUID=0.
+ENV PUID=2000 \
+    PGID=2000 \
+    SPM_DATA_DIR=/config \
     SPM_MEDIA_ROOT=/media \
     SPM_VAAPI_DEVICE=/dev/dri/renderD128 \
     SPM_PORT=8880 \
@@ -64,4 +73,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 # handlers to stdout, so container stdout carries the complete log stream
 # (uvicorn startup lines + every [spm.*] record) in chronological order.
 # Keeping them on stderr would hide them from `docker logs <c> | grep`.
+# The entrypoint execs this as PUID:PGID; `docker run <image> bash` still works
+# (you get a shell as the app user).
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8880"]

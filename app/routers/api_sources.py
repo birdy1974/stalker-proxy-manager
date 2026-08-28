@@ -19,6 +19,7 @@ from sqlalchemy import func, or_, select
 
 from ..config import MEDIA_ROOT
 from ..database import get_db
+from ..services.permissions import describe_access, permission_hint
 from ..models import (
     LiveGenre, LiveSource, LocalFile, LocalPlaylist, LocalSource, Portal,
     SerieEpisode, SerieGenre, SerieSeason, SerieSource, VodGenre, VodSource,
@@ -287,15 +288,33 @@ async def scan_local(payload: dict, db=Depends(get_db)):
     if ids:
         stmt = stmt.where(LocalSource.id.in_(ids))
     dirs = (await db.execute(stmt)).scalars().all()
-    total_new, total_seen = 0, 0
+    total_new, total_seen, total_skipped = 0, 0, 0
     for d in dirs:
         base = Path(d.directory)
         if not base.is_absolute():
             base = MEDIA_ROOT / d.directory
-        if not base.exists():
+        try:
+            is_dir = base.is_dir()        # raises PermissionError, not False
+        except PermissionError:
+            await db_log("ERROR", "local", permission_hint(base))
+            continue
+        if not is_dir:
             await db_log("ERROR", "local", f"directory not accessible: {base}")
             continue
-        walker = os.walk(base) if d.recursive else [(str(base), [], os.listdir(base))]
+        # os.walk() swallows unreadable sub-directories by default; collect them
+        # instead so the log and the GUI say why a scan came back empty
+        # (almost always: the mount is owned by another uid -> PUID/PGID).
+        skipped: list[str] = []
+
+        def _walk_error(err: OSError) -> None:
+            skipped.append(str(getattr(err, "filename", base)))
+
+        try:
+            walker = (os.walk(base, onerror=_walk_error) if d.recursive
+                      else [(str(base), [], os.listdir(base))])
+        except PermissionError:
+            await db_log("ERROR", "local", permission_hint(base))
+            continue
         n_new = 0
         for root, _, files in walker:
             for fn in files:
@@ -307,16 +326,25 @@ async def scan_local(payload: dict, db=Depends(get_db)):
                     LocalFile.local_source_id == d.id, LocalFile.relative_path == rel))
                 if exists:
                     continue
-                st = os.stat(os.path.join(root, fn))
+                try:
+                    st = os.stat(os.path.join(root, fn))
+                except OSError as e:                      # unreadable file: skip, keep scanning
+                    skipped.append(f"{os.path.join(root, fn)} ({e.strerror})")
+                    continue
                 db.add(LocalFile(local_source_id=d.id, relative_path=rel, filename=fn,
                                  size_bytes=st.st_size,
                                  mtime=datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()))
                 n_new += 1
+        if skipped:
+            total_skipped += len(skipped)
+            await db_log("ERROR", "local",
+                         f"{len(skipped)} path(s) skipped while scanning {base}, "
+                         f"first: {skipped[0]} - {permission_hint(base)}")
         d.last_scan = datetime.now(timezone.utc)
         await db.commit()
         total_new += n_new
         await db_log("INFO", "local", f"scanned {base}: {n_new} new video files")
-    return {"ok": True, "new": total_new, "seen": total_seen}
+    return {"ok": True, "new": total_new, "seen": total_seen, "skipped": total_skipped}
 
 
 @router.get("/local/files")
@@ -349,8 +377,18 @@ async def browse(path: str = ""):
     base = base.resolve()
     if not str(base).startswith(str(MEDIA_ROOT.resolve())) and base != Path("/"):
         raise HTTPException(403, "outside media root")
-    if not base.exists() or not base.is_dir():
+    try:
+        # NB: Path.is_dir()/exists() raise PermissionError (not False) when a
+        # parent directory is not searchable - the same PUID/PGID situation.
+        is_dir = base.is_dir()
+    except PermissionError:
+        raise HTTPException(403, permission_hint(base))
+    if not is_dir:
         raise HTTPException(404, "directory not found")
-    items = sorted([{"name": e.name, "path": str(e)}
-                    for e in base.iterdir() if e.is_dir()], key=lambda x: x["name"].lower())
+    try:
+        items = sorted([{"name": e.name, "path": str(e)}
+                        for e in base.iterdir() if e.is_dir()], key=lambda x: x["name"].lower())
+    except PermissionError:
+        # host mount owned by another uid -> clean 403 with the fix, not a 500
+        raise HTTPException(403, permission_hint(base))
     return {"path": str(base), "parent": str(base.parent), "dirs": items}

@@ -70,3 +70,11 @@ jobs:
         run: bash dev/smoke.sh
         env:
           SPM_SMOKE_IMAGE: spm-smoke
+      - name: PUID/PGID (host bind-mount permissions)
+        # dev/smoke-puid.sh bind-mounts a directory owned by a foreign uid with
+        # mode 750: without PUID/PGID the app must NOT be able to list /media,
+        # with PUID/PGID set to that owner it must. It skips itself when the
+        # host has no root/sudo.
+        run: bash dev/smoke-puid.sh
+        env:
+          SPM_SMOKE_PUID_IMAGE: spm-smoke
