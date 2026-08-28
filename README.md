@@ -116,6 +116,24 @@ Every subsystem writes **detailed entries** (module-tagged: portals, fetch, stre
 
 ---
 
+## Development scripts (`dev/`)
+
+| Script | What it does |
+|---|---|
+| `bash dev/smoke.sh` | Runs the freshly built image with `SPM_MOCK_PORTAL=1` and checks: GUI answers `/login` (200), mock handshake returns a token, the boot marker is in the container log **and on container stdout** (the single-stream rule above). This is what the `docker` workflow's smoke job runs. `SPM_SMOKE_IMAGE` / `SPM_SMOKE_NAME` / `SPM_SMOKE_PORT` override it for a local run against any port. |
+| `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies `dev/docker-publish.yml.example` is byte-identical to the real workflow. Run it before pushing anything under `.github/workflows/`. |
+| `bash dev/seed-demo.sh [BASE_URL]` | Seeds a *running* instance with a full demo setup against the built-in mock portal (portal → genres → live/VOD/series → users). Idempotent; dev/mockup use (`SPM_SKIP_LOGIN=1`), default base `http://127.0.0.1:8880`. |
+
+**YAML gotcha that silently disabled this whole workflow once:** a plain scalar may not contain `": "`, so step names must be quoted — `- name: "Image metadata (tags: latest, sha, semver releases)"`. Unquoted, GitHub reports *"mapping values are not allowed here"* and refuses the **entire file**: no job in it runs (build, push and smoke all vanish together), which looks like "the workflow stopped working" rather than a typo. `dev/check-yaml.sh` catches it before you push.
+
+`dev/docker-publish.yml.example` is a full copy of the workflow, kept in sync on purpose: the repo's bot cannot commit under `.github/workflows/` (GitHub denies GitHub-App commits that touch workflows), so the copy is installed with
+
+```bash
+cp dev/docker-publish.yml.example .github/workflows/docker-publish.yml   # safe: byte-identical
+```
+
+---
+
 ## Architecture
 
 ```
