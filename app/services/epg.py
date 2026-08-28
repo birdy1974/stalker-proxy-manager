@@ -25,9 +25,11 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from ..database import SessionLocal
+from ..database import SessionLocal, engine
 from ..models import EpgChannel, EpgProgramme, EpgSource, LivePlaylist
 from ..services.db_logging import db_log
 
@@ -54,6 +56,52 @@ def _sim(a: str, b: str) -> float:
     if not a or not b:
         return 0.0
     return SequenceMatcher(None, a, b).ratio()
+
+
+# Rows per grouped database round trip. EPG files easily carry tens of
+# thousands of channels/programmes: one SELECT per row is what used to make an
+# import take minutes.
+EPG_CHUNK = 500
+
+
+def _chunked(seq: list, size: int = EPG_CHUNK):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _upsert_stmt(model, rows: list[dict], index_elements: list[str],
+                 update_cols: list[str] | None = None):
+    """
+    ONE statement for a whole chunk - no "SELECT, then INSERT" round trip per
+    row. Uses the native upsert of the running engine (Postgres in production,
+    SQLite in dev); conflicting rows are updated or skipped inside the database.
+    """
+    insert = pg_insert if engine.dialect.name == "postgresql" else sqlite_insert
+    stmt = insert(model).values(rows)
+    if update_cols:
+        return stmt.on_conflict_do_update(
+            index_elements=index_elements,
+            set_={c: getattr(stmt.excluded, c) for c in update_cols})
+    return stmt.on_conflict_do_nothing(index_elements=index_elements)
+
+
+async def _upsert_channels(src_id: int, chan_rows: list[dict]) -> int:
+    """
+    Upsert parsed <channel> rows in GROUPS: one statement per chunk instead of
+    one SELECT (plus autoflush) per row - a real guide carries 10k+ channels.
+    """
+    if not chan_rows:
+        return 0
+    by_key: dict[str, dict] = {}
+    for r in chan_rows:                       # last occurrence wins per tvg_id
+        by_key[r["tvg_id"]] = r
+    rows = list(by_key.values())
+    async with SessionLocal() as s:
+        for chunk in _chunked(rows):
+            await s.execute(_upsert_stmt(EpgChannel, chunk,
+                                         ["epg_source_id", "tvg_id"], ["name", "icon"]))
+            await s.commit()
+    return len(rows)
 
 
 def _xmltv_ts(s: str) -> datetime | None:
@@ -179,15 +227,8 @@ async def _refresh_source_locked(src_id: int) -> dict:
         elif elm.tag == "programme":
             elm.clear()
 
+    await _upsert_channels(src_id, chan_rows)
     async with SessionLocal() as s:
-        for r in chan_rows:
-            row = (await s.execute(select(EpgChannel).where(
-                EpgChannel.epg_source_id == src_id,
-                EpgChannel.tvg_id == r["tvg_id"]))).scalar_one_or_none()
-            if row is None:
-                s.add(EpgChannel(**r))
-            else:
-                row.name, row.icon = r["name"], r["icon"]
         src = await s.get(EpgSource, src_id)
         src.last_fetch = now
         src.channel_count = n_chan
@@ -241,20 +282,26 @@ INGEST_LOCK = asyncio.Lock()      # serializes refreshes: one writer of the glob
 
 
 async def _flush_programmes(final: bool = False) -> None:
-    """Batch-insert buffered programme rows (dedup via natural unique key)."""
+    """
+    Batch-insert buffered programme rows (dedup via natural unique key).
+
+    Grouped access: the buffer is deduplicated in memory (it may repeat rows
+    across chunks) and the "do I already have this?" check is ONE query per
+    chunk over the composite key instead of one COUNT per row.
+    """
     global PROG_BUFFER
     buf, PROG_BUFFER = PROG_BUFFER, []
     if not buf:
         return
+    by_key: dict[tuple, dict] = {}
+    for r in buf:                             # dedupe inside the buffer itself
+        by_key[(r["tvg_id"], r["start_ts"], r["title"])] = r
+    rows = list(by_key.values())
     async with SessionLocal() as s:
-        for r in buf:
-            exists = await s.scalar(select(func.count()).select_from(EpgProgramme).where(
-                EpgProgramme.tvg_id == r["tvg_id"], EpgProgramme.start_ts == r["start_ts"],
-                EpgProgramme.title == r["title"]))
-            if exists:
-                continue
-            s.add(EpgProgramme(**r))
-        await s.commit()
+        for chunk in _chunked(rows, 200):                  # 200 rows per statement
+            await s.execute(_upsert_stmt(EpgProgramme, chunk,
+                                         ["tvg_id", "start_ts", "title"]))
+            await s.commit()
 
 
 async def refresh_all() -> dict:

@@ -20,6 +20,8 @@ from sqlalchemy import func, or_, select
 from ..config import MEDIA_ROOT
 from ..database import get_db
 from ..services.permissions import describe_access, permission_hint
+from ..services.playlist_sync import (SYNC_KINDS, add_sources,
+                                        sync_sources)
 from ..models import (
     LiveGenre, LiveSource, LocalFile, LocalPlaylist, LocalSource, Portal,
     SerieEpisode, SerieGenre, SerieSeason, SerieSource, VodGenre, VodSource,
@@ -204,13 +206,22 @@ async def toggle(payload: dict, db=Depends(get_db)):
     if model is None:
         raise HTTPException(400, "kind must be live|vod|series")
     ids = payload.get("ids", [])
+    enabled = bool(payload.get("enabled"))
     rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
     for r in rows:
-        r.enabled = bool(payload.get("enabled"))
+        r.enabled = enabled
+    # mirror the switch into the output playlist (vod/series; live channels are
+    # curated custom channels and are added explicitly from the Playlist tab)
+    synced = {}
+    if payload.get("kind") in SYNC_KINDS:
+        synced = await sync_sources(db, payload["kind"], [r.id for r in rows], enabled)
     await db.commit()
     await db_log("INFO", "sources",
-                 f"{payload['kind']}: {len(rows)} items -> enabled={bool(payload.get('enabled'))}")
-    return {"ok": True, "count": len(rows)}
+                 f"{payload['kind']}: {len(rows)} items -> enabled={enabled}"
+                 + (f" (playlist: +{synced.get('created', 0)} new, "
+                    f"{synced.get('enabled', 0)} re-enabled, "
+                    f"{synced.get('disabled', 0)} switched off)" if synced else ""))
+    return {"ok": True, "count": len(rows), "playlist": synced}
 
 
 @router.post("/series/seasons/toggle")
@@ -272,12 +283,33 @@ async def del_local_dir(did: int, db=Depends(get_db)):
 
 @router.post("/local/dirs/toggle")
 async def toggle_local_dirs(payload: dict, db=Depends(get_db)):
+    enabled = bool(payload.get("enabled"))
     rows = (await db.execute(select(LocalSource).where(
         LocalSource.id.in_(payload.get("ids", []))))).scalars().all()
     for r in rows:
-        r.enabled = bool(payload.get("enabled"))
+        r.enabled = enabled
+    # local files inherit the switch: mirror the whole directory into the Local
+    # playlist in one go (bulk, single transaction)
+    synced = {}
+    if rows:
+        file_ids = (await db.execute(select(LocalFile.id).where(
+            LocalFile.local_source_id.in_([r.id for r in rows])))).scalars().all()
+        synced = await sync_sources(db, "local", file_ids, enabled)
     await db.commit()
-    return {"ok": True, "count": len(rows)}
+    return {"ok": True, "count": len(rows), "playlist": synced}
+
+
+@router.post("/local/files/toggle")
+async def toggle_local_files(payload: dict, db=Depends(get_db)):
+    """Enable/disable individual scanned files (also syncs the Local playlist)."""
+    enabled = bool(payload.get("enabled"))
+    rows = (await db.execute(select(LocalFile).where(
+        LocalFile.id.in_(payload.get("ids", []))))).scalars().all()
+    for r in rows:
+        r.enabled = enabled
+    synced = await sync_sources(db, "local", [r.id for r in rows], enabled)
+    await db.commit()
+    return {"ok": True, "count": len(rows), "playlist": synced}
 
 
 @router.post("/local/scan")
@@ -289,6 +321,7 @@ async def scan_local(payload: dict, db=Depends(get_db)):
         stmt = stmt.where(LocalSource.id.in_(ids))
     dirs = (await db.execute(stmt)).scalars().all()
     total_new, total_seen, total_skipped = 0, 0, 0
+    added_to_playlist = 0
     for d in dirs:
         base = Path(d.directory)
         if not base.is_absolute():
@@ -344,7 +377,19 @@ async def scan_local(payload: dict, db=Depends(get_db)):
         await db.commit()
         total_new += n_new
         await db_log("INFO", "local", f"scanned {base}: {n_new} new video files")
-    return {"ok": True, "new": total_new, "seen": total_seen, "skipped": total_skipped}
+    # newly found files belong in the Local playlist straight away (bulk insert:
+    # only rows that do not exist yet are created, nothing is switched off)
+    if dirs:
+        file_ids = (await db.execute(select(LocalFile.id).where(
+            LocalFile.local_source_id.in_([d.id for d in dirs])))).scalars().all()
+        add = await add_sources(db, "local", file_ids)
+        await db.commit()
+        added_to_playlist = add["added"]
+        if add["added"]:
+            await db_log("INFO", "local",
+                         f"{add['added']} file(s) added to the Local playlist")
+    return {"ok": True, "new": total_new, "seen": total_seen, "skipped": total_skipped,
+            "playlist_added": added_to_playlist}
 
 
 @router.get("/local/files")

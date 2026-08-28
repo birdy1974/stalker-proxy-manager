@@ -9,6 +9,8 @@ hardened with the Phase-1 findings and the quirks you reported):
   * VOD and Series BOTH live under type=vod on many portals; on others series
     use type=series. We try both and accept whichever answers.
   * paginate with `p=` (pages of ~14), budgets are enforced by the caller
+  * `get_all_channels` returns the WHOLE live list in one request where the
+    portal supports it - preferred over paging through every genre
   * every request/response is summarized to the debug log for fault finding
 """
 
@@ -296,6 +298,33 @@ class StalkerClient:
         items = js.get("data") if isinstance(js, dict) else None
         total = int(js.get("total_items", 0) or 0) if isinstance(js, dict) else 0
         return Page(items=items if isinstance(items, list) else [], total=total)
+
+    async def all_channels(self) -> list[dict]:
+        """
+        The COMPLETE live channel list in ONE request.
+
+        Real set-top boxes use `type=itv&action=get_all_channels` instead of
+        walking get_ordered_list genre by genre, and it is what "fetch the whole
+        list" means for channels: one HTTP round trip for the entire catalog
+        instead of up to FETCH_PAGE_BUDGET pages for every enabled genre.
+
+        Portals that do NOT implement it answer with an error or an empty
+        payload; this returns [] then and the caller falls back to paging.
+        """
+        data = await self._get({"type": "itv", "action": "get_all_channels",
+                                "JsHttpRequest": "1-xml"})
+        js = data.get("js")
+        if isinstance(js, dict):
+            items = js.get("data")
+            if not isinstance(items, list):       # some panels: {id: channel}
+                items = [v for v in js.values() if isinstance(v, dict)]
+        elif isinstance(js, list):
+            items = js
+        else:
+            items = []
+        rows = [i for i in items if isinstance(i, dict) and str(i.get("id", "")).strip()]
+        log.info("all_channels -> %d rows", len(rows))
+        return rows
 
     async def vod_list(self, category_id: str | None, page: int) -> Page:
         """VOD items. `sortby=added` + `not_ended=0` per spec; is_series=0 tolerated loosely."""
