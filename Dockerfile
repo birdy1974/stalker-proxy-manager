@@ -60,8 +60,8 @@ EXPOSE 8880
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8880/login >/dev/null || exit 1
 
-# --log-level warning: suppress uvicorn's own startup/access lines so the
-# LAST line the container emits during boot is the app's "Stalker Proxy
-# Manager" boot marker (see app/main.py - CI greps docker logs with grep -q and
-# any trailing line causes a SIGPIPE failure of the pipeline on pipefail).
-CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8880", "--log-level", "warning"]
+# No --log-config / --log-level tricks needed: app.main re-attaches uvicorn's
+# handlers to stdout, so container stdout carries the complete log stream
+# (uvicorn startup lines + every [spm.*] record) in chronological order.
+# Keeping them on stderr would hide them from `docker logs <c> | grep`.
+CMD ["python3", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8880"]

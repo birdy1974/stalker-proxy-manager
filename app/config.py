@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import shutil
 import logging
+import sys
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -121,9 +122,19 @@ MOCK_PORTAL_ENABLED = os.environ.get("SPM_MOCK_PORTAL", "1") == "1"
 SKIP_LOGIN = os.environ.get("SPM_SKIP_LOGIN", "0") == "1"
 
 LOG_LEVEL = os.environ.get("SPM_LOG_LEVEL", "INFO").upper()
+# EVERY log record goes to stdout - on purpose, and it is load-bearing:
+# the Docker logging driver keeps a container's stdout and stderr apart, and
+# the CLI re-emits them on *its own* stdout/stderr. So `docker logs spm | grep
+# ...` (the natural way to check a container, and exactly what our CI smoke
+# test does) only ever searches stdout. Any line written to stderr is invisible
+# to such a pipe and instead leaks into the terminal unfiltered - which is why
+# the smoke test used to "fail with no output": the boot marker lived on stderr
+# and grep never saw it. main.py re-attaches uvicorn's own handlers the same way
+# so the whole image is single-stream (order preserved, no interleaving).
 logging.basicConfig(
     level=LOG_LEVEL,
     format="%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+    stream=sys.stdout,
 )
 log = logging.getLogger("spm.config")
 log.info("DATA_DIR=%s MEDIA_ROOT=%s", DATA_DIR, MEDIA_ROOT)

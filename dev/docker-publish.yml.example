@@ -29,7 +29,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata (tags: latest, sha, semver releases)
+      - name: "Image metadata (tags: latest, sha, semver releases)"
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -53,16 +53,20 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Boot smoke test: run the image with the built-in mock portal and verify
-  # that the GUI answers and the mock portal handshake works.
+  # that the GUI answers, the mock portal handshake works and the app booted
+  # cleanly. All the logic lives in dev/smoke.sh (verbose, self-diagnosing,
+  # and it cleans up after itself) - keep it there, not inline: an inline
+  # `docker logs | grep -q` is exactly the trap that made this job fail for
+  # six runs (see the script header for why it merges the log streams).
   smoke:
     runs-on: ubuntu-latest
     needs: build
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - name: Build (local)
         run: docker build -t spm-smoke .
       - name: Run with mock portal + hit health routes
-        # dev/smoke.sh is verbose and self-diagnosing: it prints every probe,
-        # cleans up the container (also on failure) and dumps container state
-        # + logs when a check fails.
         run: bash dev/smoke.sh
+        env:
+          SPM_SMOKE_IMAGE: spm-smoke
