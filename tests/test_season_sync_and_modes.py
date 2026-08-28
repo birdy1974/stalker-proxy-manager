@@ -13,6 +13,7 @@ These pin two reported bugs:
 
 from __future__ import annotations
 
+import pytest
 from sqlalchemy import delete, select
 
 from app.database import SessionLocal
@@ -194,3 +195,75 @@ async def test_boot_hook_links_seasons_that_have_none():
         rows = (await s.execute(select(SeriePlaylistSeason).where(
             SeriePlaylistSeason.serie_playlist_id == pid))).scalars().all()
         assert [r.serie_season_id for r in rows] == [season_id]
+
+
+# ---------------------------------------------------------------------------
+# the black-screen bug: a stream that produces nothing must not answer 200
+# ---------------------------------------------------------------------------
+
+async def test_guarded_stream_rejects_an_empty_body():
+    """
+    `200 OK` + `content-type: video/mp2t` + zero bytes is exactly what rendered
+    as "player popup, black screen, nothing playing" - the browser has a valid
+    response and no error to show. _guarded turns that into a 502 with a reason.
+    """
+    from fastapi import HTTPException
+
+    from app.routers.output import _guarded
+
+    async def empty():
+        return
+        yield b""                                  # pragma: no cover
+
+    with pytest.raises(HTTPException) as ei:
+        await _guarded(empty(), "test stream", "thing")
+    assert ei.value.status_code == 502
+    assert "produced no data" in ei.value.detail
+
+
+async def test_guarded_stream_passes_a_working_one_through_untouched():
+    from app.routers.output import _guarded
+
+    async def good():
+        for i in range(4):
+            yield b"chunk%d" % i
+
+    body = await _guarded(good(), "test stream", "thing")
+    got = [c async for c in body]
+    assert got == [b"chunk0", b"chunk1", b"chunk2", b"chunk3"]
+
+
+async def test_guarded_stream_reports_a_pipe_that_raises():
+    from fastapi import HTTPException
+
+    from app.routers.output import _guarded
+
+    async def broken():
+        yield b""
+        raise RuntimeError("ffmpeg died")
+
+    with pytest.raises(HTTPException) as ei:
+        await _guarded(broken(), "test stream", "thing")
+    assert ei.value.status_code == 502
+    assert "ffmpeg died" in ei.value.detail
+
+
+async def test_player_libraries_are_served_locally_not_from_a_cdn():
+    """
+    The popup loads hls.js/mpegts.js. When they came from jsdelivr, a box that
+    cannot reach the CDN left `window.mpegts` undefined, the player fell back to
+    `video.src = <raw mpeg-ts>` (undecodable in any browser) and showed black.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url=BASE) as c:
+        page = (await c.get("/dashboard")).text
+        assert "cdn.jsdelivr.net/npm/mpegts" not in page
+        assert "cdn.jsdelivr.net/npm/hls" not in page
+        for path in ("/static/vendor/mpegts.js", "/static/vendor/hls.min.js"):
+            r = await c.get(path)
+            assert r.status_code == 200, f"{path} -> {r.status_code}"
+            assert len(r.content) > 50_000, f"{path} looks truncated: {len(r.content)} bytes"

@@ -15,6 +15,9 @@ Streams honour per-user max_connections and group filters.
 
 from __future__ import annotations
 
+import asyncio
+import os
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
@@ -113,6 +116,45 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
 
 
 # ---------------------------------------------------------------- streaming
+# Answering `200 OK` + `content-type: video/mp2t` with an empty body is what a
+# browser turns into "player popup, black screen, no error anywhere" and what a
+# set-top box turns into a silent hang. We can only change the status code
+# before the first byte goes out, so peek at the first chunk and fail loudly.
+FIRST_CHUNK_TIMEOUT = float(os.environ.get("SPM_FIRST_CHUNK_TIMEOUT", "25"))
+
+
+async def _guarded(gen, label: str, item_name: str = ""):
+    """
+    Yield `gen` unchanged, but only after proving it produces at least one
+    chunk. Raises HTTPException(502) instead of streaming nothing.
+    """
+    first = None
+    try:
+        async with asyncio.timeout(FIRST_CHUNK_TIMEOUT):
+            async for chunk in gen:
+                if chunk:
+                    first = chunk
+                    break
+    except TimeoutError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - report, never swallow
+        raise HTTPException(502, f"{label}: the stream pipe failed: "
+                                 f"{type(exc).__name__}: {exc}")
+    if first is None:
+        await db_log("ERROR", "output",
+                     f"[{item_name or label}] produced no data within "
+                     f"{FIRST_CHUNK_TIMEOUT:.0f}s -> 502 (not a silent 200)")
+        raise HTTPException(502, f"{label}: the source produced no data "
+                                 f"(ffmpeg missing, template failed, or the panel "
+                                 f"returned an empty stream). Check Logs → stream.")
+
+    async def body():
+        yield first
+        async for chunk in gen:
+            yield chunk
+    return body()
+
+
 async def _stream_mode(explicit: str) -> str:
     """`proxy` (ffmpeg in the middle) or `redirect` (302 to the panel's CDN)."""
     if explicit in ("proxy", "redirect"):
@@ -154,7 +196,8 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     # disappears (then it kills the stream; see watch_disconnect). watch() keeps
     # a strong reference, so the task cannot be garbage-collected mid-flight.
     MANAGER.watch(request, handle)
-    return StreamingResponse(gen, media_type="video/mp2t",
+    body = await _guarded(gen, label, handle.item_name)
+    return StreamingResponse(body, media_type="video/mp2t",
                              headers={"Cache-Control": "no-store",
                                       "X-SPM-Stream": handle.id})
 
@@ -255,5 +298,6 @@ async def preview(kind: str, sid: int, request: Request, db=Depends(get_db)):
     if handle.dead:
         raise HTTPException(404, "preview failed: no data from source")
     MANAGER.watch(request, handle)
-    return StreamingResponse(gen, media_type="video/mp2t",
+    body = await _guarded(gen, f"preview {kind} #{sid}", name)
+    return StreamingResponse(body, media_type="video/mp2t",
                              headers={"Cache-Control": "no-store"})
