@@ -179,6 +179,21 @@ async def startup() -> None:
     # Reaps streams whose teardown was lost, so a MAC or a user's connection
     # slot can never stay occupied until the next restart.
     _bg.add(asyncio.create_task(MANAGER.reap_dead(), name="spm-stream-reaper"))
+    _bg.add(asyncio.create_task(_reap_sessions(), name="spm-session-reaper"))
+
+
+async def _reap_sessions() -> None:
+    """Close portal sessions nothing has asked for in a while (keeps the pool
+    from holding a socket open per MAC forever)."""
+    from .portal.pool import POOL
+    while True:
+        try:
+            await asyncio.sleep(300)
+            await POOL.reap()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the loop must not die
+            log.exception("session reaper failed")
 
 
 @app.on_event("shutdown")
@@ -186,6 +201,8 @@ async def shutdown() -> None:
     # Log rows live on a queue drained by a writer task; the pool is torn down
     # right after this, so anything still queued has to be committed now.
     await stop_log_writer()
+    from .portal.pool import POOL
+    await POOL.close_all()
 
 
 async def _heal_season_links() -> None:

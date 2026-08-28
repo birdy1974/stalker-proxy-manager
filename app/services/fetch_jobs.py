@@ -28,6 +28,7 @@ from ..models import (
     LiveGenre, LiveSource, MacAddress, Portal, SerieEpisode, SerieGenre,
     SerieSeason, SerieSource, VodGenre, VodSource,
 )
+from ..portal.pool import POOL
 from ..portal.client import PortalError, StalkerClient
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
@@ -147,7 +148,7 @@ async def _run_portal_fetch(job: Job) -> None:
             await s.commit()
         await db_log("INFO", "fetch", f"[{portal_name}] resolved -> {resolved}")
 
-    client = StalkerClient(resolved, mac.mac, mac.password)
+    client = await POOL.get(resolved, mac.mac, mac.password)
     try:
         await client.handshake()
         # refresh MAC expiry/status while we are here

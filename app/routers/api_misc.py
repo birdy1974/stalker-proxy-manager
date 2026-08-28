@@ -54,6 +54,8 @@ async def dashboard(db=Depends(get_db)):
         per_user[st["user_name"] or "-"] = per_user.get(st["user_name"] or "-", 0) + 1
     api = api_stats.snapshot()
     api["streams_active"] = len(streams)
+    from ..portal.pool import POOL
+    api["portal_sessions"] = POOL.stats()
     api["streams_per_user"] = [{"user": k, "streams": v}
                                for k, v in sorted(per_user.items(), key=lambda kv: -kv[1])]
     return {"stats": stats, "streams": streams, "jobs": list_jobs()[:5], "api": api}

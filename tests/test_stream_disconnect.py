@@ -59,14 +59,24 @@ class _FakeStalkerClient:
 
     def __init__(self, *args, **kwargs) -> None:
         self.portal_url = args[0] if args else ""
+        self.shared = False                 # the pool sets this on what it hands out
 
     async def handshake(self) -> None:
+        return None
+
+    async def ensure_auth(self) -> None:
+        return None
+
+    def invalidate(self) -> None:
         return None
 
     async def create_link(self, cmd: str, kind: str) -> str:
         return "http://portal.invalid/stream/1.ts"
 
     async def close(self) -> None:
+        return None
+
+    async def _aclose(self) -> None:
         return None
 
 
@@ -131,6 +141,10 @@ async def _run_until_disconnect(app, *, chunks: int) -> int:
 # ----------------------------------------------------------------------- tests
 async def test_stream_teardown_is_clean_after_client_disconnect(pool_errors, monkeypatch):
     """The production scenario, end to end through the real pump."""
+    # Construction now happens inside the shared pool, so the fake has to be
+    # installed there - patching sm.StalkerClient no longer intercepts anything.
+    from app.portal import pool as _pool
+    monkeypatch.setattr(_pool, "StalkerClient", _FakeStalkerClient)
     monkeypatch.setattr(sm, "StalkerClient", _FakeStalkerClient)
     monkeypatch.setattr(sm.StreamManager, "_spawn", _spawn_stub)
 

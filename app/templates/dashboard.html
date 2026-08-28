@@ -117,6 +117,11 @@ function renderApi(a) {
     cell(a.slowest_ms + " ms", "slowest first byte");
   const users = (a.streams_per_user || []).map(u => `${esc(u.user)}: ${u.streams}`).join(" · ");
   if (users) $("#api-summary").innerHTML += `<div class="col-12 text-muted">connections — ${users}</div>`;
+    const ps = a.portal_sessions;
+    if (ps) $("#api-summary").innerHTML +=
+      `<div class="col-12 text-muted" title="Stalker sessions are reused instead of re-handshaking per request">` +
+      `portal sessions \u2014 ${ps.sessions_open} open, ${ps.reused} reused / ${ps.handshakes} handshakes ` +
+      `(${ps.reuse_pct}%)</div>`;
   $("#api-paths").innerHTML = (a.top_paths || []).map(p =>
     `<div class="d-flex justify-content-between border-bottom"><span class="mono">${esc(p.path)}</span><span class="text-muted">${p.hits}</span></div>`
   ).join("") || '<span class="text-muted">none yet</span>';

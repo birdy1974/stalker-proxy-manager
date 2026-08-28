@@ -57,3 +57,18 @@ async def pool_errors():
     finally:
         logger.removeHandler(handler)
         logger.setLevel(old_level)
+
+
+@pytest.fixture(autouse=True)
+async def _reset_portal_pool():
+    """Reset the shared portal session pool around every test.
+
+    The pool is a process-wide singleton, so without this a fake client
+    installed by one test would be handed to the next one.
+    """
+    from app.portal.pool import POOL
+    await POOL.close_all()
+    POOL.hits = POOL.misses = 0
+    yield
+    await POOL.close_all()
+    POOL.hits = POOL.misses = 0

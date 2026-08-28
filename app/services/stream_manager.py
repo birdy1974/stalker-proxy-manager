@@ -41,6 +41,7 @@ from ..models import (
     SeriePlaylistSource, SerieSeason, SerieSource, VodPlaylist, VodPlaylistSource,
     VodSource,
 )
+from ..portal.pool import POOL
 from ..portal.client import MAG_UA, PortalError, StalkerClient
 from .db_logging import db_log
 from .ffmpeg_templates import URL_PLACEHOLDER
@@ -547,8 +548,8 @@ class StreamManager:
             for mac_row in macs:
                 if mac_row.id in self.mac_locks:
                     continue                      # occupied by one of our own pipes
-                client = StalkerClient(portal.resolved_url or portal.base_url,
-                                       mac_row.mac, mac_row.password, portal.proxy_url)
+                client = await POOL.get(portal.resolved_url or portal.base_url,
+                                        mac_row.mac, mac_row.password, portal.proxy_url)
                 try:
                     if not portal.resolved_url:
                         from ..portal.resolver import resolve_portal
@@ -556,7 +557,8 @@ class StreamManager:
                         if res.ok:
                             portal.resolved_url = res.portal_url
                             client.portal_url = res.portal_url
-                    await client.handshake()
+                            client.invalidate()   # token was for the old URL
+                    await client.ensure_auth()
                     url = await client.create_link(getattr(_src, "cmd", "") or "", link_kind)
                 except PortalError as exc:
                     await db_log("WARNING", "stream",
@@ -667,8 +669,8 @@ class StreamManager:
                     await db_log("INFO", "stream",
                                  f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
                                  f"portal '{portal.name}' mac {mac_row.mac}")
-                    client = StalkerClient(portal.resolved_url or portal.base_url,
-                                           mac_row.mac, mac_row.password, portal.proxy_url)
+                    client = await POOL.get(portal.resolved_url or portal.base_url,
+                                     mac_row.mac, mac_row.password, portal.proxy_url)
                     url = None
                     try:
                         if not portal.resolved_url:
@@ -677,7 +679,8 @@ class StreamManager:
                             if res.ok:
                                 portal.resolved_url = res.portal_url
                                 client.portal_url = res.portal_url
-                        await client.handshake()
+                                client.invalidate()   # token was for the old URL
+                        await client.ensure_auth()
                         link_kind = "live" if kind == "live" else "vod"
                         url = await client.create_link(getattr(src, "cmd", "") or "", link_kind)
                     except PortalError as exc:
