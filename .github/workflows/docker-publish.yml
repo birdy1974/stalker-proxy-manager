@@ -29,7 +29,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Image metadata (tags: latest, sha, semver releases)
+      - name: "Image metadata (tags: latest, sha, semver releases)"
         id: meta
         uses: docker/metadata-action@v5
         with:
