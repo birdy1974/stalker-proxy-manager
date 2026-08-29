@@ -17,6 +17,12 @@
         <span class="small text-muted">fields ⇄ command stay in sync automatically</span>
       </div>
       <div class="card-body">
+        <div class="alert alert-info py-2 small d-none" id="redirect-note">
+          <i class="bi bi-arrow-right-circle me-1"></i><b>Bypass ffmpeg.</b>
+          Channels assigned this template are 302-redirected straight to the portal's CDN:
+          instant start and no CPU, but no transcode and no mid-stream fallback.
+          The command text is a marker and cannot be edited here.
+        </div>
         <div class="row g-2">
               <div class="col-8"><label class="muted-label">Name</label><input class="form-control form-control-sm" id="f-name"></div>
               <div class="col-4 d-flex align-items-end"><div class="form-check form-switch">
@@ -49,11 +55,11 @@
                 </select></div>
               <div class="col-4"><label class="muted-label">Maxrate</label>
                 <select class="form-select form-select-sm ff-field" id="f-maxrate">
-                  <option value="">—</option><option>750k</option><option selected>1200k</option><option>1800k</option><option>3000k</option><option>4800k</option><option>8000k</option>
+                  <option value="">—</option><option>750k</option><option selected>1100k</option><option>1300k</option><option>1800k</option><option>2750k</option><option>3000k</option><option>4800k</option><option>8000k</option>
                 </select></div>
               <div class="col-4"><label class="muted-label">Bufsize</label>
                 <select class="form-select form-select-sm ff-field" id="f-bufsize">
-                  <option value="">—</option><option selected>1800k</option><option>2700k</option><option>4500k</option><option>7200k</option>
+                  <option value="">—</option><option selected>2000k</option><option>2400k</option><option>2700k</option><option>4500k</option><option>5000k</option><option>7200k</option>
                 </select></div>
               <div class="col-3"><label class="muted-label">FPS</label>
                 <select class="form-select form-select-sm ff-field" id="f-fps"><option value="">src</option><option selected>25</option><option>30</option><option>50</option></select></div>
@@ -62,8 +68,18 @@
                 <select class="form-select form-select-sm ff-field" id="f-profile"><option>high</option><option>main</option><option>baseline</option></select></div>
               <div class="col-3"><label class="muted-label">Level</label>
                 <select class="form-select form-select-sm ff-field" id="f-level"><option>4.1</option><option>4.0</option><option>3.1</option><option>5.1</option></select></div>
+              <div class="col-4 d-flex align-items-end"><div class="form-check form-switch">
+                <input class="form-check-input ff-field" type="checkbox" id="f-low_power"><label class="form-check-label small">VAAPI low-power (LP encoder)</label></div></div>
+              <div class="col-4"><label class="muted-label">VAAPI rate control</label>
+                <select class="form-select form-select-sm ff-field" id="f-rc_mode">
+                  <option value="auto">auto</option><option value="cqp">cqp</option><option value="cbr">cbr</option>
+                  <option value="vbr" selected>vbr</option><option value="icq">icq</option><option value="qvbr">qvbr</option><option value="avbr">avbr</option>
+                </select></div>
+              <div class="col-4"><label class="muted-label">VAAPI async depth</label>
+                <input class="form-control form-control-sm ff-field" id="f-async_depth" value="4" inputmode="numeric"></div>
+              <div class="col-12 small text-muted mb-1">Low-power / rate-control / async-depth apply to <code>h264_vaapi</code>·<code>hevc_vaapi</code> encoders (the DS918+ hardware path).</div>
               <div class="col-4"><label class="muted-label">Audio codec</label>
-                <select class="form-select form-select-sm ff-field" id="f-audio_codec"><option>aac</option><option>ac3</option><option>mp3</option><option value="copy">copy</option><option value="none">none</option></select></div>
+                <select class="form-select form-select-sm ff-field" id="f-audio_codec"><option>aac</option><option>ac3</option><option>mp2</option><option>mp3</option><option value="copy">copy</option><option value="none">none</option></select></div>
               <div class="col-3"><label class="muted-label">Audio bitrate</label>
                 <select class="form-select form-select-sm ff-field" id="f-audio_bitrate"><option>96k</option><option selected>128k</option><option>160k</option><option>192k</option></select></div>
               <div class="col-2"><label class="muted-label">Channels</label>
@@ -101,9 +117,11 @@
 {% block scripts %}
 <script>
 const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","video_codec","video_bitrate",
-  "maxrate","bufsize","fps","gop","profile","level","audio_codec","audio_bitrate","audio_channels",
+  "maxrate","bufsize","fps","gop","profile","level","low_power","rc_mode","async_depth",
+  "audio_codec","audio_bitrate","audio_channels",
   "audio_rate","output_format","extra_input","extra_output"];
 let current = null, templates = [];
+const isRedirectTpl = (t) => (t.command || "").trim() === "@redirect";
 
 function readFields() {
   const o = {};
@@ -127,6 +145,7 @@ function writeFields(t) {
 let syncTimer;
 async function fieldsToCommand() {
   clearTimeout(syncTimer);
+  if (current && isRedirectTpl(current)) return;   // marker template: command is fixed
   syncTimer = setTimeout(async () => {
     const o = readFields();
     const r = await api("/api/ffmpeg/build", { method: "POST", body: o });
@@ -155,9 +174,12 @@ async function loadList() {
   const host = $("#tpl-list"); host.innerHTML = "";
   for (const t of templates) {
     const b = el("button", { class: "btn btn-sm w-100 text-start mb-1 " + (current?.id === t.id ? "btn-accent" : "btn-light") });
+    const sub = isRedirectTpl(t)
+      ? "302 redirect to panel CDN · bypasses ffmpeg"
+      : `${esc(t.hw_accel)} · ${esc(t.video_codec)} · ${esc(t.resolution)} · ${esc(t.audio_codec)}`;
     b.innerHTML = `<div class="d-flex justify-content-between"><span>${esc(t.name)} ${t.is_default ? '<span class="badge text-bg-dark">default</span>' : ""}</span>
       <span class="badge ${t.enabled ? "st-online" : "st-unknown"}">${t.enabled ? "on" : "off"}</span></div>
-      <div class="small text-muted">${esc(t.hw_accel)} · ${esc(t.video_codec)} · ${esc(t.resolution)} · ${esc(t.audio_codec)}</div>`;
+      <div class="small text-muted">${sub}</div>`;
     b.addEventListener("click", () => selectTemplate(t.id));
     host.append(b);
   }
@@ -168,10 +190,23 @@ async function selectTemplate(id) {
   writeFields(current);
   $("#f-command").value = current.command || "";
   $("#sync-state").textContent = "";
+  /* the redirect preset is a marker, not an ffmpeg command: lock the option
+     fields and command text so a stray edit cannot turn it back into a real
+     command (name + enabled stay editable) */
+  const redir = isRedirectTpl(current);
+  $("#redirect-note").classList.toggle("d-none", !redir);
+  $$(".ff-field").forEach(n => { if (n.id !== "f-enabled") n.disabled = redir; });
+  $("#f-command").disabled = redir;
+  $("#btn-test-cmd").disabled = redir;
 }
 $("#tpl-new").addEventListener("click", () => {
   current = null; $("#ed-title").textContent = "New template (unsaved)";
-  writeFields({ name: "New template", enabled: true, hw_accel: "vaapi" });
+  $("#redirect-note").classList.add("d-none");
+  $$(".ff-field").forEach(n => n.disabled = false);
+  $("#f-command").disabled = false;
+  $("#btn-test-cmd").disabled = false;
+  writeFields({ name: "New template", enabled: true, hw_accel: "vaapi",
+                low_power: true, rc_mode: "vbr", async_depth: "4" });
   fieldsToCommand();
 });
 $("#tpl-save").addEventListener("click", async () => {

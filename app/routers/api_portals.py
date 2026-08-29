@@ -277,10 +277,31 @@ async def test_batch(payload: dict, db=Depends(get_db)):
 # ------------------------------------------------------------------ genres & fetch
 @router.post("/{pid}/fetch")
 async def start_fetch(pid: int, db=Depends(get_db)):
+    """Full fetch: genre lists + items of enabled genres + series seasons."""
     if not await db.get(Portal, pid):
         raise HTTPException(404, "portal not found")
     job = await submit("fetch_portal", pid)
     await db_log("INFO", "fetch", f"fetch job {job.id} queued for portal {pid}")
+    return {"job": job.public()}
+
+
+@router.post("/{pid}/fetch-genres")
+async def start_genre_fetch(pid: int, db=Depends(get_db)):
+    """Fetch ONLY the genre lists (live, vod, series) - no items."""
+    if not await db.get(Portal, pid):
+        raise HTTPException(404, "portal not found")
+    job = await submit("fetch_genres", pid)
+    await db_log("INFO", "fetch", f"genre fetch job {job.id} queued for portal {pid}")
+    return {"job": job.public()}
+
+
+@router.post("/{pid}/fetch-items")
+async def start_items_fetch(pid: int, db=Depends(get_db)):
+    """Fetch the items of ENABLED genres (live, vod, series) + seasons."""
+    if not await db.get(Portal, pid):
+        raise HTTPException(404, "portal not found")
+    job = await submit("fetch_items", pid)
+    await db_log("INFO", "fetch", f"items fetch job {job.id} queued for portal {pid}")
     return {"job": job.public()}
 
 

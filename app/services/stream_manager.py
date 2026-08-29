@@ -44,7 +44,7 @@ from ..models import (
 from ..portal.pool import POOL
 from ..portal.client import MAG_UA, PortalError, StalkerClient
 from .db_logging import db_log
-from .ffmpeg_templates import URL_PLACEHOLDER
+from .ffmpeg_templates import REDIRECT_COMMAND, URL_PLACEHOLDER
 
 log = logging.getLogger("spm.stream")
 
@@ -531,6 +531,48 @@ class StreamManager:
             if tpl is None:
                 return "(pass)", f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1"
             return tpl.name, (tpl.command or f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1")
+
+    async def _item_for(self, kind: str, ref_id: int):
+        """The playlist item owning a stream ref, for template resolution.
+
+        Kept deliberately light (no fallback-chain assembly): the redirect
+        decision only needs to know which template the item carries.
+        """
+        async with SessionLocal() as s:
+            if kind == "live":
+                return await s.get(LivePlaylist, ref_id)
+            if kind == "vod":
+                return await s.get(VodPlaylist, ref_id)
+            if kind == "episode":
+                ep = await s.get(SerieEpisode, ref_id)
+                if not ep:
+                    return None
+                season = await s.get(SerieSeason, ep.serie_season_id)
+                serie = await s.get(SerieSource, season.serie_source_id) if season else None
+                if not serie:
+                    return None
+                return (await s.execute(select(SeriePlaylist).where(
+                    SeriePlaylist.serie_source_id == serie.id,
+                    SeriePlaylist.enabled.is_(True)))).scalar_one_or_none()
+            if kind == "local":
+                return await s.get(LocalPlaylist, ref_id)
+        return None
+
+    async def uses_redirect(self, kind: str, ref_id: int) -> bool:
+        """True when the item's effective template is the redirect/bypass preset.
+
+        This backs the per-channel "bypass ffmpeg" mode: a playlist item whose
+        FFmpeg template is `REDIRECT_PRESET_NAME` is 302'd straight to the
+        panel's CDN instead of being proxied through ffmpeg. The redirect
+        preset is ALSO the built-in default template, so an item without an
+        explicit template assignment resolves to it and redirects too - the old
+        global switch, expressed as a template.
+        """
+        item = await self._item_for(kind, ref_id)
+        if item is None:
+            return False
+        _name, command = await self._template_for(item)
+        return command == REDIRECT_COMMAND
 
     # ------------------------------------------------------------ the pump
     async def resolve(self, kind: str, ref_id: int) -> tuple[str | None, str]:

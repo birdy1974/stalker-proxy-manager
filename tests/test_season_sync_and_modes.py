@@ -14,7 +14,7 @@ These pin two reported bugs:
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import delete, select
+from sqlalchemy import select
 
 from app.database import SessionLocal
 from app.models import (
@@ -27,7 +27,7 @@ from app.models import (
     SerieSource,
     User,
 )
-from app.services.playlist_gen import build_m3u, get_setting
+from app.services.playlist_gen import build_m3u
 from app.services.playlist_sync import sync_season_links
 
 BASE = "http://testserver"
@@ -107,28 +107,15 @@ async def test_unlinked_series_contribute_no_episodes_until_synced():
 # stream output mode
 # ---------------------------------------------------------------------------
 
-async def test_stream_mode_defaults_to_proxy_and_accepts_override():
-    from app.routers.output import _stream_mode
+async def test_wants_redirect_explicit_mode_param_wins():
+    from app.routers.output import _wants_redirect
 
-    assert await _stream_mode("") == "proxy"          # nothing configured
-    assert await _stream_mode("redirect") == "redirect"
-    assert await _stream_mode("proxy") == "proxy"
-    assert await _stream_mode("nonsense") == "proxy"  # bad value falls back
-
-    from app.models import Setting
-    async with SessionLocal() as s:
-        row = await s.get(Setting, "stream_mode") or Setting(key="stream_mode")
-        row.value = '"redirect"'
-        s.add(row)
-        await s.commit()
-    try:
-        assert await get_setting("stream_mode", "proxy") == "redirect"
-        assert await _stream_mode("") == "redirect"    # global default applies
-        assert await _stream_mode("proxy") == "proxy"  # per-request still wins
-    finally:
-        async with SessionLocal() as s:
-            await s.execute(delete(Setting).where(Setting.key == "stream_mode"))
-            await s.commit()
+    assert await _wants_redirect("live", 1, "redirect") is True
+    assert await _wants_redirect("live", 1, "proxy") is False
+    # a bad value falls through to the per-channel template check; with no
+    # item in the DB there is nothing to redirect
+    assert await _wants_redirect("live", 1, "nonsense") is False
+    assert await _wants_redirect("live", 999999, "") is False
 
 
 async def test_redirect_mode_fails_loudly_when_no_source_resolves():

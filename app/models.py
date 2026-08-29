@@ -264,6 +264,7 @@ class FFmpegTemplate(Base):
     name: Mapped[str] = mapped_column(String(120), unique=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)       # shipped preset (managed by the app)
     # ----- structured options (dropdown state; mirrored with `command`) -----
     hw_accel: Mapped[str] = mapped_column(String(10), default="vaapi")     # none|vaapi|qsv
     device: Mapped[str] = mapped_column(String(60), default="/dev/dri/renderD128")
@@ -277,6 +278,9 @@ class FFmpegTemplate(Base):
     gop: Mapped[str] = mapped_column(String(8), default="50")
     profile: Mapped[str] = mapped_column(String(12), default="high")
     level: Mapped[str] = mapped_column(String(8), default="4.1")
+    low_power: Mapped[bool] = mapped_column(Boolean, default=True)          # h264_vaapi EncSliceLP (DS918+ fixed-function encoder)
+    rc_mode: Mapped[str] = mapped_column(String(10), default="vbr")         # auto|cqp|cbr|vbr|icq|qvbr|avbr
+    async_depth: Mapped[str] = mapped_column(String(4), default="4")        # VAAPI frames in flight
     audio_codec: Mapped[str] = mapped_column(String(12), default="aac")    # aac|ac3|mp3|copy|none
     audio_bitrate: Mapped[str] = mapped_column(String(10), default="128k")
     audio_channels: Mapped[str] = mapped_column(String(4), default="2")

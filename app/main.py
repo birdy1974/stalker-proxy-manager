@@ -4,7 +4,7 @@ Stalker Proxy Manager - application entrypoint.
 Startup order:
   1. create tables (idempotent)
   2. purge active_streams rows left by a previous container run
-  3. seed default ffmpeg templates + settings on first boot
+  3. reconcile built-in ffmpeg templates + default settings (every boot)
   4. log retention cleanup
   5. start background fetch-job worker (implicit via submit)
 Everything is also mirrored to stdout, so Portainer shows the full story.
@@ -251,26 +251,70 @@ async def _hardware_sanity() -> None:
 
 
 async def _seed_defaults() -> None:
-    """First boot: default ffmpeg presets + default settings row."""
+    """
+    Built-in ffmpeg templates (defaults) live in the DATABASE, not in code.
+
+    These are the "default templates" the user can always rely on: they are
+    (re)seeded on EVERY boot so they survive deletion and pick up updates
+    (e.g. the VAAPI/Dreambox tuning). Rows are matched by name, so a user who
+    edits a built-in keeps their edits; deleting one brings it back at the next
+    boot. The "Redirect (bypass ffmpeg)" preset is the built-in default:
+    reconciling it on every boot means items without an explicit template
+    assignment are redirected to the panel CDN (no ffmpeg), and streams never
+    fall back to nothing. Default settings rows are seeded alongside
+    (idempotent).
+    """
+    from .services.ffmpeg_templates import (FFmpegOptions, REDIRECT_PRESET_NAME,
+                                             REFERENCE_PRESET_NAME)
     async with SessionLocal() as s:
-        have = (await s.execute(select(FFmpegTemplate).limit(1))).scalar_one_or_none()
-        if have is None:
-            from .services.ffmpeg_templates import FFmpegOptions
-            for p in default_presets():
-                name = p.pop("name")
-                s.add(FFmpegTemplate(name=name, is_default=name.startswith("VAAPI 720p"), **{
-                    "hw_accel": p["hw_accel"], "device": p["device"],
-                    "resolution": p["resolution"], "aspect": p["aspect"],
-                    "video_codec": p["video_codec"], "video_bitrate": p["video_bitrate"],
-                    "maxrate": p["maxrate"], "bufsize": p["bufsize"], "fps": p["fps"],
-                    "gop": p["gop"], "profile": p["profile"], "level": p["level"],
-                    "audio_codec": p["audio_codec"], "audio_bitrate": p["audio_bitrate"],
-                    "audio_channels": p["audio_channels"], "audio_rate": p["audio_rate"],
-                    "output_format": p["output_format"], "extra_input": p["extra_input"],
-                    "extra_output": p["extra_output"], "command": p["command"],
-                    "command_source": p["command_source"],
-                }))
-            log.info("seeded %d default ffmpeg templates", len(default_presets()))
+        for p in default_presets():
+            name = p.pop("name")
+            row = (await s.execute(select(FFmpegTemplate).where(
+                FFmpegTemplate.name == name))).scalar_one_or_none()
+            if row is None:
+                s.add(FFmpegTemplate(
+                    name=name, is_builtin=True,
+                    is_default=(name == REDIRECT_PRESET_NAME),
+                    **{k: p[k] for k in FFmpegOptions.__dataclass_fields__},
+                    command=p["command"], command_source=p["command_source"],
+                    enabled=True))
+                continue
+            # Built-in already exists: refresh identity + structured fields and
+            # command, but only from the FIELDS side - a user's manual command
+            # text stays untouched (their edits win).
+            row.is_builtin = True
+            if row.command_source == "fields":
+                row.command = p["command"]
+            for k, v in p.items():
+                if k in FFmpegOptions.__dataclass_fields__ and k not in ("name",):
+                    setattr(row, k, v)
+        # "Redirect (bypass ffmpeg)" is the built-in default. Reconcile it on
+        # every boot (like the other built-in fields), so installs that ran an
+        # earlier build - where "VAAPI 720p ~1M" was the fallback default -
+        # switch over too. A default that sits on a USER-created template
+        # (is_builtin=False) is a deliberate choice and is left untouched.
+        default = (await s.execute(select(FFmpegTemplate).where(
+            FFmpegTemplate.is_default.is_(True)))).scalar_one_or_none()
+        redir = (await s.execute(select(FFmpegTemplate).where(
+            FFmpegTemplate.name == REDIRECT_PRESET_NAME))).scalar_one_or_none()
+        if redir is not None and (default is None or default.is_builtin):
+            if default is not None and default.id != redir.id:
+                default.is_default = False
+            redir.is_default = True
+        elif default is None:
+            # redirect preset missing (cannot happen - it is re-seeded above,
+            # unless the user deleted it and the loop somehow skipped it): keep
+            # at least ONE enabled template default so streams never fall back
+            # to nothing.
+            ref = (await s.execute(select(FFmpegTemplate).where(
+                FFmpegTemplate.name == REFERENCE_PRESET_NAME))).scalar_one_or_none()
+            ref = ref or (await s.execute(select(FFmpegTemplate).where(
+                FFmpegTemplate.enabled.is_(True)).limit(1))).scalar_one_or_none()
+            if ref is not None:
+                ref.is_default = True
+        await s.commit()
+
+    async with SessionLocal() as s:
         from .routers.api_misc import DEFAULT_SETTINGS
         for k, v in DEFAULT_SETTINGS.items():
             if await s.get(Setting, k) is None:

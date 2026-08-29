@@ -8,10 +8,12 @@ same mechanism ffprobe would use, but with the single ffmpeg binary we ship.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 
 from ..config import FFMPEG_BIN, log
+from ..portal.client import MAG_UA
 
 _RE_DURATION = re.compile(
     r"Duration:\s*(\d+):(\d+):([\d.]+)(?:,.*?bitrate:\s*(\d+)\s*kb/s)?", re.I)
@@ -22,13 +24,38 @@ _RE_STREAM_AUDIO = re.compile(
     r"Stream .*?:\s*Audio:\s*(\w+)[^,]*,\s*(\d+)\s*Hz,\s*([^,]+)(?:.*?(\d+)\s*kb/s)?", re.I)
 _RE_DAR = re.compile(r"DAR\s+([0-9]+:[0-9]+)")
 
+# Wall-clock cap on a single probe. Network streams can be slow to connect and
+# to deliver enough data for analysis, so 10s was far too tight; 30s is the
+# default (override with SPM_PROBE_TIMEOUT). Failures are NOT cached, so a
+# retry after a slow first attempt actually runs again.
+PROBE_TIMEOUT = float(os.environ.get("SPM_PROBE_TIMEOUT", "30"))
+
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 300  # seconds — probing live streams is expensive
 
 
+def _probe_args(target: str, *, is_url: bool) -> list[str]:
+    """ffmpeg argv for one probe. Network streams get the MAG identity (same
+    as the real pipeline, so the probe reflects what the stream path sees)."""
+    args = [FFMPEG_BIN, "-hide_banner", "-nostdin"]
+    if is_url:
+        # generous read timeout but a hard wall-clock cap in probe_media
+        args += ["-rw_timeout", "15000000", "-reconnect", "1"]
+        args += ["-analyzeduration", "2500000", "-probesize", "2500000"]
+        # Impersonate the MAG box exactly like the real pipeline does
+        # (stream_manager._network_identity): panels/CDNs refuse or stall the
+        # default Lavf user-agent, which used to make the probe time out even
+        # though the stream itself was fine.
+        args += ["-user_agent", MAG_UA]
+        origin = target.split("://", 1)[-1].split("/", 1)[0]
+        args += ["-referer", f"{target.split('://', 1)[0]}://{origin}/"]
+    args += ["-i", target, "-t", "1", "-f", "null", "-"]
+    return args
+
+
 async def probe_media(target: str, *, is_url: bool) -> dict:
     """Return {'duration_s', 'overall_kbps', 'video': {...}, 'audio': [...]}
-    or {'error': '...'}. Cached a few minutes per target."""
+    or {'error': '...'}. Cached a few minutes per target (successes only)."""
     key = f"{target}|{is_url}"
     hit = _CACHE.get(key)
     if hit and time.time() - hit[0] < _CACHE_TTL:
@@ -48,26 +75,19 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
             except Exception:  # noqa: BLE001 - fall through to ffmpeg
                 pass
 
-    args = [FFMPEG_BIN, "-hide_banner"]
-    if is_url:
-        # generous read timeout but a hard wall-clock cap below
-        args += ["-rw_timeout", "6000000", "-reconnect", "1"]
-        args += ["-analyzeduration", "2500000", "-probesize", "2500000"]
-    args += ["-i", target, "-t", "1", "-f", "null", "-"]
+    args = _probe_args(target, is_url=is_url)
 
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
         try:
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=10)
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=PROBE_TIMEOUT)
         except asyncio.TimeoutError:
             try:
                 proc.kill()
             except ProcessLookupError:
                 pass
-            out = {"error": "probe timed out (>10s)"}
-            _CACHE[key] = (time.time(), out)
-            return out
+            return {"error": f"probe timed out (>{PROBE_TIMEOUT:.0f}s)"}
     except FileNotFoundError:
         return {"error": "ffmpeg binary not found"}
     except Exception as exc:  # noqa: BLE001

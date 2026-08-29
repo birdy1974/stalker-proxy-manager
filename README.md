@@ -44,6 +44,7 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here �
 | `SPM_DATABASE_URL` | sqlite | `postgresql+asyncpg://user:pass@host:5432/dbname` to switch to Postgres |
 | `SPM_ADMIN_USERNAME` / `SPM_ADMIN_PASSWORD` | `admin` / *(required)* | GUI login |
 | `SPM_VAAPI_DEVICE` | `/dev/dri/renderD128` | Intel Quick Sync render node |
+| `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
 | `SPM_MOCK_PORTAL` | `0` | `1` boots a built-in demo portal (test data, busy-MAC emulation) |
 | `SPM_LOG_LEVEL` | `INFO` | Python log level (all records go to container stdout) |
 | `SPM_SKIP_LOGIN` | `0` | **Mockup/preview only**: bypass admin login (`*** LOGIN DISABLED ***` banner in log). Never set on a real deployment |
@@ -133,8 +134,8 @@ and, when the ids do not match:
 ## The workflow
 
 1. **Portals** – add each Stalker portal base URL and its MAC addresses (optionally per-MAC password). *Check Portal* resolves the real endpoint (`/c/`, `/client/`, `/portal.php`, …) and verifies each MAC online (busy-ness and subscription expiry included). *Delete* offers a replacement-dialog cleanup for playlists that reference it.
-2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season.
-3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels.
+2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season. In the **Edit portal** popup this is a two-step flow: *Fetch genres* loads the live/VOD/series genre lists (all disabled by default — including the synthetic *(All VOD)* / *(All series)* a portal without categories gets), you tick the genres you want (the filter box narrows the list as you type), and **Save** then fetches the items of exactly those enabled genres.
+3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels. Clicking a **VOD** or **Series** row (or its ⓘ button) opens the same detail popup as Input Sources — stored portal metadata, a lazy **stream probe** (codec/resolution/bitrate) and **TMDB** enrichment. The ▶ *test stream* buttons (here and in Input Sources) open the preview player, which closes via its header **×** or the **Stop & Close** button.
 4. **Users** – each user gets `username/password` and can receive **M3U** and/or **Xtream** URLs (copy-buttons in the GUI). Per-user active-connection caps enforced.
 5. **Dashboard** – counters, active streams with kill buttons, quick actions (fetch, retry-busy), messages pane.
 
@@ -154,23 +155,80 @@ Users only ever talk to port **8880** — GUI, streams, playlists and APIs share
 
 ## ffmpeg templates & transcoding (DS918+ Quick Sync)
 
-Templates are full editable ffmpeg commands with GUI field ↔ command **2-way sync**: the option fields (encoder, bitrate, resolution, fps, GOP, audio, container, extra args) rebuild the command text, and editing the text parses back into the fields.
+Templates are full editable ffmpeg commands with GUI field ↔ command **2-way sync**: the option fields (encoder, bitrate, resolution, fps, GOP, audio, container, rate control, extra args) rebuild the command text, and editing the text parses back into the fields.
 
-Shipped presets:
+Shipped presets (stored as rows in the database and **re-seeded on every boot** — see below):
 
 | Template | Use |
 |---|---|
-| **VAAPI 720p ~1M (DS918+ reference)** | hardware H.264 via `/dev/dri/renderD128` — default |
+| VAAPI 720p ~1M (DS918+ reference) | hardware H.264 via `/dev/dri/renderD128` |
 | VAAPI 1080p ~2.5M | hardware, full HD |
 | QSV 720p ~1M | Quick Sync via `-hwaccel qsv` (alternative syntax) |
 | Software 720p (libx264) | no-GPU fallback |
-| Copy / passthrough | remux only (`-c copy`); also the automatic default when no GPU device is mapped |
+| Copy / passthrough | remux only (`-c copy`); also the automatic fallback when no GPU device is mapped |
+| **Dreambox DM800se (Enigma2 / MPEG2-SD)** | downmix to an MPEG-2 transport stream the ancient Enigma2/openpli box can play (see below) |
+| **Redirect (bypass ffmpeg)** | not an ffmpeg command at all — the player is 302-redirected straight to the portal's CDN. **The default template**: any item without an explicit template assignment redirects (see below) |
+
+**Redirect (bypass ffmpeg) is the default.** The old global *proxy vs redirect* switch in Settings is gone: redirect is now a built-in template **and the default**. An item without an explicit template assignment is 302-redirected straight to the portal's CDN — instant start and zero CPU, but no transcode, no transport-stream rewriting and no mid-stream fallback. Assign any other template (inline *FFmpeg tpl* dropdown, the edit dialog, or bulk *Assign template…* in the Playlist Builder) to switch that channel back to ffmpeg proxying/transcoding. The `?mode=redirect` / `?mode=proxy` query parameter still works as a per-URL override.
+
+**Default templates are persistent (stored in the database).** The shipped presets are real `ffmpeg_templates` rows marked `is_builtin`. On every boot the app reconciles them by name, so:
+
+* they survive deletion (delete one, restart → it is back),
+* they pick up fixes/tuning shipped in new releases,
+* your edits win — a built-in whose command you changed by hand keeps your text,
+* the built-in **default** (*Redirect (bypass ffmpeg)*) is reconciled on every boot, so upgrades switch over too; a default set on a *user-created* template is never overridden.
+
+> Deleting a built-in template is therefore always safe — the next restart restores it, and the DS918+ reference preset stays available as a fallback.
+
+**VAAPI tuning (what the `low-power` / `rate-control` / `async-depth` fields do).** The VAAPI presets are tuned for the Intel iHD driver on Apollo Lake (the DS918+'s J3455). The reference 720p template renders to:
+
+```text
+ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1
+       -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err
+       -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi
+       -hwaccel_device intel -hwaccel_output_format vaapi -i <url>
+       -vf scale_vaapi=w=1280:h=720:format=nv12,fps=25,setsar=1
+       -map 0:v:0 -map 0:a:0? -sn -dn
+       -c:v h264_vaapi -b:v 1000k -maxrate 1100k -bufsize 2000k -profile:v high -level 4.1
+       -g 50 -r 25 -low_power 1 -rc_mode vbr -async_depth 4
+       -c:a aac -b:a 128k -ac 2 -ar 48000
+       -f mpegts -mpegts_flags +resend_headers pipe:1
+```
+
+**Bitrate numbers are tuned for external (internet) streaming.** On a LAN the NAS uploads as fast as it likes; over the internet a bursty stream underruns the viewer's download link and stalls. Every transcode preset therefore caps spikes close to the target (`maxrate` ≈ bitrate + 10 %) and carries a ~2-second VBV buffer (`bufsize` = 2× bitrate) so short-lived congestion is absorbed by the encoder instead of freezing the player. The shipped values:
+
+| Preset | `-b:v` | `-maxrate` | `-bufsize` |
+|---|---|---|---|
+| VAAPI 720p ~1M (reference) | 1000k | 1100k | 2000k |
+| VAAPI 1080p ~2.5M | 2500k | 2750k | 5000k |
+| QSV 720p ~1M | 1000k | 1100k | 2000k |
+| Software 720p (libx264) | 1200k | 1300k | 2400k |
+| Dreambox DM800se | 1200k | 1300k | 2400k |
+
+* `-low_power 1` selects the **fixed-function H.264 encoder** (`VAEntrypointEncSliceLP` in `vainfo`) instead of the EU/3D path — faster, lower power, and it leaves the GPU's shader units free for more concurrent streams. On this silicon it only exists for **H.264**, so the flag is emitted for `h264_vaapi` only (an HEVC low-power entrypoint would fail).
+* `-rc_mode vbr` makes rate control **explicit** — VAAPI's implicit "auto" mode is driver-dependent, so `-b:v`/`-maxrate` are otherwise not guaranteed to be honoured the same way across driver versions. `cbr` is there too when you need a hard bandwidth ceiling (set *maxrate = bitrate* for true CBR).
+* `-async_depth 4` keeps more frames in flight → higher throughput and a faster time-to-first-frame.
+
+**Reading your `vainfo` output:** `VAEntrypointVLD` = hardware *decode*; `EncSlice`/`EncSliceLP` = hardware *encode*. On the DS918+ that means **H.264 encode is the sweet spot** (`EncSlice` + `EncSliceLP`), HEVC/VP8 encode is 8-bit only (`HEVCMain` has `EncSlice`, no `Main10` encode, no low-power), and VP9 is decode-only. Use `h264_vaapi` for live transcoding; avoid `hevc_vaapi` for realtime use.
 
 Verify acceleration inside the container with `vainfo -a` (should list EGL/VA-API entrypoints for the iHD driver).
 
-**Identity of the outgoing ffmpeg request:** for `http(s)` inputs the manager injects `-user_agent "<MAG200 UA>"` and `-referer "<stream origin>/"` in front of `-i` — unless the template sets them itself. ffmpeg would otherwise announce itself as `Lavf/61.x` and send no referer, which plenty of panels (and the CDNs in front of them) answer with **403/405** on an otherwise perfectly valid token.
+**Dreambox DM800se (Enigma2, old openpli).** That box's ancient gstreamer cannot demux modern HEVC/VP9 or AAC-in-TS cleanly, and its 400 MHz MIPS CPU cannot decode 1080p. The built-in *Dreambox* template therefore transodes on the NAS to exactly what it *can* play — H.264 **Main@3.1** in **576p** (16:9 anamorphic) with **MPEG-1 Layer II audio** (universally understood by Enigma2) inside an MPEG-2 transport stream:
 
-At boot the app performs a **hardware sanity check**: if the default template needs VAAPI/QSV but the device is absent, the default degrades to *Copy* with a warning in the log — streams never die silently.
+```text
+-vf scale_vaapi=w=1024:h=576:format=nv12,fps=25,setsar=1
+-c:v h264_vaapi -b:v 1200k -maxrate 1300k -bufsize 2400k -profile:v main -level 3.1
+-c:a mp2 -b:a 192k -ac 2 -ar 48000
+-f mpegts -mpegts_flags +resend_headers pipe:1
+```
+
+Assign it to a channel/playlist in the Playlist Builder and point the Dreambox at that M3U (or the per-channel `/play/live/{id}.ts` URL). If the box still struggles, raise `gop` or drop the bitrate — the fields are all editable in the FFmpeg tab.
+
+> **Upgrading an existing install:** built-in presets are re-seeded on every boot now, so pulling this change and restarting the container adds the Dreambox template and refreshes the built-in commands automatically (your own edits are kept).
+
+**Identity of the outgoing ffmpeg request:** for `http(s)` inputs the manager injects `-user_agent "<MAG200 UA>"` and `-referer "<stream origin>/"` in front of `-i` — unless the template sets them itself. ffmpeg would otherwise announce itself as `Lavf/61.x` and send no referer, which plenty of panels (and the CDNs in front of them) answer with **403/405** on an otherwise perfectly valid token. The detail-popup **stream probe** uses the same identity, so a probe reflects what the stream path actually gets.
+
+At boot the app performs a **hardware sanity check**: if the default template needs VAAPI/QSV but the device is absent, the default degrades to *Copy* with a warning in the log — streams never die silently. (The built-in default is *Redirect*, which needs no GPU, so this only matters once you pick a VAAPI/QSV template as default.)
 
 ---
 
@@ -310,7 +368,7 @@ python -m pytest          # or: python -m pytest -v tests/test_stream_disconnect
   configured `logo_country` folder (+`countries/all` fallback); channel names are
   fuzzy-matched to logo filenames and the best raw.githubusercontent URL is
   written to the channel logo (Settings → Channel logos).
-- **TMDB popups** for VOD/series metadata (GUI detail dialogs).
+- **TMDB popups** for VOD/series metadata (GUI detail dialogs). Titles are cleaned before lookup (trailing years, `SxxEyy` tags and resolution/quality suffixes are stripped), and lookup problems — a rejected API key, no match, a failed request — are shown in the popup instead of a silent "no hit".
 - **Xtream completeness**: real `get_vod_info` (playlist row + portal-source
   fallback), `timeshift` on live streams, episode `movie_image`+`tmdb_id`.
 - **Mock end-to-end**: `/mock/epg.xml` ships a generated XMLTV feed for the mock

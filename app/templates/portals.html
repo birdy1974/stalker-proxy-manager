@@ -111,10 +111,10 @@ async function editPortal(id) {
           <input class="form-check-input" type="checkbox" id="p-enabled" ${p.enabled ? "checked" : ""}>
           <label class="form-check-label">Portal enabled</label></div></div>
         <div class="col-md-4 d-flex align-items-end justify-content-end">
-          <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch / refresh content</button>
+          <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch genres</button>
         </div>
       </div>
-      <div class="small text-muted mt-2">Fetch order: genres → items of ENABLED genres → series seasons/episodes. Only enabled genres are fetched.</div>
+      <div class="small text-muted mt-2">Workflow: “Fetch genres” loads the genre lists → enable/disable the genres you want per tab → <b>Save</b> fetches the items of the enabled genres (live, VOD, series).</div>
     </div>
     <ul class="nav nav-tabs nav-subtabs mt-3 mb-2">
       <li class="nav-item"><a class="nav-link active" data-tab="live">1 · Live</a></li>
@@ -160,8 +160,13 @@ async function editPortal(id) {
   });
   $("#p-fetch-btn", body).addEventListener("click", async () => {
     if (!id) return;
-    const r = await api(`/api/portals/${id}/fetch`, { method: "POST" });
-    toast(`fetch job ${r.job.id} started`, "ok"); pollJobs();
+    const r = await api(`/api/portals/${id}/fetch-genres`, { method: "POST" });
+    toast(`fetching genre lists (job ${r.job.id})…`, "ok"); pollJobs();
+    // refresh the genre panes as soon as the genre fetch finishes
+    waitJob(r.job.id, () => {
+      ["live", "vod", "series"].forEach(k => loadGenres(id, k));
+      toast("genre lists updated — enable the genres you want, then Save", "ok");
+    });
   });
   for (const k of ["live", "vod", "series"]) {
     /* left-aligned textbox filters the genre list (client-side, case-insensitive) */
@@ -190,7 +195,7 @@ async function loadGenres(pid, kind) {
         value="${g.id}" ${g.enabled ? "checked" : ""}></span>
       <span class="flex-grow-1">${esc(g.name)}</span>
       <span class="text-muted">${g.item_count ?? "?"} items ${g.fetched ? "· fetched" : ""}</span>
-    </label>`).join("") : '<div class="text-muted small p-1">No genres fetched yet — press “Fetch / refresh content”.</div>';
+    </label>`).join("") : '<div class="text-muted small p-1">No genres fetched yet — press “Fetch genres”.</div>';
   $$(`input[type=checkbox]`, host).forEach(cb => cb.addEventListener("change", async () => {
     await api(`/api/portals/${pid}/genres/toggle`, { method: "POST",
       body: { kind, ids: [+cb.value], enabled: cb.checked } });
@@ -207,10 +212,18 @@ async function savePortal(id, m) {
     proxy_url: $("#p-proxy").value.trim() || null,
   };
   if (!body.name || !body.base_url) return toast("name and URL are required", "warn");
-  if (id) await api(`/api/portals/${id}`, { method: "PUT", body });
-  else await api("/api/portals", { method: "POST", body });
-  toast("portal saved — use Fetch to load content", "ok");
-  m.close(); table.reload();
+  if (id) {
+    await api(`/api/portals/${id}`, { method: "PUT", body });
+    // fetch the items of the genres that are enabled right now (live/vod/series)
+    const r = await api(`/api/portals/${id}/fetch-items`, { method: "POST" });
+    toast(`saved — fetching items of enabled genres (job ${r.job.id})`, "ok");
+  } else {
+    const r = await api("/api/portals", { method: "POST", body });
+    // no genres exist yet: pull the genre lists so they can be picked next edit
+    await api(`/api/portals/${r.id}/fetch-genres`, { method: "POST" });
+    toast("portal created — fetching genre lists; reopen it to pick genres", "ok");
+  }
+  m.close(); table.reload(); pollJobs();
 }
 
 /* ============================= actions ============================= */
@@ -320,6 +333,19 @@ async function pollJobs() {
   jobTimer = setInterval(async () => {
     const d = await api("/api/portals"); renderJobs(d.jobs);
     if (!d.jobs.some(j => j.status === "running" || j.status === "queued")) { clearInterval(jobTimer); jobTimer = null; table.reload(); }
+  }, 1500);
+}
+/* call back once a specific background job leaves queued/running (or times out) */
+function waitJob(jobId, onDone, timeoutMs = 300000) {
+  const t0 = Date.now();
+  const t = setInterval(async () => {
+    let done = Date.now() - t0 > timeoutMs;
+    try {
+      const d = await api("/api/portals");
+      const j = d.jobs.find(x => x.id === jobId);
+      done = done || (j && j.status !== "queued" && j.status !== "running");
+    } catch (e) {}
+    if (done) { clearInterval(t); onDone(); }
   }, 1500);
 }
 makeTable();

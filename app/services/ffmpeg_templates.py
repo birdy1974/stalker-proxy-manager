@@ -9,9 +9,18 @@ sync at all times (spec requirement):
                         the user typed is ever lost)
 
 The DS918+-validated command from the spec is exactly reproducible here (see
-tests/test_ffmpeg_templates.py):
-  ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 ... -i <url>
-         -vf scale_vaapi=w=1280:h=720:format=nv12,fps=25 ... pipe:1
+tests/test_ffmpeg_templates.py). The VAAPI presets are tuned for the Intel iHD
+driver on Apollo Lake (J3455):
+
+  * `-low_power 1` selects the fixed-function H.264 encoder
+    (VAEntrypointEncSliceLP) - faster and far cheaper than the EU path, and
+    it is exactly the entrypoint the iHD driver advertises for H.264 on the
+    DS918+ (see vainfo below).
+  * `-rc_mode vbr|cbr|...` makes rate control explicit. VAAPI's "auto" mode is
+    undocumented and driver-dependent; without it `-b:v`/`-maxrate` are not
+    guaranteed to be honoured the same way across driver versions.
+  * `-async_depth 4` keeps more frames in flight, raising throughput and
+    cutting time-to-first-frame.
 
 The command text contains the literal placeholder `<url>`; the stream manager
 substitutes the real input before spawning.
@@ -30,8 +39,23 @@ RESOLUTIONS = {
 }
 ASPECTS = {"4:3": 4 / 3, "16:9": 16 / 9, "21:9": 21 / 9}
 VIDEO_CODECS = ["copy", "libx264", "libx265", "h264_vaapi", "hevc_vaapi", "h264_qsv", "hevc_qsv"]
-AUDIO_CODECS = ["copy", "aac", "ac3", "mp3", "none"]
+AUDIO_CODECS = ["copy", "aac", "ac3", "mp2", "mp3", "none"]
 HW_CHOICES = ["none", "vaapi", "qsv"]
+# VAAPI rate-control modes (h264_vaapi/hevc_vaapi). "auto" = let the driver
+# choose; everything else is passed through as-is so the command stays honest.
+RC_MODES = ["auto", "cqp", "cbr", "vbr", "icq", "qvbr", "avbr"]
+# VAAPI encoders that understand -low_power/-rc_mode/-async_depth.
+VAAPI_ENCODERS = ("h264_vaapi", "hevc_vaapi", "vp8_vaapi", "vp9_vaapi")
+# The shipped reference preset (kept as a built-in, but NOT the fallback
+# default - that role belongs to the redirect preset now).
+REFERENCE_PRESET_NAME = "VAAPI 720p ~1M (DS918+ reference)"
+# The "redirect" preset is NOT an ffmpeg command: assigning it to a channel
+# makes the stream path 302 the player straight to the panel's CDN (the old
+# global proxy/redirect switch, moved into a per-channel template). It is ALSO
+# the default template: an item without an explicit template assignment is
+# redirected instead of being proxied through ffmpeg.
+REDIRECT_PRESET_NAME = "Redirect (bypass ffmpeg)"
+REDIRECT_COMMAND = "@redirect"
 URL_PLACEHOLDER = "<url>"
 
 
@@ -53,13 +77,21 @@ class FFmpegOptions:
     resolution: str = "720p"
     aspect: str = "16:9"
     video_codec: str = "h264_vaapi"
+    # Bitrate numbers are tuned for EXTERNAL (internet) streaming, not LAN: the
+    # encoder is kept near a constant rate (maxrate ~= bitrate + 10% so spikes
+    # cannot underrun a weak download link) and carries a ~2-second VBV buffer
+    # (bufsize = 2x bitrate) so brief congestion is absorbed instead of stalling
+    # the player. See default_presets() for the per-resolution values.
     video_bitrate: str = "1000k"
-    maxrate: str = "1200k"
-    bufsize: str = "1800k"
+    maxrate: str = "1100k"
+    bufsize: str = "2000k"
     fps: str = "25"
     gop: str = "50"
     profile: str = "high"
     level: str = "4.1"
+    low_power: bool = True           # h264_vaapi: use EncSliceLP (fixed-function)
+    rc_mode: str = "vbr"             # VAAPI rate control: auto|cqp|cbr|vbr|icq|qvbr|avbr
+    async_depth: str = "4"           # VAAPI frames in flight (throughput / startup)
     audio_codec: str = "aac"
     audio_bitrate: str = "128k"
     audio_channels: str = "2"
@@ -144,6 +176,16 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
             c += ["-g", opts.gop]
         if opts.fps:
             c += ["-r", opts.fps]
+        # VAAPI tuning (Intel iHD driver; DS918+ Apollo Lake). low_power is
+        # emitted only for h264_vaapi: on this silicon H.264 is the only codec
+        # with a fixed-function LP entrypoint (hevc_vaapi -low_power would fail).
+        if opts.video_codec in VAAPI_ENCODERS:
+            if opts.video_codec == "h264_vaapi" and opts.low_power:
+                c += ["-low_power", "1"]
+            if opts.rc_mode and opts.rc_mode != "auto":
+                c += ["-rc_mode", opts.rc_mode]
+            if opts.async_depth:
+                c += ["-async_depth", opts.async_depth]
 
     # ---- audio encoder ------------------------------------------------------
     if opts.audio_codec != "none":
@@ -176,6 +218,16 @@ _KNOWN_WITH_VALUE = {
     "-g": "gop", "-r": "fps", "-profile:v": "profile", "-level": "level",
     "-b:a": "audio_bitrate", "-ac": "audio_channels", "-ar": "audio_rate",
 }
+
+# numeric rc_mode spellings (ffmpeg -h encoder=h264_vaapi) -> names
+_RC_NUM = {"0": "auto", "1": "cqp", "2": "cbr", "3": "vbr",
+           "4": "icq", "5": "qvbr", "6": "avbr"}
+
+
+def _rc_name(value: str) -> str:
+    """Normalise a -rc_mode argument (accepts both 'cbr' and its int '2')."""
+    v = value.strip().lower()
+    return _RC_NUM.get(v, v)
 
 
 def parse_command(cmd: str) -> dict:
@@ -262,6 +314,18 @@ def parse_command(cmd: str) -> dict:
                 opts.hw_accel = "none"
             i += 2
             continue
+        if t == "-low_power" and i + 1 < len(toks):
+            opts.low_power = toks[i + 1] not in ("0", "false", "off", "no")
+            i += 2
+            continue
+        if t == "-rc_mode" and i + 1 < len(toks):
+            opts.rc_mode = _rc_name(toks[i + 1])
+            i += 2
+            continue
+        if t == "-async_depth" and i + 1 < len(toks):
+            opts.async_depth = toks[i + 1]
+            i += 2
+            continue
         if t == "-c:a" and i + 1 < len(toks):
             opts.audio_codec = toks[i + 1]
             i += 2
@@ -289,20 +353,42 @@ def parse_command(cmd: str) -> dict:
 #  Presets inserted at first boot
 # --------------------------------------------------------------------------- #
 def default_presets() -> list[dict]:
+    # Rate control for external (internet) streaming: maxrate stays ~10% above
+    # the target so bitrate spikes cannot underrun a weak viewer link, while
+    # bufsize = 2x bitrate (~2 seconds of VBV) absorbs short-lived congestion
+    # instead of freezing the player.
     mk = lambda name, **kw: {**asdict(FFmpegOptions(**kw)), "name": name}   # noqa: E731
     presets = [
-        mk("VAAPI 720p ~1M (DS918+ reference)"),
+        mk(REFERENCE_PRESET_NAME, low_power=True, rc_mode="vbr", async_depth="4"),
         mk("VAAPI 1080p ~2.5M", resolution="1080p", video_bitrate="2500k",
-           maxrate="3000k", bufsize="4500k"),
+           maxrate="2750k", bufsize="5000k", low_power=True, rc_mode="vbr", async_depth="4"),
         mk("QSV 720p ~1M", hw_accel="qsv", video_codec="h264_qsv"),
         mk("Software 720p ~1.2M (libx264)", hw_accel="none", video_codec="libx264",
-           video_bitrate="1200k", maxrate="1500k", bufsize="2200k"),
+           video_bitrate="1200k", maxrate="1300k", bufsize="2400k"),
         mk("Copy / passthrough (no transcode)", hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source"),
+        mk("Dreambox DM800se (Enigma2 / MPEG2-SD)", hw_accel="vaapi",
+           resolution="576p", aspect="16:9", video_codec="h264_vaapi",
+           video_bitrate="1200k", maxrate="1300k", bufsize="2400k",
+           fps="25", gop="50", profile="main", level="3.1",
+           low_power=True, rc_mode="vbr", async_depth="4",
+           audio_codec="mp2", audio_bitrate="192k"),
     ]
     for p in presets:
         opts = {k: v for k, v in p.items() if k != "name"}
         p["command"] = build_command(FFmpegOptions(**opts))
         p["command_source"] = "fields"
         p["enabled"] = True
+    # The redirect preset is a marker, not an ffmpeg command. It ships with the
+    # same structured fields as any other template (so the seeder and the GUI
+    # treat it uniformly), but its command is a sentinel that the stream path
+    # checks for to bypass ffmpeg entirely.
+    presets.append({
+        **asdict(FFmpegOptions(video_codec="copy", audio_codec="copy",
+                               resolution="source", hw_accel="none")),
+        "name": REDIRECT_PRESET_NAME,
+        "command": REDIRECT_COMMAND,
+        "command_source": "fields",
+        "enabled": True,
+    })
     return presets

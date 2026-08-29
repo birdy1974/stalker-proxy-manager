@@ -19,6 +19,7 @@ import asyncio
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 from sqlalchemy import select
 
@@ -109,6 +110,10 @@ async def _worker() -> None:
         try:
             if job.kind == "fetch_portal":
                 await _run_portal_fetch(job)
+            elif job.kind == "fetch_genres":
+                await _run_genre_fetch(job)
+            elif job.kind == "fetch_items":
+                await _run_items_fetch(job)
             job.status = "cancelled" if job._cancel.is_set() else "done"
         except Exception as exc:  # noqa: BLE001
             job.status, job.error = "error", f"{type(exc).__name__}: {exc}"
@@ -119,7 +124,12 @@ async def _worker() -> None:
 
 
 # --------------------------------------------------------------------------- #
-async def _run_portal_fetch(job: Job) -> None:
+async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
+    """
+    Resolve the portal URL (once per job) and open an authenticated session on
+    the first MAC. Returns (client, portal_name); the caller MUST close the
+    client. Also refreshes the MAC's online/expiry status on the way.
+    """
     async with SessionLocal() as s:
         portal = await s.get(Portal, job.portal_id)
         if not portal:
@@ -149,19 +159,108 @@ async def _run_portal_fetch(job: Job) -> None:
         await db_log("INFO", "fetch", f"[{portal_name}] resolved -> {resolved}")
 
     client = await POOL.get(resolved, mac.mac, mac.password)
-    try:
-        await client.handshake()
-        # refresh MAC expiry/status while we are here
-        try:
-            exp = await client.account_expires()
-            async with SessionLocal() as s:
-                m = await s.get(MacAddress, mac.id)
-                m.expire_date, m.status, m.online = exp, "online", True
-                m.last_checked = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
-                await s.commit()
-        except PortalError:
-            pass
+    await client.handshake()
+    try:                                    # refresh MAC expiry/status while we are here
+        exp = await client.account_expires()
+        async with SessionLocal() as s:
+            m = await s.get(MacAddress, mac.id)
+            m.expire_date, m.status, m.online = exp, "online", True
+            m.last_checked = datetime.now(timezone.utc)
+            await s.commit()
+    except PortalError:
+        pass
+    return client, portal_name
 
+
+async def _sync_all_genres(job: Job, client: StalkerClient, portal_id: int,
+                           portal_name: str) -> None:
+    """
+    Fetch the genre/category lists for live, VOD and series and upsert them.
+    No items are fetched here. Portals without usable VOD/series categories get
+    a synthetic "(All VOD)"/"(All series)" row that is DISABLED by default, so
+    the user explicitly opts in before their (usually huge) items are fetched.
+    """
+    job.stage = "live genres"
+    genres = await client.live_genres()
+    async with SessionLocal() as s:
+        await _sync_genres(s, LiveGenre, portal_id, genres)
+        await s.commit()
+
+    job.stage = "vod genres"
+    cats = await client.vod_genres()
+    async with SessionLocal() as s:
+        known = await _sync_genres(s, VodGenre, portal_id, cats)
+        if not known:                      # no usable categories -> synthetic "all"
+            row = (await s.execute(select(VodGenre).where(
+                VodGenre.portal_id == portal_id, VodGenre.genre_portal_id == ""))
+                   ).scalar_one_or_none()
+            if row is None:
+                s.add(VodGenre(portal_id=portal_id, genre_portal_id="",
+                               name="(All VOD)", enabled=False))
+        await s.commit()
+
+    job.stage = "series genres"
+    cats = await client.series_genres()
+    async with SessionLocal() as s:
+        known = await _sync_genres(s, SerieGenre, portal_id, cats)
+        if not known:
+            row = (await s.execute(select(SerieGenre).where(
+                SerieGenre.portal_id == portal_id, SerieGenre.genre_portal_id == ""))
+                   ).scalar_one_or_none()
+            if row is None:
+                s.add(SerieGenre(portal_id=portal_id, genre_portal_id="",
+                                 name="(All series)", enabled=False))
+        await s.commit()
+    await db_log("INFO", "fetch", f"[{portal_name}] genre lists fetched")
+
+
+async def _sync_season_links(portal_name: str) -> None:
+    """Reconcile playlist series that gained seasons during this fetch."""
+    try:
+        from .playlist_sync import sync_season_links
+        async with SessionLocal() as s:
+            added = await sync_season_links(s)
+        if added:
+            await db_log("INFO", "fetch",
+                         f"[{portal_name}] linked {added} new season(s) to playlist series")
+    except Exception:  # noqa: BLE001 - never fail a fetch over bookkeeping
+        log.exception("season link sync failed")
+
+
+async def _run_portal_fetch(job: Job) -> None:
+    """Full fetch: genre lists + items of enabled genres + series seasons/episodes."""
+    client, portal_name = await _prepare_client(job)
+    try:
+        await _sync_all_genres(job, client, job.portal_id, portal_name)
+        if job._cancel.is_set():
+            return
+        await _run_items_fetch(job, client, portal_name)
+    finally:
+        await client.close()
+
+
+async def _run_genre_fetch(job: Job) -> None:
+    """Fetch the genre lists only (no items)."""
+    client, portal_name = await _prepare_client(job)
+    try:
+        await _sync_all_genres(job, client, job.portal_id, portal_name)
+        await db_log("INFO", "fetch", f"[{portal_name}] genre fetch finished")
+    finally:
+        await client.close()
+
+
+async def _run_items_fetch(job: Job, client: StalkerClient | None = None,
+                           portal_name: str | None = None) -> None:
+    """
+    Fetch the items of ENABLED genres (live, VOD, series) + series
+    seasons/episodes. Assumes the genre lists are already synced (via
+    fetch_genres or the full fetch). When no client is passed the session is
+    opened here and closed by this function; otherwise the caller owns it.
+    """
+    own = client is None
+    if client is None:
+        client, portal_name = await _prepare_client(job)
+    try:
         await _fetch_live(job, client, job.portal_id, portal_name)
         if job._cancel.is_set():
             return
@@ -172,18 +271,12 @@ async def _run_portal_fetch(job: Job) -> None:
         # Seasons arrive after the series were added to the playlist, so their
         # link rows have to be reconciled here - otherwise the series stay in
         # the builder but contribute no episodes to any playlist.
-        try:
-            from .playlist_sync import sync_season_links
-            async with SessionLocal() as s:
-                added = await sync_season_links(s)
-            if added:
-                await db_log("INFO", "fetch",
-                             f"[{portal_name}] linked {added} new season(s) to playlist series")
-        except Exception:  # noqa: BLE001 - never fail a fetch over bookkeeping
-            log.exception("season link sync failed")
-        await db_log("INFO", "fetch", f"[{portal_name}] fetch finished: {job.done_items} items")
+        await _sync_season_links(portal_name)
+        await db_log("INFO", "fetch",
+                     f"[{portal_name}] items fetch finished: {job.done_items} items")
     finally:
-        await client.close()
+        if own:
+            await client.close()
 
 
 async def _sync_genres(s, model, portal_id: int, incoming: list[dict], syn_ok_none=True) -> dict[str, int]:
@@ -400,14 +493,14 @@ def _serie_fields(row, item, genre_db_id: int) -> None:
 
 
 async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_name: str) -> None:
-    job.stage = "live genres"
-    genres = await client.live_genres()
+    job.stage = "live channels"
     async with SessionLocal() as s:
-        id_map = await _sync_genres(s, LiveGenre, portal_id, genres)
-        await s.commit()
         enabled = (await s.execute(select(LiveGenre).where(
             LiveGenre.portal_id == portal_id, LiveGenre.enabled.is_(True)))).scalars().all()
         enabled = [(g.id, g.genre_portal_id, g.name) for g in enabled]
+    if not enabled:
+        await db_log("INFO", "fetch", f"[{portal_name}] live: no enabled genres - skipping")
+        return
 
     async def upsert_many(items, db_id: int) -> int:
         async with SessionLocal() as s2:
@@ -427,7 +520,6 @@ async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_na
         await db_log("DEBUG", "fetch",
                      f"[{portal_name}] get_all_channels unavailable ({exc}) - paging per genre")
     if complete:
-        job.stage = "live channels"
         job.detail = f"live: complete list ({len(complete)} rows)"
         counts: dict[str, int] = {}
         bucket: dict[str, list[dict]] = {}
@@ -458,7 +550,6 @@ async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_na
     for db_id, gid, name in enabled:
         if job._cancel.is_set():
             return
-        job.stage = "live channels"
 
         async def page_fetch(p, _gid=gid):  # noqa: ANN202
             return await client.live_channels(_gid, p)
@@ -473,20 +564,14 @@ async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_na
 
 
 async def _fetch_vod(job: Job, client: StalkerClient, portal_id: int, portal_name: str) -> None:
-    job.stage = "vod genres"
-    cats = await client.vod_genres()
+    job.stage = "vod items"
     async with SessionLocal() as s:
-        id_map = await _sync_genres(s, VodGenre, portal_id, cats)
-        if not id_map:                                # no categories -> synthetic "All"
-            row = (await s.execute(select(VodGenre).where(
-                VodGenre.portal_id == portal_id, VodGenre.genre_portal_id == ""))).scalar_one_or_none()
-            if row is None:
-                row = VodGenre(portal_id=portal_id, genre_portal_id="", name="(All VOD)", enabled=True)
-                s.add(row)
-        await s.commit()
         enabled = (await s.execute(select(VodGenre).where(
             VodGenre.portal_id == portal_id, VodGenre.enabled.is_(True)))).scalars().all()
         enabled = [(g.id, g.genre_portal_id, g.name) for g in enabled]
+    if not enabled:
+        await db_log("INFO", "fetch", f"[{portal_name}] vod: no enabled genres - skipping")
+        return
 
     async def upsert_many(items, db_id: int) -> int:
         async with SessionLocal() as s2:
@@ -498,7 +583,6 @@ async def _fetch_vod(job: Job, client: StalkerClient, portal_id: int, portal_nam
     for db_id, cid, name in enabled:
         if job._cancel.is_set():
             return
-        job.stage = "vod items"
 
         async def page_fetch(p, _cid=cid):
             return await client.vod_list(_cid or None, p)
@@ -513,20 +597,14 @@ async def _fetch_vod(job: Job, client: StalkerClient, portal_id: int, portal_nam
 
 
 async def _fetch_series(job: Job, client: StalkerClient, portal_id: int, portal_name: str) -> None:
-    job.stage = "series genres"
-    cats = await client.series_genres()
+    job.stage = "series items"
     async with SessionLocal() as s:
-        id_map = await _sync_genres(s, SerieGenre, portal_id, cats)
-        if not id_map:
-            row = (await s.execute(select(SerieGenre).where(
-                SerieGenre.portal_id == portal_id, SerieGenre.genre_portal_id == ""))).scalar_one_or_none()
-            if row is None:
-                row = SerieGenre(portal_id=portal_id, genre_portal_id="", name="(All series)", enabled=True)
-                s.add(row)
-        await s.commit()
         enabled = (await s.execute(select(SerieGenre).where(
             SerieGenre.portal_id == portal_id, SerieGenre.enabled.is_(True)))).scalars().all()
         enabled = [(g.id, g.genre_portal_id, g.name) for g in enabled]
+    if not enabled:
+        await db_log("INFO", "fetch", f"[{portal_name}] series: no enabled genres - skipping")
+        return
 
     async def upsert_many(items, db_id: int) -> int:
         async with SessionLocal() as s2:
@@ -538,7 +616,6 @@ async def _fetch_series(job: Job, client: StalkerClient, portal_id: int, portal_
     for db_id, cid, name in enabled:
         if job._cancel.is_set():
             return
-        job.stage = "series items"
 
         async def page_fetch(p, _cid=cid):
             return await client.series_list(_cid or None, p)
