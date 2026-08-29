@@ -47,6 +47,7 @@ class Job:
     started: float = 0.0
     ended: float = 0.0
     error: str = ""
+    series_ids: list[int] = field(default_factory=list)
     _cancel: asyncio.Event = field(default_factory=asyncio.Event)
 
     def public(self) -> dict:
@@ -74,11 +75,27 @@ def list_jobs() -> list[dict]:
     return [j.public() for j in sorted(JOBS.values(), key=lambda j: j.started, reverse=True)[:50]]
 
 
-async def submit(kind: str, portal_id: int) -> Job:
-    for j in JOBS.values():                                       # one job per portal
-        if j.portal_id == portal_id and j.status in ("queued", "running"):
-            return j
-    job = Job(id=uuid.uuid4().hex[:12], kind=kind, portal_id=portal_id)
+async def submit(kind: str, portal_id: int, series_ids: list[int] | None = None) -> Job:
+    # Full portal/genre/item jobs stay one-per-portal. Season fetches for
+    # newly enabled series must not be swallowed by an in-flight catalog job
+    # (that job already snapshotted its series list).
+    if kind == "fetch_seasons":
+        ids = list(series_ids or [])
+        for j in JOBS.values():
+            if (j.kind == "fetch_seasons" and j.portal_id == portal_id
+                    and j.status == "queued"):
+                for sid in ids:
+                    if sid not in j.series_ids:
+                        j.series_ids.append(sid)
+                return j
+        job = Job(id=uuid.uuid4().hex[:12], kind=kind, portal_id=portal_id,
+                  series_ids=ids)
+    else:
+        for j in JOBS.values():
+            if j.portal_id == portal_id and j.status in ("queued", "running") \
+                    and j.kind != "fetch_seasons":
+                return j
+        job = Job(id=uuid.uuid4().hex[:12], kind=kind, portal_id=portal_id)
     JOBS[job.id] = job
     await _QUEUE.put(job)
     _ensure_worker()
@@ -113,6 +130,8 @@ async def _worker() -> None:
                 await _run_genre_fetch(job)
             elif job.kind == "fetch_items":
                 await _run_items_fetch(job)
+            elif job.kind == "fetch_seasons":
+                await _run_seasons_fetch(job)
             job.status = "cancelled" if job._cancel.is_set() else "done"
         except Exception as exc:  # noqa: BLE001
             job.status, job.error = "error", f"{type(exc).__name__}: {exc}"
@@ -630,6 +649,22 @@ async def _fetch_series(job: Job, client: StalkerClient, portal_id: int, portal_
             g.item_count, g.items_fetched = (total or n), True
             await s3.commit()
 
+    await _fetch_seasons_episodes(job, client, portal_id, portal_name)
+
+
+async def _run_seasons_fetch(job: Job) -> None:
+    """Fetch seasons/episodes for series that were just enabled in the GUI."""
+    client, portal_name = await _prepare_client(job)
+    try:
+        await _fetch_seasons_episodes(job, client, job.portal_id, portal_name,
+                                      series_ids=job.series_ids or None)
+        await _sync_season_links(portal_name)
+    finally:
+        await client.close()
+
+
+async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: int,
+                                  portal_name: str, series_ids: list[int] | None = None) -> None:
     # ---- seasons + episodes for enabled series (Q6=A: season-level) --------
     # The portal has no "all seasons of all series" call, so one request per
     # series is unavoidable - but the DATABASE side is grouped: one SELECT for
@@ -637,9 +672,14 @@ async def _fetch_series(job: Job, client: StalkerClient, portal_id: int, portal_
     # one COMMIT per series instead of a round trip per row.
     job.stage = "series seasons/episodes"
     async with SessionLocal() as s:
-        series = (await s.execute(select(SerieSource).where(
-            SerieSource.portal_id == portal_id, SerieSource.enabled.is_(True),
-            SerieSource.seasons_fetched.is_(False)))).scalars().all()
+        stmt = select(SerieSource).where(
+            SerieSource.portal_id == portal_id,
+            SerieSource.seasons_fetched.is_(False))
+        if series_ids:
+            stmt = stmt.where(SerieSource.id.in_(series_ids))
+        else:
+            stmt = stmt.where(SerieSource.enabled.is_(True))
+        series = (await s.execute(stmt)).scalars().all()
         ids = [(x.id, x.portal_item_id, x.original_name) for x in series]
     total_series = len(ids)
     whole_episode_list = True          # hope for "all episodes in one request"

@@ -41,8 +41,10 @@ function sourceTable(kind, hostSel) {
   const bulk = (enabled) => async () => {
     const ids = [...t.selected];
     if (!ids.length) return toast("select rows first", "warn");
-    await api("/api/sources/toggle", { method: "POST", body: { kind, ids, enabled } });
+    const res = await api("/api/sources/toggle", { method: "POST", body: { kind, ids, enabled } });
     t.reload(); toast(`${ids.length} ${kind} source(s) ${enabled ? "enabled" : "disabled"}`, "ok");
+    if (kind === "series" && enabled && (res.season_jobs || []).length)
+      waitForSeasons(ids, t);
   };
   bulkBar.append(
     el("span", { class: "muted-label" }, "Bulk:"),
@@ -70,7 +72,7 @@ function sourceTable(kind, hostSel) {
       { key: "play", label: "", width: "40px", render: r => `<button class="btn btn-sm btn-outline-secondary" title="Test stream" onclick="event.stopPropagation();playInModal('/preview/vod/${r.id}.ts',${JSON.stringify(r.name).replace(/"/g, '&quot;')})"><i class="bi bi-play-btn"></i></button>` },
     ],
     series: [
-      { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'series',ids:[${r.id}],enabled:this.checked}})"></div>` },
+      { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();toggleSerie(${r.id}, this.checked)"></div>` },
       { key: "poster", label: "Poster", width: "48px", render: r => r.poster ? `<img class="poster-thumb" loading="lazy" src="${esc(r.poster)}">` : "" },
       { key: "name", label: "Series", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => esc(r.name) },
       { key: "year", label: "Year", width: "60px" },
@@ -87,6 +89,30 @@ function sourceTable(kind, hostSel) {
     emptyText: "Nothing here yet. Fetch a portal (Portals → Fetch) and enable genres first.",
   });
   return t;
+}
+
+window.toggleSerie = async (id, enabled) => {
+  const res = await api("/api/sources/toggle", { method: "POST", body: { kind: "series", ids: [id], enabled } });
+  if (enabled && (res.season_jobs || []).length) {
+    toast("fetching seasons for this series…", "ok");
+    waitForSeasons([id], TABS.series);
+  }
+};
+async function waitForSeasons(ids, table) {
+  const want = new Set(ids.map(Number));
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const d = await api("/api/sources/series?per_page=100&" + (table ? table.params() : "page=1"));
+      const rows = (d.items || []).filter(x => want.has(x.id));
+      if (rows.length && rows.every(x => x.seasons_fetched)) {
+        toast("seasons loaded — open the series to pick which to enable", "ok");
+        table && table.reload();
+        return;
+      }
+    } catch { /* keep polling */ }
+  }
+  table && table.reload();
 }
 
 /* detail popups (data from portal; TMDB merge lands in Phase 3) */
@@ -141,7 +167,7 @@ async function seriesDetail(row) {
             <input type="checkbox" ${s.enabled ? "checked" : ""} onchange="api('/api/sources/series/seasons/toggle',{method:'POST',body:{ids:[${s.id}],enabled:this.checked}}).then(()=>toast('season updated','ok'))">
             <span>${esc(s.name || "Season " + s.season_number)}</span>
             <span class="text-muted">${s.episode_count} episodes ${s.episodes_fetched ? "" : "· pending fetch"}</span>
-          </label>`).join("") : '<div class="small text-muted">seasons not fetched yet (they arrive after the series item is enabled + next fetch)</div>'}
+          </label>`).join("") : `<div class="small text-muted">${item.enabled ? "seasons are being fetched — close and reopen this popup in a moment" : "enable the series (switch in the list) to fetch seasons"}</div>`}
         <div class="muted-label mt-2">Stream info (first episode probe)</div>
         <div class="probe-box"><span class="text-muted small">probing the first playable episode…</span></div>
         <div class="muted-label mt-2">TMDB</div>
