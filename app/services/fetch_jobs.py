@@ -32,6 +32,7 @@ from ..portal.pool import POOL
 from ..portal.client import PortalError, StalkerClient
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
+from .titles import portal_item_title
 
 
 @dataclass
@@ -489,7 +490,7 @@ def _live_fields(row, item, genre_db_id: int) -> None:
 
 def _vod_fields(row, item, genre_db_id: int) -> None:
     row.vod_genre_id = genre_db_id
-    row.original_name = (item.get("name") or item.get("o_name") or "?")[:400]
+    row.original_name = portal_item_title(item, limit=400)
     row.cmd = item.get("cmd")
     row.position = item.get("position") if isinstance(item.get("position"), int) else None
     row.poster = (item.get("screenshot_uri") or "")[:600] or None
@@ -505,7 +506,7 @@ def _vod_fields(row, item, genre_db_id: int) -> None:
 
 def _serie_fields(row, item, genre_db_id: int) -> None:
     row.serie_genre_id = genre_db_id
-    row.original_name = (item.get("name") or item.get("o_name") or "?")[:400]
+    row.original_name = portal_item_title(item, limit=400)
     row.poster = (item.get("screenshot_uri") or "")[:600] or None
     row.year = str(item.get("year", "") or "")[:10]
     row.description = item.get("description")

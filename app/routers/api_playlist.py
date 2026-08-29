@@ -28,6 +28,7 @@ from ..security import require_admin
 from ..services import item_info
 from ..services.db_logging import db_log
 from ..services.playlist_sync import ADD_KINDS, add_sources
+from ..services.titles import best_title
 
 router = APIRouter(prefix="/api/playlist", tags=["playlist"], dependencies=[Depends(require_admin)])
 
@@ -310,7 +311,7 @@ async def add_from_source(payload: dict, db=Depends(get_db)):
         if (await db.execute(select(VodPlaylist).where(VodPlaylist.vod_source_id == sid))).scalar_one_or_none():
             return {"ok": True, "exists": True}
         genre_row = await db.get(VodGenre, src.vod_genre_id) if src.vod_genre_id else None
-        r = VodPlaylist(vod_source_id=sid, custom_name=src.original_name,
+        r = VodPlaylist(vod_source_id=sid, custom_name=best_title(src.original_name),
                         group_name=genre_row.name if genre_row else "VOD",
                         poster=src.poster, year=src.year, rating=src.rating,
                         overview=src.description,
@@ -479,14 +480,22 @@ async def vod_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1
     total, rows, groups, tpls = await _pl_list(db, VodPlaylist, VodSource, "vod_source_id",
                                                q, group, {}, page, per_page, sort, direction)
     items = []
+    dirty = False
     for r in rows:
         chain = await _map_chain(db, VodPlaylist, VodPlaylistSource, VodSource,
                                  VodPlaylistSource, VodPlaylistSource.vod_playlist_id, r.id)
-        items.append({"id": r.id, "custom_name": r.custom_name, "group_name": r.group_name,
+        src_title = chain[0]["name"] if chain else None
+        title = best_title(r.custom_name, src_title)
+        if title != (r.custom_name or "") and title != "?":
+            r.custom_name = title
+            dirty = True
+        items.append({"id": r.id, "custom_name": title, "group_name": r.group_name,
                       "poster": r.poster, "year": r.year, "rating": r.rating,
                       "overview": r.overview, "enabled": r.enabled,
                       "order": r.order, "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""), "chain": chain})
+    if dirty:
+        await db.commit()
     return {"total": total, "page": page, "per_page": per_page, "items": items, "groups": groups}
 
 

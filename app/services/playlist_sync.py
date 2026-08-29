@@ -30,6 +30,7 @@ from ..models import (LiveGenre, LivePlaylist, LivePlaylistSource, LiveSource,
                       SeriePlaylistSeason, SeriePlaylistSource, SerieSeason,
                       SerieSource, VodGenre, VodPlaylist, VodPlaylistSource,
                       VodSource)
+from .titles import best_title
 
 # kinds whose "enabled" switch mirrors straight into the output playlist
 SYNC_KINDS = ("vod", "series", "local")
@@ -65,7 +66,7 @@ async def _sync_vod(db, ids: list[int], enabled: bool) -> dict:
             if not enabled:
                 continue                      # nothing to switch off
             genre = await db.get(VodGenre, src.vod_genre_id) if src.vod_genre_id else None
-            row = VodPlaylist(vod_source_id=src.id, custom_name=src.original_name,
+            row = VodPlaylist(vod_source_id=src.id, custom_name=best_title(src.original_name),
                               group_name=(genre.name if genre else None) or src.genre or "VOD",
                               poster=src.poster, year=src.year, rating=src.rating,
                               overview=src.description, enabled=True, order=nxt)
@@ -95,7 +96,7 @@ async def _sync_series(db, ids: list[int], enabled: bool) -> dict:
             if not enabled:
                 continue
             genre = await db.get(SerieGenre, src.serie_genre_id) if src.serie_genre_id else None
-            row = SeriePlaylist(serie_source_id=src.id, custom_name=src.original_name,
+            row = SeriePlaylist(serie_source_id=src.id, custom_name=best_title(src.original_name),
                                 group_name=(genre.name if genre else None)
                                 or src.category_name or "Series",
                                 poster=src.poster, year=src.year, rating=src.rating,

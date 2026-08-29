@@ -202,6 +202,23 @@ async def test_full_titles_reach_the_playlist_and_carry_tvg_name():
     assert f'tvg-name="{long_title}"' in extinf, f"no tvg-name: {extinf!r}"
 
 
+async def test_year_only_custom_name_uses_full_source_title():
+    """Portal `name` is often just the year; `o_name` holds '**Man of War - 2026'."""
+    full = "**Man of War - 2026"
+    await _seed(0)
+    async with SessionLocal() as s:
+        portal = Portal(name="t2", base_url="http://p2.invalid")
+        s.add(portal); await s.flush()
+        src = VodSource(portal_id=portal.id, portal_item_id="yearonly", original_name=full)
+        s.add(src); await s.flush()
+        s.add(VodPlaylist(vod_source_id=src.id, custom_name="2026", group_name="Action"))
+        await s.commit()
+        user = await s.get(User, 1)
+    text = await build_m3u(BASE, user)
+    assert full in text
+    assert not any(ln.endswith(",2026") for ln in text.splitlines() if ln.startswith("#EXTINF"))
+
+
 async def test_m3u_does_not_point_vlc_at_epg():
     """VLC waits on url-tvg until /epg.xml returns or times out (~30s)."""
     await _seed(1)
