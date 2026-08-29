@@ -32,18 +32,19 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import delete, select
 
-from ..config import FFMPEG_BIN, MEDIA_ROOT, STREAM_START_TIMEOUT
+from ..config import FFMPEG_BIN, STREAM_START_TIMEOUT
 from ..database import SessionLocal, run_uncancelled
 from ..models import (
     ActiveStream, FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource,
-    LocalFile, LocalPlaylist, MacAddress, Portal, SerieEpisode, SeriePlaylist,
+    LocalFile, LocalPlaylist, LocalSource, MacAddress, Portal, SerieEpisode, SeriePlaylist,
     SeriePlaylistSource, SerieSeason, SerieSource, VodPlaylist, VodPlaylistSource,
     VodSource,
 )
 from ..portal.pool import POOL
 from ..portal.client import MAG_UA, PortalError, StalkerClient
 from .db_logging import db_log
-from .ffmpeg_templates import REDIRECT_COMMAND, URL_PLACEHOLDER
+from .ffmpeg_templates import REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file
+from .item_info import local_file_path
 
 log = logging.getLogger("spm.stream")
 
@@ -342,23 +343,44 @@ class StreamManager:
         exit_t.cancel()
         return b""
 
-    async def _spawn(self, cmd_template: str, url: str) -> asyncio.subprocess.Process | None:
-        cmd_text = self._network_identity(cmd_template.replace(URL_PLACEHOLDER, url), url)
-        # Network-source options do not exist for file:// inputs and make
-        # ffmpeg abort with "Option reconnect not found". Strip them for
-        # local-file playback.
-        if url.startswith("file:") or os.path.isabs(url):
+    @staticmethod
+    def _ffmpeg_argv(cmd_template: str, url: str) -> list[str] | None:
+        """Render a template + input into an argv list, or None if unusable.
+
+        Local paths are quoted so `shlex.split` keeps spaces/quotes as one
+        `-i` argument, and network-only flags are stripped so ffmpeg does not
+        abort with "Option reconnect not found" on a file.
+        """
+        if (cmd_template or "").strip() == REDIRECT_COMMAND:
+            return None
+        is_net = url.lower().startswith(_NET_SCHEMES)
+        insert = url if is_net else shlex.quote(url)
+        cmd_text = StreamManager._network_identity(
+            cmd_template.replace(URL_PLACEHOLDER, insert), url)
+        if not is_net:
             cmd_text = _NETONLY_OPTS.sub(" ", cmd_text)
         if cmd_text.startswith("ffmpeg"):
             cmd_text = FFMPEG_BIN + cmd_text[len("ffmpeg"):]
-        # HLS writes to files instead of stdout - not supported in phase 2 core
         if "<out_dir>" in cmd_text:
-            await db_log("ERROR", "stream", "template uses HLS file output; use mpegts for live proxying")
             return None
         try:
             args = shlex.split(cmd_text)
-        except ValueError as exc:
-            await db_log("ERROR", "stream", f"unparseable ffmpeg template: {exc}")
+        except ValueError:
+            return None
+        return args or None
+
+    async def _spawn(self, cmd_template: str, url: str) -> asyncio.subprocess.Process | None:
+        if (cmd_template or "").strip() == REDIRECT_COMMAND:
+            await db_log("ERROR", "stream",
+                         "cannot spawn the redirect template as ffmpeg "
+                         "(local files must be served directly)")
+            return None
+        if "<out_dir>" in (cmd_template or ""):
+            await db_log("ERROR", "stream", "template uses HLS file output; use mpegts for live proxying")
+            return None
+        args = self._ffmpeg_argv(cmd_template, url)
+        if not args:
+            await db_log("ERROR", "stream", "unparseable ffmpeg template")
             return None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -599,6 +621,41 @@ class StreamManager:
         _name, command = await self._template_for(item)
         return command == REDIRECT_COMMAND
 
+    async def local_disk_path(self, ref_id: int) -> tuple[str | None, str]:
+        """Absolute path of a local playlist item, or (None, name) if missing."""
+        async with SessionLocal() as s:
+            lp = await s.get(LocalPlaylist, ref_id)
+            lf = await s.get(LocalFile, lp.local_file_id) if lp else None
+            ls = await s.get(LocalSource, lf.local_source_id) if lf else None
+        name = (lp.custom_name or lf.filename) if lp and lf else "local file"
+        if not (lf and ls):
+            return None, name
+        path = local_file_path(ls.directory, lf.relative_path)
+        if path and os.path.isfile(path):
+            return path, name
+        return None, name
+
+    async def local_serves_original(self, ref_id: int) -> bool:
+        """True when this local item should be FileResponse'd, not ffmpeg'd."""
+        item = await self._item_for("local", ref_id)
+        _name, command = await self._template_for(item)
+        return serves_original_file(command)
+
+    async def register_local_file(self, ref_id: int, user_name: str | None,
+                                  path: str, item_name: str) -> StreamHandle:
+        """Dashboard/max-connections slot for a direct file serve (no ffmpeg)."""
+        item = await self._item_for("local", ref_id)
+        tpl_name, _command = await self._template_for(item)
+        h = StreamHandle(id=uuid.uuid4().hex, kind="local", item_name=item_name,
+                         user_name=user_name, template_name=tpl_name or "file",
+                         command="(file)", url=path)
+        await self._register(h)
+        from ..database import spawn
+        from .local_files import fill_duration_for_playlist_item
+        spawn(fill_duration_for_playlist_item(ref_id),
+              name=f"dur-local-{ref_id}")
+        return h
+
     # ------------------------------------------------------------ the pump
     async def resolve(self, kind: str, ref_id: int) -> tuple[str | None, str]:
         """
@@ -681,20 +738,9 @@ class StreamManager:
             else:
                 chain, item_name, item = got
         elif kind == "local":
-            async with SessionLocal() as s:
-                lp = await s.get(LocalPlaylist, ref_id)
-                lf = await s.get(LocalFile, lp.local_file_id) if lp else None
-            item = lp
-            item_name = (lp.custom_name or lf.filename) if lp and lf else "local file"
-            path = None
-            if lp and lf:
-                async with SessionLocal() as s:
-                    from ..models import LocalSource
-                    ls = await s.get(LocalSource, lf.local_source_id)
-                    path = f"{ls.directory.rstrip('/')}/{lf.relative_path}" if ls else None
-            if path and not os.path.isabs(path):
-                path = str(MEDIA_ROOT / path)          # same resolution as the scanner
-            chain = [("local", path)] if path and os.path.exists(path) else []
+            path, item_name = await self.local_disk_path(ref_id)
+            item = await self._item_for("local", ref_id)
+            chain = [("local", path)] if path else []
         else:
             raise ValueError(f"unknown kind {kind}")
 
@@ -703,7 +749,12 @@ class StreamManager:
                               user_name=user_name, template_name=tpl_name, command=command)
         # Pre-check: empty chain or EVERY mac currently occupied -> fail fast
         # with 404 instead of hanging a client with a 200 + empty body.
-        if kind != "local":
+        if kind == "local":
+            if not chain:
+                await db_log("ERROR", "stream",
+                             f"[{item_name}] local file missing on disk -> 404")
+                handle.dead = True
+        else:
             free = any(m.id not in self.mac_locks for (_s, _p, macs) in chain for m in macs)
             if not chain or not free:
                 if chain and not free:
@@ -727,13 +778,22 @@ class StreamManager:
         registered = False
         try:
             if kind == "local":
+                if not chain:
+                    return
                 _tag, path = chain[0]
-                proc = await self._spawn(h.command, ("file:" + path))
+                proc = await self._spawn(h.command, path)
                 if proc is None:
                     return
                 h.url, h.proc = path, proc
                 await self._register(h)
                 registered = True
+                first = await self._first_bytes(proc)
+                if not first:
+                    await db_log("WARNING", "stream",
+                                 f"[{h.item_name}] ffmpeg produced no data for local file")
+                    await self._kill_quiet(proc)
+                    return
+                yield first
                 async for chunk in self._read_proc(h, proc):
                     yield chunk
                 return

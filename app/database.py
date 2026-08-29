@@ -232,6 +232,9 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         "async_depth": ("VARCHAR(4)", "'4'"),
         "is_builtin": ("BOOLEAN", "0"),
     },
+    "local_files": {
+        "duration_s": ("FLOAT", "NULL"),
+    },
 }
 
 

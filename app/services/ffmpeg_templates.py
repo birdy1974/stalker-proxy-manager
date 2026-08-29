@@ -56,7 +56,50 @@ REFERENCE_PRESET_NAME = "VAAPI 720p ~1M (DS918+ reference)"
 # redirected instead of being proxied through ffmpeg.
 REDIRECT_PRESET_NAME = "Redirect (bypass ffmpeg)"
 REDIRECT_COMMAND = "@redirect"
+COPY_PRESET_NAME = "Copy / passthrough (no transcode)"
 URL_PLACEHOLDER = "<url>"
+
+
+def serves_original_file(command: str | None) -> bool:
+    """True when a local file should be sent as-is (no ffmpeg).
+
+    Redirect is a CDN 302 for portal streams; on disk that means 'give the
+    player the original container'. Copy/passthrough is the same idea without
+    remuxing to MPEG-TS. Anything that actually transcodes still goes through
+    ffmpeg.
+    """
+    cmd = (command or "").strip()
+    if not cmd or cmd == REDIRECT_COMMAND:
+        return True
+    try:
+        toks = shlex.split(cmd)
+    except ValueError:
+        return False
+    vcodec = acodec = None
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        nxt = toks[i + 1] if i + 1 < len(toks) else None
+        if t in ("-c:v", "-vcodec") and nxt:
+            vcodec = nxt
+            i += 2
+            continue
+        if t in ("-c:a", "-acodec") and nxt:
+            acodec = nxt
+            i += 2
+            continue
+        if t in ("-c", "-codec") and nxt:
+            vcodec = acodec = nxt
+            i += 2
+            continue
+        if t == "-an":
+            acodec = "none"
+            i += 1
+            continue
+        i += 1
+    if vcodec is None:
+        return False
+    return vcodec == "copy" and (acodec or "copy") in ("copy", "none")
 
 
 def target_size(resolution: str, aspect: str) -> tuple[int, int] | None:
@@ -365,7 +408,7 @@ def default_presets() -> list[dict]:
         mk("QSV 720p ~1M", hw_accel="qsv", video_codec="h264_qsv"),
         mk("Software 720p ~1.2M (libx264)", hw_accel="none", video_codec="libx264",
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k"),
-        mk("Copy / passthrough (no transcode)", hw_accel="none", video_codec="copy",
+        mk(COPY_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source"),
         mk("Dreambox DM800se (Enigma2 / MPEG2-SD)", hw_accel="vaapi",
            resolution="576p", aspect="16:9", video_codec="h264_vaapi",

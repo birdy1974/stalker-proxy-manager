@@ -20,7 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy import (
-    Boolean, DateTime, ForeignKey, Index, Integer, BigInteger, String, Text, SmallInteger,
+    Boolean, DateTime, Float, ForeignKey, Index, Integer, BigInteger, String, Text, SmallInteger,
     UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -251,6 +251,7 @@ class LocalFile(Base):
     filename: Mapped[str] = mapped_column(String(400), index=True)
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     mtime: Mapped[str | None] = mapped_column(String(40))
+    duration_s: Mapped[float | None] = mapped_column(Float)   # probed; drives M3U EXTINF
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 

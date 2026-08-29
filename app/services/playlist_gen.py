@@ -23,6 +23,7 @@ from ..models import (
     SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource, User,
     VodPlaylist, VodSource,
 )
+from .local_files import extinf_duration, play_extension
 from .runtime_settings import get_setting  # noqa: F401  (re-export; EPG scheduler)
 
 
@@ -179,9 +180,11 @@ async def build_m3u(base_url: str, user: User) -> str:
             if not lf:
                 continue
             name = it.custom_name or lf.filename
-            lines.append(f'#EXTINF:-1 tvg-name="{name}" '
+            dur = extinf_duration(lf.duration_s)
+            ext = play_extension(lf.filename)
+            lines.append(f'#EXTINF:{dur} tvg-name="{name}" '
                          f'group-title="{it.group_name or "vod-local"}",{name}')
-            lines.append(f"{base_url}/play/local/{it.id}.ts?u={u}&p={p}")
+            lines.append(f"{base_url}/play/local/{it.id}{ext}?u={u}&p={p}")
 
     return "\n".join(lines) + "\n"
 

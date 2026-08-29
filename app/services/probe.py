@@ -53,6 +53,38 @@ def _probe_args(target: str, *, is_url: bool) -> list[str]:
     return args
 
 
+async def probe_duration(path: str) -> float | None:
+    """Fast duration-only probe of a local file (no decode, no network flags).
+
+    `ffmpeg -i <file>` prints `Duration: HH:MM:SS.xx` on stderr and exits.
+    Used to fill `local_files.duration_s` so the M3U can advertise a real
+    `#EXTINF:` instead of live `-1`.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    args = [FFMPEG_BIN, "-hide_banner", "-nostdin", "-i", path]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    text = (err or b"").decode("utf-8", errors="replace")
+    m = _RE_DURATION.search(text)
+    if not m:
+        return None
+    h, mnt, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    dur = h * 3600 + mnt * 60 + sec
+    return dur if dur > 0 else None
+
+
 async def probe_media(target: str, *, is_url: bool) -> dict:
     """Return {'duration_s', 'overall_kbps', 'video': {...}, 'audio': [...]}
     or {'error': '...'}. Cached a few minutes per target (successes only)."""

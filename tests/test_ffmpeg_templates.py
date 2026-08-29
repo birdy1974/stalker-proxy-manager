@@ -15,8 +15,9 @@ silently drop them.
 from __future__ import annotations
 
 from app.services.ffmpeg_templates import (
-    FFmpegOptions, REDIRECT_COMMAND, REDIRECT_PRESET_NAME, REFERENCE_PRESET_NAME,
-    build_command, default_presets, parse_command, URL_PLACEHOLDER,
+    COPY_PRESET_NAME, FFmpegOptions, REDIRECT_COMMAND, REDIRECT_PRESET_NAME,
+    REFERENCE_PRESET_NAME, build_command, default_presets, parse_command,
+    serves_original_file, URL_PLACEHOLDER,
 )
 
 
@@ -103,6 +104,22 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
             continue
         fields = {k: v for k, v in p.items() if k in FFmpegOptions.__dataclass_fields__}
         assert build_command(FFmpegOptions(**fields)) == p["command"], name
+
+
+def test_serves_original_file_covers_redirect_and_copy():
+    assert serves_original_file(REDIRECT_COMMAND) is True
+    assert serves_original_file("") is True
+    copy = build_command(FFmpegOptions(hw_accel="none", video_codec="copy",
+                                       audio_codec="copy", resolution="source"))
+    assert serves_original_file(copy) is True
+    assert serves_original_file(f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1") is True
+    vaapi = build_command(FFmpegOptions())
+    assert serves_original_file(vaapi) is False
+    sw = build_command(FFmpegOptions(hw_accel="none", video_codec="libx264"))
+    assert serves_original_file(sw) is False
+    presets = {p["name"]: p for p in default_presets()}
+    assert serves_original_file(presets[COPY_PRESET_NAME]["command"]) is True
+    assert serves_original_file(presets[REDIRECT_PRESET_NAME]["command"]) is True
 
 
 def test_redirect_preset_is_a_sentinel_not_a_command():
