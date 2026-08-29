@@ -156,6 +156,45 @@ def truthy(v: Any) -> bool:
     return v in (1, True, "1", "true", "True", "yes")
 
 
+def _is_valid_season_item(item: dict, series_id: str) -> bool:
+    """True if item is a legitimate season object, False if it is a fallback VOD movie dump."""
+    if not isinstance(item, dict):
+        return False
+    if truthy(item.get("is_season")):
+        return True
+    if item.get("season_id") is not None and not item.get("cmd"):
+        return True
+    clean_id = series_id.split(":")[0] if ":" in series_id else series_id
+    item_series_id = str(item.get("series_id", "") or item.get("movie_id", "") or "")
+    if item_series_id and item_series_id in (series_id, clean_id):
+        return True
+    if isinstance(item.get("series"), list) and len(item.get("series")) > 0:
+        return True
+    if truthy(item.get("is_series")) and not item.get("cmd"):
+        return True
+    # Generic VOD movie dump (is_series 0/False, stream cmd, no season marker) -> False
+    if not truthy(item.get("is_series")) and item.get("cmd"):
+        return False
+    return False
+
+
+def _is_valid_episode_item(item: dict, series_id: str) -> bool:
+    """True if item is an episode (not a generic movie dump from an ignored query)."""
+    if not isinstance(item, dict):
+        return False
+    if truthy(item.get("is_episode")):
+        return True
+    if item.get("series_number") is not None:
+        return True
+    if isinstance(item.get("series"), (list, tuple)) and len(item.get("series")) >= 2:
+        return True
+    if item.get("video_id") or item.get("season_id"):
+        return True
+    if item.get("cmd"):
+        return True
+    return False
+
+
 @dataclass
 class Page:
     items: list[dict]
@@ -422,24 +461,87 @@ class StalkerClient:
 
     # ------------------------------------------------------------ seasons/episodes
     async def series_seasons(self, series_id: str) -> list[dict]:
-        """Seasons of a series. movie_id flow is the common denominator."""
-        params: dict = {"type": "vod", "action": "get_ordered_list", "movie_id": series_id,
-                        "sortby": "series", "p": "1", "JsHttpRequest": "1-xml"}
-        data = await self._get(params)
-        js = data.get("js") or {}
-        items = js.get("data") if isinstance(js, dict) else []
-        return items if isinstance(items, list) else []
+        """
+        Seasons of a series. Tries multiple query strategies (type=series, type=vod,
+        clean IDs) and strictly validates returned items to reject generic VOD movie fallbacks.
+        """
+        clean_id = series_id.split(":")[0] if ":" in series_id else series_id
+        ids = [series_id] if series_id == clean_id else [series_id, clean_id]
+
+        for type_ in ("series", "vod"):
+            for id_ in ids:
+                params = {"type": type_, "action": "get_ordered_list", "movie_id": id_,
+                          "sortby": "series", "p": "1", "JsHttpRequest": "1-xml"}
+                try:
+                    data = await self._get(params)
+                    js = data.get("js") or {}
+                    items = js.get("data") if isinstance(js, dict) else []
+                    if isinstance(items, list) and items:
+                        valid = [i for i in items if _is_valid_season_item(i, series_id)]
+                        if valid:
+                            return valid
+                except PortalError:
+                    pass
+
+                if type_ == "series":
+                    params = {"type": type_, "action": "get_ordered_list", "category": id_,
+                              "p": "1", "JsHttpRequest": "1-xml"}
+                    try:
+                        data = await self._get(params)
+                        js = data.get("js") or {}
+                        items = js.get("data") if isinstance(js, dict) else []
+                        if isinstance(items, list) and items:
+                            valid = [i for i in items if _is_valid_season_item(i, series_id)]
+                            if valid:
+                                return valid
+                    except PortalError:
+                        pass
+
+        return []
 
     async def series_episodes(self, series_id: str, season_id: str | None) -> list[dict]:
-        """Episodes of a season; tolerant to season_id vs season param naming."""
-        params: dict = {"type": "vod", "action": "get_ordered_list", "movie_id": series_id,
-                        "p": "1", "JsHttpRequest": "1-xml"}
-        if season_id:
-            params["season_id"] = season_id
-        data = await self._get(params)
-        js = data.get("js") or {}
-        items = js.get("data") if isinstance(js, dict) else []
-        return items if isinstance(items, list) else []
+        """
+        Episodes of a season. Tries type=series and type=vod, both season_id and series
+        parameter naming, and clean IDs.
+        """
+        clean_id = series_id.split(":")[0] if ":" in series_id else series_id
+        ids = [series_id] if series_id == clean_id else [series_id, clean_id]
+
+        for type_ in ("series", "vod"):
+            for id_ in ids:
+                param_keys = ["season_id", "series", "season"] if season_id is not None else [None]
+                for pkey in param_keys:
+                    params: dict = {"type": type_, "action": "get_ordered_list",
+                                    "movie_id": id_, "p": "1", "JsHttpRequest": "1-xml"}
+                    if pkey and season_id is not None:
+                        params[pkey] = str(season_id)
+                    try:
+                        data = await self._get(params)
+                        js = data.get("js") or {}
+                        items = js.get("data") if isinstance(js, dict) else []
+                        if isinstance(items, list) and items:
+                            valid = [i for i in items if _is_valid_episode_item(i, series_id)]
+                            if valid:
+                                return valid
+                    except PortalError:
+                        continue
+
+                if type_ == "series" and season_id is not None:
+                    params = {"type": type_, "action": "get_ordered_list",
+                              "category": id_, "season_id": str(season_id),
+                              "p": "1", "JsHttpRequest": "1-xml"}
+                    try:
+                        data = await self._get(params)
+                        js = data.get("js") or {}
+                        items = js.get("data") if isinstance(js, dict) else []
+                        if isinstance(items, list) and items:
+                            valid = [i for i in items if _is_valid_episode_item(i, series_id)]
+                            if valid:
+                                return valid
+                    except PortalError:
+                        pass
+
+        return []
 
     # ---------------------------------------------------------------- links
     async def create_link(self, cmd: str, kind: str = "itv") -> str:

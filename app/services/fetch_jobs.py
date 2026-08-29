@@ -433,9 +433,20 @@ async def _bulk_upsert(s, model, portal_id: int, key_col, items: list[dict],
 
 
 def _season_number(item: dict) -> int:
-    """Season number of a season row; panels use season_id, 'Season 3' or nothing."""
-    raw = str(item.get("season_id") or item.get("name") or "1")
-    raw = raw.replace("Season", "").replace("season", "").strip()
+    """Season number of a season row; handles season_id, 'Season 3', 'S03', or plain ints."""
+    for key in ("season_number", "season_id", "season", "series_number"):
+        val = item.get(key)
+        if val is not None and str(val).strip().isdigit():
+            return max(int(val), 1)
+    name = str(item.get("name") or "")
+    import re
+    m = re.search(r"(?:season|s|^)\s*(\d+)", name, re.IGNORECASE)
+    if m:
+        try:
+            return max(int(m.group(1)), 1)
+        except ValueError:
+            pass
+    raw = name.replace("Season", "").replace("season", "").strip()
     try:
         return max(int(raw), 1)
     except ValueError:
@@ -443,30 +454,112 @@ def _season_number(item: dict) -> int:
 
 
 def _episode_number(item: dict) -> int | None:
-    """Episode number from the `series` pair [season, episode] if the panel sends it."""
+    """Episode number from `series` pair [season, episode], `series_number`, or name 'S01E05'."""
     meta = item.get("series") or []
-    if len(meta) > 1:
+    if isinstance(meta, (list, tuple)) and len(meta) > 1:
         try:
             return int(meta[1])
         except (TypeError, ValueError):
-            return None
+            pass
+    for key in ("series_number", "episode_number", "episode_id", "episode"):
+        val = item.get(key)
+        if val is not None and str(val).strip().isdigit():
+            return int(val)
+    name = str(item.get("name") or "")
+    import re
+    m = re.search(r"(?:episode|ep|e)\s*(\d+)", name, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
     return None
 
 
 def _episode_season(item: dict) -> int | None:
-    """
-    Season number carried by an episode row - ONLY trusted when the row really
-    is an episode, i.e. it carries the full `series: [season, episode]` pair.
-    Season rows (and season-1-only answers) carry no such pair and must never
-    be mistaken for the complete episode list.
-    """
+    """Season number carried by an episode row."""
     meta = item.get("series") or []
-    if len(meta) > 1:
+    if isinstance(meta, (list, tuple)) and len(meta) > 1:
         try:
             return int(meta[0])
         except (TypeError, ValueError):
-            return None
+            pass
+    for key in ("season_number", "season_id", "season"):
+        val = item.get(key)
+        if val is not None and str(val).strip().isdigit():
+            return int(val)
+    name = str(item.get("name") or "")
+    import re
+    m = re.search(r"(?:season|s)\s*(\d+)", name, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
     return None
+
+
+def extract_seasons_from_meta(raw: Any) -> list[tuple[int, str, str]]:
+    """
+    Extract season numbers from series metadata.
+    Handles:
+      - list of numbers: [1, 2, ..., 14]
+      - list of strings: ["1", "2", ...]
+      - list of dicts: [{"id": "1", "name": "Season 1", "season_id": "1"}, ...]
+      - single integer/string count: 14 -> 1..14
+      - comma-separated numbers: "1,2,3,4,..."
+    Returns list of (season_number, portal_season_id, season_title).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return []
+        import json
+        try:
+            parsed = json.loads(raw)
+            if parsed is not None and parsed != raw:
+                return extract_seasons_from_meta(parsed)
+        except Exception:
+            pass
+        if "," in raw:
+            parts = [p.strip() for p in raw.split(",") if p.strip().isdigit()]
+            if parts:
+                return [(int(p), p, f"Season {p}") for p in parts]
+        if raw.isdigit():
+            count = int(raw)
+            if 1 <= count <= 100:
+                return [(i, str(i), f"Season {i}") for i in range(1, count + 1)]
+            return [(count, str(count), f"Season {count}")]
+        return []
+
+    if isinstance(raw, (int, float)):
+        count = int(raw)
+        if 1 <= count <= 100:
+            return [(i, str(i), f"Season {i}") for i in range(1, count + 1)]
+        return [(count, str(count), f"Season {count}")]
+
+    if isinstance(raw, (list, tuple)):
+        result = []
+        for item in raw:
+            if isinstance(item, dict):
+                sn = _season_number(item)
+                pid = str(item.get("season_id") or item.get("id") or sn)
+                title = str(item.get("name") or f"Season {sn}")[:300]
+                result.append((sn, pid, title))
+            elif isinstance(item, (int, str)) and str(item).strip().isdigit():
+                sn = int(str(item).strip())
+                result.append((sn, str(sn), f"Season {sn}"))
+        seen = set()
+        deduped = []
+        for s in result:
+            if s[0] not in seen:
+                seen.add(s[0])
+                deduped.append(s)
+        return deduped
+
+    return []
 
 
 def _live_genre_of(item: dict) -> str:
@@ -512,6 +605,13 @@ def _serie_fields(row, item, genre_db_id: int) -> None:
     row.description = item.get("description")
     row.rating = str(item.get("rating_kinopoisk", "") or "")[:10]
     row.category_name = (item.get("category_name") or "")[:300] or None
+    s_raw = item.get("series") or item.get("seasons")
+    if s_raw is not None:
+        import json
+        try:
+            row.raw_series = json.dumps(s_raw) if not isinstance(s_raw, str) else s_raw
+        except Exception:
+            row.raw_series = str(s_raw)
 
 
 async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_name: str) -> None:
@@ -681,7 +781,7 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
         else:
             stmt = stmt.where(SerieSource.enabled.is_(True))
         series = (await s.execute(stmt)).scalars().all()
-        ids = [(x.id, x.portal_item_id, x.original_name) for x in series]
+        ids = [(x.id, x.portal_item_id, x.original_name, x.raw_series) for x in series]
     total_series = len(ids)
     whole_episode_list = True          # hope for "all episodes in one request"
     done_series = 0
@@ -696,18 +796,32 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
             for r in season_rows:
                 by_series.setdefault(r.serie_source_id, {})[r.season_number] = r
 
-            for sid, pid, sname in chunk:
+            for sid, pid, sname, raw_series in chunk:
                 if job._cancel.is_set():
                     return
                 done_series += 1
                 job.detail = f"series {done_series}/{total_series}: {sname}"
                 try:
-                    seasons = await client.series_seasons(pid)
                     wanted: list[tuple[int, str, str]] = []
-                    for sitem in seasons:
-                        snum = _season_number(sitem)
-                        wanted.append((snum, str(sitem.get("season_id") or snum),
-                                       (sitem.get("name") or f"Season {snum}")[:300]))
+                    # 1. Try querying the portal seasons API (Option 3 with strict validation)
+                    try:
+                        seasons = await client.series_seasons(pid)
+                        for sitem in seasons:
+                            snum = _season_number(sitem)
+                            wanted.append((snum, str(sitem.get("season_id") or sitem.get("id") or snum),
+                                           (sitem.get("name") or f"Season {snum}")[:300]))
+                    except PortalError:
+                        pass
+
+                    # 2. If portal seasons API returned nothing or was rejected as invalid,
+                    #    extract seasons from parent series metadata (Option 1)
+                    if not wanted and raw_series:
+                        wanted = extract_seasons_from_meta(raw_series)
+
+                    # 3. Fallback to Season 1 if no season information found anywhere
+                    if not wanted:
+                        wanted = [(1, "1", "Season 1")]
+
                     # --- complete episode list in ONE request when supported
                     bulk: dict[int, list[dict]] = {}
                     if whole_episode_list and len(wanted) > 1:
