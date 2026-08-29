@@ -235,6 +235,9 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "local_files": {
         "duration_s": ("FLOAT", "NULL"),
     },
+    "serie_sources": {
+        "raw_series": ("TEXT", "NULL"),
+    },
 }
 
 

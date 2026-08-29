@@ -242,7 +242,7 @@ function filterGenrePane(pane) {
     all++;
     const name = (lb.dataset.name || lb.textContent || "").toLowerCase();
     const show = !needle || name.includes(needle);
-    lb.style.display = show ? "" : "none";
+    lb.classList.toggle("d-none", !show);
     if (show) vis++;
   });
   if (cnt) cnt.textContent = all ? (needle ? `${vis}/${all}` : `${all}`) : "";

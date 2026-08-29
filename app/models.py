@@ -185,6 +185,7 @@ class SerieSource(Base):
     description: Mapped[str | None] = mapped_column(Text)
     rating: Mapped[str | None] = mapped_column(String(10))
     category_name: Mapped[str | None] = mapped_column(String(300))
+    raw_series: Mapped[str | None] = mapped_column(Text)                  # stored series/seasons metadata
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     seasons_fetched: Mapped[bool] = mapped_column(Boolean, default=False)
 
