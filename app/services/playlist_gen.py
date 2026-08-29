@@ -21,8 +21,9 @@ from ..database import SessionLocal
 from ..models import (
     LivePlaylist, LocalFile, LocalPlaylist, LocalSource, SerieEpisode,
     SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource, User,
-    VodPlaylist, VodSource, Setting,
+    VodPlaylist, VodSource,
 )
+from .runtime_settings import get_setting  # noqa: F401  (re-export; EPG scheduler)
 
 
 class UserAuth:
@@ -71,17 +72,6 @@ def _allowed(group_name: str | None, whitelist: list[str]) -> bool:
     if not whitelist:
         return True
     return (group_name or "").lower() in [w.lower() for w in whitelist]   # case-insensitive
-
-
-async def get_setting(key: str, default=None):
-    async with SessionLocal() as s:
-        row = await s.get(Setting, key)
-        if row is None or row.value is None:
-            return default
-        try:
-            return json.loads(row.value)
-        except json.JSONDecodeError:
-            return default
 
 
 def _chunked(seq: list, size: int = 800):
@@ -200,6 +190,7 @@ async def build_m3u(base_url: str, user: User) -> str:
 # Xtream Codes API data views (player_api.php)
 # ---------------------------------------------------------------------------
 async def xtream_base(user: User, base_url: str) -> dict:
+    from .stream_manager import MANAGER as _mgr
     now = int(datetime.now(timezone.utc).timestamp())
     return {
         "user_info": {
@@ -207,7 +198,9 @@ async def xtream_base(user: User, base_url: str) -> dict:
             "auth": 1, "status": "Active",
             "exp_date": str(int(datetime.fromisoformat(user.expire_date).timestamp()))
             if user.expire_date else None,
-            "is_trial": "0", "active_cons": "0", "created_at": str(now),
+            "is_trial": "0",
+            "active_cons": str(_mgr.user_stream_count(user.name)),
+            "created_at": str(now),
             "max_connections": str(user.max_connections),
             "allowed_output_formats": ["ts", "m3u8"],
         },

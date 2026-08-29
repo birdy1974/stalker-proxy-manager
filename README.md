@@ -146,7 +146,7 @@ M3U:      http://<host>:8880/get.php?username=USER&password=PASS&type=m3u_plus&o
 Xtream:   http://<host>:8880/player_api.php?username=USER&password=PASS
 Stream:   http://<host>:8880/play/live/{id}.ts?username=..&password=..
           http://<host>:8880/{user}/{pass}/{stream_id}.ts   (xtream short form)
-xmltv:    http://<host>:8880/xmltv.php?username=USER&password=PASS   (stub for now)
+xmltv:    http://<host>:8880/xmltv.php?username=USER&password=PASS
 ```
 
 Users only ever talk to port **8880** — GUI, streams, playlists and APIs share it.

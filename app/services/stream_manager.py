@@ -32,8 +32,7 @@ from dataclasses import dataclass, field
 
 from sqlalchemy import delete, select
 
-from ..config import (FALLBACK_STRATEGY, FFMPEG_BIN, MEDIA_ROOT,
-                      STREAM_START_TIMEOUT)
+from ..config import FFMPEG_BIN, MEDIA_ROOT, STREAM_START_TIMEOUT
 from ..database import SessionLocal, run_uncancelled
 from ..models import (
     ActiveStream, FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource,
@@ -400,8 +399,30 @@ class StreamManager:
                 pass
 
     # ------------------------------------------------------- chain building
+    @staticmethod
+    def _pick_macs(macs, portal_id: int, strategy: str, used_portals: set[int]):
+        """Apply the GUI/env fallback strategy to one portal's MAC list.
+
+        macs_first  -> try every MAC of this portal (even if the portal already
+                       appeared earlier in the chain as a different source).
+        portal_first -> one MAC per portal; later sources on the same portal
+                       are skipped so we hop to the next portal immediately.
+        """
+        if not macs:
+            return None
+        if strategy == "portal_first":
+            if portal_id in used_portals:
+                return None
+            picked = list(macs[:1])
+        else:
+            picked = list(macs)
+        used_portals.add(portal_id)
+        return picked
+
     async def _live_chain(self, playlist_id: int) -> tuple[list, str, object]:
         """[(LiveSource, Portal, [MacAddress...])] in fallback priority order."""
+        from .runtime_settings import fallback_strategy
+        strategy = await fallback_strategy()
         async with SessionLocal() as s:
             item = await s.get(LivePlaylist, playlist_id)
             if not item:
@@ -420,17 +441,15 @@ class StreamManager:
                     continue
                 macs = (await s.execute(select(MacAddress).where(
                     MacAddress.portal_id == portal.id).order_by(MacAddress.order))).scalars().all()
-                if not macs:
+                picked = self._pick_macs(macs, portal.id, strategy, used_portals)
+                if not picked:
                     continue
-                # portal_first strategy: only the best MAC per portal is tried
-                macs = list(macs) if FALLBACK_STRATEGY == "macs_first" else list(macs[:1])
-                if FALLBACK_STRATEGY == "portal_first" and portal.id in used_portals:
-                    continue
-                used_portals.add(portal.id)
-                chain.append((src, portal, macs))
+                chain.append((src, portal, picked))
             return chain, item.custom_name, item
 
     async def _vod_chain(self, playlist_id: int):
+        from .runtime_settings import fallback_strategy
+        strategy = await fallback_strategy()
         async with SessionLocal() as s:
             item = await s.get(VodPlaylist, playlist_id)
             if not item:
@@ -439,6 +458,7 @@ class StreamManager:
                 select(VodPlaylistSource).where(VodPlaylistSource.vod_playlist_id == playlist_id)
                 .order_by(VodPlaylistSource.priority))).scalars().all()
             chain = []
+            used_portals: set[int] = set()
             for r in rows:
                 src = await s.get(VodSource, r.vod_source_id)
                 if not src or not src.cmd:
@@ -448,8 +468,9 @@ class StreamManager:
                     continue
                 macs = (await s.execute(select(MacAddress).where(
                     MacAddress.portal_id == portal.id).order_by(MacAddress.order))).scalars().all()
-                if macs:
-                    chain.append((src, portal, list(macs)))
+                picked = self._pick_macs(macs, portal.id, strategy, used_portals)
+                if picked:
+                    chain.append((src, portal, picked))
             return chain, item.custom_name, item
 
     async def _episode_target(self, episode_id: int):
@@ -468,7 +489,10 @@ class StreamManager:
             rows = (await s.execute(
                 select(SeriePlaylistSource).where(SeriePlaylistSource.serie_playlist_id == pl.id)
                 .order_by(SeriePlaylistSource.priority))).scalars().all()
+            from .runtime_settings import fallback_strategy
+            strategy = await fallback_strategy()
             chain = []
+            used_portals: set[int] = set()
             for r in rows:
                 src = await s.get(SerieSource, r.serie_source_id)
                 if not src:
@@ -489,8 +513,9 @@ class StreamManager:
                     continue
                 macs = (await s.execute(select(MacAddress).where(
                     MacAddress.portal_id == portal.id).order_by(MacAddress.order))).scalars().all()
-                if macs:
-                    chain.append((alt_ep, portal, list(macs)))
+                picked = self._pick_macs(macs, portal.id, strategy, used_portals)
+                if picked:
+                    chain.append((alt_ep, portal, picked))
             name = f"{pl.custom_name} S{season.season_number:02d}E{ep.episode_number:02d}"
             return chain, name, pl
 

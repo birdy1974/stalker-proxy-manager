@@ -21,7 +21,6 @@ import os
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
 
-from ..config import OUTPUT_BASE_URL
 from ..database import get_db
 from ..models import (
     LivePlaylist, LiveSource, LocalPlaylist, LocalFile, SerieEpisode,
@@ -38,10 +37,12 @@ from sqlalchemy import select
 router = APIRouter(tags=["output"])
 
 
-def base_url_of(request: Request) -> str:
-    """Public base URL: settings/env override wins, else derive from request."""
-    if OUTPUT_BASE_URL:
-        return OUTPUT_BASE_URL
+async def base_url_of(request: Request) -> str:
+    """Public base URL: GUI setting, then env, else derive from the request."""
+    from ..services.runtime_settings import output_base_url
+    override = await output_base_url()
+    if override:
+        return override
     return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
@@ -56,7 +57,7 @@ async def _authed(u: str | None, p: str | None, need: str = "m3u") -> User:
 @router.get("/playlist.m3u")
 async def playlist_m3u(request: Request, u: str = "", p: str = ""):
     user = await _authed(u, p, "m3u")
-    text = await build_m3u(base_url_of(request), user)
+    text = await build_m3u(await base_url_of(request), user)
     fname = f"playlist_{user.name}.m3u"
     return PlainTextResponse(text, media_type="application/x-mpegURL",
                              headers={"Content-Disposition": f'attachment; filename="{fname}"'})
@@ -66,7 +67,7 @@ async def playlist_m3u(request: Request, u: str = "", p: str = ""):
 async def get_php(request: Request, username: str = "", password: str = "",
                   type: str = Query("m3u_plus"), output: str = "ts"):  # noqa: A002
     user = await _authed(username, password, "xtream")
-    text = await build_m3u(base_url_of(request), user)
+    text = await build_m3u(await base_url_of(request), user)
     return PlainTextResponse(text, media_type="application/x-mpegURL")
 
 
@@ -75,7 +76,7 @@ async def get_php(request: Request, username: str = "", password: str = "",
 async def player_api(request: Request, username: str = "", password: str = "",
                      action: str = "", vod_id: int = 0, series_id: int = 0):
     user = await _authed(username, password, "xtream")
-    base = base_url_of(request)
+    base = await base_url_of(request)
     if not action:
         return await xtream_base(user, base)
     if action == "get_live_categories":
@@ -111,7 +112,7 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
     enabled EPG sources (auto-matched or manually assigned tvg-ids)."""
     from ..services import epg as epg_svc
     user = await _authed(u or username, p or password, "xtream")
-    xml = await epg_svc.build_xmltv(base_url_of(request), user)
+    xml = await epg_svc.build_xmltv(await base_url_of(request), user)
     return Response(xml, media_type="application/xml")
 
 
