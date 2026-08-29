@@ -64,7 +64,7 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 .footer-note { color: #9ca3af; font-size: .72rem; }
 
 /* portal edit popup: genres in multiple columns so long lists stay compact */
-.genre-grid { columns: 3 190px auto; column-gap: 1.2rem; }
+.genre-grid { columns: 3 190px; column-gap: 1.2rem; }
 .genre-grid label { break-inside: avoid; display: block; }
 
 /* thin separator between the stages of the pipeline in the top nav */

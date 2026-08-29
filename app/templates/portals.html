@@ -168,18 +168,39 @@ async function editPortal(id) {
       toast("genre lists updated — enable the genres you want, then Save", "ok");
     });
   });
-  for (const k of ["live", "vod", "series"]) {
-    /* left-aligned textbox filters the genre list (client-side, case-insensitive) */
-    $(`#genre-q-${k}`, body)?.addEventListener("input", (e) => {
-      const q = e.target.value.toLowerCase();
-      $$(`#genre-list-${k} label`, body).forEach(lb =>
-        lb.style.display = (lb.dataset.name || "").includes(q) ? "" : "none");
-      const all = $$(`#genre-list-${k} label`, body).length,
-            vis = $$(`#genre-list-${k} label`, body).filter(lb => lb.style.display !== "none").length;
-      const cnt = $(`#genre-count-${k}`, body);
-      if (cnt) cnt.textContent = q ? `${vis}/${all}` : `${all}`;
+  for (const evt of ["input", "keyup"]) {
+    /* Genre filter boxes: filter the genre list below the box LIVE, while the
+       user types. One delegated listener per event on the popup body (works
+       for all three panes and survives every list re-render); `keyup` covers
+       IME/autofill edge cases where `input` may not fire. */
+    body.addEventListener(evt, (e) => {
+      const inp = e.target?.closest?.("#genre-q-live, #genre-q-vod, #genre-q-series");
+      if (inp) filterGenrePane(inp.closest("[data-pane]"));
     });
   }
+}
+
+/* Live client-side genre filter: hides the genre rows of one pane that do not
+ * match what is typed in that pane's filter box (case-insensitive), and keeps
+ * the "matching/total" counter in sync. Called on every keystroke and after
+ * every (re-)render of the list, so a filter stays applied. */
+function filterGenrePane(pane) {
+  if (!pane) return;
+  const kind = pane.dataset.pane;
+  const q = $(`#genre-q-${kind}`, pane);
+  const host = $(`#genre-list-${kind}`, pane);
+  const cnt = $(`#genre-count-${kind}`, pane);
+  if (!host) return;
+  const needle = (q ? q.value : "").trim().toLowerCase();
+  let vis = 0, all = 0;
+  $$("label", host).forEach(lb => {
+    all++;
+    const name = (lb.dataset.name || lb.textContent || "").toLowerCase();
+    const show = !needle || name.includes(needle);
+    lb.style.display = show ? "" : "none";
+    if (show) vis++;
+  });
+  if (cnt) cnt.textContent = all ? (needle ? `${vis}/${all}` : `${all}`) : "";
 }
 
 async function loadGenres(pid, kind) {
@@ -201,8 +222,9 @@ async function loadGenres(pid, kind) {
       body: { kind, ids: [+cb.value], enabled: cb.checked } });
     toast(`genre ${cb.checked ? "enabled" : "disabled"} — use Fetch to (un)load its items`, "ok");
   }));
-  const q = $(`#genre-q-${kind}`); if (q && q.value) q.dispatchEvent(new Event("input"));
-  const cnt = $(`#genre-count-${kind}`); if (cnt) cnt.textContent = `${rows.length}`;
+  /* re-apply the pane's filter (if any) to the freshly rendered list so a
+     typed query stays in effect across re-renders (tab switch, refetch) */
+  filterGenrePane(host.closest("[data-pane]"));
 }
 
 async function savePortal(id, m) {
