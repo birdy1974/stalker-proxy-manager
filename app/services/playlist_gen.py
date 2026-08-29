@@ -25,6 +25,7 @@ from ..models import (
 )
 from .local_files import extinf_duration, play_extension
 from .runtime_settings import get_setting  # noqa: F401  (re-export; EPG scheduler)
+from .titles import best_title, m3u_attr
 
 
 class UserAuth:
@@ -107,28 +108,34 @@ async def build_m3u(base_url: str, user: User) -> str:
         for it in items:
             if not _allowed(it.group_name, groups["live"]):
                 continue
+            title = best_title(it.custom_name)
             attrs = {
                 "tvg-chno": it.number if it.number is not None else it.order,
-                "tvg-id": it.epg_id or "", "tvg-name": it.custom_name,
-                "tvg-logo": it.logo or "", "group-title": it.group_name or "Live",
+                "tvg-id": m3u_attr(it.epg_id or ""), "tvg-name": m3u_attr(title),
+                "tvg-logo": m3u_attr(it.logo or ""), "group-title": m3u_attr(it.group_name or "Live"),
             }
             attr = " ".join(f'{k}="{v}"' for k, v in attrs.items())
-            lines.append(f"#EXTINF:-1 {attr},{it.custom_name}")
+            lines.append(f"#EXTINF:-1 {attr},{title}")
             lines.append(f"{base_url}/play/live/{it.id}.ts?u={u}&p={p}")
 
         # ---- vod -------------------------------------------------------
         vods = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                                 .order_by(VodPlaylist.order, VodPlaylist.id))).scalars().all()
+        src_names: dict[int, str] = {}
+        wanted_src = [it.vod_source_id for it in vods if it.vod_source_id]
+        for batch in _chunked(wanted_src):
+            for src in (await s.execute(select(VodSource).where(VodSource.id.in_(batch)))).scalars().all():
+                src_names[src.id] = src.original_name
         for it in vods:
             if not _allowed(it.group_name, groups["vod"]):
                 continue
-            # tvg-name matters: several players (and all Xtream clients) prefer
-            # it over the text after the comma, and without it they fall back to
-            # the URL - which is how titles end up looking "not complete".
-            attr = (f'tvg-name="{it.custom_name}" '
-                    f'tvg-logo="{it.poster or it.logo or ""}" '
-                    f'group-title="{it.group_name or "VOD"}"')
-            lines.append(f"#EXTINF:-1 {attr},{it.custom_name}")
+            # Prefer the longest non-year title: some portals store the year in
+            # `name` and the full title in `o_name` (now original_name).
+            title = best_title(it.custom_name, src_names.get(it.vod_source_id))
+            attr = (f'tvg-name="{m3u_attr(title)}" '
+                    f'tvg-logo="{m3u_attr(it.poster or it.logo or "")}" '
+                    f'group-title="{m3u_attr(it.group_name or "VOD")}"')
+            lines.append(f"#EXTINF:-1 {attr},{title}")
             lines.append(f"{base_url}/play/vod/{it.id}.ts?u={u}&p={p}")
 
         # ---- series: one m3u entry per episode of enabled seasons ------
@@ -160,10 +167,10 @@ async def build_m3u(base_url: str, user: User) -> str:
         for sp in visible:
             for sp_id, season_id, season_number in [r for r in season_rows if r[0] == sp.id]:
                 for ep_id, ep_num in eps_by_season.get(season_id, []):
-                    name = f"{sp.custom_name} S{season_number:02d}E{ep_num:02d}"
-                    attr = (f'tvg-name="{name}" '
-                            f'tvg-logo="{sp.poster or sp.logo or ""}" '
-                            f'group-title="Series: {sp.group_name or sp.custom_name}"')
+                    name = f"{best_title(sp.custom_name)} S{season_number:02d}E{ep_num:02d}"
+                    attr = (f'tvg-name="{m3u_attr(name)}" '
+                            f'tvg-logo="{m3u_attr(sp.poster or sp.logo or "")}" '
+                            f'group-title="{m3u_attr("Series: " + (sp.group_name or sp.custom_name))}"')
                     lines.append(f"#EXTINF:-1 {attr},{name}")
                     lines.append(f"{base_url}/play/episode/{ep_id}.ts?u={u}&p={p}")
 
@@ -182,11 +189,11 @@ async def build_m3u(base_url: str, user: User) -> str:
             lf = files.get(it.local_file_id)
             if not lf:
                 continue
-            name = it.custom_name or lf.filename
+            name = best_title(it.custom_name, lf.filename)
             dur = extinf_duration(lf.duration_s)
             ext = play_extension(lf.filename)
-            lines.append(f'#EXTINF:{dur} tvg-name="{name}" '
-                         f'group-title="{it.group_name or "vod-local"}",{name}')
+            lines.append(f'#EXTINF:{dur} tvg-name="{m3u_attr(name)}" '
+                         f'group-title="{m3u_attr(it.group_name or "vod-local")}",{name}')
             lines.append(f"{base_url}/play/local/{it.id}{ext}?u={u}&p={p}")
 
     return "\n".join(lines) + "\n"
@@ -266,8 +273,16 @@ async def xtream_vod(user: User) -> list[dict]:
     async with SessionLocal() as s:
         items = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                                  .order_by(VodPlaylist.order))).scalars().all()
+    src_names: dict[int, str] = {}
+    async with SessionLocal() as s2:
+        wanted = [it.vod_source_id for it in items if it.vod_source_id]
+        for batch in _chunked(wanted):
+            for src in (await s2.execute(select(VodSource).where(VodSource.id.in_(batch)))).scalars().all():
+                src_names[src.id] = src.original_name
     return [{
-        "num": it.order, "name": it.custom_name, "stream_type": "movie",
+        "num": it.order,
+        "name": best_title(it.custom_name, src_names.get(it.vod_source_id)),
+        "stream_type": "movie",
         "stream_id": it.id, "stream_icon": it.poster or it.logo or "",
         "rating": it.rating or "", "rating_5based": 0, "added": "0",
         "category_id": cats.get(it.group_name or "VOD", "1"),
@@ -288,10 +303,11 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
     plot = it.overview or (src.description if src else "") or ""
     rating = it.rating or (src.rating if src else "") or ""
     year = it.year or (src.year if src else "") or ""
+    title = best_title(it.custom_name, src.original_name if src else None)
     cats = {c["category_name"]: c["category_id"] for c in await xtream_categories(user, "vod")}
     info = {
         "kinopoisk_url": "", "tmdb_id": str(it.tmdb_id or ""),
-        "name": it.custom_name, "o_name": src.original_name if src else it.custom_name,
+        "name": title, "o_name": src.original_name if src else title,
         "cover_big": poster, "movie_image": poster, "releasedate": year,
         "episode_run_time": 0, "youtube_trailer": "", "director": "",
         "actors": "", "cast": "", "description": plot, "plot": plot,
@@ -301,7 +317,7 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
         "video": [], "audio": [], "bitrate": 0, "rating": rating,
     }
     return {"info": info,
-            "movie_data": {"stream_id": it.id, "name": it.custom_name, "added": "0",
+            "movie_data": {"stream_id": it.id, "name": title, "added": "0",
                            "category_id": cats.get(it.group_name or "VOD", "1"),
                            "container_extension": "ts", "custom_sid": "", "direct_source": ""}}
 

@@ -93,12 +93,19 @@
           <div class="col-12 mt-2">
             <label class="muted-label">Full ffmpeg command (edit freely — fields update on the fly)</label>
             <textarea class="form-control ff-edit mono" id="f-command" spellcheck="false"></textarea>
-            <div class="d-flex align-items-center gap-2 mt-1">
+            <div class="d-flex align-items-center gap-2 mt-1 flex-wrap">
               <span class="small" id="sync-state"></span>
-              <button class="btn btn-sm btn-outline-secondary ms-auto" id="btn-test-cmd">Validate syntax</button>
+              <div class="btn-group ms-auto">
+                <button class="btn btn-sm btn-outline-secondary" id="btn-test-syntax">Validate syntax</button>
+                <button class="btn btn-sm btn-outline-secondary" id="btn-test-lavfi" title="ffmpeg lavfi testsrc2, ~2s">Demo (testsrc)</button>
+                <button class="btn btn-sm btn-outline-secondary" id="btn-test-url" title="Big Buck Bunny 10s clip from test-videos.co.uk">Demo (test video)</button>
+              </div>
             </div>
+            <pre class="small bg-dark text-light p-2 mt-2 d-none" id="validate-out" style="max-height:220px;overflow:auto;white-space:pre-wrap"></pre>
             <div class="small text-muted mt-2">The literal <code>&lt;url&gt;</code> is replaced with the real stream at runtime.
-              Reference DS918+ command (spec) is the “VAAPI 720p ~1M” preset.</div>
+              Demos run the <b>actual</b> command for ~2s: testsrc is synthetic (no network);
+              test video is <a href="https://test-videos.co.uk/" target="_blank" rel="noopener">test-videos.co.uk</a> Big Buck Bunny H.264 360p.
+              VAAPI/QSV failures on testsrc are expected if the encoder needs hardware frames — use the test video for that.</div>
           </div>
         </div>
       </div>
@@ -199,14 +206,18 @@ async function selectTemplate(id) {
   $("#redirect-note").classList.toggle("d-none", !redir);
   $$(".ff-field").forEach(n => { if (n.id !== "f-enabled") n.disabled = redir; });
   $("#f-command").disabled = redir;
-  $("#btn-test-cmd").disabled = redir;
+  $("#btn-test-syntax").disabled = redir;
+  $("#btn-test-lavfi").disabled = redir;
+  $("#btn-test-url").disabled = redir;
 }
 $("#tpl-new").addEventListener("click", () => {
   current = null; $("#ed-title").textContent = "New template (unsaved)";
   $("#redirect-note").classList.add("d-none");
   $$(".ff-field").forEach(n => n.disabled = false);
   $("#f-command").disabled = false;
-  $("#btn-test-cmd").disabled = false;
+  $("#btn-test-syntax").disabled = false;
+  $("#btn-test-lavfi").disabled = false;
+  $("#btn-test-url").disabled = false;
   writeFields({ name: "New template", enabled: true, hw_accel: "vaapi",
                 low_power: true, rc_mode: "VBR", async_depth: "4" });
   fieldsToCommand();

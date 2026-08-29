@@ -12,6 +12,7 @@ from ..database import get_db
 from ..models import FFmpegTemplate
 from ..security import require_admin
 from ..services.ffmpeg_templates import FFmpegOptions, build_command, parse_command
+from ..services.ffmpeg_validate import TEST_VIDEO_URL, run_demo, syntax_check
 
 router = APIRouter(prefix="/api/ffmpeg", tags=["ffmpeg"], dependencies=[Depends(require_admin)])
 

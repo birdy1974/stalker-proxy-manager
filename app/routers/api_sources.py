@@ -217,12 +217,30 @@ async def toggle(payload: dict, db=Depends(get_db)):
     if payload.get("kind") in SYNC_KINDS:
         synced = await sync_sources(db, payload["kind"], [r.id for r in rows], enabled)
     await db.commit()
+    jobs = []
+    if payload.get("kind") == "series" and enabled and rows:
+        # Seasons are not part of the catalog fetch. As soon as the user
+        # enables a series, pull its seasons so they can pick which ones
+        # go into the output without waiting for a full portal Fetch.
+        from collections import defaultdict
+        from ..services.fetch_jobs import submit as submit_fetch
+        by_portal: dict[int, list[int]] = defaultdict(list)
+        for r in rows:
+            if not r.seasons_fetched:
+                by_portal[r.portal_id].append(r.id)
+        for pid, sids in by_portal.items():
+            job = await submit_fetch("fetch_seasons", pid, series_ids=sids)
+            jobs.append(job.public())
+        if jobs:
+            await db_log("INFO", "sources",
+                         f"series: queued season fetch for {sum(len(v) for v in by_portal.values())} title(s)")
     await db_log("INFO", "sources",
                  f"{payload['kind']}: {len(rows)} items -> enabled={enabled}"
                  + (f" (playlist: +{synced.get('created', 0)} new, "
                     f"{synced.get('enabled', 0)} re-enabled, "
                     f"{synced.get('disabled', 0)} switched off)" if synced else ""))
-    return {"ok": True, "count": len(rows), "playlist": synced}
+    return {"ok": True, "count": len(rows), "playlist": synced,
+            "season_jobs": jobs}
 
 
 @router.post("/series/seasons/toggle")
@@ -267,8 +285,12 @@ async def add_local_dir(payload: dict, db=Depends(get_db)):
                       recursive=bool(payload.get("recursive", True)))
     db.add(row)
     await db.commit()
+    await db.refresh(row)
     await db_log("INFO", "local", f"local directory added: {directory}")
-    return {"id": row.id}
+    # First add always scans immediately so the file list is not empty until
+    # the user remembers to hit Fetch.
+    scanned = await scan_local({"ids": [row.id]}, db)
+    return {"id": row.id, "scan": scanned}
 
 
 @router.delete("/local/dirs/{did}")
