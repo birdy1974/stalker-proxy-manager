@@ -95,7 +95,10 @@ async def build_m3u(base_url: str, user: User) -> str:
     """
     groups = _groups(user)
     u, p = quote(user.name), quote(user.password)
-    lines = [f'#EXTM3U url-tvg="{base_url}/epg.xml?u={u}&p={p}" x-tvg-url="{base_url}/epg.xml?u={u}&p={p}"']
+    # No url-tvg / x-tvg-url: VLC (and several other players) block playlist
+    # parse until that EPG URL finishes or times out (~30s). /epg.xml is still
+    # served; add it in the player as a separate XMLTV source if you want guide.
+    lines = ["#EXTM3U"]
 
     async with SessionLocal() as s:
         # ---- live ------------------------------------------------------
