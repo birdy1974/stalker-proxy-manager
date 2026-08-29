@@ -164,8 +164,10 @@ async function seriesDetail(row) {
 function localTab(hostSel) {
   const host = $(hostSel);
   host.innerHTML = `<div class="row g-3"><div class="col-lg-5">
-      <div class="d-flex gap-2 mb-2">
+      <div class="d-flex flex-wrap gap-2 mb-2">
         <button class="btn btn-sm btn-accent" id="ld-add"><i class="bi bi-folder-plus"></i> Add directory</button>
+        <button class="btn btn-sm btn-outline-primary" id="ld-fetch" title="Scan every enabled directory for video files">
+          <i class="bi bi-cloud-download"></i> Fetch media files</button>
         <button class="btn btn-sm btn-outline-secondary" id="ld-scan"><i class="bi bi-arrow-repeat"></i> Scan selected</button>
       </div><div id="ldirs"></div>
     </div><div class="col-lg-7"><div class="muted-label mb-1">Scanned video files (used by the Local playlist builder)</div><div id="lfiles"></div></div></div>`;

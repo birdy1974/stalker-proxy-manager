@@ -267,8 +267,12 @@ async def add_local_dir(payload: dict, db=Depends(get_db)):
                       recursive=bool(payload.get("recursive", True)))
     db.add(row)
     await db.commit()
+    await db.refresh(row)
     await db_log("INFO", "local", f"local directory added: {directory}")
-    return {"id": row.id}
+    # First add always scans immediately so the file list is not empty until
+    # the user remembers to hit Fetch.
+    scanned = await scan_local({"ids": [row.id]}, db)
+    return {"id": row.id, "scan": scanned}
 
 
 @router.delete("/local/dirs/{did}")
