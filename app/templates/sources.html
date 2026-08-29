@@ -184,20 +184,31 @@ function localTab(hostSel) {
     ],
     emptyText: "No directories yet. Add paths inside the mounted /media volume.",
   });
+  const runScan = async (ids) => {
+    const r = await api("/api/sources/local/scan", { method: "POST", body: { ids } });
+    toast(`fetched ${r.new} new file(s) (${r.seen} seen`
+      + (r.playlist_added ? `, ${r.playlist_added} added to playlist` : "")
+      + (r.skipped ? `, ${r.skipped} skipped` : "") + ")", "ok");
+    dt.reload(); ft.reload();
+    return r;
+  };
   window.editDir = (id, dir) => browseDir(dir, async (path) => {
     await api(`/api/sources/local/dirs`, { method: "POST", body: { directory: path } }).catch(() => {});
-    dt.reload();
+    dt.reload(); ft.reload();
   });
   window.delDir = (id) => confirmDialog({ title: "Delete directory", body: "Remove this directory and its scanned files from the app? (Files on disk stay untouched.)",
     okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/sources/local/dirs/${id}`, { method: "DELETE" }); dt.reload(); ft.reload(); } });
   $("#ld-add").addEventListener("click", () => browseDir("", async (path) => {
-    await api("/api/sources/local/dirs", { method: "POST", body: { directory: path } });
-    toast("directory added", "ok"); dt.reload();
+    const added = await api("/api/sources/local/dirs", { method: "POST", body: { directory: path } });
+    const sc = added.scan || {};
+    toast(`directory added · fetched ${sc.new ?? 0} file(s)`, "ok");
+    dt.reload(); ft.reload();
   }));
+  $("#ld-fetch").addEventListener("click", () => runScan([]));
   $("#ld-scan").addEventListener("click", async () => {
     const ids = [...dt.selected];
-    const r = await api("/api/sources/local/scan", { method: "POST", body: { ids } });
-    toast(`scan done: ${r.new} new files (of ${r.seen} seen)`, "ok"); dt.reload(); ft.reload();
+    if (!ids.length) return toast("select directories, or use Fetch media files for all enabled ones", "warn");
+    await runScan(ids);
   });
   const ft = new DataTable($("#lfiles"), {
     perPageDefault: 15, defaultSort: "path",
