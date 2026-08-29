@@ -16,8 +16,9 @@ driver on Apollo Lake (J3455):
     (VAEntrypointEncSliceLP) - faster and far cheaper than the EU path, and
     it is exactly the entrypoint the iHD driver advertises for H.264 on the
     DS918+ (see vainfo below).
-  * `-rc_mode vbr|cbr|...` makes rate control explicit. VAAPI's "auto" mode is
-    undocumented and driver-dependent; without it `-b:v`/`-maxrate` are not
+  * `-rc_mode VBR|CBR|...` makes rate control explicit (ffmpeg's VAAPI encoder
+    aliases are uppercase). VAAPI's "AUTO" mode is undocumented and
+    driver-dependent; without an explicit mode `-b:v`/`-maxrate` are not
     guaranteed to be honoured the same way across driver versions.
   * `-async_depth 4` keeps more frames in flight, raising throughput and
     cutting time-to-first-frame.
@@ -41,9 +42,10 @@ ASPECTS = {"4:3": 4 / 3, "16:9": 16 / 9, "21:9": 21 / 9}
 VIDEO_CODECS = ["copy", "libx264", "libx265", "h264_vaapi", "hevc_vaapi", "h264_qsv", "hevc_qsv"]
 AUDIO_CODECS = ["copy", "aac", "ac3", "mp2", "mp3", "none"]
 HW_CHOICES = ["none", "vaapi", "qsv"]
-# VAAPI rate-control modes (h264_vaapi/hevc_vaapi). "auto" = let the driver
+# VAAPI rate-control modes (h264_vaapi/hevc_vaapi). ffmpeg's encoder aliases
+# are uppercase (see `ffmpeg -h encoder=h264_vaapi`). "AUTO" = let the driver
 # choose; everything else is passed through as-is so the command stays honest.
-RC_MODES = ["auto", "cqp", "cbr", "vbr", "icq", "qvbr", "avbr"]
+RC_MODES = ["AUTO", "CQP", "CBR", "VBR", "ICQ", "QVBR", "AVBR"]
 # VAAPI encoders that understand -low_power/-rc_mode/-async_depth.
 VAAPI_ENCODERS = ("h264_vaapi", "hevc_vaapi", "vp8_vaapi", "vp9_vaapi")
 # The shipped reference preset (kept as a built-in, but NOT the fallback
@@ -133,7 +135,7 @@ class FFmpegOptions:
     profile: str = "high"
     level: str = "4.1"
     low_power: bool = True           # h264_vaapi: use EncSliceLP (fixed-function)
-    rc_mode: str = "vbr"             # VAAPI rate control: auto|cqp|cbr|vbr|icq|qvbr|avbr
+    rc_mode: str = "VBR"             # VAAPI rate control: AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
     async_depth: str = "4"           # VAAPI frames in flight (throughput / startup)
     audio_codec: str = "aac"
     audio_bitrate: str = "128k"
@@ -195,10 +197,11 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
         filters.append("setsar=1")      # neutral SAR honours the aspect choice
         c += ["-vf", ",".join(filters)]
 
-    # ---- stream mapping (first video + best audio, drop subs/data) ---------
+    # ---- stream mapping (first video + optional audio + optional DVB subs)
     c += ["-map", "0:v:0"]
     c += ["-map", "0:a:0?"] if opts.audio_codec != "none" else ["-an"]
-    c += ["-sn", "-dn"]
+    c += ["-map", "0:s?"]
+    c += ["-dn"]
 
     # ---- video encoder ------------------------------------------------------
     c += ["-c:v", opts.video_codec]
@@ -225,8 +228,9 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
         if opts.video_codec in VAAPI_ENCODERS:
             if opts.video_codec == "h264_vaapi" and opts.low_power:
                 c += ["-low_power", "1"]
-            if opts.rc_mode and opts.rc_mode != "auto":
-                c += ["-rc_mode", opts.rc_mode]
+            rc = (opts.rc_mode or "").upper()
+            if rc and rc != "AUTO":
+                c += ["-rc_mode", rc]
             if opts.async_depth:
                 c += ["-async_depth", opts.async_depth]
 
@@ -240,6 +244,8 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
                 c += ["-ac", opts.audio_channels]
             if opts.audio_rate:
                 c += ["-ar", opts.audio_rate]
+
+    c += ["-c:s", "dvbsub"]
 
     if opts.extra_output.strip():
         c += shlex.split(opts.extra_output)
@@ -263,14 +269,17 @@ _KNOWN_WITH_VALUE = {
 }
 
 # numeric rc_mode spellings (ffmpeg -h encoder=h264_vaapi) -> names
-_RC_NUM = {"0": "auto", "1": "cqp", "2": "cbr", "3": "vbr",
-           "4": "icq", "5": "qvbr", "6": "avbr"}
+_RC_NUM = {"0": "AUTO", "1": "CQP", "2": "CBR", "3": "VBR",
+           "4": "ICQ", "5": "QVBR", "6": "AVBR"}
 
 
 def _rc_name(value: str) -> str:
-    """Normalise a -rc_mode argument (accepts both 'cbr' and its int '2')."""
-    v = value.strip().lower()
-    return _RC_NUM.get(v, v)
+    """Normalise a -rc_mode argument (accepts 'VBR', 'vbr', and its int '3')."""
+    v = value.strip()
+    if v in _RC_NUM:
+        return _RC_NUM[v]
+    up = v.upper()
+    return up if up in RC_MODES else (up or "AUTO")
 
 
 def parse_command(cmd: str) -> dict:
@@ -351,6 +360,9 @@ def parse_command(cmd: str) -> dict:
         if t in ("-sn", "-dn"):
             i += 1
             continue
+        if t == "-c:s" and i + 1 < len(toks):
+            i += 2
+            continue
         if t == "-c:v" and i + 1 < len(toks):
             opts.video_codec = toks[i + 1]
             if opts.video_codec == "copy":
@@ -402,9 +414,9 @@ def default_presets() -> list[dict]:
     # instead of freezing the player.
     mk = lambda name, **kw: {**asdict(FFmpegOptions(**kw)), "name": name}   # noqa: E731
     presets = [
-        mk(REFERENCE_PRESET_NAME, low_power=True, rc_mode="vbr", async_depth="4"),
+        mk(REFERENCE_PRESET_NAME, low_power=True, rc_mode="VBR", async_depth="4"),
         mk("VAAPI 1080p ~2.5M", resolution="1080p", video_bitrate="2500k",
-           maxrate="2750k", bufsize="5000k", low_power=True, rc_mode="vbr", async_depth="4"),
+           maxrate="2750k", bufsize="5000k", low_power=True, rc_mode="VBR", async_depth="4"),
         mk("QSV 720p ~1M", hw_accel="qsv", video_codec="h264_qsv"),
         mk("Software 720p ~1.2M (libx264)", hw_accel="none", video_codec="libx264",
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k"),
@@ -414,7 +426,7 @@ def default_presets() -> list[dict]:
            resolution="576p", aspect="16:9", video_codec="h264_vaapi",
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k",
            fps="25", gop="50", profile="main", level="3.1",
-           low_power=True, rc_mode="vbr", async_depth="4",
+           low_power=True, rc_mode="VBR", async_depth="4",
            audio_codec="mp2", audio_bitrate="192k"),
     ]
     for p in presets:

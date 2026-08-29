@@ -280,7 +280,7 @@ class FFmpegTemplate(Base):
     profile: Mapped[str] = mapped_column(String(12), default="high")
     level: Mapped[str] = mapped_column(String(8), default="4.1")
     low_power: Mapped[bool] = mapped_column(Boolean, default=True)          # h264_vaapi EncSliceLP (DS918+ fixed-function encoder)
-    rc_mode: Mapped[str] = mapped_column(String(10), default="vbr")         # auto|cqp|cbr|vbr|icq|qvbr|avbr
+    rc_mode: Mapped[str] = mapped_column(String(10), default="VBR")         # AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
     async_depth: Mapped[str] = mapped_column(String(4), default="4")        # VAAPI frames in flight
     audio_codec: Mapped[str] = mapped_column(String(12), default="aac")    # aac|ac3|mp3|copy|none
     audio_bitrate: Mapped[str] = mapped_column(String(10), default="128k")
