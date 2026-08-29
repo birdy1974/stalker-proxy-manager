@@ -51,8 +51,11 @@ function toast(msg, kind = "info", ms = 4500) {
 }
 
 /* --------------------------------------------------------------- modal */
-/* Static backdrop, no Esc: the ONLY ways out are the explicit buttons (spec). */
-function openModal({ title, body, footer, size = "lg", onClose, extraClass = "" }) {
+/* Static backdrop, no Esc: the ONLY ways out are the explicit buttons (spec).
+ * `closeButton: true` additionally puts an explicit "×" in the header - still
+ * a button, so it does not violate the spec - for popups that are a "window"
+ * in the user's mind (the player/preview popup) rather than a form. */
+function openModal({ title, body, footer, size = "lg", onClose, extraClass = "", closeButton = false }) {
   const wrap = el("div", { class: `modal fade ${extraClass}` });
   wrap.innerHTML = `<div class="modal-dialog modal-${size} modal-dialog-scrollable">
     <div class="modal-content">
@@ -66,6 +69,10 @@ function openModal({ title, body, footer, size = "lg", onClose, extraClass = "" 
   document.body.append(wrap);
   const modal = new bootstrap.Modal(wrap, { backdrop: "static", keyboard: false });
   const close = () => { modal.hide(); setTimeout(() => wrap.remove(), 250); if (onClose) onClose(); };
+  if (closeButton) {
+    $(".modal-header", wrap).append(
+      el("button", { type: "button", class: "btn-close", "aria-label": "Close", onclick: close }));
+  }
   modal.show();
   return { close, root: wrap, modal };
 }
@@ -327,7 +334,9 @@ const probeHtml = (pr) => {
 };
 const tmdbHtml = (t) => !t
   ? `<span class="text-muted small">No TMDB hit (set the TMDB API key in Settings → TMDB for enrichment).</span>`
-  : `<div class="small">
+  : (t.error
+    ? `<span class="text-warning small">TMDB: ${esc(t.error)}</span>`
+    : `<div class="small">
       <div class="mb-1">${t.tagline ? `<i>${esc(t.tagline)}</i><br>` : ""}
       ${(t.genres || []).map(g => `<span class="badge text-bg-light me-1">${esc(g)}</span>`).join("")}
       ${t.vote_average ? `<span class="badge text-bg-warning me-1">★ ${Number(t.vote_average).toFixed(1)}</span>` : ""}
@@ -340,7 +349,7 @@ const tmdbHtml = (t) => !t
         ${t.director ? `<tr><td class="muted-label">Director</td><td>${esc(t.director)}</td></tr>` : ""}
         ${(t.cast || []).length ? `<tr><td class="muted-label">Cast</td><td>${esc(t.cast.join(", "))}</td></tr>` : ""}
         ${t.seasons_count ? `<tr><td class="muted-label">Seasons/Eps.</td><td>${t.seasons_count} / ${t.episodes_count ?? "?"}</td></tr>` : ""}
-      </table></div>`;
+      </table></div>`);
 
 /* ------------------------------------------------------------- player */
 /* HLS -> hls.js; MPEG-TS (what Stalker proxies output) -> mpegts.js.
@@ -373,6 +382,7 @@ function playInModal(url, title) {
 
   const m = openModal({
     title: `▶ ${title}`, body, footer: el("div"), size: "xl", extraClass: "player-modal",
+    closeButton: true,
     onClose: () => { try { engine?.destroy(); } catch {} video.pause(); video.src = ""; },
   });
   m.footer.append(mBtn("Stop & Close", "btn-outline-secondary", m.close, "bi-stop-circle"));

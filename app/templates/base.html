@@ -32,12 +32,12 @@
         <li class="navbar-divider" aria-hidden="true"></li>
         {# --- stage 2: how it is served ------------------------------------ #}
         <li class="nav-item"><a class="nav-link {{ 'active' if active=='ffmpeg' }}" href="/ffmpeg"
-              title="Output: transcode templates (VAAPI / QSV / copy) and the redirect-vs-proxy mode"><i class="bi bi-gear-wide-connected"></i> Output / FFmpeg</a></li>
+              title="Output: transcode templates (VAAPI / QSV / copy) and the per-channel redirect (bypass ffmpeg) template"><i class="bi bi-gear-wide-connected"></i> Output / FFmpeg</a></li>
         <li class="nav-item"><a class="nav-link {{ 'active' if active=='users' }}" href="/users"
               title="Accounts: credentials, connection limits, expiry, m3u and xtream access"><i class="bi bi-people"></i> Users</a></li>
         <li class="navbar-divider" aria-hidden="true"></li>
         <li class="nav-item"><a class="nav-link {{ 'active' if active=='settings' }}" href="/settings"
-              title="Global settings: output base URL, stream mode, fallback order, EPG, TMDB"><i class="bi bi-sliders"></i> Settings</a></li>
+              title="Global settings: output base URL, fallback order, EPG, TMDB"><i class="bi bi-sliders"></i> Settings</a></li>
       </ul>
       <a href="/" id="api-indicator" class="btn btn-sm btn-outline-light me-2 d-flex align-items-center gap-1"
          title="API status: serving requests / active streams. Click for the dashboard.">

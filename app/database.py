@@ -217,4 +217,39 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(models.Base.metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
     log.info("Database schema ensured (%d tables)", len(models.Base.metadata.tables))
+
+
+# Columns introduced after the first release. `create_all` creates tables but
+# never alters existing ones, so an upgraded container would otherwise fail
+# with "no such column" on the next SELECT. (name, sql-type, default) - the
+# default is dialect-specific for booleans, hence the tiny branch below.
+_NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
+    "ffmpeg_templates": {
+        "low_power": ("BOOLEAN", "1"),
+        "rc_mode": ("VARCHAR(10)", "'vbr'"),
+        "async_depth": ("VARCHAR(4)", "'4'"),
+        "is_builtin": ("BOOLEAN", "0"),
+    },
+}
+
+
+def _add_missing_columns(sync_conn) -> None:
+    """Idempotent ALTER TABLEs for columns added after first release."""
+    from sqlalchemy import inspect, text
+
+    is_sqlite = sync_conn.dialect.name == "sqlite"
+    insp = inspect(sync_conn)
+    for table, columns in _NEW_COLUMNS.items():
+        if not insp.has_table(table):
+            continue
+        existing = {c["name"] for c in insp.get_columns(table)}
+        for name, (typ, default) in columns.items():
+            if name in existing:
+                continue
+            if typ == "BOOLEAN" and not is_sqlite:
+                default = "TRUE"          # postgres rejects DEFAULT 1 on boolean
+            sync_conn.execute(text(
+                f"ALTER TABLE {table} ADD COLUMN {name} {typ} DEFAULT {default}"))
+            log.info("schema: added %s.%s (%s default %s)", table, name, typ, default)

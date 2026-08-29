@@ -103,10 +103,6 @@ async def logs(db=Depends(get_db), level: str = "", module: str = "", q: str = "
 DEFAULT_SETTINGS = {
     "playlist_url_format": "{base}/play/{type}/{id}.ts?u={u}&p={p}",
     "fallback_strategy": "macs_first",          # macs_first | portal_first (spec option)
-    # proxy = ffmpeg in the middle (transcode/copy, mid-stream fallback works)
-    # redirect = 302 the player straight to the panel's CDN (instant start, no
-    #            CPU, but no fallback and no transport-stream rewriting)
-    "stream_mode": "proxy",
     "epg_refresh_hours": 24,
     "logo_country": "netherlands",
     "tmdb_api_key": "",

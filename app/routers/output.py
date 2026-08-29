@@ -155,13 +155,17 @@ async def _guarded(gen, label: str, item_name: str = ""):
     return body()
 
 
-async def _stream_mode(explicit: str) -> str:
-    """`proxy` (ffmpeg in the middle) or `redirect` (302 to the panel's CDN)."""
-    if explicit in ("proxy", "redirect"):
-        return explicit
-    from ..services.playlist_gen import get_setting
-    mode = await get_setting("stream_mode", "proxy")
-    return mode if mode in ("proxy", "redirect") else "proxy"
+async def _wants_redirect(kind: str, ref_id: int, mode: str) -> bool:
+    """Whether this stream should 302 straight to the panel's CDN.
+
+    Decided by, in priority order:
+      1. an explicit `?mode=redirect|proxy` query param (per-URL override);
+      2. the item's assigned FFmpeg template being the built-in
+         "Redirect (bypass ffmpeg)" preset (per-channel bypass).
+    """
+    if mode in ("proxy", "redirect"):
+        return mode == "redirect"
+    return await MANAGER.uses_redirect(kind, ref_id)
 
 
 async def _stream_response(kind: str, ref_id: int, user: User | None, label: str,
@@ -172,10 +176,12 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
 
     Redirect skips ffmpeg entirely - instant start, no CPU, works for panels
     whose stream ffmpeg refuses to remux - at the cost of mid-stream fallback
-    and transport-stream rewriting. Local files can never be redirected (the
-    client cannot see our filesystem), so they always proxy.
+    and transport-stream rewriting. It is chosen per channel by assigning the
+    "Redirect (bypass ffmpeg)" template (or per URL with `?mode=redirect`).
+    Local files can never be redirected (the client cannot see our filesystem),
+    so they always proxy.
     """
-    if await _stream_mode(mode) == "redirect" and kind != "local":
+    if kind != "local" and await _wants_redirect(kind, ref_id, mode):
         from fastapi.responses import RedirectResponse
         url, item_name = await MANAGER.resolve(kind, ref_id)
         if url:
