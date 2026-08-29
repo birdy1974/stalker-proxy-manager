@@ -228,9 +228,12 @@ async def init_db() -> None:
 _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "ffmpeg_templates": {
         "low_power": ("BOOLEAN", "1"),
-        "rc_mode": ("VARCHAR(10)", "'vbr'"),
+        "rc_mode": ("VARCHAR(10)", "'VBR'"),
         "async_depth": ("VARCHAR(4)", "'4'"),
         "is_builtin": ("BOOLEAN", "0"),
+    },
+    "local_files": {
+        "duration_s": ("FLOAT", "NULL"),
     },
 }
 

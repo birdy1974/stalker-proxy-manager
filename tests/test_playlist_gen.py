@@ -202,6 +202,19 @@ async def test_full_titles_reach_the_playlist_and_carry_tvg_name():
     assert f'tvg-name="{long_title}"' in extinf, f"no tvg-name: {extinf!r}"
 
 
+async def test_m3u_does_not_point_vlc_at_epg():
+    """VLC waits on url-tvg until /epg.xml returns or times out (~30s)."""
+    await _seed(1)
+    async with SessionLocal() as s:
+        user = await s.get(User, 1)
+    text = await build_m3u(BASE, user)
+    header = text.splitlines()[0]
+    assert header == "#EXTM3U"
+    assert "url-tvg" not in text
+    assert "x-tvg-url" not in text
+    assert "/epg.xml" not in text
+
+
 async def test_every_entry_has_a_matching_playable_url():
     await _seed(3)
     async with SessionLocal() as s:

@@ -86,7 +86,7 @@ async function loadSettings() {
       return `<div class="mb-2"><label class="muted-label">${label}</label>
         <select class="form-select form-select-sm set-field" data-key="${k}" data-kind="str">
           ${type.map(o => `<option ${o === v ? "selected" : ""}>${o}</option>`).join("")}
-        </select><div class="small text-muted">${k === "fallback_strategy" ? "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately" : ""}</div></div>`;
+        </select><div class="small text-muted">${k === "fallback_strategy" ? "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately. Takes effect on the next play/fetch (no restart)." : ""}</div></div>`;
     return `<div class="mb-2"><label class="muted-label">${label}</label>
       <input class="form-control form-control-sm set-field" data-key="${k}" data-kind="${type === "number" ? "num" : "str"}"
              type="${type}" value="${esc(v)}"></div>`;

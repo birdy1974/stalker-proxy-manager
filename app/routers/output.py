@@ -19,9 +19,9 @@ import asyncio
 import os
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from starlette.background import BackgroundTask
 
-from ..config import OUTPUT_BASE_URL
 from ..database import get_db
 from ..models import (
     LivePlaylist, LiveSource, LocalPlaylist, LocalFile, SerieEpisode,
@@ -32,16 +32,19 @@ from ..services.playlist_gen import (
     UserAuth, build_m3u, xtream_base, xtream_categories, xtream_live,
     xtream_series, xtream_series_info, xtream_vod,
 )
+from ..services.local_files import media_type_for
 from ..services.stream_manager import MANAGER
 from sqlalchemy import select
 
 router = APIRouter(tags=["output"])
 
 
-def base_url_of(request: Request) -> str:
-    """Public base URL: settings/env override wins, else derive from request."""
-    if OUTPUT_BASE_URL:
-        return OUTPUT_BASE_URL
+async def base_url_of(request: Request) -> str:
+    """Public base URL: GUI setting, then env, else derive from the request."""
+    from ..services.runtime_settings import output_base_url
+    override = await output_base_url()
+    if override:
+        return override
     return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
@@ -56,7 +59,7 @@ async def _authed(u: str | None, p: str | None, need: str = "m3u") -> User:
 @router.get("/playlist.m3u")
 async def playlist_m3u(request: Request, u: str = "", p: str = ""):
     user = await _authed(u, p, "m3u")
-    text = await build_m3u(base_url_of(request), user)
+    text = await build_m3u(await base_url_of(request), user)
     fname = f"playlist_{user.name}.m3u"
     return PlainTextResponse(text, media_type="application/x-mpegURL",
                              headers={"Content-Disposition": f'attachment; filename="{fname}"'})
@@ -66,7 +69,7 @@ async def playlist_m3u(request: Request, u: str = "", p: str = ""):
 async def get_php(request: Request, username: str = "", password: str = "",
                   type: str = Query("m3u_plus"), output: str = "ts"):  # noqa: A002
     user = await _authed(username, password, "xtream")
-    text = await build_m3u(base_url_of(request), user)
+    text = await build_m3u(await base_url_of(request), user)
     return PlainTextResponse(text, media_type="application/x-mpegURL")
 
 
@@ -75,7 +78,7 @@ async def get_php(request: Request, username: str = "", password: str = "",
 async def player_api(request: Request, username: str = "", password: str = "",
                      action: str = "", vod_id: int = 0, series_id: int = 0):
     user = await _authed(username, password, "xtream")
-    base = base_url_of(request)
+    base = await base_url_of(request)
     if not action:
         return await xtream_base(user, base)
     if action == "get_live_categories":
@@ -111,7 +114,7 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
     enabled EPG sources (auto-matched or manually assigned tvg-ids)."""
     from ..services import epg as epg_svc
     user = await _authed(u or username, p or password, "xtream")
-    xml = await epg_svc.build_xmltv(base_url_of(request), user)
+    xml = await epg_svc.build_xmltv(await base_url_of(request), user)
     return Response(xml, media_type="application/xml")
 
 
@@ -178,8 +181,9 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     whose stream ffmpeg refuses to remux - at the cost of mid-stream fallback
     and transport-stream rewriting. It is chosen per channel by assigning the
     "Redirect (bypass ffmpeg)" template (or per URL with `?mode=redirect`).
-    Local files can never be redirected (the client cannot see our filesystem),
-    so they always proxy.
+    Local files never 302 (the client cannot see our filesystem). Direct/copy
+    templates serve the original file; transcode templates still go through
+    ffmpeg.
     """
     if kind != "local" and await _wants_redirect(kind, ref_id, mode):
         from fastapi.responses import RedirectResponse
@@ -226,10 +230,39 @@ async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mod
     return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode)
 
 
-@router.get("/play/local/{pid}.ts")
-async def play_local(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
+@router.api_route("/play/local/{pid}.{ext}", methods=["GET", "HEAD"])
+async def play_local(request: Request, pid: int, ext: str, u: str = "", p: str = "",
+                     mode: str = ""):  # noqa: ARG001
     user = await _authed(u, p, "m3u")
-    # local files are never redirectable: the client cannot see our filesystem
+    return await _local_response(pid, user, request)
+
+
+async def _local_response(pid: int, user, request: Request):
+    """Serve a local playlist item: original file for direct/copy, else ffmpeg."""
+    path, item_name = await MANAGER.local_disk_path(pid)
+    if not path:
+        raise HTTPException(404, f"local #{pid}: file not found on disk")
+    if await MANAGER.local_serves_original(pid):
+        if not MANAGER.can_open_for(user.name if user else None,
+                                    user.max_connections if user else None):
+            await db_log("WARNING", "output",
+                         f"user {user.name if user else 'admin'} exceeded max_connections")
+            raise HTTPException(429, "max connections reached for this user")
+        media_type = media_type_for(path)
+        headers = {"Cache-Control": "no-store"}
+        if request.method == "HEAD":
+            return FileResponse(path, media_type=media_type, headers=headers)
+        handle = await MANAGER.register_local_file(
+            pid, user.name if user else None, path, item_name)
+        MANAGER.watch(request, handle)
+        headers["X-SPM-Stream"] = handle.id
+        await db_log("INFO", "output",
+                     f"[{item_name}] serving original file ({media_type})")
+        return FileResponse(path, media_type=media_type, headers=headers,
+                            background=BackgroundTask(MANAGER.kill, handle.id))
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type="video/mp2t",
+                        headers={"Cache-Control": "no-store"})
     return await _stream_response("local", pid, user, f"local #{pid}", request, "proxy")
 
 
@@ -258,6 +291,8 @@ async def admin_play(kind: str, pid: int, request: Request, mode: str = ""):
     require_admin(request)
     if kind not in ("live", "vod", "episode", "local"):
         raise HTTPException(400, "kind must be live|vod|episode|local")
+    if kind == "local":
+        return await _local_response(pid, None, request)
     return await _stream_response(kind, pid, None, f"{kind} #{pid}", request, mode)
 
 

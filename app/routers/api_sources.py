@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, or_, select
 
 from ..config import MEDIA_ROOT
-from ..database import get_db
+from ..database import get_db, spawn
 from ..services.permissions import describe_access, permission_hint
 from ..services.playlist_sync import (SYNC_KINDS, add_sources,
                                         sync_sources)
@@ -29,6 +29,7 @@ from ..models import (
 from ..security import require_admin
 from ..services import item_info
 from ..services.db_logging import db_log
+from ..services.local_files import fill_local_durations, missing_duration_ids
 
 router = APIRouter(prefix="/api/sources", tags=["sources"], dependencies=[Depends(require_admin)])
 
@@ -388,6 +389,9 @@ async def scan_local(payload: dict, db=Depends(get_db)):
         if add["added"]:
             await db_log("INFO", "local",
                          f"{add['added']} file(s) added to the Local playlist")
+        need = await missing_duration_ids([d.id for d in dirs])
+        if need:
+            spawn(fill_local_durations(need), name="local-durations")
     return {"ok": True, "new": total_new, "seen": total_seen, "skipped": total_skipped,
             "playlist_added": added_to_playlist}
 

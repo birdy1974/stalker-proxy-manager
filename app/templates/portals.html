@@ -114,7 +114,7 @@ async function editPortal(id) {
           <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch genres</button>
         </div>
       </div>
-      <div class="small text-muted mt-2">Workflow: “Fetch genres” loads the genre lists → enable/disable the genres you want per tab → <b>Save</b> fetches the items of the enabled genres (live, VOD, series).</div>
+      <div class="small text-muted mt-2">Two API calls: <b>Fetch genres</b> loads the genre lists → enable/disable the genres you want per tab → <b>Save</b> fetches the channels of the enabled genres (live, VOD, series).</div>
     </div>
     <ul class="nav nav-tabs nav-subtabs mt-3 mb-2">
       <li class="nav-item"><a class="nav-link active" data-tab="live">1 · Live</a></li>
@@ -128,12 +128,21 @@ async function editPortal(id) {
           <span class="small text-muted ms-auto" id="genre-count-${k}"></span>
         </div>
         <!-- multi-column genre list (long genre catalogs stay compact) -->
-        <div class="border rounded p-2 genre-grid" style="max-height:260px;overflow:auto" id="genre-list-${k}"></div>
+        <div class="border rounded p-2 genre-grid" style="max-height:260px;overflow:auto" id="genre-list-${k}"><div class="text-muted small p-1">No genres fetched yet — press “Fetch genres”.</div></div>
       </div>`).join("")}`;
   const footer = el("div", { class: "d-flex gap-2 w-100" });
   const m = openModal({ title: id ? `Edit portal: ${p.name}` : "Add portal", body, footer, size: "xl" });
+  /* Popup state: the portal id (existing, or assigned when a NEW portal is
+     first saved / when "Fetch genres" creates it), a created-in-this-popup
+     flag, and a double-submit guard. */
+  const state = { pid: id, createdHere: !id, saving: false };
+  const portalPayload = () => ({
+    name: $("#p-name", body).value.trim(), base_url: $("#p-url", body).value.trim(),
+    macs: $("#p-macs", body).value, enabled: $("#p-enabled", body).checked,
+    proxy_url: $("#p-proxy", body).value.trim() || null,
+  });
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
-                mBtn("Save", "btn-accent", () => savePortal(id, m), "bi-check2"));
+                mBtn("Save", "btn-accent", () => savePortal(state, body, m), "bi-check2"));
 
   /* sub-tab switching: general stays visible, only the 3 genre panes toggle */
   $$(".nav-link", body).forEach(a => a.addEventListener("click", (e) => {
@@ -141,15 +150,30 @@ async function editPortal(id) {
     $$(".nav-link", body).forEach(x => x.classList.remove("active"));
     a.classList.add("active");
     $$("[data-pane]", body).forEach(pn => pn.classList.toggle("d-none", pn.dataset.pane !== a.dataset.tab));
-    if (id) loadGenres(id, a.dataset.tab);
+    if (state.pid) loadGenres(state.pid, a.dataset.tab);
   }));
 
-  if (id) {
-    $("#p-resolve-btn", body).setAttribute("data-id", id);
-    loadGenres(id, "live");
+  if (state.pid) {
+    $("#p-resolve-btn", body).setAttribute("data-id", state.pid);
+    loadGenres(state.pid, "live");
   }
+
+  /* API 1 - "Fetch genres": needs a saved portal id, so for a NEW portal the
+     button turns on as soon as URL + MAC are entered and on first use it
+     creates the portal, then fetches the genre lists. The popup stays open so
+     the genres can be enabled right here. */
+  const fetchBtn = $("#p-fetch-btn", body);
+  const updateFetchBtn = () => {
+    fetchBtn.disabled = !state.pid &&
+      (!$("#p-url", body).value.trim() || !$("#p-macs", body).value.trim());
+  };
+  state.updateFetchBtn = updateFetchBtn;
+  $("#p-url", body).addEventListener("input", updateFetchBtn);
+  $("#p-macs", body).addEventListener("input", updateFetchBtn);
+  updateFetchBtn();
+
   $("#p-resolve-btn", body).addEventListener("click", async () => {
-    const pid = $("#p-resolve-btn", body).dataset.id || id;
+    const pid = $("#p-resolve-btn", body).dataset.id || state.pid;
     if (!pid) { toast("Save the portal first, then resolve.", "warn"); return; }
     $("#p-resolve-out", body).textContent = "probing paths…";
     const r = await api(`/api/portals/${pid}/resolve`, { method: "POST" });
@@ -158,28 +182,70 @@ async function editPortal(id) {
       : `<span class="text-danger">failed: ${esc(r.error)}</span>` +
         `<details class="mt-1"><summary class="small">probe log</summary><pre class="mono small">${r.attempts.map(esc).join("\n")}</pre></details>`;
   });
-  $("#p-fetch-btn", body).addEventListener("click", async () => {
-    if (!id) return;
-    const r = await api(`/api/portals/${id}/fetch-genres`, { method: "POST" });
-    toast(`fetching genre lists (job ${r.job.id})…`, "ok"); pollJobs();
-    // refresh the genre panes as soon as the genre fetch finishes
-    waitJob(r.job.id, () => {
-      ["live", "vod", "series"].forEach(k => loadGenres(id, k));
-      toast("genre lists updated — enable the genres you want, then Save", "ok");
-    });
+  fetchBtn.addEventListener("click", async () => {
+    if (state.saving) return;
+    const data = portalPayload();
+    if (!data.name || !data.base_url) return toast("name and URL are required", "warn");
+    if (!state.pid && !data.macs.trim()) return toast("enter at least one MAC address", "warn");
+    state.saving = true; fetchBtn.disabled = true;
+    try {
+      if (!state.pid) {
+        /* fetch-genres is a per-portal API: create the portal first, stay in
+           the popup (mere creation fires NO fetch API) */
+        const r = await api("/api/portals", { method: "POST", body: data });
+        state.pid = r.id;
+        $("#p-resolve-btn", body).removeAttribute("disabled");
+        $("#p-resolve-btn", body).setAttribute("data-id", r.id);
+        table.reload();
+        toast("portal saved — fetching genre lists…", "ok");
+      }
+      const r = await api(`/api/portals/${state.pid}/fetch-genres`, { method: "POST" });
+      toast(`fetching genre lists (job ${r.job.id})…`, "ok"); pollJobs();
+      // refresh the genre panes as soon as the genre fetch finishes
+      waitJob(r.job.id, async () => {
+        ["live", "vod", "series"].forEach(k => loadGenres(state.pid, k));
+        const d = await api("/api/portals");
+        const j = d.jobs.find(x => x.id === r.job.id);
+        if (j && j.status === "error")
+          toast(`genre fetch failed: ${j.error} — check the fetch history below`, "error");
+        else
+          toast("genre lists loaded — enable the genres you want, then Save fetches their channels", "ok");
+      });
+    } finally { state.saving = false; updateFetchBtn(); }
   });
-  for (const k of ["live", "vod", "series"]) {
-    /* left-aligned textbox filters the genre list (client-side, case-insensitive) */
-    $(`#genre-q-${k}`, body)?.addEventListener("input", (e) => {
-      const q = e.target.value.toLowerCase();
-      $$(`#genre-list-${k} label`, body).forEach(lb =>
-        lb.style.display = (lb.dataset.name || "").includes(q) ? "" : "none");
-      const all = $$(`#genre-list-${k} label`, body).length,
-            vis = $$(`#genre-list-${k} label`, body).filter(lb => lb.style.display !== "none").length;
-      const cnt = $(`#genre-count-${k}`, body);
-      if (cnt) cnt.textContent = q ? `${vis}/${all}` : `${all}`;
+  for (const evt of ["input", "keyup"]) {
+    /* Genre filter boxes: filter the genre list below the box LIVE, while the
+       user types. One delegated listener per event on the popup body (works
+       for all three panes and survives every list re-render); `keyup` covers
+       IME/autofill edge cases where `input` may not fire. */
+    body.addEventListener(evt, (e) => {
+      const inp = e.target?.closest?.("#genre-q-live, #genre-q-vod, #genre-q-series");
+      if (inp) filterGenrePane(inp.closest("[data-pane]"));
     });
   }
+}
+
+/* Live client-side genre filter: hides the genre rows of one pane that do not
+ * match what is typed in that pane's filter box (case-insensitive), and keeps
+ * the "matching/total" counter in sync. Called on every keystroke and after
+ * every (re-)render of the list, so a filter stays applied. */
+function filterGenrePane(pane) {
+  if (!pane) return;
+  const kind = pane.dataset.pane;
+  const q = $(`#genre-q-${kind}`, pane);
+  const host = $(`#genre-list-${kind}`, pane);
+  const cnt = $(`#genre-count-${kind}`, pane);
+  if (!host) return;
+  const needle = (q ? q.value : "").trim().toLowerCase();
+  let vis = 0, all = 0;
+  $$("label", host).forEach(lb => {
+    all++;
+    const name = (lb.dataset.name || lb.textContent || "").toLowerCase();
+    const show = !needle || name.includes(needle);
+    lb.style.display = show ? "" : "none";
+    if (show) vis++;
+  });
+  if (cnt) cnt.textContent = all ? (needle ? `${vis}/${all}` : `${all}`) : "";
 }
 
 async function loadGenres(pid, kind) {
@@ -201,29 +267,58 @@ async function loadGenres(pid, kind) {
       body: { kind, ids: [+cb.value], enabled: cb.checked } });
     toast(`genre ${cb.checked ? "enabled" : "disabled"} — use Fetch to (un)load its items`, "ok");
   }));
-  const q = $(`#genre-q-${kind}`); if (q && q.value) q.dispatchEvent(new Event("input"));
-  const cnt = $(`#genre-count-${kind}`); if (cnt) cnt.textContent = `${rows.length}`;
+  /* re-apply the pane's filter (if any) to the freshly rendered list so a
+     typed query stays in effect across re-renders (tab switch, refetch) */
+  filterGenrePane(host.closest("[data-pane]"));
+  host.dataset.loaded = "1";
 }
 
-async function savePortal(id, m) {
-  const body = {
-    name: $("#p-name").value.trim(), base_url: $("#p-url").value.trim(),
-    macs: $("#p-macs").value, enabled: $("#p-enabled").checked,
-    proxy_url: $("#p-proxy").value.trim() || null,
-  };
-  if (!body.name || !body.base_url) return toast("name and URL are required", "warn");
-  if (id) {
-    await api(`/api/portals/${id}`, { method: "PUT", body });
-    // fetch the items of the genres that are enabled right now (live/vod/series)
-    const r = await api(`/api/portals/${id}/fetch-items`, { method: "POST" });
-    toast(`saved — fetching items of enabled genres (job ${r.job.id})`, "ok");
-  } else {
-    const r = await api("/api/portals", { method: "POST", body });
-    // no genres exist yet: pull the genre lists so they can be picked next edit
-    await api(`/api/portals/${r.id}/fetch-genres`, { method: "POST" });
-    toast("portal created — fetching genre lists; reopen it to pick genres", "ok");
+/* true when at least one genre in any of the three panes is enabled; loads
+   panes that were never rendered yet so the check matches the server state */
+async function anyGenreEnabled(pid, body) {
+  for (const k of ["live", "vod", "series"]) {
+    const host = $(`#genre-list-${k}`, body);
+    if (host && !host.dataset.loaded) await loadGenres(pid, k);
+    if ($(`#genre-list-${k} input[type=checkbox]:checked`, body)) return true;
   }
-  m.close(); table.reload(); pollJobs();
+  return false;
+}
+
+async function savePortal(state, body, m) {
+  if (state.saving) return;
+  const data = {
+    name: $("#p-name", body).value.trim(), base_url: $("#p-url", body).value.trim(),
+    macs: $("#p-macs", body).value, enabled: $("#p-enabled", body).checked,
+    proxy_url: $("#p-proxy", body).value.trim() || null,
+  };
+  if (!data.name || !data.base_url) return toast("name and URL are required", "warn");
+  state.saving = true;
+  try {
+    if (!state.pid) {
+      /* brand-new portal: Save only stores it - NO fetch API fires here. The
+         genre fetch is the explicit "Fetch genres" button (API 1); the channel
+         fetch is this same Save pressed again after enabling genres (API 2).
+         Keep the popup open so that flow can continue. */
+      const r = await api("/api/portals", { method: "POST", body: data });
+      state.pid = r.id;
+      $("#p-resolve-btn", body).removeAttribute("disabled");
+      $("#p-resolve-btn", body).setAttribute("data-id", r.id);
+      table.reload(); state.updateFetchBtn?.();
+      toast("portal saved — press “Fetch genres” to load the genre lists, enable the genres you want, then Save again to fetch their channels", "ok");
+      return;
+    }
+    await api(`/api/portals/${state.pid}`, { method: "PUT", body: data });
+    /* API 2 on Save: fetch the channels of the genres that are enabled right
+       now (live, VOD, series). A portal created in this popup must have at
+       least one genre enabled first - genres arrive disabled from the fetch. */
+    if (state.createdHere && !(await anyGenreEnabled(state.pid, body))) {
+      toast("no genres enabled — press “Fetch genres” to load the genre lists, enable the genres you want, then Save", "warn");
+      return; // stay in the popup
+    }
+    const r = await api(`/api/portals/${state.pid}/fetch-items`, { method: "POST" });
+    toast(`saved — fetching channels of enabled genres (job ${r.job.id})`, "ok");
+    m.close(); table.reload(); pollJobs();
+  } finally { state.saving = false; }
 }
 
 /* ============================= actions ============================= */

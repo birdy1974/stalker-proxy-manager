@@ -9,7 +9,7 @@ starts a fetch returns immediately; the job updates:
   * per-genre item counts + `*_fetched` flags (dashboard "X of Y")
 
 Only ENABLED genres are fetched (spec workflow step 4/6). Page budget per
-genre comes from FETCH_PAGE_BUDGET so one giant genre cannot stall the queue;
+genre comes from the GUI `fetch_page_budget` setting (env fallback) so one giant genre cannot stall the queue;
 a "fetch more" button re-runs the job which resumes (fetched flag per genre).
 """
 
@@ -23,7 +23,6 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 
-from ..config import FETCH_PAGE_BUDGET
 from ..database import SessionLocal
 from ..models import (
     LiveGenre, LiveSource, MacAddress, Portal, SerieEpisode, SerieGenre,
@@ -300,13 +299,16 @@ async def _sync_genres(s, model, portal_id: int, incoming: list[dict], syn_ok_no
 
 
 async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
-                        portal_name, budget=FETCH_PAGE_BUDGET) -> tuple[int, int]:
+                        portal_name, budget=None) -> tuple[int, int]:
     """
     Fetch up to `budget` pages for one genre and hand each page to `upsert_many`
     as a WHOLE (one SELECT + one COMMIT per page instead of one round trip per
     item). Returns (n, total).
     """
     from ..config import FETCH_PAGE_CONCURRENCY
+    from .runtime_settings import fetch_page_budget
+    if budget is None:
+        budget = await fetch_page_budget()
 
     inserted, total = 0, 0
     job.detail = f"{genre_name}: page 1"

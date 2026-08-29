@@ -71,18 +71,16 @@ async def root_dispatch(request: Request):
     u, p = request.query_params.get("username"), request.query_params.get("password")
     if u is None and p is None:
         return RedirectResponse("/dashboard", status_code=303)
-    from .services.playlist_gen import UserAuth
-    async with SessionLocal() as db:
-        ok, user = await UserAuth.verify(db, u or "", p or "", "xtream")
-    if not ok:
+    # Xtream players probe "/?username=&password=" for identity. UserAuth.verify
+    # takes (username, password, need) and returns User | None — a previous
+    # call passed the DB session as the username and unpacked a (ok, user)
+    # tuple, so every probe 500'd.
+    from .services.playlist_gen import UserAuth, xtream_base
+    user = await UserAuth.verify(u or "", p or "", "xtream")
+    if not user:
         return JSONResponse({"user_info": {"auth": 0, "status": "Disabled"}}, status_code=401)
-    expire = int(user.expire_date.timestamp()) if user.expire_date else None
-    return JSONResponse({"user_info": {"username": user.username, "password": user.password,
-                                       "message": "", "auth": 1,
-                                       "status": "Active" if user.enabled else "Disabled",
-                                       "exp_date": str(expire) if expire else None,
-                                       "is_trial": "0", "active_cons": str(MANAGER.user_stream_count(user.username)),
-                                       "max_connections": str(user.max_connections)}})
+    from .routers.output import base_url_of
+    return JSONResponse(await xtream_base(user, await base_url_of(request)))
 
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, max_age=SESSION_MAX_AGE,
                    same_site="lax", https_only=False)

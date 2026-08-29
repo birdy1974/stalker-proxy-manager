@@ -5,8 +5,9 @@ The reference spec command is kept reproducible, extended with the three knobs
 that make VAAPI encoding actually fast and deterministic on that silicon:
 
   * -low_power 1   -> VAEntrypointEncSliceLP (fixed-function H.264 encoder)
-  * -rc_mode vbr   -> explicit rate control (auto is driver-dependent)
+  * -rc_mode VBR   -> explicit rate control (AUTO is driver-dependent)
   * -async_depth 4 -> more frames in flight
+  * -map 0:s? / -c:s dvbsub -> keep DVB subtitles when the source has them
 
 These tests pin both directions of the 2-way sync so a GUI edit can never
 silently drop them.
@@ -15,8 +16,9 @@ silently drop them.
 from __future__ import annotations
 
 from app.services.ffmpeg_templates import (
-    FFmpegOptions, REDIRECT_COMMAND, REDIRECT_PRESET_NAME, REFERENCE_PRESET_NAME,
-    build_command, default_presets, parse_command, URL_PLACEHOLDER,
+    COPY_PRESET_NAME, FFmpegOptions, REDIRECT_COMMAND, REDIRECT_PRESET_NAME,
+    REFERENCE_PRESET_NAME, build_command, default_presets, parse_command,
+    serves_original_file, URL_PLACEHOLDER,
 )
 
 
@@ -34,7 +36,7 @@ def test_vaapi_720p_command_is_the_optimised_reference():
     # the optimisations this change adds
     assert "-c:v h264_vaapi" in cmd
     assert "-low_power 1" in cmd
-    assert "-rc_mode vbr" in cmd
+    assert "-rc_mode VBR" in cmd
     assert "-async_depth 4" in cmd
     assert "-f mpegts" in cmd and "+resend_headers" in cmd
     assert URL_PLACEHOLDER in cmd
@@ -45,7 +47,7 @@ def test_low_power_is_emitted_only_for_h264_vaapi():
     EncSlice but no EncSliceLP), so -low_power must not leak into hevc_vaapi."""
     hevc = build_command(FFmpegOptions(video_codec="hevc_vaapi"))
     assert "-low_power" not in hevc
-    assert "-rc_mode vbr" in hevc and "-async_depth 4" in hevc
+    assert "-rc_mode VBR" in hevc and "-async_depth 4" in hevc
     # but it is there for h264_vaapi
     assert "-low_power 1" in build_command(FFmpegOptions(video_codec="h264_vaapi"))
 
@@ -63,8 +65,11 @@ def test_low_power_and_rc_mode_are_toggleable():
     off = build_command(FFmpegOptions(low_power=False, rc_mode="auto"))
     assert "-low_power" not in off
     assert "-rc_mode" not in off
+    # lowercase GUI leftovers still render as ffmpeg's uppercase aliases
     cbr = build_command(FFmpegOptions(rc_mode="cbr"))
-    assert "-rc_mode cbr" in cbr
+    assert "-rc_mode CBR" in cbr
+    assert "-rc_mode CBR" in build_command(FFmpegOptions(rc_mode="CBR"))
+    assert "-rc_mode" not in build_command(FFmpegOptions(rc_mode="AUTO"))
 
 
 def test_parse_command_recovers_the_new_fields():
@@ -74,7 +79,7 @@ def test_parse_command_recovers_the_new_fields():
     assert o["hw_accel"] == "vaapi"
     assert o["video_codec"] == "h264_vaapi"
     assert o["low_power"] is True
-    assert o["rc_mode"] == "vbr"
+    assert o["rc_mode"] == "VBR"
     assert o["async_depth"] == "4"
     assert o["video_bitrate"] == "1000k"
     assert o["resolution"] == "720p"
@@ -85,7 +90,9 @@ def test_parse_command_normalises_numeric_rc_mode():
     res = parse_command("ffmpeg -i <url> -c:v h264_vaapi -rc_mode 2 -low_power 0 "
                         "-async_depth 8 -f mpegts pipe:1")
     o = res["options"]
-    assert o["rc_mode"] == "cbr"
+    assert o["rc_mode"] == "CBR"
+    lower = parse_command("ffmpeg -i <url> -c:v h264_vaapi -rc_mode vbr -f mpegts pipe:1")
+    assert lower["options"]["rc_mode"] == "VBR"
     assert o["low_power"] is False
     assert o["async_depth"] == "8"
 
@@ -94,7 +101,7 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
     presets = {p["name"]: p for p in default_presets()}
     vaapi = presets[REFERENCE_PRESET_NAME]
     assert "-low_power 1" in vaapi["command"]
-    assert "-rc_mode vbr" in vaapi["command"]
+    assert "-rc_mode VBR" in vaapi["command"]
     assert "-async_depth 4" in vaapi["command"]
     # every preset's stored command must match its structured fields (2-way sync);
     # the redirect preset is exempt: it is a marker, not an ffmpeg command.
@@ -103,6 +110,22 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
             continue
         fields = {k: v for k, v in p.items() if k in FFmpegOptions.__dataclass_fields__}
         assert build_command(FFmpegOptions(**fields)) == p["command"], name
+
+
+def test_serves_original_file_covers_redirect_and_copy():
+    assert serves_original_file(REDIRECT_COMMAND) is True
+    assert serves_original_file("") is True
+    copy = build_command(FFmpegOptions(hw_accel="none", video_codec="copy",
+                                       audio_codec="copy", resolution="source"))
+    assert serves_original_file(copy) is True
+    assert serves_original_file(f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1") is True
+    vaapi = build_command(FFmpegOptions())
+    assert serves_original_file(vaapi) is False
+    sw = build_command(FFmpegOptions(hw_accel="none", video_codec="libx264"))
+    assert serves_original_file(sw) is False
+    presets = {p["name"]: p for p in default_presets()}
+    assert serves_original_file(presets[COPY_PRESET_NAME]["command"]) is True
+    assert serves_original_file(presets[REDIRECT_PRESET_NAME]["command"]) is True
 
 
 def test_redirect_preset_is_a_sentinel_not_a_command():
@@ -134,3 +157,35 @@ def test_dreambox_preset_targets_mpeg2_ts_for_enigma2():
     assert "-profile:v main" in dreambox["command"]
     assert "scale_vaapi=w=1024:h=576:format=nv12" in dreambox["command"]
     assert "-f mpegts" in dreambox["command"]
+
+
+def test_persistent_templates_carry_optional_dvb_subtitles():
+    """Every real ffmpeg command maps optional DVB subs; redirect is a marker."""
+    variants = [
+        FFmpegOptions(),
+        FFmpegOptions(hw_accel="none", video_codec="libx264"),
+        FFmpegOptions(hw_accel="none", video_codec="copy",
+                      audio_codec="copy", resolution="source"),
+        FFmpegOptions(video_codec="hevc_vaapi"),
+        FFmpegOptions(hw_accel="qsv", video_codec="h264_qsv"),
+        FFmpegOptions(audio_codec="none"),
+    ]
+    for opts in variants:
+        cmd = build_command(opts)
+        toks = cmd.split()
+        assert "-sn" not in toks
+        assert "-map" in toks and "0:s?" in toks
+        assert "-c:s" in toks and "dvbsub" in toks
+        assert "-dn" in toks
+        parsed = parse_command(cmd)
+        assert "-c:s" not in (parsed["options"]["extra_output"] or "")
+
+    for name, p in {p["name"]: p for p in default_presets()}.items():
+        if name == REDIRECT_PRESET_NAME:
+            assert p["command"] == REDIRECT_COMMAND
+            continue
+        toks = p["command"].split()
+        assert "-sn" not in toks, name
+        assert "0:s?" in toks, name
+        assert "-c:s" in toks and "dvbsub" in toks, name
+        assert "-dn" in toks, name

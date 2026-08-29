@@ -22,10 +22,11 @@ FIELDS = ("name", "password", "m3u_enabled", "xtream_enabled", "expire_date",
           "max_connections", "enabled")
 
 
-def _base(request: Request) -> str:
-    from ..config import OUTPUT_BASE_URL
-    if OUTPUT_BASE_URL:
-        return OUTPUT_BASE_URL
+async def _base(request: Request) -> str:
+    from ..services.runtime_settings import output_base_url
+    override = await output_base_url()
+    if override:
+        return override
     return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
@@ -45,7 +46,7 @@ def _row(u: User, base: str) -> dict:
 
 @router.get("")
 async def list_users(request: Request, db=Depends(get_db)):
-    base = _base(request)
+    base = await _base(request)
     rows = (await db.execute(select(User).order_by(User.name))).scalars().all()
     # all existing group names per type (for the group whitelist editor)
     async def distinct(model):

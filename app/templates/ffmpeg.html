@@ -72,8 +72,8 @@
                 <input class="form-check-input ff-field" type="checkbox" id="f-low_power"><label class="form-check-label small">VAAPI low-power (LP encoder)</label></div></div>
               <div class="col-4"><label class="muted-label">VAAPI rate control</label>
                 <select class="form-select form-select-sm ff-field" id="f-rc_mode">
-                  <option value="auto">auto</option><option value="cqp">cqp</option><option value="cbr">cbr</option>
-                  <option value="vbr" selected>vbr</option><option value="icq">icq</option><option value="qvbr">qvbr</option><option value="avbr">avbr</option>
+                  <option value="AUTO">AUTO</option><option value="CQP">CQP</option><option value="CBR">CBR</option>
+                  <option value="VBR" selected>VBR</option><option value="ICQ">ICQ</option><option value="QVBR">QVBR</option><option value="AVBR">AVBR</option>
                 </select></div>
               <div class="col-4"><label class="muted-label">VAAPI async depth</label>
                 <input class="form-control form-control-sm ff-field" id="f-async_depth" value="4" inputmode="numeric"></div>
@@ -133,10 +133,12 @@ function readFields() {
 }
 function writeFields(t) {
   for (const k of FIELD_IDS) if (t[k] !== undefined && t[k] !== null) {
+    let val = t[k];
+    if (k === "rc_mode" && typeof val === "string") val = val.toUpperCase();
     const n = $("#f-" + k);
-    if (n.type === "checkbox") n.checked = !!t[k]; else n.value = t[k];
-    if (n.tagName === "SELECT" && n.value !== String(t[k])) {
-      n.append(el("option", { value: t[k], selected: "" }, t[k]));   // keep unknown custom values
+    if (n.type === "checkbox") n.checked = !!val; else n.value = val;
+    if (n.tagName === "SELECT" && n.value !== String(val)) {
+      n.append(el("option", { value: val, selected: "" }, val));   // keep unknown custom values
     }
   }
 }
@@ -206,7 +208,7 @@ $("#tpl-new").addEventListener("click", () => {
   $("#f-command").disabled = false;
   $("#btn-test-cmd").disabled = false;
   writeFields({ name: "New template", enabled: true, hw_accel: "vaapi",
-                low_power: true, rc_mode: "vbr", async_depth: "4" });
+                low_power: true, rc_mode: "VBR", async_depth: "4" });
   fieldsToCommand();
 });
 $("#tpl-save").addEventListener("click", async () => {

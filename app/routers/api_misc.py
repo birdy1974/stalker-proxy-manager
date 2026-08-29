@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 
+from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL
 from ..database import get_db
 from ..models import (
     EpgSource, FFmpegTemplate, LiveGenre, LivePlaylist, LiveSource, LocalFile,
@@ -102,12 +103,13 @@ async def logs(db=Depends(get_db), level: str = "", module: str = "", q: str = "
 # ------------------------------------------------------------------ settings
 DEFAULT_SETTINGS = {
     "playlist_url_format": "{base}/play/{type}/{id}.ts?u={u}&p={p}",
-    "fallback_strategy": "macs_first",          # macs_first | portal_first (spec option)
+    # Seed from env so a first boot honours docker-compose; later GUI edits win.
+    "fallback_strategy": FALLBACK_STRATEGY,     # macs_first | portal_first
     "epg_refresh_hours": 24,
     "logo_country": "netherlands",
     "tmdb_api_key": "",
-    "fetch_page_budget": 30,
-    "output_base_url": "",
+    "fetch_page_budget": FETCH_PAGE_BUDGET,
+    "output_base_url": OUTPUT_BASE_URL,
 }
 
 
