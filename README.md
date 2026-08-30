@@ -41,7 +41,7 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 |---|---|---|
 | `SPM_DATA_DIR` | `/config` | config DB + state volume |
 | `SPM_MEDIA_ROOT` | `/media` | local video files mount |
-| `SPM_DATABASE_URL` | sqlite | `postgresql+asyncpg://user:pass@host:5432/dbname` to switch to Postgres |
+| `SPM_DATABASE_URL` | sqlite | `postgresql+asyncpg://user:pass@host:5432/dbname` to switch to Postgres; if that Postgres cluster exists but `dbname` does not yet, the app creates it automatically when the credentials allow `CREATE DATABASE` |
 | `SPM_ADMIN_USERNAME` / `SPM_ADMIN_PASSWORD` | `admin` / *(required)* | GUI login |
 | `SPM_VAAPI_DEVICE` | `/dev/dri/renderD128` | Intel Quick Sync render node |
 | `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
