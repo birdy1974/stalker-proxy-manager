@@ -124,6 +124,12 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
 # set-top box turns into a silent hang. We can only change the status code
 # before the first byte goes out, so peek at the first chunk and fail loudly.
 FIRST_CHUNK_TIMEOUT = float(os.environ.get("SPM_FIRST_CHUNK_TIMEOUT", "25"))
+# Headers for every infinite stream: X-Accel-Buffering tells reverse proxies
+# (nginx and everything speaking its conventions) not to buffer the response -
+# a buffering proxy turns a live TS pipe into "player receives nothing", and
+# the browser aborts the fetch long before the first frame.
+STREAM_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no",
+                  "Connection": "keep-alive"}
 
 
 async def _guarded(gen, label: str, item_name: str = ""):
@@ -208,8 +214,7 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     MANAGER.watch(request, handle)
     body = await _guarded(gen, label, handle.item_name)
     return StreamingResponse(body, media_type="video/mp2t",
-                             headers={"Cache-Control": "no-store",
-                                      "X-SPM-Stream": handle.id})
+                             headers=STREAM_HEADERS | {"X-SPM-Stream": handle.id})
 
 
 @router.api_route("/play/live/{pid}.ts", methods=["GET", "HEAD"])
@@ -343,4 +348,4 @@ async def preview(kind: str, sid: int, request: Request, db=Depends(get_db),
     MANAGER.watch(request, handle)
     body = await _guarded(gen, f"preview {kind} #{sid}", name)
     return StreamingResponse(body, media_type="video/mp2t",
-                             headers={"Cache-Control": "no-store"})
+                             headers=STREAM_HEADERS)
