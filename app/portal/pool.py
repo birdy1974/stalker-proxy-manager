@@ -19,7 +19,9 @@ The reference implementations all reuse one session:
 So: keep the client alive, let its own TTL logic refresh the token just under
 the portal's validity window, and reap clients that have been idle. Reusing the
 instance also reuses the httpx connection pool, so keep-alive survives between
-requests.
+requests. A session is keyed by its full connection profile - including the
+per-portal TLS policy - so flipping that flag in the GUI cannot leave a stale
+client with the other policy in the pool.
 
 Callers still do `finally: await client.close()` - for a pooled client that is a
 no-op (see `StalkerClient.close`), so no call site has to know it is sharing.
@@ -52,17 +54,22 @@ class ClientPool:
 
     @staticmethod
     def _key(portal_url: str, mac: str, password: str | None,
-             proxy: str | None) -> tuple:
-        return (portal_url, mac, password or "", proxy or "")
+             proxy: str | None, tls_insecure: bool = False) -> tuple:
+        # The TLS policy is part of the identity of a session: two clients for
+        # the same (portal, MAC) may NOT differ only in verification, and a
+        # flipped flag must not keep serving a session built with the old one.
+        return (portal_url, mac, password or "", proxy or "", bool(tls_insecure))
 
     async def get(self, portal_url: str, mac: str, password: str | None = None,
                   proxy: str | None = None,
-                  timeout: float = PORTAL_HTTP_TIMEOUT) -> StalkerClient:
-        key = self._key(portal_url, mac, password, proxy)
+                  timeout: float = PORTAL_HTTP_TIMEOUT,
+                  tls_insecure: bool = False) -> StalkerClient:
+        key = self._key(portal_url, mac, password, proxy, tls_insecure)
         async with self._guard:
             client = self._clients.get(key)
             if client is None:
-                client = StalkerClient(portal_url, mac, password, proxy, timeout)
+                client = StalkerClient(portal_url, mac, password, proxy, timeout,
+                                       tls_insecure=tls_insecure)
                 client.shared = True
                 self._clients[key] = client
                 self.misses += 1
@@ -91,9 +98,9 @@ class ClientPool:
         return closed
 
     async def drop(self, portal_url: str, mac: str, password: str | None = None,
-                   proxy: str | None = None) -> None:
+                   proxy: str | None = None, tls_insecure: bool = False) -> None:
         """Forget one session - used when a portal or MAC is edited/deleted."""
-        key = self._key(portal_url, mac, password, proxy)
+        key = self._key(portal_url, mac, password, proxy, tls_insecure)
         async with self._guard:
             client = self._clients.pop(key, None)
             self._used.pop(key, None)

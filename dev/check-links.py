@@ -28,7 +28,8 @@ logging.disable(logging.CRITICAL)
 os.environ.setdefault("SPM_DATA_DIR", tempfile.mkdtemp(prefix="spm-check-links-"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.portal.client import (extract_url, mask_token, merge_link,  # noqa: E402
+from app.portal.client import (apply_mac_placeholder, extract_url, is_hls,  # noqa: E402
+                               js_error, mask_token, merge_link, normalize_error,
                                sanitize_cmd, strip_volatile)
 
 CASES: list[tuple[str, object, object]] = []
@@ -119,6 +120,74 @@ check("mask: token hidden, rest readable",
       mask_token("http://host/a.ts?stream=392166&play_token=SECRET"),
       "http://host/a.ts?stream=392166&play_token=%2A%2A%2A")
 check("mask: no query -> unchanged", mask_token("http://host/a.ts"), "http://host/a.ts")
+
+# --------------------------------------------------------------------------- #
+# apply_mac_placeholder - panels with ONE link template for every box
+# --------------------------------------------------------------------------- #
+# `cmd` from the portal: 'http://cdn/ch/%mac%/1234.ts' - the STB is the only
+# party that knows its MAC, so a literal %mac% that reaches ffmpeg is a 404
+# that looks like a dead channel.
+M = "00:1A:79:01:6D:BF"
+check("mac placeholder: path form",
+      apply_mac_placeholder("http://cdn/ch/%mac%/1234.ts", M),
+      f"http://cdn/ch/{M}/1234.ts")
+check("mac placeholder: any casing",
+      apply_mac_placeholder("http://cdn/ch/%MAC%/1.ts", M), f"http://cdn/ch/{M}/1.ts")
+check("mac placeholder: after a query round trip (%25..%25)",
+      apply_mac_placeholder("http://cdn/1.ts?m=%25mac%25", M), f"http://cdn/1.ts?m={M}")
+check("mac placeholder: nothing to do",
+      apply_mac_placeholder("http://cdn/1.ts?x=1", M), "http://cdn/1.ts?x=1")
+check("mac placeholder: no mac -> unchanged",
+      apply_mac_placeholder("http://cdn/%mac%.ts", ""), "http://cdn/%mac%.ts")
+# the placeholder has to survive the repair, so the round trip is checked too
+check("round trip: repair keeps the mac fill-in",
+      apply_mac_placeholder(
+          merge_link("http://host/play/live.php?stream=&play_token=NEW",
+                     "http://host/play/live.php?stream=392166&m=%mac%"), M),
+      "http://host/play/live.php?stream=392166&m=%s&play_token=NEW" % M)
+
+# --------------------------------------------------------------------------- #
+# is_hls - a playlist input needs extra ffmpeg input options
+# --------------------------------------------------------------------------- #
+check("hls: plain playlist", is_hls("http://h/a.m3u8"), True)
+check("hls: with query", is_hls("http://h/a.m3u8?token=x"), True)
+check("hls: m3u8 in the query only is not a playlist", is_hls("http://h/a.ts?f=.m3u8"), False)
+check("hls: mpegts link", is_hls("http://h/a.ts"), False)
+check("hls: empty", is_hls(""), False)
+
+# --------------------------------------------------------------------------- #
+# portal refusals carry their code
+# --------------------------------------------------------------------------- #
+check("error: portal wording normalized", normalize_error("Account is in use"),
+      "account_is_in_use")
+check("error: 'error': 0 next to data is not a refusal",
+      js_error({"js": {"error": 0, "data": [{"id": "1"}]}}), "")
+check("error: bare refusal is reported", js_error({"js": {"error": "limit"}}), "limit")
+check("error: ok-with-empty-payload via msg", js_error({"js": {"msg": "OK"}}), "")
+check("error: usable payload keeps an informational msg",
+      js_error({"js": {"msg": "wait", "total_items": 0, "data": []}}), "wait")
+
+# --------------------------------------------------------------------------- #
+# dead code stays dead
+# --------------------------------------------------------------------------- #
+# `profile()` and `short_epg()` were methods nothing ever called, and they each
+# carried their own http client - i.e. a second path that quietly ignored the
+# portal proxy and the per-portal TLS policy. `_network_identity` was renamed
+# when it grew the HLS input options (it is no longer only about identity).
+# If one of these names comes back, someone re-added a bypass.
+FORBIDDEN = {
+    "profile(": "use StalkerClient.handshake/account_expires, or wire a real caller",
+    "short_epg(": "dead code: it ignored the portal proxy and TLS policy",
+    "_network_identity": "renamed to _network_input_options (HLS opts are not identity)",
+}
+import subprocess  # noqa: PLC0415
+hits = []
+for sym, why in FORBIDDEN.items():
+    r = subprocess.run(["grep", "-rn", "--include=*.py", "--", sym, "app"],
+                       capture_output=True, text=True)
+    if r.stdout.strip():
+        hits += [f"{sym} ({why})\n          {line}" for line in r.stdout.strip().splitlines()]
+check("no dead portal helpers came back", hits, [])
 
 # --------------------------------------------------------------------------- #
 failed = 0

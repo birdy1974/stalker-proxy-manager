@@ -226,6 +226,9 @@ async def init_db() -> None:
 # with "no such column" on the next SELECT. (name, sql-type, default) - the
 # default is dialect-specific for booleans, hence the tiny branch below.
 _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
+    "portals": {
+        "tls_insecure": ("BOOLEAN", "0"),
+    },
     "ffmpeg_templates": {
         "low_power": ("BOOLEAN", "1"),
         "rc_mode": ("VARCHAR(10)", "'VBR'"),

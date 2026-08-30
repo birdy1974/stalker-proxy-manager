@@ -113,7 +113,10 @@ async def test_reap_closes_idle_sessions_and_keeps_fresh_ones():
     pool = ClientPool()
     old = await pool.get("http://p/c/", "00:11:22:33:44:55")
     new = await pool.get("http://p/c/", "00:11:22:33:44:66")
-    pool._used[("http://p/c/", "00:11:22:33:44:55", "", "")] = time.monotonic() - 10_000
+    # keyed through the pool's own helper: the tuple is an implementation
+    # detail (it now also carries the per-portal TLS policy)
+    pool._used[pool._key("http://p/c/", "00:11:22:33:44:55", None, None)] = \
+        time.monotonic() - 10_000
 
     assert await pool.reap(idle_ttl=60) == 1
     assert pool.stats()["sessions_open"] == 1

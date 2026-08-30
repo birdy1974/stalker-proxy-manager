@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import select
 
@@ -154,6 +155,7 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
         if not portal:
             raise PortalError("portal not found")
         portal_name, base, resolved = portal.name, portal.base_url, portal.resolved_url
+        insecure, portal_proxy = portal.tls_insecure, portal.proxy_url
         macs = (await s.execute(
             select(MacAddress).where(MacAddress.portal_id == portal.id)
             .order_by(MacAddress.order))).scalars().all()
@@ -165,7 +167,8 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
     if not resolved:
         job.stage = "resolving portal url"
         await db_log("INFO", "fetch", f"[{portal_name}] resolving portal path for {base}")
-        res = await resolve_portal(base, mac=mac.mac)
+        res = await resolve_portal(base, mac=mac.mac, proxy=portal_proxy,
+                                   tls_insecure=insecure)
         for line in res.attempts:
             await db_log("DEBUG", "resolve", f"[{portal_name}] {line}")
         if not res.ok:
@@ -177,7 +180,11 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
             await s.commit()
         await db_log("INFO", "fetch", f"[{portal_name}] resolved -> {resolved}")
 
-    client = await POOL.get(resolved, mac.mac, mac.password)
+    # The portal's HTTP proxy applies to catalogue calls too - a panel that is
+    # only reachable through it used to be resolvable/streamable but not
+    # fetchable, which made the whole feature look broken.
+    client = await POOL.get(resolved, mac.mac, mac.password, portal_proxy,
+                            tls_insecure=insecure)
     await client.handshake()
     try:                                    # refresh MAC expiry/status while we are here
         exp = await client.account_expires()
@@ -242,8 +249,12 @@ async def _sync_season_links(portal_name: str) -> None:
         if added:
             await db_log("INFO", "fetch",
                          f"[{portal_name}] linked {added} new season(s) to playlist series")
-    except Exception:  # noqa: BLE001 - never fail a fetch over bookkeeping
-        log.exception("season link sync failed")
+    except Exception as exc:  # noqa: BLE001 - never fail a fetch over bookkeeping
+        # There is no module logger in this file (it reports through db_log).
+        # `log.exception` here used to raise NameError *inside the handler*,
+        # which turned a bookkeeping hiccup into a failed fetch job.
+        await db_log("ERROR", "fetch",
+                     f"[{portal_name}] season link sync failed: {type(exc).__name__}: {exc}")
 
 
 async def _run_portal_fetch(job: Job) -> None:

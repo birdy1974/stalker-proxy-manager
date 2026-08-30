@@ -11,6 +11,9 @@ hardened with the Phase-1 findings and the quirks you reported):
   * paginate with `p=` (pages of ~14), budgets are enforced by the caller
   * `get_all_channels` returns the WHOLE live list in one request where the
     portal supports it - preferred over paging through every genre
+  * a refusal is a *code*, not just a message: many panels answer
+    HTTP 200 + {"js":{"error":"limit"}}, and `limit` (this MAC is over its
+    quota) has to be told apart from `nothing_to_play` (this source is dead)
   * every request/response is summarized to the debug log for fault finding
 """
 
@@ -18,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 import logging
 from dataclasses import dataclass
@@ -27,6 +31,7 @@ from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 import httpx
 
 from ..config import PORTAL_HTTP_TIMEOUT
+from ..services.http_client import outbound_client
 
 # How long we keep a handshake token before refreshing it. Portals normally
 # accept one for ~3600s (crispy-stalker uses exactly that); staying just under
@@ -147,8 +152,162 @@ def mask_token(url: str) -> str:
                        urlencode(masked, safe=":"), parts.fragment))
 
 
+# Panels that keep ONE link template for every box do not substitute the MAC
+# themselves: they hand out 'http://cdn/ch/%mac%/1234.ts' and expect the
+# set-top box - the only party that knows its own MAC - to fill it in. Handing
+# that URL to ffmpeg verbatim produces a 404 that looks like a dead channel.
+# The double-encoded variants appear when a placeholder travels through a
+# query-string round trip (parse_qsl + urlencode in merge_link).
+MAC_PLACEHOLDER = re.compile(r"%(?:25)?mac%(?:25)?", re.I)
+
+
+def apply_mac_placeholder(url: str, mac: str) -> str:
+    """Fill every `%mac%` (any casing, any encoding) in a resolved link."""
+    if not url or "%" not in url or not mac:
+        return url
+    return MAC_PLACEHOLDER.sub(mac, url)
+
+
+def is_hls(url: str) -> bool:
+    """
+    True when a resolved link points at an HLS *playlist* rather than a file.
+
+    Not cosmetic: a playlist input needs two extra input options or ffmpeg
+    refuses to open it at all ("-protocol_whitelist" for the segment URLs,
+    "-allowed_extensions ALL" for the fMP4/init segments panels like to use),
+    and the browser preview has to be handed to hls.js instead of mpegts.js.
+    """
+    return ".m3u8" in urlsplit(str(url or "")).path.lower()
+
+
+# ---------------------------------------------------------------------------
+# portal error codes
+# ---------------------------------------------------------------------------
+# What a portal refused *with a reason*. Panels are inconsistent about how
+# they say no: a real HTTP 401, an HTTP 200 carrying {"js":{"error":"limit"}},
+# or a {"js":{"msg":"..."}} with no payload at all. All three arrive here and
+# all three become a PortalError with a normalized `code`, because the code -
+# not the message - is what tells the fallback engine whether to move to the
+# next MAC or to the next source.
+PORTAL_ERROR_HINTS = {
+    "limit": "connection limit for this MAC (panel says it is already streaming)",
+    "account_is_in_use": "the MAC is already in use on the panel",
+    "max_connections": "the panel reports max connections reached",
+    "nothing_to_play": "the portal has nothing to play for this item",
+    "link_fault": "portal/CDN fault while building the link",
+    "access_denied": "the MAC is not enrolled/authorized on this portal",
+    "unauthorized": "the portal refused the credentials",
+    "not_authorized": "the portal refused the credentials",
+    "no_token": "handshake returned no token (MAC unknown, IP blocked?)",
+    "http_401": "portal requires authentication (401)",
+    "http_403": "portal forbids this client (403)",
+    "empty_reply": "portal closed the connection without a body (IP blocked?)",
+    "bad_json": "portal answered something that is not JSON (WAF/captive portal page?)",
+    "timeout": "portal did not answer in time",
+    "transport": "the portal could not be reached",
+    "no_url": "the portal returned no playable URL",
+}
+
+# `js.error` values that mean "this bearer is gone", not "you are banned":
+# worth exactly one transparent re-handshake (same as a real 401).
+TOKEN_ERROR_CODES = frozenset({
+    "token", "invalid_token", "bad_token", "no_token", "expired_token", "token_expired",
+    "auth", "authorization", "unauthorized", "not_authorized", "session", "session_expired",
+})
+
+# Codes that mean "this MAC is not usable" rather than "this portal/source is down".
+MAC_SUSPECT_CODES = frozenset({"limit", "account_is_in_use", "max_connections",
+                               "access_denied", "unauthorized", "not_authorized",
+                               "no_token", "http_401", "http_403", "blocked"})
+
+
+def normalize_error(raw: Any) -> str:
+    """
+    A portal error value as a comparable code ('' = no error).
+
+    'Account is in use' -> 'account_is_in_use', '403' -> '403'. Values that
+    carry no information (0, '', 'ok', 'false') are NOT errors - some panels
+    always answer {"error":0} next to perfectly good data.
+    """
+    if raw is None or isinstance(raw, bool):
+        return ""
+    if isinstance(raw, (int, float)):
+        return str(int(raw)) if raw else ""
+    if not isinstance(raw, str):
+        return ""
+    text = raw.strip()
+    if not text or text.lower() in ("ok", "0", "none", "null", "false", "success"):
+        return ""
+    return re.sub(r"[^0-9a-z]+", "_", text.lower()).strip("_")
+
+
+def js_has_payload(data: Any) -> bool:
+    """True when a `{"js": ...}` envelope carries something usable."""
+    js = data.get("js") if isinstance(data, dict) else None
+    if isinstance(js, dict):
+        if any(js.get(k) for k in ("data", "cmd", "url", "token", "id", "play_token")):
+            return True
+        # genre/profile style payloads: {"1": {...}, "2": {...}}
+        return any(isinstance(v, (dict, list)) and v for v in js.values())
+    return bool(js)
+
+
+def js_error(data: Any) -> str:
+    """
+    Portal error code from a `{"js": ...}` envelope, '' when the answer is fine.
+
+    `js.error` wins; `js.msg` is only consulted when the payload is empty, so a
+    panel that puts an informational msg next to real data stays readable.
+    """
+    js = data.get("js") if isinstance(data, dict) else None
+    if not isinstance(js, dict):
+        return ""
+    code = normalize_error(js.get("error"))
+    if code:
+        return code
+    if not js_has_payload(data):
+        return normalize_error(js.get("msg"))
+    return ""
+
+
 class PortalError(RuntimeError):
-    """Raised for portal-level failures (offline, unauthorized, bad payload)."""
+    """
+    Raised for portal-level failures (offline, unauthorized, bad payload).
+
+    `code` is the machine-readable reason: the portal's own `js.error` when it
+    sent one (normalized), otherwise one of ours (`timeout`, `transport`,
+    `http_503`, `unauthorized`, `no_url`, ...). Callers branch on it; the
+    message is for humans and the log.
+    """
+
+    def __init__(self, message: str, *, code: str = "") -> None:
+        super().__init__(message)
+        self.code = code or ""
+
+    @property
+    def hint(self) -> str:
+        """One-line explanation of `code` ('' when we have nothing to add)."""
+        return PORTAL_ERROR_HINTS.get(self.code, "")
+
+    @property
+    def mac_suspect(self) -> bool:
+        """True when this MAC - not the source or the portal - is the problem."""
+        return self.code in MAC_SUSPECT_CODES
+
+    def detail(self) -> str:
+        """Message plus the human explanation of the code - for logs and GUI."""
+        return f"{self}: {self.hint}" if self.hint else str(self)
+
+
+def status_for_error(exc: PortalError) -> str:
+    """Map a failure onto the MacAddress.status vocabulary."""
+    code = (exc.code or "").lower()
+    if code in ("access_denied", "unauthorized", "not_authorized", "no_token",
+                "http_401", "http_403", "token", "invalid_token", "blocked"):
+        return "unauthorized"
+    if code in ("transport", "timeout", "empty_reply", "bad_json") or code.startswith("http_5"):
+        return "offline"
+    return "error"
 
 
 def truthy(v: Any) -> bool:
@@ -203,12 +362,17 @@ class Page:
 
 class StalkerClient:
     def __init__(self, portal_url: str, mac: str, password: str | None = None,
-                 proxy: str | None = None, timeout: float = PORTAL_HTTP_TIMEOUT) -> None:
+                 proxy: str | None = None, timeout: float = PORTAL_HTTP_TIMEOUT,
+                 tls_insecure: bool = False) -> None:
         self.portal_url = portal_url
         self.mac = mac
         self.password = password
         self.proxy = proxy
         self.timeout = timeout
+        # Per-portal opt-out for panels with a broken cert chain. TLS
+        # verification is ON everywhere else, including here - see
+        # app/services/http_client.py for why that distinction matters.
+        self.tls_insecure = bool(tls_insecure)
         self._token: str | None = None
         self._token_at: float = 0.0        # monotonic time of the last handshake
         self._client: httpx.AsyncClient | None = None
@@ -238,7 +402,9 @@ class StalkerClient:
             }
             if self.proxy:
                 kwargs["proxy"] = self.proxy
-            self._client = httpx.AsyncClient(**kwargs)
+            # Same trust policy as every other outbound call in this app (OS CA
+            # store, verification on) instead of a private httpx default.
+            self._client = outbound_client(insecure=self.tls_insecure, **kwargs)
         return self._client
 
     async def close(self) -> None:
@@ -255,7 +421,23 @@ class StalkerClient:
             self._client = None
 
     async def _get(self, params: dict, *, retried: bool = False) -> Any:
-        """Single GET with token auth + one re-handshake retry."""
+        """
+        Single GET with token auth, one re-handshake retry and a *code*.
+
+        Three shapes of "no" are handled, and only the first two may retry -
+        a retry is what makes one long-lived session survive a portal that
+        rotates its bearer:
+
+          1. HTTP 401/403                      -> re-handshake, retry once
+          2. HTTP 200 + {"js":{"error":"token"}}  -> re-handshake, retry once
+             (Ministra does answer refusals with a 200; without this the whole
+             portal would look broken until the token TTL expired)
+          3. anything else that is a refusal     -> PortalError(code=...)
+
+        A portal error next to a usable payload is NOT an error: some panels
+        carry `{"error":0}` or an informational `msg` on perfectly good genre
+        and channel lists, so we only fail when the answer is also empty.
+        """
         http = await self._http()
         if self._token is None or self._token_stale():
             async with self._lock:
@@ -264,8 +446,12 @@ class StalkerClient:
         log.debug("GET %s params=%s", self.portal_url, {k: v for k, v in params.items() if k != "JsHttpRequest"})
         try:
             r = await http.get(self.portal_url, params=params)
-        except Exception as exc:  # noqa: BLE001
-            raise PortalError(f"request failed: {type(exc).__name__}: {exc}") from exc
+        except httpx.TimeoutException as exc:
+            raise PortalError(f"request failed: timeout after {self.timeout:.0f}s",
+                              code="timeout") from exc
+        except Exception as exc:  # noqa: BLE001 - any transport error means "unreachable"
+            raise PortalError(f"request failed: {type(exc).__name__}: {exc}",
+                              code="transport") from exc
         if r.status_code in (401, 403) and not retried:
             log.info("portal answered %s -> re-handshaking once", r.status_code)
             async with self._lock:
@@ -273,13 +459,35 @@ class StalkerClient:
                 await self.handshake()
             return await self._get(params, retried=True)
         if r.status_code != 200:
-            raise PortalError(f"HTTP {r.status_code}")
+            raise PortalError(f"HTTP {r.status_code}", code=f"http_{r.status_code}")
         if not r.content:
-            raise PortalError("empty reply (portal dropped connection or IP is blocked)")
+            raise PortalError("empty reply (portal dropped connection or IP is blocked)",
+                              code="empty_reply")
         try:
-            return r.json()
+            data = r.json()
         except Exception as exc:  # noqa: BLE001
-            raise PortalError(f"invalid JSON payload ({len(r.content)} bytes)") from exc
+            raise PortalError(f"invalid JSON payload ({len(r.content)} bytes)",
+                              code="bad_json") from exc
+        code = js_error(data)
+        if code:
+            if js_has_payload(data):
+                log.debug("portal reported %r alongside a usable payload - ignoring it", code)
+            elif code in TOKEN_ERROR_CODES and not retried:
+                log.info("portal refused the bearer on HTTP 200 (%s) -> re-handshaking once", code)
+                async with self._lock:
+                    self._token = None
+                    await self.handshake()
+                return await self._get(params, retried=True)
+            else:
+                # The portal told us WHY. Keep its code, and its text when the
+                # code is not self-explanatory, so the log is actionable.
+                msg = ""
+                js = data.get("js") if isinstance(data, dict) else None
+                if isinstance(js, dict):
+                    msg = normalize_error(js.get("msg"))
+                raise PortalError(f"portal said {code}"
+                                  + (f" ({msg})" if msg and msg != code else ""), code=code)
+        return data
 
     async def ensure_auth(self) -> None:
         """
@@ -306,24 +514,37 @@ class StalkerClient:
         log.info("handshake %s mac=%s", self.portal_url, self.mac)
         try:
             r = await http.get(self.portal_url, params=params)
+        except httpx.TimeoutException as exc:
+            raise PortalError(f"handshake failed: timeout after {self.timeout:.0f}s",
+                              code="timeout") from exc
         except Exception as exc:  # noqa: BLE001
-            raise PortalError(f"handshake failed: {type(exc).__name__}: {exc}") from exc
+            raise PortalError(f"handshake failed: {type(exc).__name__}: {exc}",
+                              code="transport") from exc
         if r.status_code != 200:
-            raise PortalError(f"handshake HTTP {r.status_code}")
+            raise PortalError(f"handshake HTTP {r.status_code}",
+                              code="unauthorized" if r.status_code in (401, 403)
+                              else f"http_{r.status_code}")
+        token, code = "", ""
         try:
-            token = r.json()["js"]["token"]
-        except Exception as exc:  # noqa: BLE001
-            raise PortalError("handshake: no token in reply (MAC unknown/blocked?)") from exc
+            data = r.json()
+            js = data.get("js") if isinstance(data, dict) else None
+            if isinstance(js, dict):
+                token = str(js.get("token") or "")
+                if not token:
+                    code = js_error(data)
+        except Exception as exc:  # noqa: BLE001 - an unparsable answer is a refusal
+            code = "bad_json"
+            log.debug("handshake reply was not JSON: %s", exc)
+        if not token:
+            why = f" - portal said {code}" if code and code != "no_token" else ""
+            raise PortalError("handshake: no token in reply (MAC unknown/blocked?)"
+                              f"{why}", code=code or "no_token")
         self._token = token
         self._token_at = time.monotonic()
         # Authorization header is set per-request because httpx cookies persist
         http.headers["Authorization"] = "Bearer " + token
         log.debug("handshake ok, token=%s…", token[:8])
         return token
-
-    async def profile(self) -> dict:
-        data = await self._get({"type": "stb", "action": "get_profile", "JsHttpRequest": "1-xml"})
-        return data.get("js") or {}
 
     async def account_expires(self) -> str | None:
         """Portals report expiry in account_info.get_main_info 'phone' (STB-Proxy convention)."""
@@ -548,7 +769,7 @@ class StalkerClient:
         """
         Resolve a portal `cmd` to a playable stream URL.
 
-        Two steps that matter on real panels (both learned the hard way):
+        Three steps that matter on real panels (all learned the hard way):
 
         1. the outgoing cmd is stripped of volatile parameters. Many portals
            store - and we therefore keep - an already tokenised link; handing
@@ -556,6 +777,9 @@ class StalkerClient:
         2. the answer is repaired against the request, so a portal that drops
            or blanks parameters still yields a complete URL (fresh token is
            always taken from the answer).
+        3. `%mac%` in the answer is filled in with OUR mac: a panel that keeps
+           one link template for every box expects the STB to do this, and a
+           literal `%mac%` in a URL is a guaranteed 404 from ffmpeg.
         """
         type_ = {"live": "itv", "itv": "itv", "vod": "vod", "series": "vod", "episode": "vod"}.get(kind, "itv")
         raw_cmd = str(cmd or "").strip()
@@ -576,20 +800,22 @@ class StalkerClient:
             raw = js
         link = extract_url(raw)
         if not link:
-            raise PortalError(f"create_link returned no usable url for cmd={cmd!r}")
+            # No link, but no refusal either - the panel answered something we
+            # cannot use (an empty cmd, a relative path, a plugin command we do
+            # not speak). Say so, and name the format we got.
+            raise PortalError(
+                f"create_link returned no usable url for cmd={cmd!r}"
+                + (f" (portal cmd: {str(raw)[:120]!r})" if raw else ""),
+                code="no_url")
         repaired = merge_link(link, requested)
         if repaired != link:
             log.info("create_link: portal dropped parameters -> repaired from cmd")
-        log.debug("create_link -> %s", repaired)
-        log.info("create_link -> %s", mask_token(repaired))
-        return repaired
-
-    # ------------------------------------------------------------------ epg
-    async def short_epg(self, ch_id: str) -> list[dict]:
-        try:
-            data = await self._get({"type": "itv", "action": "get_short_epg", "ch_id": ch_id,
-                                    "size": "10", "JsHttpRequest": "1-xml"})
-            js = data.get("js")
-            return js if isinstance(js, list) else []
-        except PortalError:
-            return []
+        with_mac = apply_mac_placeholder(repaired, self.mac)
+        if with_mac != repaired:
+            log.info("create_link: portal left a mac placeholder in the link -> filled in from our MAC")
+        if is_hls(with_mac):
+            log.debug("create_link: HLS playlist link (ffmpeg needs the segment "
+                      "protocols whitelisted; the stream path adds that)")
+        log.debug("create_link -> %s", with_mac)
+        log.info("create_link -> %s", mask_token(with_mac))
+        return with_mac

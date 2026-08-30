@@ -44,7 +44,10 @@ function makeTable() {
       { key: "enabled", label: "On", width: "40px", render: r =>
         `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""}
           onchange="api('/api/portals/${r.id}',{method:'PUT',body:{enabled:this.checked}}).then(()=>toast('portal ${r.enabled ? "disabled" : "enabled"}','ok'))"></div>` },
-      { key: "name", label: "Portal", sort: "name", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono">${esc(r.base_url)}</div>`,
+      { key: "name", label: "Portal", sort: "name", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono">${esc(r.base_url)}</div>`
+          /* visible in the list, not only in the editor: an unverified portal is
+             a deliberate exception and should be easy to spot and remove */
+          + (r.tls_insecure ? '<div><span class="badge text-bg-warning" title="certificate verification is OFF for this portal"><i class="bi bi-shield-exclamation"></i> TLS unverified</span></div>' : ""),
         filter: { type: "text", placeholder: "name…" } },
       { key: "resolved_path", label: "Resolved path", render: r => r.resolved_url ? `<span class="badge text-bg-light mono">${esc(r.resolved_path || "?")}</span>` : '<span class="text-muted small">not resolved</span>' },
       { key: "macs", label: "MAC addresses", render: r => r.macs.map(m => `
@@ -92,7 +95,7 @@ function renderJobs(jobs) {
 
 /* ============================= add / edit modal ============================= */
 async function editPortal(id) {
-  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "" };
+  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false };
   const body = el("div");
   body.innerHTML = `
     <div>
@@ -110,6 +113,11 @@ async function editPortal(id) {
         <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch">
           <input class="form-check-input" type="checkbox" id="p-enabled" ${p.enabled ? "checked" : ""}>
           <label class="form-check-label">Portal enabled</label></div></div>
+        <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" id="p-tls" ${p.tls_insecure ? "checked" : ""}>
+          <label class="form-check-label" for="p-tls">Allow broken TLS</label>
+          <div class="small text-muted">off by default - only for a panel with a self-signed /
+            incomplete cert chain; it disables certificate verification for THIS portal only</div></div></div>
         <div class="col-md-4 d-flex align-items-end justify-content-end">
           <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch genres</button>
         </div>
@@ -140,6 +148,7 @@ async function editPortal(id) {
     name: $("#p-name", body).value.trim(), base_url: $("#p-url", body).value.trim(),
     macs: $("#p-macs", body).value, enabled: $("#p-enabled", body).checked,
     proxy_url: $("#p-proxy", body).value.trim() || null,
+    tls_insecure: $("#p-tls", body).checked,
   });
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
                 mBtn("Save", "btn-accent", () => savePortal(state, body, m), "bi-check2"));
@@ -290,6 +299,7 @@ async function savePortal(state, body, m) {
     name: $("#p-name", body).value.trim(), base_url: $("#p-url", body).value.trim(),
     macs: $("#p-macs", body).value, enabled: $("#p-enabled", body).checked,
     proxy_url: $("#p-proxy", body).value.trim() || null,
+    tls_insecure: $("#p-tls", body).checked,
   };
   if (!data.name || !data.base_url) return toast("name and URL are required", "warn");
   state.saving = true;

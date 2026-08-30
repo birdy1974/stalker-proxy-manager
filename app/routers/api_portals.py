@@ -18,7 +18,7 @@ from ..models import (
     SeriePlaylistSource, SerieSource, VodGenre, VodPlaylistSource, VodSource,
 )
 from ..portal.pool import POOL
-from ..portal.client import PortalError, StalkerClient
+from ..portal.client import PortalError, status_for_error
 from ..portal.resolver import resolve_portal
 from ..security import require_admin
 from ..services.db_logging import db_log
@@ -46,6 +46,7 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
     return {"id": p.id, "name": p.name, "base_url": p.base_url,
             "resolved_url": p.resolved_url, "resolved_path": p.resolved_path,
             "enabled": p.enabled, "proxy_url": p.proxy_url,
+            "tls_insecure": bool(p.tls_insecure),
             "macs": [{"id": m.id, "mac": m.mac, "order": m.order, "status": m.status,
                       "online": m.online, "expire_date": m.expire_date,
                       "fail_count": m.fail_count,
@@ -71,7 +72,8 @@ async def create_portal(payload: dict, db=Depends(get_db)):
     if not name or not base_url:
         raise HTTPException(400, "name and url are required")
     p = Portal(name=name, base_url=base_url, enabled=bool(payload.get("enabled", True)),
-               proxy_url=(payload.get("proxy_url") or None))
+               proxy_url=(payload.get("proxy_url") or None),
+               tls_insecure=bool(payload.get("tls_insecure", False)))
     db.add(p)
     await db.flush()
     for i, mac in enumerate(parse_macs(payload.get("macs", ""))):
@@ -86,11 +88,11 @@ async def update_portal(pid: int, payload: dict, db=Depends(get_db)):
     p = await db.get(Portal, pid)
     if not p:
         raise HTTPException(404, "portal not found")
-    for f in ("name", "base_url", "enabled", "proxy_url"):
+    for f in ("name", "base_url", "enabled", "proxy_url", "tls_insecure"):
         if f in payload:
-            setattr(p, f, payload[f])
-    if "base_url" in payload:                    # URL changed -> re-resolve later
-        p.resolved_url = p.resolved_path = None
+            setattr(p, f, bool(payload[f]) if f == "tls_insecure" else payload[f])
+    if "base_url" in payload or "tls_insecure" in payload:
+        p.resolved_url = p.resolved_path = None   # endpoint/TLS policy changed -> re-resolve
     p.updated = datetime.now(timezone.utc)
     if "macs" in payload:                        # replace full mac list, keep order/status of existing
         existing = {m.mac: m for m in (await db.execute(
@@ -202,7 +204,7 @@ async def resolve(pid: int, db=Depends(get_db)):
     first_mac = (await db.execute(select(MacAddress).where(MacAddress.portal_id == pid)
                                   .order_by(MacAddress.order))).scalars().first()
     res = await resolve_portal(p.base_url, mac=first_mac.mac if first_mac else None,
-                               proxy=p.proxy_url)
+                               proxy=p.proxy_url, tls_insecure=p.tls_insecure)
     for line in res.attempts:
         await db_log("DEBUG", "resolve", f"[{p.name}] {line}")
     if res.ok:
@@ -226,7 +228,8 @@ async def test_portal(pid: int, db=Depends(get_db)):
     results = []
     url = p.resolved_url
     if not url:
-        res = await resolve_portal(p.base_url, mac=macs[0].mac if macs else None, proxy=p.proxy_url)
+        res = await resolve_portal(p.base_url, mac=macs[0].mac if macs else None,
+                                   proxy=p.proxy_url, tls_insecure=p.tls_insecure)
         if not res.ok:
             for m in macs:
                 m.status, m.online = "offline", False
@@ -238,7 +241,8 @@ async def test_portal(pid: int, db=Depends(get_db)):
         url = res.portal_url
         p.resolved_url, p.resolved_path = res.portal_url, res.path
     for m in macs:
-        client = await POOL.get(url, m.mac, m.password, p.proxy_url)
+        client = await POOL.get(url, m.mac, m.password, p.proxy_url, tls_insecure=p.tls_insecure)
+        code = ""
         try:
             await client.handshake()
             exp = await client.account_expires()
@@ -246,18 +250,21 @@ async def test_portal(pid: int, db=Depends(get_db)):
             detail = f"expires: {exp or 'unknown'}"
             await db_log("INFO", "portal", f"[{p.name}] mac {m.mac} online ({detail})")
         except PortalError as exc:
-            msg = str(exc).lower()
-            m.status = ("unauthorized" if "401" in msg or "403" in msg or "token" in msg
-                        else "offline" if "request failed" in msg or "http 5" in msg else "error")
+            # Was: guess from substrings of the message ("401" in msg, "token"
+            # in msg). The client now carries the portal's own code, so the
+            # status is decided from what the panel actually said.
+            code = exc.code
+            m.status = status_for_error(exc)
             m.online = False
             m.fail_count += 1
-            detail = str(exc)
-            await db_log("WARNING", "portal", f"[{p.name}] mac {m.mac} failed: {detail}")
+            detail = exc.detail()
+            await db_log("WARNING", "portal",
+                         f"[{p.name}] mac {m.mac} failed ({m.status}): {detail}")
         finally:
             m.last_checked = datetime.now(timezone.utc)
             await client.close()
         results.append({"mac": m.mac, "status": m.status, "expire_date": m.expire_date,
-                        "detail": detail})
+                        "code": code or None, "detail": detail})
     await db.commit()
     return {"results": results}
 

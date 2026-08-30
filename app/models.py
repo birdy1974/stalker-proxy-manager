@@ -49,6 +49,10 @@ class Portal(Base):
     resolved_path: Mapped[str | None] = mapped_column(String(120))        # the path that won (/c/, ...)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     proxy_url: Mapped[str | None] = mapped_column(String(300))            # optional http proxy
+    # Opt-out for panels with a broken/self-signed certificate chain. False by
+    # default: verification is ON for every portal, and this only ever widens
+    # trust for ONE portal the user explicitly says is misconfigured.
+    tls_insecure: Mapped[bool] = mapped_column(Boolean, default=False)
     notes: Mapped[str | None] = mapped_column(Text)
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

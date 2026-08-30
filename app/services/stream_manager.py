@@ -41,9 +41,10 @@ from ..models import (
     VodSource,
 )
 from ..portal.pool import POOL
-from ..portal.client import MAG_UA, PortalError, StalkerClient
+from ..portal.client import MAG_UA, PortalError, StalkerClient, is_hls
 from .db_logging import db_log
-from .ffmpeg_templates import REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file
+from .ffmpeg_templates import (HLS_ALLOWED_EXTENSIONS, HLS_PROTOCOL_WHITELIST,
+                               REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file)
 from .item_info import local_file_path
 
 log = logging.getLogger("spm.stream")
@@ -283,15 +284,21 @@ class StreamManager:
 
     # --------------------------------------------------------- ffmpeg spawn
     @staticmethod
-    def _network_identity(cmd_text: str, url: str) -> str:
+    def _network_input_options(cmd_text: str, url: str) -> str:
         """
-        Give ffmpeg the identity of the STB it is impersonating.
+        Give ffmpeg the identity of the STB it is impersonating, and the input
+        options the resolved link itself requires.
 
-        ffmpeg announces itself as "Lavf/61.x" and sends no Referer; plenty of
-        Stalker panels - and the CDNs in front of them - answer that with 403
-        or 405 ("Method Not Allowed") on an otherwise perfectly valid link.
-        Inject the MAG user-agent and the stream's own origin unless the
-        template already says otherwise (user edits always win).
+        Identity: ffmpeg announces itself as "Lavf/61.x" and sends no Referer;
+        plenty of Stalker panels - and the CDNs in front of them - answer that
+        with 403 or 405 ("Method Not Allowed") on an otherwise perfectly valid
+        link.
+
+        Per-input options: an HLS playlist additionally needs its segment
+        protocols whitelisted or ffmpeg refuses to open it at all (see
+        ffmpeg_templates.HLS_INPUT_OPTS). A user who wrote their own
+        -protocol_whitelist/-user_agent/-referer/-headers into the template is
+        never overridden.
         """
         if not url.lower().startswith(_NET_SCHEMES):
             return cmd_text
@@ -301,6 +308,11 @@ class StreamManager:
         if "-referer" not in cmd_text and "-headers" not in cmd_text:
             origin = url.split("://", 1)[-1].split("/", 1)[0]
             add.append(f'-referer "{url.split("://", 1)[0]}://{origin}/"')
+        if is_hls(url):                                 # two independent flags
+            if "-protocol_whitelist" not in cmd_text:
+                add.append(f'-protocol_whitelist "{HLS_PROTOCOL_WHITELIST}"')
+            if "-allowed_extensions" not in cmd_text:
+                add.append(f"-allowed_extensions {HLS_ALLOWED_EXTENSIONS}")
         if not add:
             return cmd_text
         # options belong directly in front of the input they apply to
@@ -359,7 +371,7 @@ class StreamManager:
             return None
         is_net = url.lower().startswith(_NET_SCHEMES)
         insert = url if is_net else shlex.quote(url)
-        cmd_text = StreamManager._network_identity(
+        cmd_text = StreamManager._network_input_options(
             cmd_template.replace(URL_PLACEHOLDER, insert), url)
         if not is_net:
             cmd_text = _NETONLY_OPTS.sub(" ", cmd_text)
@@ -711,11 +723,14 @@ class StreamManager:
                 if mac_row.id in self.mac_locks:
                     continue                      # occupied by one of our own pipes
                 client = await POOL.get(portal.resolved_url or portal.base_url,
-                                        mac_row.mac, mac_row.password, portal.proxy_url)
+                                        mac_row.mac, mac_row.password, portal.proxy_url,
+                                        tls_insecure=portal.tls_insecure)
                 try:
                     if not portal.resolved_url:
                         from ..portal.resolver import resolve_portal
-                        res = await resolve_portal(portal.base_url, mac=mac_row.mac)
+                        res = await resolve_portal(portal.base_url, mac=mac_row.mac,
+                                                  proxy=portal.proxy_url,
+                                                  tls_insecure=portal.tls_insecure)
                         if res.ok:
                             portal.resolved_url = res.portal_url
                             client.portal_url = res.portal_url
@@ -724,7 +739,8 @@ class StreamManager:
                     url = await client.create_link(getattr(_src, "cmd", "") or "", link_kind)
                 except PortalError as exc:
                     await db_log("WARNING", "stream",
-                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: {exc} -> next")
+                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
+                                 f"{exc.detail()} -> next")
                     continue
                 except Exception as exc:  # noqa: BLE001
                     await db_log("WARNING", "stream",
@@ -835,12 +851,15 @@ class StreamManager:
                                  f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
                                  f"portal '{portal.name}' mac {mac_row.mac}")
                     client = await POOL.get(portal.resolved_url or portal.base_url,
-                                     mac_row.mac, mac_row.password, portal.proxy_url)
+                                     mac_row.mac, mac_row.password, portal.proxy_url,
+                                     tls_insecure=portal.tls_insecure)
                     url = None
                     try:
                         if not portal.resolved_url:
                             from ..portal.resolver import resolve_portal  # local import: avoids cycle
-                            res = await resolve_portal(portal.base_url, mac=mac_row.mac)
+                            res = await resolve_portal(portal.base_url, mac=mac_row.mac,
+                                                       proxy=portal.proxy_url,
+                                                       tls_insecure=portal.tls_insecure)
                             if res.ok:
                                 portal.resolved_url = res.portal_url
                                 client.portal_url = res.portal_url
@@ -849,8 +868,13 @@ class StreamManager:
                         link_kind = "live" if kind == "live" else "vod"
                         url = await client.create_link(getattr(src, "cmd", "") or "", link_kind)
                     except PortalError as exc:
+                        # The code decides what this means for the rest of the
+                        # chain: `limit` is "this MAC is busy over there", so
+                        # the next MAC is the right move, while `nothing_to_play`
+                        # is "this source is dead", so hopping MACs is pointless.
                         await db_log("WARNING", "stream",
-                                     f"[{h.item_name}] {portal.name}/{mac_row.mac}: {exc} -> next")
+                                     f"[{h.item_name}] {portal.name}/{mac_row.mac}: {exc.detail()}"
+                                     f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
                         continue
                     except Exception as exc:  # noqa: BLE001
                         await db_log("WARNING", "stream",

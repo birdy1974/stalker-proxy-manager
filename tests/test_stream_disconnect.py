@@ -43,6 +43,7 @@ class _Portal:
     base_url = "http://portal.invalid"
     resolved_url = "http://portal.invalid"
     proxy_url = None
+    tls_insecure = False            # the Portal column the stream path forwards
 
 
 class _Mac:

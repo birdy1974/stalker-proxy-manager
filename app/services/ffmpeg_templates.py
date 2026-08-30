@@ -61,6 +61,19 @@ REDIRECT_COMMAND = "@redirect"
 COPY_PRESET_NAME = "Copy / passthrough (no transcode)"
 URL_PLACEHOLDER = "<url>"
 
+# Input options an HLS *playlist* needs and a plain stream does not. ffmpeg
+# refuses a .m3u8 whose segments are reached over a protocol outside the
+# whitelist ("Protocol not on whitelist") and rejects the fMP4/init segments
+# that Ministra panels like to reference ("EXT-X-MAP ... not allowed"), so a
+# perfectly valid portal link dies before a single byte is read. Added by
+# StreamManager only when the resolved link actually is a playlist, and never
+# over a user's own flag (an explicit -protocol_whitelist in the template
+# always wins).
+HLS_PROTOCOL_WHITELIST = "file,http,https,tcp,tls,crypto"
+HLS_ALLOWED_EXTENSIONS = "ALL"
+HLS_INPUT_OPTS = ["-protocol_whitelist", HLS_PROTOCOL_WHITELIST,
+                  "-allowed_extensions", HLS_ALLOWED_EXTENSIONS]
+
 
 def serves_original_file(command: str | None) -> bool:
     """True when a local file should be sent as-is (no ffmpeg).

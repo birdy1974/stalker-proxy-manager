@@ -26,9 +26,8 @@ import re
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-import httpx
-
 from ..config import PORTAL_HTTP_TIMEOUT
+from ..services.http_client import outbound_client
 
 # MAG-styled UA; many portals reject anything else (observed in the wild and
 # during Phase-1 probing: plain curl gets an empty reply from many servers).
@@ -142,8 +141,16 @@ async def resolve_portal(
     mac: str | None = None,
     proxy: str | None = None,
     timeout: float = PORTAL_HTTP_TIMEOUT,
+    tls_insecure: bool = False,
 ) -> ResolveResult:
-    """Probe `raw_url` and return the working portal.php URL (if any)."""
+    """
+    Probe `raw_url` and return the working portal.php URL (if any).
+
+    `tls_insecure` is the caller's per-portal opt-out, forwarded verbatim: a
+    panel with a broken certificate chain has to be resolvable, or the user
+    never gets as far as the GUI flag that would have fixed it. Verification
+    stays on by default (see app/services/http_client.py).
+    """
     result = ResolveResult()
     base, hint = _normalize_base(raw_url)
     headers = {"User-Agent": MAG_UA}
@@ -157,11 +164,12 @@ async def resolve_portal(
         if p not in paths:
             paths.append(p)
 
-    client_kwargs: dict = {"headers": headers, "cookies": cookies, "timeout": timeout, "follow_redirects": True}
+    client_kwargs: dict = {"headers": headers, "cookies": cookies, "timeout": timeout,
+                           "follow_redirects": True}
     if proxy:
         client_kwargs["proxy"] = proxy
 
-    async with httpx.AsyncClient(**client_kwargs) as http:
+    async with outbound_client(insecure=tls_insecure, **client_kwargs) as http:
         for path in paths:
             # ---- strategy 1: xpcom.common.js indirection --------------------
             xp = _xpcom_for(base, path)

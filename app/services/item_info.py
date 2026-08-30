@@ -36,7 +36,8 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str) -> str | None:
             # Pooled: do NOT handshake here. create_link() authenticates lazily
             # and reuses the cached token, so a detail popup costs no extra
             # portal round trip once a session already exists.
-            client = await POOL.get(portal.resolved_url, mac.mac, mac.password)
+            client = await POOL.get(portal.resolved_url, mac.mac, mac.password,
+                                    portal.proxy_url, tls_insecure=portal.tls_insecure)
             try:
                 return await client.create_link(cmd, kind)
             except Exception:  # noqa: BLE001 - fall through to raw cmd

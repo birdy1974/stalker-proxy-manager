@@ -188,7 +188,8 @@ async def export_config(section: str = "all", db=Depends(get_db)):
 
     if section in ("all", "portals"):
         from ..models import MacAddress
-        data["portals"] = await dump(Portal, ["name", "base_url", "enabled", "proxy_url"])
+        data["portals"] = await dump(Portal, ["name", "base_url", "enabled", "proxy_url",
+                                              "tls_insecure"])
         macs = (await db.execute(select(MacAddress, Portal)
                                  .join(Portal, Portal.id == MacAddress.portal_id))).all()
         data["macs"] = [{"portal": p.name, "mac": m.mac, "order": m.order}

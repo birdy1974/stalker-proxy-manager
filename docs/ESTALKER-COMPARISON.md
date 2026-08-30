@@ -46,22 +46,22 @@ bouquet writing, aspect-ratio handling, i18n) I ignore it.
 | 3 | Request identity | `X-User-Agent`, `Referer: …/index.html`, `Pragma`, `Accept-Encoding/Language`, `Host`, `Connection: Close`, cookies `mac/stb_lang/timezone/adid` + `token` cookie | `User-Agent` + cookies `mac/stb_lang/timezone` only | **ES** by a wide margin |
 | 4 | Adaptive headers | regex-scrapes `set_cookie('x')` / `setRequestHeader('X-…')` out of `xpcom.common.js` and only sends what the portal declares | fixed set | **ES** (nice idea, fragile) |
 | 5 | Handshake | 2 shapes (with/without explicit `mac=`), `"missing"` → fake bearer + `prehash=sha1(fake)` retry, reads `js.random`, `js.not_valid` | 1 shape, `prehash=0`, no `mac` param, no prehash dance | **ES** |
-| 6 | `get_profile` | full MAG250 fingerprint (sn, device_id, device_id2, signature, hw_version, hw_version_2, metrics, api_signature, prehash, not_valid_token) + minimal fallback | bare `type=stb&action=get_profile`, **result never read** (`client.py:324` is dead code) | **ES** |
+| 6 | `get_profile` | full MAG250 fingerprint (sn, device_id, device_id2, signature, hw_version, hw_version_2, metrics, api_signature, prehash, not_valid_token) + minimal fallback | no fingerprint request at all — the old `profile()` had no caller and was deleted in R5 | **ES** (R1) |
 | 7 | Account state | `account_info` expiry **plus** `js.status`, `js.blocked`, `force_ch_link_check`; playlist marked invalid if `blocked==1` | expiry only (`account_expires`); no blocked/status/force flags anywhere | **ES** |
 | 8 | Token/session lifecycle | token+headers persisted to JSON, re-`handshake` via `reauthorize_portal()` on **any** failed call, exactly 1 retry (24 call sites) | pooled client per (portal,MAC), TTL 3000 s, `401/403` → re-handshake + 1 retry, idle reap 900 s, hit/miss stats | **us** (TTL, pooling, reuse, stats); ES wins on "retry on transport errors too" |
 | 9 | Catalogue fetch | lazy, scroll-driven paging (14/page), `pages_downloaded` set, `all_data[total_items]` positional array, `/tmp/allchannels.json` | background jobs, `get_all_channels` first, 4-way concurrent paging, budget, per-page bulk upsert, resumable, progress in GUI | **us** (server-side need); ES's positional page placement is a good idea we already get from `gather` ordering |
 | 10 | Series/VOD type duality | hardcodes `type=vod` for VOD, `type=series` for series | tries `series` then `vod`, validates season/episode rows, id-shape tolerance | **us** |
 | 11 | `create_link` policy | **conditional**: only when the channel says `use_http_tmp_link`/`use_load_balancing` or portal says `force_ch_link_check`; else play the stored `cmd` as-is; fallback heuristic for legacy rows (`localhost`, `///`, `/ch/`, no `http`) | **always** resolves (proxy needs an absolute URL + it is the "is this source alive?" signal) | **ES** on portal load & start-up latency, **us** on correctness/uniformity — see R2 |
-| 12 | Link post-processing | `%mac%` substitution; `ffmpeg `/`ffrt ` prefix strip; `urlparse().geturl()` normalisation; `.m3u8`→streamtype | prefix strip, stale-token strip, **answer repair** when the panel drops `&stream=…` (`merge_link`) | tie; each has one thing the other lacks |
-| 13 | Portal error semantics | maps `js.error` → user-visible text: `limit`, `nothing_to_play`, `link_fault`, `access_denied` | generic `PortalError("create_link returned no usable url for cmd=…")`; an HTTP-200 `{"js":{"error":…}}` looks like an *empty page* | **ES** |
-| 14 | Portal EPG | `get_short_epg&size=10` for the visible rows only, deduped, `503` retry ×2, one reauth generation | `client.short_epg()` exists, **never called** (`client.py:588`); EPG comes from external XMLTV only | **ES** |
+| 12 | Link post-processing | `%mac%` substitution; `ffmpeg `/`ffrt ` prefix strip; `urlparse().geturl()` normalisation; `.m3u8`→streamtype | prefix strip, stale-token strip, **answer repair** when the panel drops `&stream=…` (`merge_link`), and — since R4 — `%mac%` substitution plus `.m3u8`→HLS input options | **us**: repair is the more valuable trick, and we now have their two as well |
+| 13 | Portal error semantics | maps `js.error` → user-visible text: `limit`, `nothing_to_play`, `link_fault`, `access_denied` | the same codes, in `PortalError.code` + `detail()`, and *plus* a decision each one drives (`limit` = rotate MAC, `nothing_to_play` = advance the chain), a per-code check status, and the payload guard on `js.msg` (R4 ✅) | **us** |
+| 14 | Portal EPG | `get_short_epg&size=10` for the visible rows only, deduped, `503` retry ×2, one reauth generation | the unused `client.short_epg()` is now deleted, so this is external XMLTV only until R9 | **ES** |
 | 15 | TV archive / catch-up | full: modules gate, `get_all_channels`+`archive` filter, `type=epg&action=get_week`, `get_simple_data_table` paged by `total_items`/`max_page_items`, `mark_archive`, `tv_archive_duration` cutoff, play via `type=tv_archive&action=create_link&cmd=auto /media/<id>.mpg` | none — `tv_archive` is fetched and then hard-set to `0` in output (`playlist_gen.py:264`) | **ES** (the single biggest gap) |
 | 16 | Module discovery | `type=stb&action=get_modules` → `all_modules` minus `disabled_modules`, gates menu entries (e.g. `tv_archive`) | none: a portal without series/VOD is discovered by trial and error at fetch time | **ES** |
 | 17 | Player hygiene | `type=itv&action=set_last_id`, `type=watchdog&action=get_events&init=` (timer currently commented out) | nothing | **ES** (small but cheap) |
 | 18 | Multi-MAC / fairness | one MAC per playlist; N playlists fetched with **one in-flight request per domain per round**, ≤30 threads, sequential fallback | MAC order per portal, occupancy locks (1 stream/MAC), `macs_first`/`portal_first`, `FETCH_PAGE_CONCURRENCY=4` | **us** for MAC semantics; ES's per-domain round-robin is the missing fairness piece |
-| 19 | Transport/TLS | `verify=False` everywhere, `HTTPAdapter(max_retries=0/1)`, GET `(8,8)` timeouts | TLS verification **on** (good), `PORTAL_HTTP_TIMEOUT=10`; but portal client builds its own `httpx.AsyncClient`, so it does *not* get the OS-CA context that `http_client.outbound_client()` gives EPG/logos | **us** on security; our inconsistency is a bug (R5) |
+| 19 | Transport/TLS | `verify=False` everywhere, `HTTPAdapter(max_retries=0/1)`, GET `(8,8)` timeouts | TLS verification **on** for every outbound call, `PORTAL_HTTP_TIMEOUT=10`; portal traffic shares the one TLS policy with EPG/logos, plus a per-portal `tls_insecure` opt-out in the GUI (R5 ✅) | **us**, decisively |
 | 20 | Xtream interop | harvests `/movie/<user>/<pass>/` from a `create_link` answer, then queries `player_api.php` for status/`created_at`/`exp_date`/`active_cons`/`max_connections`; auto-delete of invalid playlists | we *serve* Xtream, we do not *ingest* it | **ES** (see R7) |
-| 21 | Code quality | screen-centric, `print()` debugging, broad `except`, mixed Py2/Py3, no tests | typed, module loggers with masked tokens, 20 pytest files (2 792 LOC), CI smoke test, mock portal | **us**, decisively |
+| 21 | Code quality | screen-centric, `print()` debugging, broad `except`, mixed Py2/Py3, no tests | typed, module loggers with masked tokens, 20 pytest files (3141 LOC), CI smoke test, mock portal with toggleable failure modes | **us**, decisively |
 
 ---
 
@@ -202,7 +202,7 @@ account is blocked or expired. Adopt EStalker's decision function instead:
   chain builder (`stream_manager._live_chain` → `_pick_macs`) should skip non-`online` MACs, which
   also fixes the "expired mock MAC is still tried" wart.
 
-### R4 — Portal error codes, `%mac%`, and a real message per failure — **DO**
+### R4 — Portal error codes, `%mac%`, and a real message per failure — **DO** ✅ *delivered*
 
 *Effort ≈ 2–3 h. Highest value-per-hour in this document.*
 
@@ -222,7 +222,7 @@ account is blocked or expired. Adopt EStalker's decision function instead:
 5. Detect `js.error == "limit"` in the *stream* log message and surface a per-user toast
    ("portal reports connection limit reached") instead of a silent fallback.
 
-### R5 — Fix the two internal inconsistencies this comparison exposed — **DO (tiny)**
+### R5 — Fix the two internal inconsistencies this comparison exposed — **DO (tiny)** ✅ *delivered*
 
 *Effort ≈ 1 h.*
 
@@ -232,7 +232,7 @@ account is blocked or expired. Adopt EStalker's decision function instead:
   per-portal `tls_insecure` flag (default **off**) for panels with broken chains, so we never have to
   write `verify=False` into the code the way EStalker does everywhere.
 * `client.profile()` and `client.short_epg()` are dead code — either wire them up (R1, R8) or delete
-  them; both are currently a trap for the next reader.
+  them; both are currently a trap for the next reader. *(deleted, since nothing ever called them)*
 
 ### R6 — Capability & version probing on *Resolve* — **DO (cheap, big DX win)**
 
@@ -313,9 +313,9 @@ gets an IP banned. Cheap version: an `/api/epg/now?source_id=` endpoint feeding 
 | Rank | Item | Value | Effort | Risk |
 |---|---|---|---|---|
 | 1 | **R1** STB identity (fingerprint, prehash dance, headers/cookies) | unlocks picky/blocked portals | 6–10 h | low (flag-guarded) |
-| 2 | **R4** error codes + `%mac%` + classified `PortalError` | turns "black channel" into an actionable log | 2–3 h | very low |
+| 2 | ~~**R4**~~ ✅ error codes + `%mac%` + classified `PortalError` | turns "black channel" into an actionable log | 2–3 h | very low |
 | 3 | **R3** consume `blocked`/expiry in MAC status & chain | stops burning quota on dead MACs | 3–5 h | low |
-| 4 | **R5** `outbound_client` for portal + per-portal TLS flag, drop dead code | fixes a latent TLS failure mode | 1 h | very low |
+| 4 | ~~**R5**~~ ✅ `outbound_client` for portal + per-portal TLS flag, drop dead code | fixes a latent TLS failure mode | 1 h | very low |
 | 5 | **R6** `version.js` + `get_modules` capability panel | self-documenting portals | 3 h | low |
 | 6 | **R2** conditional `create_link` + link flags in DB | halves portal load on redirect path | 4 h | medium (fallback semantics) |
 | 7 | **R8** TV archive / catch-up | real user-visible feature | 12–20 h | medium |
@@ -323,15 +323,91 @@ gets an IP banned. Cheap version: an `/api/epg/now?source_id=` endpoint feeding 
 | 9 | **R9** short-EPG "now" | nice-to-have | 4 h | low |
 | — | **R10** list | *guardrail: what not to copy* | — | — |
 
-Suggested order: **R5 → R4 → R1 → R3 → R6 → R2 → R8** (cheap-and-safe first, then the identity work
-that changes request shapes, then the feature). Extend `app/portal/mock_portal.py` first: it should
-reject a bare handshake when the portal is configured with `require_prehash`, return
-`{"js":{"error":"limit"}}`, answer `get_modules`, `version.js`, `get_week`/`get_simple_data_table`
-and `type=tv_archive`, so each R above lands with a test instead of a hope.
+Suggested order: ~~R5~~ ✅ → ~~R4~~ ✅ → **R1** → R3 → R6 → R2 → R8 (cheap-and-safe first, then the
+identity work that changes request shapes, then the feature). The mock portal gained the knobs for
+the two delivered items (`create_link_error`, `token_rejects`, `mac_placeholder`, next to the
+pre-existing `offline` / `slow` / `max_per_mac`, all echoed by `GET /mock/_state`);
+still worth adding for the rest: `require_prehash`, `get_modules`, `version.js`,
+`get_week`/`get_simple_data_table` and `type=tv_archive`, so each R above lands with a test instead
+of a hope.
 
 ---
 
-## 6. Legal note: do not copy code
+## 6. Delivered: R5 + R4
+
+What actually landed, including two deviations from the plan and two real bugs the wiring exposed.
+
+**R5 — one trust policy.**
+* `http_client.outbound_client()` is now the only place in the app that decides TLS, and the only
+  place that builds an `httpx.AsyncClient`. It grew an explicit `insecure` keyword (default False)
+  that resolves to `verify=False` **for that one client**; everyone else keeps getting the shared OS
+  trust context. `StalkerClient._http()` and `resolve_portal()` both go through it, so portal
+  handshake, catalogue pages, `create_link`, EPG and logo fetches now share one policy —
+  and the resolver no longer has its own `httpx` import to get out of sync.
+  Deviation from the plan: the plan said "route portal calls *through* `outbound_client()`", which
+  read as one client per request; what landed is the *factory* being shared instead, so the pooled
+  long-lived client keeps its keep-alive (a fetch is dozens of paginated calls on one session).
+* `Portal.tls_insecure` is a new column (added to `_NEW_COLUMNS`, so existing installs migrate on
+  boot), editable in the portal modal, badged `TLS unverified` in the portal list, and **part of the
+  pooled session key**, so flipping it cannot leave an old verified session attached to the MAC.
+  Default off; verification is never disabled globally.
+* `profile()` and `short_epg()` — which nothing ever called, and which would have bypassed the
+  portal's proxy too — are deleted.
+
+**R4 — portal language.**
+* `normalize_error()` / `js_error()` / `js_has_payload()` in `client.py`. The plan missed one thing:
+  real portals use `js.error` **and** `js.msg` for both refusals and chatter, and `error: 0/1/2` are
+  *status codes* on some `itv` pages. A refusal is therefore only honoured when the reply carries no
+  usable data; otherwise a page that legitimately contains a field named `error` becomes a phantom
+  failure. `{"js":{"msg":"OK"}}` on an empty payload still reads as `ok_with_empty_payload`.
+* `PortalError` gained `code` / `message` / `hint`, and a `detail()` line that reads
+  `portal said limit - connection limit for this MAC (panel says it is already streaming)`.
+  `MAC_SUSPECT_CODES` separates "go away, MAC" (rotate) from "the source is dead" (advance the
+  chain); `status_for_error()` maps codes to `unauthorized` / `offline` / `error` instead of the old
+  "every exception is an error".
+* Deviation/addition: refusals arriving under **HTTP 200** with a token-shaped code — Ministra's way
+  of saying "your bearer expired", with no 401 anywhere — trigger the same one-shot re-handshake +
+  retry as a 401 (never a loop). That closes part of R1.2 and fixes a real stall: a revoked bearer
+  stayed broken until our own 30-minute TTL expired.
+* `%mac%` (and the `%25mac%25` a query round trip produces) is substituted **after** `merge_link`;
+  before it, `urlencode(..., safe=":")` re-encodes the placeholder and the repair never matches.
+* `is_hls()` on the resolved link adds `-protocol_whitelist` and `-allowed_extensions ALL`,
+  **each tested independently** — a single `"-protocol_whitelist" in cmd` gate lets a template that
+  sets one flag silently lose the other, which is how this was written first and how a user would
+  have inherited a black channel.
+* Tests: `tests/test_portal_tls_and_errors.py` (23, driving the real `StalkerClient` against the
+  mock ASGI app rather than stubbing `profile()`), plus 17 new cases in `dev/check-links.py`.
+
+**Three bugs found while wiring it up** — all pre-existing, all fixed here:
+* `routers/api_portals.py` called `resolve_portal()` **without** `proxy_url` while the MAC
+  verification just below built its own client *with* it: a portal configured to go through a proxy
+  resolved its base path over the open internet — on IP-locked panels, precisely the request that
+  must not leak.
+* `fetch_jobs._prepare_client` handed `proxy_url` to its throw-away verification client but
+  called `POOL.get(...)` for the real catalogue work **without** it: a proxied portal could be
+  resolved, could stream, and could not be fetched. The proxy now reaches all three call sites
+  (resolve, fetch, stream).
+* `app/main.py::_reap_sessions` referenced `asyncio`, imported only inside `_lifespan`, so every
+  300-second pass died with `NameError`, was swallowed by its own `except Exception` and logged
+  "session reaper failed". Idle portal sessions were therefore never reaped — one socket per MAC for
+  the life of the process, with a log line claiming the safety net had a hiccup while it never ran.
+  Now imported at module level, with a regression test that asserts a reap actually happens.
+* `fetch_jobs._sync_season_links` reported its failure with `log.exception` in a module that has no
+  `log` (it reports through `db_log`) — a `NameError` raised *inside* the `except` that exists to
+  prevent bookkeeping from failing a fetch, so the fetch job failed and the real error was lost.
+  It is `db_log` now, also with a fail-before/pass-after test.
+
+The pattern is worth naming, because it is the reason these survived: a bare `except Exception` that
+logs turns a bug into a *feature that quietly never runs*. All three of the above were
+import/typing slips of exactly one line; a `ruff check` (F821 catches all of them) is the cheapest
+possible guard, and it is not in this repo's CI yet — that is now the only thing in this document I'd
+add to the backlog that EStalker never mentioned.
+
+Not done, deliberately: R1, R2, R3, R6, R7, R8, R9 — see the ranking above for why.
+
+---
+
+## 7. Legal note: do not copy code
 
 EStalker ships no `LICENSE` (only `README.md`: "Enigma2 - IPTV Ministra stalker player") and
 `CONTROL/control` credits `Maintainer: kiddac`, `Source: linuxsat-support.com`. Absent a license we

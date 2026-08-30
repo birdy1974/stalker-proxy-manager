@@ -13,7 +13,13 @@ the demo MACs listed in MOCK_MACS. The mock emulates:
                              episodes / create_link
   * /mock/ts/<file>.ts       infinite MPEG-TS testsrc stream (via ffmpeg)
   * behaviours: per-MAC concurrency limit (default 1) so the fallback logic is
-    really triggered, plus /mock/_control toggles: offline, slow, busy
+    really triggered, plus /mock/_control toggles: offline, slow, busy, and
+    the three that reproduce how real panels *refuse*:
+      create_link_error  answer create_link with HTTP 200 + {"js":{"error":X}}
+      token_rejects=N    the next N calls reject the bearer with a 200
+                         {"js":{"error":"token"}} - exactly how Ministra
+                         expires a session - then behave again
+      mac_placeholder    hand out links containing %mac% instead of a MAC
 
 The dataset is deterministic: 3 live genres x 4 channels, 2 vod genres x 12
 movies, 2 series genres x 6 series (2-3 seasons x 5 episodes).
@@ -93,8 +99,16 @@ _SERIE_NAMES = {
 
 PAGE_SIZE = 14  # exactly what real portals use
 
-# runtime state: mac -> in-flight stream count, plus behaviour toggles
-_STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note": ""}
+# runtime state: mac -> in-flight stream count, plus behaviour toggles.
+#   create_link_error  portal-level refusal code answered with HTTP 200 on
+#                      create_link ("limit", "nothing_to_play", "link_fault",
+#                      "access_denied") - the shape real panels use and the one
+#                      that used to reach the log as "no usable url"
+#   token_rejects      number of following non-handshake calls that reject the
+#                      bearer with a 200 {"js":{"error":"token"}}
+#   mac_placeholder    hand out `%mac%` inside the link instead of a real MAC
+_STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note": "",
+          "create_link_error": "", "token_rejects": 0, "mac_placeholder": False}
 
 
 def _usage(mac: str) -> int:
@@ -220,10 +234,24 @@ def _portal_mac(request: Request) -> str:
 
 def _auth(request: Request) -> tuple[str, JSONResponse | None]:
     """Post-handshake authorization: known mac + the bearer token that the
-    handshake issued. The handshake itself is permissive (see portal_php)."""
+    handshake issued. The handshake itself is permissive (see portal_php).
+
+    `token_rejects` emulates the way Ministra actually expires a session: NOT
+    with a 401 but with HTTP 200 + {"js":{"error":"token"}}, which a lenient
+    client reads as "empty result". A client that does not re-handshake on it
+    stalls until its token TTL runs out - which is exactly the bug this toggle
+    guards against.
+    """
     mac = _portal_mac(request)
     if mac not in MOCK_MACS:
         return mac, JSONResponse({"js": {"error": "unknown mac"}}, status_code=403)
+    if _STATE.get("token_rejects", 0):
+        _STATE["token_rejects"] = int(_STATE["token_rejects"]) - 1
+        log.warning("mock portal: rejecting bearer for %s with HTTP 200 token error "
+                    "(%d left)", mac, _STATE["token_rejects"])
+        return mac, JSONResponse({"js": {"error": "token",
+                                         "msg": "timeout of authorization token"}},
+                                 status_code=200)
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer mock-" + mac.replace(":", "")):
         return mac, JSONResponse({"js": {"error": "token"}}, status_code=401)
@@ -315,11 +343,23 @@ async def portal_php(request: Request):  # noqa: A002
 
     if action == "create_link":
         cmd = qp.get("cmd", "")
+        # A portal-level refusal with HTTP 200 (real panels answer exactly
+        # like this, and the code is the only thing that tells "this MAC is
+        # busy" from "this channel is gone").
+        if _STATE.get("create_link_error"):
+            code = str(_STATE["create_link_error"])
+            log.warning("mock portal: create_link refused for %s with 200 + error=%r",
+                        mac, code)
+            return _js({"error": code})
         # busy-MAC emulation: refuse when this MAC already streams something
         if _usage(mac) >= _STATE["max_per_mac"]:
             return JSONResponse({"js": {"error": "account is in use"}}, status_code=403)
         if ".ts" in cmd or ".mp4" in cmd or ".m3u8" in cmd:
-            url = cmd.split()[-1].replace("http://mock/", str(request.base_url).rstrip("/") + "/mock/")
+            base = str(request.base_url).rstrip("/") + "/mock/"
+            if _STATE.get("mac_placeholder"):
+                # one template for every box: the STB has to fill in its own MAC
+                return _js({"cmd": f"ffmpeg {base}ts/%mac%.ts?m=%MAC%"})
+            url = cmd.split()[-1].replace("http://mock/", base)
             return _js({"cmd": "ffmpeg " + url})
         return JSONResponse({"js": {"error": "bad cmd"}}, status_code=404)
 
@@ -422,13 +462,17 @@ async def mock_vod(name: str):
 # ---------------------------------------------------------------------------
 # Control endpoint for demos/tests (flip offline/slow/busy on the fly)
 # ---------------------------------------------------------------------------
+_TOGGLE_KEYS = ("offline", "slow", "max_per_mac", "create_link_error",
+                "token_rejects", "mac_placeholder")
+
+
 @router.post("/mock/_control")
 async def control(payload: dict):
-    for k in ("offline", "slow", "max_per_mac"):
+    for k in _TOGGLE_KEYS:
         if k in payload:
             _STATE[k] = payload[k]
-    log.warning("mock portal control: %s", {k: _STATE[k] for k in ("offline", "slow", "max_per_mac")})
-    return {"state": {k: _STATE[k] for k in ("offline", "slow", "max_per_mac", "note")}}
+    log.warning("mock portal control: %s", {k: _STATE[k] for k in _TOGGLE_KEYS})
+    return {"state": {k: _STATE[k] for k in _TOGGLE_KEYS + ("note",)}}
 
 
 @router.get("/mock/_state")
