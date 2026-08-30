@@ -13,8 +13,9 @@ import logging
 from contextlib import contextmanager
 from typing import Any, Coroutine
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy import event
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from .config import DATABASE_URL, log
 
@@ -211,13 +212,100 @@ async def get_db() -> AsyncSession:  # FastAPI dependency
         yield session
 
 
+def _walk_exc_chain(exc: BaseException) -> list[BaseException]:
+    """Flatten ``orig`` / cause / context links so wrapped DBAPI errors are easy
+    to reason about in tests and in startup recovery."""
+    seen: set[int] = set()
+    todo: list[BaseException] = [exc]
+    out: list[BaseException] = []
+    while todo:
+        cur = todo.pop()
+        if id(cur) in seen:
+            continue
+        seen.add(id(cur))
+        out.append(cur)
+        for nxt in (getattr(cur, "orig", None), cur.__cause__, cur.__context__):
+            if isinstance(nxt, BaseException):
+                todo.append(nxt)
+    return out
+
+
+def _is_missing_postgres_database(exc: BaseException) -> bool:
+    try:
+        import asyncpg
+    except ImportError:
+        return False
+    return any(isinstance(e, asyncpg.InvalidCatalogNameError)
+               for e in _walk_exc_chain(exc))
+
+
+def _quote_pg_ident(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
+
+
+async def _create_postgres_database(database_url: str = DATABASE_URL) -> None:
+    """Create the configured Postgres database if the cluster exists but the
+    named database does not yet.
+
+    Docker Compose creates it for us, but a bare external Postgres server often
+    does not. Retrying startup by hand works; doing it here is friendlier.
+    """
+    import asyncpg
+
+    url = make_url(database_url)
+    if not (url.drivername or "").startswith("postgresql") or not url.database:
+        return
+    target_db = url.database
+    admin_dbs = [name for name in ("postgres", "template1") if name != target_db]
+    if not admin_dbs:
+        admin_dbs = ["template1"]
+
+    last_exc: BaseException | None = None
+    for admin_db in admin_dbs:
+        admin_url = url.set(drivername="postgresql", database=admin_db)
+        conn = None
+        try:
+            conn = await asyncpg.connect(admin_url.render_as_string(hide_password=False))
+            exists = await conn.fetchval("SELECT 1 FROM pg_database WHERE datname = $1", target_db)
+            if exists:
+                log.info("PostgreSQL database %s appeared while booting", target_db)
+                return
+            await conn.execute(f"CREATE DATABASE {_quote_pg_ident(target_db)}")
+            log.warning("Created missing PostgreSQL database %s", target_db)
+            return
+        except asyncpg.InvalidCatalogNameError as exc:
+            last_exc = exc
+            continue
+        except asyncpg.DuplicateDatabaseError:
+            log.info("PostgreSQL database %s was created concurrently", target_db)
+            return
+        finally:
+            if conn is not None:
+                await conn.close()
+
+    if last_exc is not None:
+        raise last_exc
+
+
+async def _ensure_schema(metadata) -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
+
+
 async def init_db() -> None:
     """Create all tables. Safe to call on every startup (IF NOT EXISTS semantics)."""
     from . import models  # noqa: F401  (register metadata)
 
-    async with engine.begin() as conn:
-        await conn.run_sync(models.Base.metadata.create_all)
-        await conn.run_sync(_add_missing_columns)
+    try:
+        await _ensure_schema(models.Base.metadata)
+    except Exception as exc:  # noqa: BLE001 - startup recovery is intentionally narrow below
+        if engine.dialect.name != "postgresql" or not _is_missing_postgres_database(exc):
+            raise
+        log.warning("Configured PostgreSQL database %s does not exist yet; creating it now",
+                    make_url(DATABASE_URL).database)
+        await _create_postgres_database()
+        await _ensure_schema(models.Base.metadata)
     log.info("Database schema ensured (%d tables)", len(models.Base.metadata.tables))
 
 
