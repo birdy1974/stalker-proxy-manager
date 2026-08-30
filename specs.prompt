@@ -3,40 +3,68 @@ read all specification below in great detail before you start, if something is n
 
 you can test the functionality and API with portal: "http://line.cloud-ott.net:80/c/" and Mac address: "00:1A:79:1C:0B:16"
 
-call the project and docker "stalker proxy manager". please provide a complete new docker compose image to run on the docker manager on a synology nas ds918+ based on https://github.com/Chris230291/STB-Proxy, including the use of hardware transcoding with a synology nas ds918+ (via Intel Quick Sync and/or VA-API) and fallback functionality in case portal fails. 
+call the project and docker "stalker proxy manager". please provide a complete new docker compose image to run on the docker manager on a synology nas ds918+ based on https://github.com/Chris230291/STB-Proxy, 
+including the use of hardware transcoding with a synology nas ds918+ (via Intel Quick Sync and/or VA-API) and fallback functionality in case portal fails. 
 another references you can investigate is: https://github.com/kpirnie/kptv-proxy and all available information about API calls to interface with stalker portal HSL IPTV Mac addresses
 
 first phase check the requirement and let me know if there are any inconsistecies between the gui, the functionality and the proposed database structure. please identify problem, advise improvements
-second phase implement the core functionality based on https://github.com/Chris230291/STB-Proxy, including the use of hardware transcoding with a synology nas ds918+ (via Intel Quick Sync and/or VA-API) and fallback functionality in case portal fails. and a mockup of the complete web GUI and database structure.
+second phase implement the core functionality based on https://github.com/Chris230291/STB-Proxy, including the use of hardware transcoding with a synology nas ds918+ (via Intel Quick Sync and/or VA-API) 
+and fallback functionality in case portal fails. and a mockup of the complete web GUI and database structure.
 third phase implement full functionality.
 
 Main functionality:
-The main functionality of the application is to provide an IPTV proxy to route/proxy the streams the original source to a new generated m3u playlist or xtream user. So the custom channels from the generated m3u playlist need to play the stream of the original channel (PROXY FUNCTIONALITY), based on the priority and fall back channels, but depending on the ffmpeg settings first need to be transcoded or not. This functionality should be based on https://github.com/Chris230291/STB-Proxy all the confoguration for the application needs to be saved in a persistent database. database can be in a separate docker if this is benefitial for the performance. Also provide the web interface. use port 8880 for the web gui.  Fetching the information from a portal can be tricky so the input format for the request to the portals should not be limited to a certain format, but should accept multiple paths (like /c/, /client/, /c_/, /stalker_portal/c/, /portal.php/, /php, etc.). Design the portal resolution logic to be more robust and handle more portal formats and that the filters are not too strict
+The main functionality of the application is to provide an IPTV proxy to route/proxy the streams the original source to a new generated m3u playlist or xtream user. 
+So the custom channels from the generated m3u playlist need to play the stream of the original channel (PROXY FUNCTIONALITY), based on the priority and fall back channels, 
+but depending on the ffmpeg settings first need to be transcoded or not. 
+This functionality should be based on https://github.com/Chris230291/STB-Proxy all the confoguration for the application needs to be saved in a persistent database. 
+database can be in a separate docker if this is benefitial for the performance. Also provide the web interface. use port 8880 for the web gui.  
+Fetching the information from a portal can be tricky so the input format for the request to the portals should not be limited to a certain format, but should accept multiple paths 
+(like /c/, /client/, /c_/, /stalker_portal/c/, /portal.php/, /php, etc.). Design the portal resolution logic to be more robust and handle more portal formats and that the filters are not too strict
 Detailed warning and log messages needs to be generated
 user input for filtering should not be case sensitive
-In case a portal is deleted by the user, all internal references need to be cleaned up, including internal databases. Before the portal can be deleted the application need to check if the portal is used as fallback and if so warn the user and ask if the portal needs to be replaced by another portal or can be removed.
+In case a portal is deleted by the user, all internal references need to be cleaned up, including internal databases. 
+Before the portal can be deleted the application need to check if the portal is used as fallback and if so warn the user and ask if the portal needs to be replaced by another portal or can be removed.
 
 Fallback functionality: 
-The application must have fall back functionality so in case a portal is not available the next fallback channel is used. A channel is not available when the portal is offline (not responding) or disabled); the mac address is not working; the portal / mac address is already used for another stream, or the stream does not provide any data. The application must keep track of which portal/mac address is being used/occupied. to avoid that too many streams are open at the same time to the same portal/mac address. The user must be able to assign the fallback portal and the order of the portals for each m3u channel. There should be a general option to select if first all the mac addresses within a portal should be tried or that the application will directly go to the next portal if a channel fails. It should also be possible to replace the fallback portal for all instances where it is used in case the portal is not active anymore and needs to be deleted/replaced.
+The application must have fall back functionality so in case a portal is not available the next fallback channel is used. 
+A channel is not available when the portal is offline (not responding) or disabled); the mac address is not working; the portal / mac address is already used for another stream, or the stream does not provide any data. 
+The application must keep track of which portal/mac address is being used/occupied. to avoid that too many streams are open at the same time to the same portal/mac address. 
+The user must be able to assign the fallback portal and the order of the portals for each m3u channel. 
+There should be a general option to select if first all the mac addresses within a portal should be tried or that the application will directly go to the next portal if a channel fails. 
+It should also be possible to replace the fallback portal for all instances where it is used in case the portal is not active anymore and needs to be deleted/replaced.
 
 Transcoding functionality: 
-There should be functionality so the original stream will be transcoded, so the bandwidth of the generated m3u stream is smaller than the original portal/mac stream. The transcoding should be done with the ffmpeg command. The user can select the details of the ffmpeg transcoding. The ffmpeg transcoding command should be suitable to use on synology DS981+ hardware (via Intel Quick Sync and/or VA-API). The user should be able to build up the ffmpeg command by means of selection of each ffmpeg option or to directly change the ffmpeg command itself. The selection of each ffmpeg option and the ffmpeg command should be aligned at all times. So a change in one of them will automatically update the other.
+There should be functionality so the original stream will be transcoded, so the bandwidth of the generated m3u stream is smaller than the original portal/mac stream. 
+The transcoding should be done with the ffmpeg command. The user can select the details of the ffmpeg transcoding. 
+The ffmpeg transcoding command should be suitable to use on synology DS981+ hardware (via Intel Quick Sync and/or VA-API). 
+The user should be able to build up the ffmpeg command by means of selection of each ffmpeg option or to directly change the ffmpeg command itself. 
+The selection of each ffmpeg option and the ffmpeg command should be aligned at all times. So a change in one of them will automatically update the other.
 a working ffmpeg command on the synology nas ds918+ looks like this: 
-ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -i <url> -vf scale_vaapi=w=1280:h=720:format=nv12,fps=25 -map 0:v:0 -map 0:a:0? -sn -dn -c:v h264_vaapi -b:v 1000k -maxrate 1200k -bufsize 1800k -profile:v high -level 4.1 -g 50 -r 25 -c:a aac -b:a 128k -ac 2 -ar 48000 -f mpegts -mpegts_flags +resend_headers pipe:1
+ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 
+-hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -i <url> -vf scale_vaapi=w=1280:h=720:format=nv12,fps=25 -map 0:v:0 -map 0:a:0? -sn -dn -c:v h264_vaapi -b:v 1000k -maxrate 1200k -bufsize 1800k 
+-profile:v high -level 4.1 -g 50 -r 25 -c:a aac -b:a 128k -ac 2 -ar 48000 -f mpegts -mpegts_flags +resend_headers pipe:1
 the whole ffmpeg documentatie you can find here: https://ffmpeg.org/ffmpeg.html
 
 EPG functionality: 
-It should be possible to add an external EPG sources to the generated m3u playlist and Xtream. The application should automatically match the best EPG channel id based on the user channel name, but the user should be able to override the suggestion. External EPG sources can be: http://www.xmltvepg.nl/rytecNL_Basic.xz, http://rytecepg.wanwizard.eu/rytecNL_Basic.xz, http://epg.vuplus-community.net/rytecNL_Basic.xz
+It should be possible to add an external EPG sources to the generated m3u playlist and Xtream. The application should automatically match the best EPG channel id based on the user channel name, 
+but the user should be able to override the suggestion. External EPG sources can be: 
+http://www.xmltvepg.nl/rytecNL_Basic.xz, http://rytecepg.wanwizard.eu/rytecNL_Basic.xz, http://epg.vuplus-community.net/rytecNL_Basic.xz
 
 Channel logo functionality: 
-It should be possible to add (external) channel logo's to the channels in the generated m3u playlist and Xtream. The application should automatically match the best channel logo's based on the user channel name or the logo from the original portal/mac/channel, but the user should be able to override the suggestion. 
-if possible get the icons/logo from the original portals/streams else get the icons from https://github.com/tv-logo/tv-logos/blob/main/countries. pre-select the best icon from https://github.com/tv-logo/tv-logos/tree/main/countries based on the country and custom channel name. make sure that it is linked to the actual .png web address (add "?raw=true" to the web address if it is not already there. example web address https://github.com/tv-logo/tv-logos/blob/main/countries/netherlands/npo1-nl.png?raw=true for Netherlands "NPO 1". check if found icon web address exists. try a couple of times to find the correct web address.
+It should be possible to add (external) channel logo's to the channels in the generated m3u playlist and Xtream. 
+The application should automatically match the best channel logo's based on the user channel name or the logo from the original portal/mac/channel, but the user should be able to override the suggestion. 
+if possible get the icons/logo from the original portals/streams else get the icons from https://github.com/tv-logo/tv-logos/blob/main/countries. 
+pre-select the best icon from https://github.com/tv-logo/tv-logos/tree/main/countries based on the country and custom channel name. 
+make sure that it is linked to the actual .png web address (add "?raw=true" to the web address if it is not already there. example web address 
+https://github.com/tv-logo/tv-logos/blob/main/countries/netherlands/npo1-nl.png?raw=true for Netherlands "NPO 1". check if found icon web address exists. 
+try a couple of times to find the correct web address.
 other external source for logos can be: https://commons.wikimedia.org/wiki/Category:Logos_of_television_channels_in_the_Netherlands
 If multiple logo's are found, ask the user to select one.
 Now let me look at the API and how the Playlist modal uses it:
 Now let me check what the tv-logos repo actually looks like to understand the correct URL format:
 https://api.github.com/repos/tv-logo/tv-logos/git/trees/main?recursive=1
-Now I understand the real structure. The logos are named like npo1-nl.png, bbc-one-uk.png etc. The approach of guessing filenames and doing HEAD requests is brittle. Instead, I should use the GitHub API to search the actual file tree for the country folder and fuzzy-match filenames.
+Now I understand the real structure. The logos are named like npo1-nl.png, bbc-one-uk.png etc. The approach of guessing filenames and doing HEAD requests is brittle. 
+Instead, I should use the GitHub API to search the actual file tree for the country folder and fuzzy-match filenames.
 
 the generated playlist consists of 4 items:
 1- live channels
@@ -47,24 +75,30 @@ the generated playlist consists of 4 items:
 to get good preformance (and to keep the database small) do not read in all the channels from the stalker portals in 1 time, but do it in steps where the user can select exactly what to read in.
 For live channels read in all the genres of the portal, present the list with genres, user can select which genres to enable, read only the channels of the enabled genres
 for the movies/vod the same, first read the genres, user enables the genres he wants, only read the vods of the enabled genres.
-for series the same, but there is an extra step. so first read the genres/provides, user enables the genres/providers he wants, read the series of these genres/providers, user can select which seasons he wants to enable, then finaly read the episodes of the enabled seasons.
+for series the same, but there is an extra step. so first read the genres/provides, user enables the genres/providers he wants, read the series of these genres/providers, 
+user can select which seasons he wants to enable, then finaly read the episodes of the enabled seasons.
 for the local files the user can browse to a local (docker mounted) directory where the local series/movies are located.
 all selections of enabled sources should be stored in a persistent database
 
-after the references of all sources are read/stored, the user can select from this list which specific sources needs to be in the final generated m3u pkaylist and xtream. the user needs to do this for all 4 items (live channels, vod, series and local files)
+after the references of all sources are read/stored, the user can select from this list which specific sources needs to be in the final generated m3u pkaylist and xtream. 
+the user needs to do this for all 4 items (live channels, vod, series and local files)
 
 Playlist generation functionality: 
 0- for easy navigation the user should be able to filter/sort the complete original channel list
 1- The user should be able to select which channel from the original portals he wants to have in the final m3u playlist / Xtream
 2- The user should be able to create his own (custom) channel name, suggestion can be done by the application based on the original channel name from the portal, but the user should be able to change it.
-3- The user should be able to assign a transcoding template, EPG id and channel logo for each selected channel in the final m3u playlist. He should be able to do this per channel or with a lot of selected channels in 1 go and also per group of channels
+3- The user should be able to assign a transcoding template, EPG id and channel logo for each selected channel in the final m3u playlist. 
+He should be able to do this per channel or with a lot of selected channels in 1 go and also per group of channels
 4- It should be possible to group channels in a channel group. It should be possible to assign this per channel or with a lot of selected channels in 1 go. This channel group is also stored in the final m3u playlist
 5- The order of the channels in the final m3u playlist should be determined by the user by means of drag and drop
 6- The functionality to select the channels to include in the final Playlist can be combined with the configuration of the fall back portals and assignment of EPG id and channel logo's
 
 Channels and vod and series: 
-There is a difference between channels and vod/series in the original portals. a channel is for live IPTV. vod and series are for video on demand. Do a detailed search on the internet as there are some different ways to determine if a stream is a live channel or a vod/serie. Make the application as flexible as possible so it will do the split for as many portals as possible so do not put vod and series detection filters too strict:
-There should be a segregation between these 2 in the application, but in the final m3u playlist they should be combined. The selected original channels that will go in the final playlist will have fallback functionality, EPG id, channel logo's, transcoding template. The selected vod/series will only have a transcoding template.
+There is a difference between channels and vod/series in the original portals. a channel is for live IPTV. vod and series are for video on demand. 
+Do a detailed search on the internet as there are some different ways to determine if a stream is a live channel or a vod/serie. 
+Make the application as flexible as possible so it will do the split for as many portals as possible so do not put vod and series detection filters too strict:
+There should be a segregation between these 2 in the application, but in the final m3u playlist they should be combined. 
+The selected original channels that will go in the final playlist will have fallback functionality, EPG id, channel logo's, transcoding template. The selected vod/series will only have a transcoding template.
 Some more information for the way to fetch vod and series check on the internet and see below:
 For Series, both VOD and Series use type=vod for get_ordered_list - the type parameter for categories is different but fetching uses vod
 The sortby parameter should use added and also include not_ended=0
@@ -77,8 +111,10 @@ Use category-based fetching - fetch per category instead of all at once
 Don't fetch all pages - just get first page per category (to get the list)
 Make it async/streaming - fetch in the background, don't block the HTTP response
 Still timing out. The problem is even with category-based fetching, there are many categories and each has many pages. Let me check how many categories exist and limit more aggressively:
-181 VOD categories and 129 series categories. Each with pages of 14 items. Even fetching just page 1 per category = 181 requests. That's doable but the current approach tries to get multiple pages per category. The fix: just fetch page 1 per category to get a sample of items per category. That gives us 181 * 14 = ~2500 items quickly. For categories with >14 items, we can fetch more pages later or just get the first page.
-Actually, a much better approach: just fetch ALL items without any category filter in a limited number of pages. With 14 per page, 50 pages = 700 items which is a good representative sample. The category info is embedded in each item's category_id field anyway.
+181 VOD categories and 129 series categories. Each with pages of 14 items. Even fetching just page 1 per category = 181 requests. That's doable but the current approach tries to get multiple pages per category. 
+The fix: just fetch page 1 per category to get a sample of items per category. That gives us 181 * 14 = ~2500 items quickly. For categories with >14 items, we can fetch more pages later or just get the first page.
+Actually, a much better approach: just fetch ALL items without any category filter in a limited number of pages. With 14 per page, 50 pages = 700 items which is a good representative sample. 
+The category info is embedded in each item's category_id field anyway.
 Now let me test with the real portal:
 Still timing out at 100 pages. The portal has 69K items / 14 per page = even 100 pages takes too long (100 sequential HTTP requests to a remote server). Let me reduce to 10 pages max and test:
 ~1 second per page. So 100 pages = ~100 seconds. That's the core issue — the remote portal is slow. But it works! I need to:
@@ -93,7 +129,8 @@ It ran fast but returned 0 items! The fetching call works (I proved it earlier) 
 Running timeout 30 node -e " // Direct test of getVodList … failed
 It's TypeScript so I can't require it directly. Let me test using raw axios:
 Ran timeout 30 node -e " const axios = require('axios'…
-OK so the raw call works perfectly. The problem must be that the API code path isn't reaching the fetch loop, OR the token/profile is failing silently. Let me check — I suspect the issue is that when getProfile or getToken is called from within the running Next.js server, there's a cookie issue with encodeURIComponent:
+OK so the raw call works perfectly. The problem must be that the API code path isn't reaching the fetch loop, OR the token/profile is failing silently. 
+Let me check — I suspect the issue is that when getProfile or getToken is called from within the running Next.js server, there's a cookie issue with encodeURIComponent:
 Ran timeout 30 node -e " // Check what the token looks…
 Series works! 420 items fetched (30 pages × 14 per page) from 18596 total. Now let me test VOD again:
 Ran timeout 60 node -e " const http = require('http');…
@@ -101,12 +138,14 @@ VOD works too! 420 items fetched (updated since the series test had already crea
 The earlier test that returned 0 items was probably a token re-use issue (the token from the series test expired). Now both work.
 
 user configuration:
-it should be possible to configure different users that get their own the output (m3u playlist and xtream) where the user/admin can enable/disable which custom genres and items (live channels, vod,series,local files) are included in the final output. 
+it should be possible to configure different users that get their own the output (m3u playlist and xtream) where the user/admin can enable/disable which custom genres and items (live channels, vod,series,local files) 
+are included in the final output. 
 
 Export and Import functionality: 
 The user should be able to export and import the configuration of the application for backup purposes but also for mass changes (outside the web gui)
 
-Web player functionality: There should be an integrated web player (pop-up window) to play the streams (HLS) to quickly see if the streams are working or not. This should be possible for the original streams as well as for the channels in the final m3u playlist.
+Web player functionality: There should be an integrated web player (pop-up window) to play the streams (HLS) to quickly see if the streams are working or not. 
+This should be possible for the original streams as well as for the channels in the final m3u playlist.
 
 
 Human Interface (GUI)
@@ -116,7 +155,8 @@ in case the lists with information is long, make sure that the headers of the ta
 the headers of the tables can also be used for sorting and for filtering (either by selection list or textbox)
 
 for dashboard tab:
-- give overview with most important info, like number of portal, number of enabled live channels of possible available live channels, number of enabled vod channels of possible available vod channels, number of enabled series of possible available series, number of channels in Playlist, number of ffmpeg templates, number of active streams, number of users
+- give overview with most important info, like number of portal, number of enabled live channels of possible available live channels, number of enabled vod channels of possible available vod channels, 
+number of enabled series of possible available series, number of channels in Playlist, number of ffmpeg templates, number of active streams, number of users
 - quick actions like add of portal, channels, edit playlist and Xtream users
 - show pane with active streams (including all info like channel, user, mac, transcoding, active since, etc). Also provide option to stop/kill streams / all streams. 
 - pane to show all messages (info, warning, error) including filter possibility
@@ -202,7 +242,8 @@ for Playlist Builder tab, there will be 4 sub tabs:
 1- live playlist builder:
 button to add a new custom channel, that calls up a popup window to specify:
 	new custom channel name
-	if custom channel name is typed, automatically filter enabled channel names from live-playlist custom channel name. it does not need to be a perfect match, but it should be close (fuzzy match). this way easy selection can be done which real channels, will be linked to the final playlist channel. if the filter result is empty show all channels that are enabled in channels tab
+	if custom channel name is typed, automatically filter enabled channel names from live-playlist custom channel name. it does not need to be a perfect match, but it should be close (fuzzy match). 
+       this way easy selection can be done which real channels, will be linked to the final playlist channel. if the filter result is empty show all channels that are enabled in channels tab
 	channel genre: initially original genre name, but can be overwritten by user
 	EPG name
 	ffmpeg template
@@ -225,7 +266,9 @@ sorting of the list can be done by pressing the list headers.
 export and import possibility
 
 LOGO:	
-- if possible get the icons/logo from the portal else (get the icons from https://github.com/tv-logo/tv-logos/blob/main/countries). pre-select the best icon from https://github.com/tv-logo/tv-logos/tree/main/countries based on the country and custom channel name. make sure that it is linked to the actual .png web address (add "?raw=true" to the web address if it is not already there. example web address https://github.com/tv-logo/tv-logos/blob/main/countries/netherlands/npo1-nl.png?raw=true for Netherlands npo1. check if found icon web address exists. try a couple of times to find the correct web address
+- if possible get the icons/logo from the portal else (get the icons from https://github.com/tv-logo/tv-logos/blob/main/countries). pre-select the best icon from https://github.com/tv-logo/tv-logos/tree/main/countries 
+based on the country and custom channel name. make sure that it is linked to the actual .png web address (add "?raw=true" to the web address if it is not already there. 
+example web address https://github.com/tv-logo/tv-logos/blob/main/countries/netherlands/npo1-nl.png?raw=true for Netherlands npo1. check if found icon web address exists. try a couple of times to find the correct web address
 
 2- vod list builder
 pane with list of all vod in vod-playlist with a possibility to select individual vod or all channels in a group so they will be added to the final output m3u playlist / xtream
