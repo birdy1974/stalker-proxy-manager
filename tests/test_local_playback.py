@@ -143,7 +143,7 @@ async def test_transcode_template_goes_through_ffmpeg_with_quoted_path(
     await _seed_defaults()
     seen: list[str] = []
 
-    async def _spawn_stub(self, cmd_template: str, url: str):
+    async def _spawn_stub(self, cmd_template: str, url: str, title: str | None = None):
         seen.append(url)
         return await asyncio.create_subprocess_exec(
             "sh", "-c", "printf MPEGTS",
