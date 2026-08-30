@@ -49,6 +49,12 @@ class Portal(Base):
     resolved_path: Mapped[str | None] = mapped_column(String(120))        # the path that won (/c/, ...)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     proxy_url: Mapped[str | None] = mapped_column(String(300))            # optional http proxy
+    # What we tell the panel we are. "mag250" sends the device fingerprint a real
+    # box sends (see app/portal/identity.py); "minimal" is the escape hatch for a
+    # panel that rejects an identity it never enrolled - a WRONG fingerprint is
+    # worse than none, so the user has to be able to switch without a code change.
+    identity_mode: Mapped[str] = mapped_column(String(12), default="mag250")
+    stb_timezone: Mapped[str | None] = mapped_column(String(64))          # cookie a MAG sends
     # Opt-out for panels with a broken/self-signed certificate chain. False by
     # default: verification is ON for every portal, and this only ever widens
     # trust for ONE portal the user explicitly says is misconfigured.
@@ -74,11 +80,23 @@ class MacAddress(Base):
     mac: Mapped[str] = mapped_column(String(17))
     password: Mapped[str | None] = mapped_column(String(120))             # rare, some portals need it
     order: Mapped[int] = mapped_column(Integer, default=0)                # try order within portal
-    status: Mapped[str] = mapped_column(String(20), default="unknown")    # unknown/online/offline/unauthorized/expired/error
+    # `banned` (the panel disabled this MAC) and `expired` (its subscription
+    # ended) come from the portal itself and take the MAC out of every fallback
+    # chain; the rest are our own verdicts about transport and stay retryable.
+    status: Mapped[str] = mapped_column(String(20), default="unknown")    # unknown/online/offline/unauthorized/expired/banned/error
     online: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     expire_date: Mapped[str | None] = mapped_column(String(40))           # as reported by the portal
+    last_error: Mapped[str | None] = mapped_column(String(200))           # why, in the panel's own words
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
     last_checked: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The panel asks every link to be re-validated for this account (create_link
+    # with force_ch_link_check=1). Stored so the stream path can honour it.
+    force_ch_link_check: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Pinned STB identity: derived from the MAC when empty, kept stable forever
+    # when the real box's values were captured (a re-generated serial is how a
+    # working account gets flagged as a new device).
+    sn: Mapped[str | None] = mapped_column(String(40))
+    device_id: Mapped[str | None] = mapped_column(String(80))
 
     portal: Mapped[Portal] = relationship(back_populates="macs")
 

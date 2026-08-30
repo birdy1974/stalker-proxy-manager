@@ -189,10 +189,14 @@ async def export_config(section: str = "all", db=Depends(get_db)):
     if section in ("all", "portals"):
         from ..models import MacAddress
         data["portals"] = await dump(Portal, ["name", "base_url", "enabled", "proxy_url",
-                                              "tls_insecure"])
+                                              "tls_insecure", "identity_mode", "stb_timezone"])
         macs = (await db.execute(select(MacAddress, Portal)
                                  .join(Portal, Portal.id == MacAddress.portal_id))).all()
-        data["macs"] = [{"portal": p.name, "mac": m.mac, "order": m.order}
+        # sn / device_id travel with the MAC on purpose: they are the serial this
+        # portal enrolled, so a backup that drops them would hand the panel a new
+        # device the next time it is restored.
+        data["macs"] = [{"portal": p.name, "mac": m.mac, "order": m.order,
+                         "sn": m.sn, "device_id": m.device_id}
                         for m, p in macs]
         data["live_genres"] = await dump(LiveGenre, ["portal_id", "genre_portal_id", "name", "enabled"])
         data["vod_genres"] = await dump(VodGenre, ["portal_id", "genre_portal_id", "name", "enabled"])

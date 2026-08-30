@@ -24,7 +24,7 @@ import os
 import re
 import time
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
@@ -32,6 +32,10 @@ import httpx
 
 from ..config import PORTAL_HTTP_TIMEOUT
 from ..services.http_client import outbound_client
+from .account import AccountVerdict, account_verdict
+from .identity import (MAG250, MINIMAL, STB_LANG, STB_TIMEZONE, STB_UA, cookies_for,
+                       derive_identity, headers_for, make_fake_bearer,
+                       minimal_profile_params, missing_token, profile_params)
 
 # How long we keep a handshake token before refreshing it. Portals normally
 # accept one for ~3600s (crispy-stalker uses exactly that); staying just under
@@ -41,10 +45,14 @@ TOKEN_VALIDITY = float(os.environ.get("SPM_TOKEN_VALIDITY", "3000"))
 
 log = logging.getLogger("spm.portal")
 
-MAG_UA = (
-    "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
-    "(KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2721 Safari/533.3"
-)
+#: Send `get_profile` with the device fingerprint after a handshake (see
+#: app/portal/identity.py). Set SPM_STB_PROFILE=0 for a panel that reacts badly
+#: to the call - a portal that rate-limits or bans on an unexpected action is
+#: worth more than the account state it reports, and this is the switch for it.
+STB_PROFILE_ENABLED = os.environ.get("SPM_STB_PROFILE", "1").strip().lower() not in (
+    "0", "off", "no", "false")
+
+MAG_UA = STB_UA   # probe.py / stream_manager.py import this name for ffmpeg
 
 # ---------------------------------------------------------------------------
 # link helpers (see create_link)
@@ -363,18 +371,35 @@ class Page:
 class StalkerClient:
     def __init__(self, portal_url: str, mac: str, password: str | None = None,
                  proxy: str | None = None, timeout: float = PORTAL_HTTP_TIMEOUT,
-                 tls_insecure: bool = False) -> None:
+                 tls_insecure: bool = False, *, identity_mode: str = MAG250,
+                 timezone: str = STB_TIMEZONE, lang: str = STB_LANG,
+                 sn: str | None = None, device_id: str | None = None) -> None:
         self.portal_url = portal_url
         self.mac = mac
         self.password = password
         self.proxy = proxy
         self.timeout = timeout
+        # What we claim to be. `minimal` sends the two-field profile and is the
+        # escape hatch for a panel that dislikes a fingerprint it did not enrol.
+        self.identity_mode = (MINIMAL if str(identity_mode or "").strip().lower()
+                              in ("minimal", "bare", "none", "off", "no", "0") else MAG250)
+        self.timezone = timezone or STB_TIMEZONE
+        self.lang = lang or STB_LANG
+        self.identity = derive_identity(mac, sn=sn, device_id=device_id,
+                                        minimal=self.identity_mode == MINIMAL)
+        #: the panel's own account state, once we have asked (see refresh_account)
+        self.account: AccountVerdict | None = None
+        self.account_info_error: str = ""   # why account_info was unusable
+        self._handshaking = False           # re-entrancy guard, see _may_reauth
         # Per-portal opt-out for panels with a broken cert chain. TLS
         # verification is ON everywhere else, including here - see
         # app/services/http_client.py for why that distinction matters.
         self.tls_insecure = bool(tls_insecure)
         self._token: str | None = None
         self._token_at: float = 0.0        # monotonic time of the last handshake
+        self._token_random: str = ""      # `js.random` from the handshake, echoed in metrics
+        self._not_valid: bool = False     # `js.not_valid`: the panel wants not_valid_token=1
+        self._profile: dict | None = None  # last get_profile payload (account truth lives here)
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()  # serialize token refresh
         # Set by the pool: a shared client's connection is not owned by the
@@ -395,8 +420,10 @@ class StalkerClient:
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
             kwargs: dict = {
-                "headers": {"User-Agent": MAG_UA},
-                "cookies": {"mac": self.mac, "stb_lang": "en", "timezone": "Europe/Amsterdam"},
+                "headers": headers_for(self.portal_url, self.identity, user_agent=MAG_UA,
+                                       lang=self.lang, timezone=self.timezone),
+                "cookies": cookies_for(self.portal_url, self.mac, lang=self.lang,
+                                       timezone=self.timezone, adid=self.identity.adid),
                 "timeout": self.timeout,
                 "follow_redirects": True,
             }
@@ -420,7 +447,8 @@ class StalkerClient:
             await self._client.aclose()
             self._client = None
 
-    async def _get(self, params: dict, *, retried: bool = False) -> Any:
+    async def _get(self, params: dict, *, retried: bool = False,
+                   retry_on_auth: bool = True) -> Any:
         """
         Single GET with token auth, one re-handshake retry and a *code*.
 
@@ -452,12 +480,12 @@ class StalkerClient:
         except Exception as exc:  # noqa: BLE001 - any transport error means "unreachable"
             raise PortalError(f"request failed: {type(exc).__name__}: {exc}",
                               code="transport") from exc
-        if r.status_code in (401, 403) and not retried:
+        if r.status_code in (401, 403) and self._may_reauth(retry_on_auth, retried):
             log.info("portal answered %s -> re-handshaking once", r.status_code)
             async with self._lock:
                 self._token = None
                 await self.handshake()
-            return await self._get(params, retried=True)
+            return await self._get(params, retried=True, retry_on_auth=retry_on_auth)
         if r.status_code != 200:
             raise PortalError(f"HTTP {r.status_code}", code=f"http_{r.status_code}")
         if not r.content:
@@ -472,12 +500,12 @@ class StalkerClient:
         if code:
             if js_has_payload(data):
                 log.debug("portal reported %r alongside a usable payload - ignoring it", code)
-            elif code in TOKEN_ERROR_CODES and not retried:
+            elif code in TOKEN_ERROR_CODES and self._may_reauth(retry_on_auth, retried):
                 log.info("portal refused the bearer on HTTP 200 (%s) -> re-handshaking once", code)
                 async with self._lock:
                     self._token = None
                     await self.handshake()
-                return await self._get(params, retried=True)
+                return await self._get(params, retried=True, retry_on_auth=retry_on_auth)
             else:
                 # The portal told us WHY. Keep its code, and its text when the
                 # code is not self-explanatory, so the log is actionable.
@@ -506,61 +534,217 @@ class StalkerClient:
     def invalidate(self) -> None:
         """Drop the token - call after the portal URL changed under us."""
         self._token, self._token_at = None, 0.0
+        self._profile = None
+        self.account = None
+        if self._client is not None:
+            # the bearer is echoed in a cookie as well (a real box does this, and
+            # some panels read the cookie instead of the header) - both have to go
+            # together, or the "fresh" handshake is shadowed by a dead session
+            self._client.cookies.pop("token", None)
 
     # ------------------------------------------------------------- handshake
-    async def handshake(self) -> str:
-        http = await self._http()
-        params = {"type": "stb", "action": "handshake", "prehash": "0", "JsHttpRequest": "1-xml"}
-        log.info("handshake %s mac=%s", self.portal_url, self.mac)
+    async def _handshake_stage(self, http: httpx.AsyncClient, params: dict,
+                               *, bearer: str | None = None) -> tuple[dict, str, str]:
+        """One handshake GET -> `(js, token, error_code)`.
+
+        It does not raise for a refusal: a handshake *sequence* has to keep
+        trying shapes, and the reason for the last failure is reported once at the
+        end. Transport/timeout codes are kept distinct because "portal is down"
+        must never be written to the log as "MAC not enrolled".
+        """
+        headers = {"Authorization": f"Bearer {bearer}"} if bearer else None
         try:
-            r = await http.get(self.portal_url, params=params)
-        except httpx.TimeoutException as exc:
-            raise PortalError(f"handshake failed: timeout after {self.timeout:.0f}s",
-                              code="timeout") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise PortalError(f"handshake failed: {type(exc).__name__}: {exc}",
-                              code="transport") from exc
+            r = await http.get(self.portal_url, params=params, headers=headers)
+        except httpx.TimeoutException:
+            return {}, "", "timeout"
+        except Exception as exc:  # noqa: BLE001 - unreachable is a verdict, not a bug
+            log.debug("handshake transport error: %s", exc)
+            return {}, "", "transport"
         if r.status_code != 200:
-            raise PortalError(f"handshake HTTP {r.status_code}",
-                              code="unauthorized" if r.status_code in (401, 403)
-                              else f"http_{r.status_code}")
-        token, code = "", ""
+            return {}, "", ("unauthorized" if r.status_code in (401, 403)
+                            else f"http_{r.status_code}")
         try:
             data = r.json()
-            js = data.get("js") if isinstance(data, dict) else None
-            if isinstance(js, dict):
-                token = str(js.get("token") or "")
-                if not token:
-                    code = js_error(data)
-        except Exception as exc:  # noqa: BLE001 - an unparsable answer is a refusal
-            code = "bad_json"
-            log.debug("handshake reply was not JSON: %s", exc)
+        except Exception:  # noqa: BLE001 - an unparsable answer is a refusal
+            log.debug("handshake reply was not JSON (%d bytes)", len(r.content or b""))
+            return {}, "", "bad_json"
+        js = data.get("js") if isinstance(data, dict) else None
+        js = js if isinstance(js, dict) else {}
+        token = str(js.get("token") or "")
+        if token:
+            return js, token, ""
+        return js, "", (js_error(data) or "no_token")
+
+    async def handshake(self) -> str:
+        """
+        Get a bearer, in up to three shapes - from least to most specific.
+
+        1. the shape this client has always sent (no `mac` parameter);
+        2. the same with `mac=<MAC>` as a parameter, which is what a real STB's
+           own first request looks like - panels that key the session on it
+           answer stage 1 with no token at all;
+        3. **second-step auth**: a panel that answers `{"js":{"msg":"missing"}}`
+           is asking for the dance - invent a bearer, send it as `Authorization`,
+           and send its SHA-1 as `prehash`. It then issues the real token.
+
+        Stage 3 is the one that decides whether a picky portal works at all, and
+        it is invisible in the logs of a client that does not do it: the panel
+        does not say "you forgot the prehash", it just returns nothing.
+        """
+        http = await self._http()
+        if self._handshaking:                      # see _may_reauth
+            raise PortalError("handshake already in progress", code="no_token")
+        self._handshaking = True
+        try:
+            return await self._handshake(http)
+        finally:
+            self._handshaking = False
+
+    async def _handshake(self, http: httpx.AsyncClient) -> str:
+        log.info("handshake %s mac=%s (sn %s)", self.portal_url, self.mac, self.identity.sn)
+        base = {"type": "stb", "action": "handshake", "JsHttpRequest": "1-xml"}
+        code = "no_token"
+        js: dict = {}
+        token = ""
+        for stage, params, bearer in (
+            (1, {**base, "prehash": "0"}, None),
+            (2, {**base, "prehash": "0", "token": "", "mac": self.mac}, None),
+        ):
+            js, token, code = await self._handshake_stage(http, params, bearer=bearer)
+            if token:
+                break
+            if stage == 2 and missing_token(js):
+                fake, prehash = make_fake_bearer()
+                js, token, code = await self._handshake_stage(
+                    http, {**base, "mac": self.mac, "prehash": prehash}, bearer=fake)
+                if token:
+                    log.info("portal required the second-step (prehash) handshake -> satisfied")
+                break
         if not token:
-            why = f" - portal said {code}" if code and code != "no_token" else ""
+            if code in ("transport", "timeout"):
+                raise PortalError(f"handshake failed: portal unreachable ({code})", code=code)
             raise PortalError("handshake: no token in reply (MAC unknown/blocked?)"
-                              f"{why}", code=code or "no_token")
+                              + (f" - portal said {code}" if code and code != "no_token" else ""),
+                              code=code or "no_token")
         self._token = token
         self._token_at = time.monotonic()
-        # Authorization header is set per-request because httpx cookies persist
+        self._token_random = str(js.get("random") or "")
+        self._not_valid = str(js.get("not_valid") or "").strip().lower() in ("1", "true", "yes")
+        # Authorization header + `token` cookie, like the box: the cookie is set
+        # here (not in _http) because the jar is created before we have a token.
         http.headers["Authorization"] = "Bearer " + token
-        log.debug("handshake ok, token=%s…", token[:8])
+        http.cookies.set("token", token)
+        log.debug("handshake ok, token=%s… random=%s not_valid=%s",
+                  token[:8], bool(self._token_random), self._not_valid)
+        if STB_PROFILE_ENABLED:
+            await self.stb_profile()          # best effort, never fails the handshake
         return token
 
-    async def account_expires(self) -> str | None:
-        """Portals report expiry in account_info.get_main_info 'phone' (STB-Proxy convention)."""
+    # ------------------------------------------------------------- identity
+    async def stb_profile(self, *, force: bool = False) -> dict:
+        """
+        `type=stb&action=get_profile`, with the device fingerprint - and the
+        answer is *used*: it is where `blocked`, `status` and
+        `force_ch_link_check` come from (see app/portal/account.py).
+
+        Best effort on purpose. A panel without this action (404, or a refusal)
+        is a normal panel, not a broken one, so the failure is remembered as a
+        code and never raised: an account-info gap must not take a working
+        stream path down with it.
+        """
+        if not STB_PROFILE_ENABLED:
+            return self._profile or {}
+        if self._profile is not None and not force:
+            return self._profile
+        params = profile_params(self.identity, token_random=self._token_random,
+                                not_valid=self._not_valid)
+        js = await self._profile_call(params, "full")
+        if js is None:
+            return self._profile or {}
+        if not js.get("id") and self.identity_mode == MAG250:
+            # The full shape was accepted but nothing came back: the panel does
+            # not know this fingerprint. Retry with the two-field profile a box
+            # without stbapp support sends - EStalker's own fallback, and the
+            # difference between "no account data" and a working portal.
+            js = await self._profile_call(minimal_profile_params(self.identity), "minimal") or js
+        self._profile = js
+        return js
+
+    async def _profile_call(self, params: dict, shape: str) -> dict | None:
+        try:
+            data = await self._get(params, retry_on_auth=False)
+        except PortalError as exc:
+            log.info("get_profile (%s shape) refused: %s", shape, exc.code)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("get_profile (%s shape) failed: %s", shape, exc)
+            return None
+        js = data.get("js") if isinstance(data, dict) else None
+        if not isinstance(js, dict):
+            return {}
+        log.debug("get_profile (%s): id=%s blocked=%s status=%s force_ch_link_check=%s",
+                  shape, js.get("id"), js.get("blocked"), js.get("status"),
+                  js.get("force_ch_link_check"))
+        return js
+
+    async def account_info(self) -> dict:
+        """`type=account_info&action=get_main_info` payload ({} when unavailable)."""
         try:
             data = await self._get({"type": "account_info", "action": "get_main_info",
                                     "JsHttpRequest": "1-xml"})
-            js = data.get("js")
-            if isinstance(js, dict):
-                return js.get("phone") or js.get("end_date")
-            if isinstance(js, list) and js:
-                return js[0].get("phone")
-        except PortalError:
-            raise
-        except Exception:  # noqa: BLE001
-            pass
-        return None
+        except PortalError as exc:
+            self.account_info_error = exc.code
+            return {}
+        js = data.get("js") if isinstance(data, dict) else None
+        if isinstance(js, dict):
+            return js
+        if isinstance(js, list) and js and isinstance(js[0], dict):
+            return js[0]
+        return {}
+
+    async def refresh_account(self) -> AccountVerdict:
+        """
+        Ask the portal what it thinks of this MAC, and say so in one verdict.
+
+        Combines `get_profile` (blocked / status / force_ch_link_check) with
+        `account_info` (expiry). A panel that refused *both* is not "active":
+        the refusal's own code wins, mapped through `status_for_error` so an
+        unreachable portal does not get logged as a banned MAC.
+        """
+        profile = await self.stb_profile(force=True)
+        info = await self.account_info()
+        verdict = account_verdict(profile=profile, info=info, token=self._token)
+        if not profile and not info:
+            hard = self.account_info_error or ""
+            if hard and verdict.status == "active":
+                verdict = replace(verdict, status=status_for_error(PortalError("", code=hard)),
+                                  online=False,
+                                  reason=f"account state unavailable (portal said {hard})")
+        self.account = verdict
+        return verdict
+
+    def _may_reauth(self, retry_on_auth: bool = True, retried: bool = False) -> bool:
+        """May this failure be answered by a fresh handshake?
+
+        Three ways to say no, each preventing a loop that is easy to write and
+        impossible to see in a log: the request already used its one retry; the
+        caller opted out (an identity/account call, where a refusal is *data*
+        about what this portal implements, not a token problem); or we are
+        INSIDE a handshake - refreshing the token from a call the handshake
+        itself makes recurses forever, which is exactly how a portal without
+        `get_profile` used to hang this client.
+        """
+        return bool(retry_on_auth) and not retried and not self._handshaking
+
+    async def account_expires(self) -> str | None:
+        """Portals report expiry in account_info.get_main_info 'phone' (STB-Proxy
+        convention); `end_date` is the other name in the wild. Kept as the
+        lightweight call for callers that only want the date string - everything
+        that has to *decide* something should use refresh_account()."""
+        self.account_info_error = ""
+        js = await self.account_info()
+        exp = js.get("phone") or js.get("end_date")
+        return str(exp) if exp else None
 
     # --------------------------------------------------------------- genres
     async def _genres_for_type(self, type_: str) -> list[dict]:

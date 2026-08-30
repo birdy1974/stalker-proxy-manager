@@ -28,10 +28,10 @@ movies, 2 series genres x 6 series (2-3 seasons x 5 episodes).
 from __future__ import annotations
 
 import asyncio
-import json
+import hashlib
 import logging
-import random
 import time
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -44,10 +44,15 @@ router = APIRouter(tags=["mock-portal"])
 # ---------------------------------------------------------------------------
 # Demo dataset (deterministic - no randomness between restarts)
 # ---------------------------------------------------------------------------
+# `phone` is the expiry, in the field name real portals use (see
+# app/portal/account.py); `blocked` is what `get_profile` reports and what no
+# amount of retrying can change. One MAC per account state, so the GUI and the
+# tests can exercise the whole vocabulary against a single portal.
 MOCK_MACS = {
     "00:1A:79:AA:AA:01": {"phone": "2032-12-31 00:00:00"},
     "00:1A:79:AA:AA:02": {"phone": "2032-12-31 00:00:00"},
     "00:1A:79:BB:BB:01": {"phone": "2024-01-01 00:00:00"},   # expired on purpose
+    "00:1A:79:CC:CC:01": {"phone": "2032-12-31 00:00:00", "blocked": 1},   # banned
 }
 
 LIVE_GENRES = {"1": "News", "2": "Sport", "3": "Kids", "4": "Movies & Series",
@@ -107,8 +112,25 @@ PAGE_SIZE = 14  # exactly what real portals use
 #   token_rejects      number of following non-handshake calls that reject the
 #                      bearer with a 200 {"js":{"error":"token"}}
 #   mac_placeholder    hand out `%mac%` inside the link instead of a real MAC
+#   require_prehash      second-step auth: a handshake without `prehash` is
+#                        answered {"js":{"msg":"missing"}}, and only an invented
+#                        bearer + sha1(bearer) as `prehash` gets a token. A
+#                        client that does not know the dance cannot use this
+#                        portal at all - and the panel never says why, which is
+#                        exactly why the gap is invisible in a log.
+#   require_mac_param    answer only when `mac=` is a query parameter (some
+#                        panels key the session on it and return no token otherwise)
+#   fingerprint_required get_profile must carry the device fingerprint
+#   profile_mode         "full" | "no_id" (panel answers without `id`, so a
+#                        client must fall back to the minimal shape) | "none"
+#                        (no get_profile at all -> 404; the common case)
+#   not_valid            handshake answers js.not_valid=1, which a box must echo
+#                        back as not_valid_token=1
 _STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note": "",
-          "create_link_error": "", "token_rejects": 0, "mac_placeholder": False}
+          "create_link_error": "", "token_rejects": 0, "mac_placeholder": False,
+          "require_prehash": False, "require_mac_param": False,
+          "fingerprint_required": False, "profile_mode": "full", "not_valid": False,
+          "handshakes": 0, "profile_calls": 0, "profile_seen": {}, "handshake_seen": []}
 
 
 def _usage(mac: str) -> int:
@@ -228,8 +250,17 @@ async def _guard(request: Request):
 
 
 def _portal_mac(request: Request) -> str:
-    """Real STBs send the mac as cookie or as query param - accept both."""
-    return request.cookies.get("mac", "") or request.query_params.get("mac", "") or ""
+    """Real STBs send the mac as cookie or as query param - accept both.
+
+    And accept both *spellings*: box firmware puts the percent-encoded form in
+    the cookie (`mac=00%3A1A%3A...`, because its set_cookie escapes the value),
+    other clients send the plain colons. A portal that only understood one of
+    the two would be a broken portal, so the mock must not be stricter than the
+    thing it stands in for - that mismatch reads as "unknown mac" in a test and
+    as a dead account in the field.
+    """
+    raw = request.cookies.get("mac", "") or request.query_params.get("mac", "") or ""
+    return unquote(raw).strip().upper()
 
 
 def _auth(request: Request) -> tuple[str, JSONResponse | None]:
@@ -282,10 +313,38 @@ async def portal_php(request: Request):  # noqa: A002
     # We also accept type=stb with a missing/extra action (some emulators drop
     # or rename params), so a handshake is never rejected by param shape.
     if type == "stb" and (action == "handshake" or not action):
+        qp_mac = unquote(request.query_params.get("mac", "") or "").strip().upper()
+        bearer = (request.headers.get("Authorization") or "").replace("Bearer ", "").strip()
+        prehash = (request.query_params.get("prehash") or "").strip()
+        _STATE["handshakes"] = int(_STATE.get("handshakes", 0)) + 1
+        _STATE.setdefault("handshake_seen", []).append(
+            {"mac_param": bool(qp_mac), "prehash": prehash, "bearer": bool(bearer)})
+        _STATE["handshake_seen"] = _STATE["handshake_seen"][-12:]
+
+        if _STATE.get("require_mac_param") and not qp_mac:
+            log.warning("mock portal: handshake without a mac parameter -> no token")
+            return _js({"js_empty": 1})
+        if _STATE.get("require_prehash"):
+            if prehash in ("", "0"):
+                # the exact shape Ministra uses for second-step auth: HTTP 200,
+                # no token, and a one-word msg that means "prove your bearer"
+                log.warning("mock portal: handshake without prehash -> msg=missing")
+                return _js({"msg": "missing", "random": "mock-random-seed"})
+            expected = hashlib.sha1(bearer.encode()).hexdigest()
+            if not bearer or expected != prehash:
+                log.warning("mock portal: prehash %r does not match the bearer -> 403",
+                            prehash[:12] or "-")
+                return JSONResponse({"js": {"error": "invalid prehash"}}, status_code=403)
         token = "mock-" + (mac.replace(":", "") if mac else "000000000000")
         log.info("mock portal: query=%s mac=%s -> handshake token issued",
                  request.url.query or "-", mac or "-")
-        return _js({"token": token})
+        # `random` is the seed the box has to echo inside its get_profile
+        # `metrics`; real panels send it on every handshake, lenient ones just
+        # never look - so the mock always offers it and the client always keeps it
+        js: dict = {"token": token, "random": "mock-random-seed"}
+        if _STATE.get("not_valid"):
+            js["not_valid"] = 1
+        return _js(js)
 
     mac, err = _auth(request)
     if err is not None:
@@ -296,9 +355,35 @@ async def portal_php(request: Request):  # noqa: A002
         return err
     log.debug("mock portal: type=%s action=%s mac=%s -> ok", type, action, mac or "-")
     if type == "stb" and action == "get_profile":
-        return _js({"mac": mac, "locale": "en_GB.utf8", "hd": 1, "ver": "MockPortal 1.0"})
+        mode = str(_STATE.get("profile_mode") or "full").strip().lower()
+        _STATE["profile_calls"] = int(_STATE.get("profile_calls", 0)) + 1
+        seen = dict(request.query_params)
+        _STATE["profile_seen"] = seen
+        if mode == "none":
+            return JSONResponse({"js": {"error": "not implemented"}}, status_code=404)
+        if _STATE.get("fingerprint_required"):
+            missing = [k for k in ("sn", "device_id", "prehash", "signature", "metrics")
+                       if not (seen.get(k) or "").strip()]
+            if not missing and _STATE.get("not_valid") and seen.get("not_valid_token") != "1":
+                missing = ["not_valid_token"]      # the panel asked, the box must echo
+            if missing:
+                log.warning("mock portal: get_profile without a fingerprint (missing %s) -> 403",
+                            ",".join(missing))
+                return JSONResponse({"js": {"error": "no fingerprint", "missing": missing}},
+                                    status_code=403)
+        acct = MOCK_MACS.get(mac, {})
+        if mode == "no_id":
+            # a portal that answers the full shape with nothing usable: the
+            # client has to notice and retry with the minimal profile
+            return _js({"mac": mac, "locale": "en_GB.utf8"})
+        return _js({"id": "7", "mac": mac, "locale": "en_GB.utf8", "hd": 1,
+                    "ver": "MockPortal 1.0", "sn": seen.get("sn", ""),
+                    "play_token": "mock-play-" + mac.replace(":", "")[-6:],
+                    "status": 1, "blocked": int(acct.get("blocked", 0)),
+                    "force_ch_link_check": 0})
     if type == "account_info" and action == "get_main_info":
-        return _js({"mac": mac, "phone": MOCK_MACS[mac]["phone"], "fname": "Mock User"})
+        return _js({"mac": mac, "phone": MOCK_MACS.get(mac, {}).get("phone"),
+                    "fname": "Mock User"})
 
     if type == "itv" and action == "get_genres":
         return _js([{"id": gid, "title": name, "number": i * 10, "censored": 0}
@@ -462,8 +547,16 @@ async def mock_vod(name: str):
 # ---------------------------------------------------------------------------
 # Control endpoint for demos/tests (flip offline/slow/busy on the fly)
 # ---------------------------------------------------------------------------
+#: every knob `/mock/_control` may set. The client tests also poke the failure
+#: knobs directly, but a knob only a test can turn is half a knob: rehearsing a
+#: failing portal from the GUI or a curl is how you learn what your proxy does
+#: before a real one teaches you.
 _TOGGLE_KEYS = ("offline", "slow", "max_per_mac", "create_link_error",
-                "token_rejects", "mac_placeholder")
+                "token_rejects", "mac_placeholder", "require_prehash",
+                "require_mac_param", "fingerprint_required", "profile_mode",
+                "not_valid", "http_status", "js_error", "empty_reply",
+                "corrupt_stream", "reject_no_cookie", "reject_no_referer",
+                "require_host", "require_tls", "note")
 
 
 @router.post("/mock/_control")
@@ -471,10 +564,25 @@ async def control(payload: dict):
     for k in _TOGGLE_KEYS:
         if k in payload:
             _STATE[k] = payload[k]
-    log.warning("mock portal control: %s", {k: _STATE[k] for k in _TOGGLE_KEYS})
-    return {"state": {k: _STATE[k] for k in _TOGGLE_KEYS + ("note",)}}
+    # `.get`, not `[...]`: the failure knobs have no default entry, and a control
+    # endpoint that raises KeyError while *applying* a valid setting is worse than
+    # one that does not accept the knob at all
+    shown = {k: _STATE.get(k) for k in _TOGGLE_KEYS}
+    log.warning("mock portal control: %s", shown)
+    return {"state": shown}
 
 
 @router.get("/mock/_state")
 async def state():
-    return {"state": {**_STATE, "usage": dict(_STATE["usage"])}}
+    """What the mock is configured to do, and what it actually saw.
+
+    `seen_profile` / `seen_handshakes` are the assertions a client test needs:
+    the point of R1 is not that we *intended* to send a fingerprint, it is that
+    the portal received one - so the mock records the queries it was sent.
+    """
+    return {"state": {k: _STATE.get(k) for k in _TOGGLE_KEYS + ("note",)},
+            "counters": {"handshakes": _STATE.get("handshakes", 0),
+                         "profile_calls": _STATE.get("profile_calls", 0)},
+            "seen_profile": _STATE.get("profile_seen") or {},
+            "seen_handshakes": _STATE.get("handshake_seen") or [],
+            "usage": dict(_STATE["usage"])}

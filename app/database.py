@@ -228,6 +228,14 @@ async def init_db() -> None:
 _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "portals": {
         "tls_insecure": ("BOOLEAN", "0"),
+        "identity_mode": ("VARCHAR(12)", "'mag250'"),
+        "stb_timezone": ("VARCHAR(64)", "NULL"),
+    },
+    "mac_addresses": {
+        "last_error": ("VARCHAR(200)", "NULL"),
+        "force_ch_link_check": ("BOOLEAN", "0"),
+        "sn": ("VARCHAR(40)", "NULL"),
+        "device_id": ("VARCHAR(80)", "NULL"),
     },
     "ffmpeg_templates": {
         "low_power": ("BOOLEAN", "1"),

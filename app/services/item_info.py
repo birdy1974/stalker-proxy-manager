@@ -12,7 +12,7 @@ import os
 from sqlalchemy import select
 
 from ..models import MacAddress, Portal
-from ..portal.pool import POOL
+from ..portal.pool import POOL, PortalSession
 from .probe import probe_media
 from .tmdb import tmdb_lookup
 
@@ -36,8 +36,8 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str) -> str | None:
             # Pooled: do NOT handshake here. create_link() authenticates lazily
             # and reuses the cached token, so a detail popup costs no extra
             # portal round trip once a session already exists.
-            client = await POOL.get(portal.resolved_url, mac.mac, mac.password,
-                                    portal.proxy_url, tls_insecure=portal.tls_insecure)
+            client = await POOL.get(PortalSession.from_rows(portal, mac,
+                                                             portal_url=portal.resolved_url))
             try:
                 return await client.create_link(cmd, kind)
             except Exception:  # noqa: BLE001 - fall through to raw cmd

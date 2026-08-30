@@ -242,13 +242,63 @@ At boot the app performs a **hardware sanity check**: if the default template ne
 - **`%mac%` in a resolved link is filled in.** Portals that keep one link template for every box hand out `…/ch/%mac%/1234.ts` and expect the set-top box to substitute its own MAC; anything else is a 404 that reads as a dead channel.
 - **HLS links get the input options they need.** When the resolved link is a `.m3u8` playlist, ffmpeg receives `-protocol_whitelist file,http,https,tcp,tls,crypto` and `-allowed_extensions ALL` (unless the template already sets them) — without those two, a valid portal playlist dies before the first byte.
 - **One trust policy for every outbound call.** Portal, EPG and logo fetches all go through `app/services/http_client.outbound_client()` (OS CA store, verification on). `Portal.tls_insecure` is the only opt-out, it is per portal, and it is part of the pooled-session key so flipping it cannot leave an old session behind.
+- **The panel's own account state is honoured.** Per MAC the panel reports `blocked`, `status` and an expiry, and Check Portal / the nightly portal sync now store that verdict: `banned` and `expired` MACs are dropped from fallback chains and from a fetch job's starting MAC, the Portals tab shows the badge, and the *reason* the portal gave is on the MAC row (`last_error`, shown in the badge tooltip). `offline`/`error` — our transport verdicts — stay retryable, because a portal that timed out is not a portal that said no.
 - Client disconnects (and the Dashboard *kill* button) deterministically free the MAC and kill ffmpeg via a disconnect watchdog.
+
+---
+
+## What the portal is told about the box (STB identity)
+
+A Stalker portal does not authenticate a user, it authenticates a *set-top box* — so a
+proxy that announces itself as `python-httpx/0.28` gets a token and a playlist, and then
+either 403s on the stream or starts behaving in ways no box ever does. Every portal request
+now carries the identity of a MAG250, per MAC and derived from the MAC itself
+(`md5(mac)` for the serial, `sha256(mac)` for the device id, …) so it is **stable across
+restarts and unique per MAC** — nothing is stored on disk, and two MACs never look like the
+same box:
+
+- **The full handshake dance.** Some panels answer the first handshake with
+  `{"js":{"msg":"missing"}}` plus a random seed and expect a *second* request carrying
+  `mac=` and `prehash=sha1(<the bearer we just invented>)`. Both steps are performed, and the
+  `Authorization: Bearer` header and the `token=` cookie are set together, as the stalker
+  app does.
+- **`get_profile` with the device fingerprint** (serial, device id, signature, hw versions,
+  `api_signature=262`, a `metrics` blob quoting the random seed), and `not_valid_token`
+  echoed from the handshake. The answer's `blocked` / `status` / `force_ch_link_check` are
+  consumed (see above). A panel that answers nothing usable falls back to the minimal
+  `sn`/`device_id`/`timestamp` request, because some panels 403 the full one.
+- **Headers and cookies on every request, including portal *discovery*:** the MAG200
+  `User-Agent`, `X-User-Agent: Model: MAG250; Link: WiFi`, `Referer: <portal>/index.html`,
+  and `mac=…; stb_lang=en; timezone=<yours>` cookies (plus `adid=<md5(sn+mac)>` for
+  `/stalker_portal/` panels). A wrong or missing cookie MAC is a 403 on *any* action, so the
+  `mac` cookie is always in colon form and never rewritten.
+
+Per portal you can tune what it is told, in the portal dialog or via the API:
+
+| Field | Default | why you would change it |
+|---|---|---|
+| `identity_mode` | `mag250` | `minimal` sends only `sn`/`device_id`/`timestamp` to `get_profile` — some panels 403 the full fingerprint |
+| `stb_timezone` | `Europe/Amsterdam` | what the box's `timezone=` cookie says; some panels key content or sessions on it |
+| per-MAC `sn` | derived | the box's **real** serial, if you captured one (see below) |
+| per-MAC `device_id` | derived | same, for `device_id`/`device_id2`/`signature` |
+
+To pin a real serial: **MACs → ⚙ → 🎩** on the MAC's row, then type
+`SERIAL123, DEVICEID456` (device id optional). A panel that has seen the box's real serial
+once will notice a changed one, so pinning it is what makes moving a subscription to this
+proxy invisible.
+
+Environment knobs, when a panel wants something different again: `SPM_STB_UA` (the portal
+calls, the stream probes and ffmpeg's `-user_agent` all use this one value),
+`SPM_STB_MODEL`, `SPM_STB_IMAGE_VERSION`, `SPM_STB_HW_VERSION`, `SPM_STB_VER` (the whole
+`ver=` ImageDescription block), `SPM_STB_PORTAL_VERSION`, `SPM_STB_LANG`, `SPM_STB_TIMEZONE`. `SPM_STB_PROFILE=0` stops the `get_profile` call
+entirely (handshake and play links keep working) — for the panel that treats an unexpected
+`get_profile` as a reason to be rude.
 
 ---
 
 ## Built-in mock portal (testing without a real subscription)
 
-`SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02` (plus expired `…BB:BB:01`), 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {"offline":…, "slow":…, "max_per_mac":…}` emulates outages and account-in-use errors for fallback testing.
+`SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02`, expired `…BB:BB:01` and blocked `…CC:CC:01`, 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {...}` emulates what the portal can do to you, so the client's behaviour is testable without a subscription: `offline`, `slow`, `max_per_mac`, `http_status`, `require_prehash` (demand the second handshake step), `fingerprint_required` (403 a `get_profile` with no serial), `profile_mode` (`full`/`no_id`/`none`), `not_valid` (short-lived token), `token_rejects` (answer 200 + `{"error":"token"}`), `js_error`, `empty_reply`, `corrupt_stream`, `require_tls`, `require_host`, `reject_no_cookie`, `reject_no_referer`. `GET /mock/_state` answers with those settings *and* what the portal actually received (`seen_profile`, the handshake `prehash`es, and per-MAC usage) — which is how the identity tests prove a box fingerprint arrived instead of trusting the client.
 
 Tip: the GUI shows the ready-to-copy mock portal URL/MACs in the Portals tab when enabled.
 

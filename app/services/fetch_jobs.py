@@ -29,7 +29,8 @@ from ..models import (
     LiveGenre, LiveSource, MacAddress, Portal, SerieEpisode, SerieGenre,
     SerieSeason, SerieSource, VodGenre, VodSource,
 )
-from ..portal.pool import POOL
+from ..portal.account import mac_is_usable, mac_status
+from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, StalkerClient
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
@@ -162,7 +163,11 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
     if not macs:
         raise PortalError("portal has no MAC addresses")
 
-    mac = macs[0]
+    # The first MAC the panel does NOT consider dead. A banned or expired one
+    # cannot authenticate, so a 30-minute catalogue job started on it would
+    # simply fail at page 1; falling back to macs[0] when all of them look
+    # unusable keeps a stale status from disabling the portal forever.
+    mac = next((m for m in macs if mac_is_usable(getattr(m, "status", None))), macs[0])
     # ---- resolve once per job if needed ------------------------------------
     if not resolved:
         job.stage = "resolving portal url"
@@ -180,17 +185,20 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
             await s.commit()
         await db_log("INFO", "fetch", f"[{portal_name}] resolved -> {resolved}")
 
-    # The portal's HTTP proxy applies to catalogue calls too - a panel that is
-    # only reachable through it used to be resolvable/streamable but not
-    # fetchable, which made the whole feature look broken.
-    client = await POOL.get(resolved, mac.mac, mac.password, portal_proxy,
-                            tls_insecure=insecure)
+    # One profile, built from the rows: this call used to hand POOL.get a proxy
+    # and a TLS policy by hand, which is how catalogue fetches ended up the one
+    # path that ignored a portal's proxy. PortalSession.from_rows is the only
+    # way to get a session now, so it cannot be half-applied again.
+    client = await POOL.get(PortalSession.from_rows(portal, mac, portal_url=resolved))
     await client.handshake()
-    try:                                    # refresh MAC expiry/status while we are here
-        exp = await client.account_expires()
+    try:          # refresh what the panel says about this MAC while we are here
+        verdict = await client.refresh_account()
         async with SessionLocal() as s:
             m = await s.get(MacAddress, mac.id)
-            m.expire_date, m.status, m.online = exp, "online", True
+            m.expire_date = verdict.expire_date
+            m.status, m.online = mac_status(verdict), verdict.online
+            m.force_ch_link_check = verdict.force_ch_link_check
+            m.last_error = None if verdict.online else verdict.reason[:200]
             m.last_checked = datetime.now(timezone.utc)
             await s.commit()
     except PortalError:

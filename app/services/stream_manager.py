@@ -40,7 +40,8 @@ from ..models import (
     SeriePlaylistSource, SerieSeason, SerieSource, VodPlaylist, VodPlaylistSource,
     VodSource,
 )
-from ..portal.pool import POOL
+from ..portal.account import mac_is_usable
+from ..portal.pool import POOL, PortalSession
 from ..portal.client import MAG_UA, PortalError, StalkerClient, is_hls
 from .db_logging import db_log
 from .ffmpeg_templates import (HLS_ALLOWED_EXTENSIONS, HLS_PROTOCOL_WHITELIST,
@@ -463,7 +464,18 @@ class StreamManager:
                        appeared earlier in the chain as a different source).
         portal_first -> one MAC per portal; later sources on the same portal
                        are skipped so we hop to the next portal immediately.
+
+        MACs the *portal* says are unusable (banned / expired subscription) are
+        dropped first: opening a stream through one costs a create_link, a
+        refusal, and - on a panel that counts connections per MAC - a slot that a
+        working MAC could have used. `offline`/`error` stay in the list because
+        those are our own verdicts about transport, usually transient.
         """
+        usable = [m for m in macs if mac_is_usable(getattr(m, "status", None))]
+        if len(usable) != len(macs):
+            log.info("skipping %d mac(s) the portal says are unusable for portal %s",
+                     len(macs) - len(usable), portal_id)
+        macs = usable
         if not macs:
             return None
         if strategy == "portal_first":
@@ -722,9 +734,7 @@ class StreamManager:
             for mac_row in macs:
                 if mac_row.id in self.mac_locks:
                     continue                      # occupied by one of our own pipes
-                client = await POOL.get(portal.resolved_url or portal.base_url,
-                                        mac_row.mac, mac_row.password, portal.proxy_url,
-                                        tls_insecure=portal.tls_insecure)
+                client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                 try:
                     if not portal.resolved_url:
                         from ..portal.resolver import resolve_portal
@@ -850,9 +860,7 @@ class StreamManager:
                     await db_log("INFO", "stream",
                                  f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
                                  f"portal '{portal.name}' mac {mac_row.mac}")
-                    client = await POOL.get(portal.resolved_url or portal.base_url,
-                                     mac_row.mac, mac_row.password, portal.proxy_url,
-                                     tls_insecure=portal.tls_insecure)
+                    client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                     url = None
                     try:
                         if not portal.resolved_url:

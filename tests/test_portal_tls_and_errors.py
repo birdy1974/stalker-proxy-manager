@@ -35,7 +35,7 @@ from app.portal.client import (PortalError, StalkerClient, apply_mac_placeholder
                                is_hls, js_error, js_has_payload, normalize_error,
                                status_for_error)
 from app.portal.mock_portal import router as MOCK_ROUTER
-from app.portal.pool import ClientPool
+from app.portal.pool import ClientPool, PortalSession
 from app.services import http_client as hc
 
 MAC = "00:1A:79:AA:AA:01"
@@ -133,11 +133,11 @@ async def test_tls_insecure_reaches_the_http_client(monkeypatch):
 
 async def test_pool_does_not_share_sessions_across_tls_policies():
     pool = ClientPool()
-    verified = await pool.get("http://p/c/", MAC)
-    insecure = await pool.get("http://p/c/", MAC, tls_insecure=True)
+    verified = await pool.get(PortalSession("http://p/c/", MAC))
+    insecure = await pool.get(PortalSession("http://p/c/", MAC, tls_insecure=True))
     assert verified is not insecure, "verification is part of a session's identity"
     assert insecure.tls_insecure is True and verified.tls_insecure is False
-    assert await pool.get("http://p/c/", MAC) is verified
+    assert await pool.get(PortalSession("http://p/c/", MAC)) is verified
     assert pool.stats()["sessions_open"] == 2
 
 
@@ -155,7 +155,7 @@ async def test_session_reaper_actually_runs(monkeypatch):
     from app import main
     from app.portal.pool import POOL
 
-    await POOL.get("http://p/c/", MAC)      # one open session, now idle
+    await POOL.get(PortalSession("http://p/c/", MAC))      # one open session, now idle
     reaped: list[int] = []
     real_reap = POOL.reap
 

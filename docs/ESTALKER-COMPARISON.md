@@ -43,11 +43,11 @@ bouquet writing, aspect-ratio handling, i18n) I ignore it.
 |---|---|---|---|---|
 | 1 | Portal endpoint discovery | `xpcom.common.js` at `/c/`, `/stalker_portal/c/` + saved prefix; parses `this.ajax_loader` with 3 regex shapes; caches per host | 9 path candidates, `varpattern`+`ajax_loader` eval (STB-Proxy port), **plus** a direct `handshake` probe per path, full attempt log in GUI | **us** (more strategies, observable); ES for the `portal_ip`/`path_prefix` line-shapes |
 | 2 | Portal self-description | fetches `version.js` → "Ministra 5.4.x", persists `path_prefix` | none | **ES** |
-| 3 | Request identity | `X-User-Agent`, `Referer: …/index.html`, `Pragma`, `Accept-Encoding/Language`, `Host`, `Connection: Close`, cookies `mac/stb_lang/timezone/adid` + `token` cookie | `User-Agent` + cookies `mac/stb_lang/timezone` only | **ES** by a wide margin |
+| 3 | Request identity | `X-User-Agent`, `Referer: …/index.html`, `Pragma`, `Accept-Encoding/Language`, `Host`, `Connection: Close`, cookies `mac/stb_lang/timezone/adid` + `token` cookie | the same set minus `Host`/`Connection: Close`, which we refuse on purpose (pooled keep-alive, and a proxy sets its own `Host`); cookies `mac/stb_lang/timezone` + `adid` on `/stalker_portal/` + `token` after handshake — on every request, **including discovery** | **us** (R1 ✅): same announcement, minus the two headers that hurt a proxy |
 | 4 | Adaptive headers | regex-scrapes `set_cookie('x')` / `setRequestHeader('X-…')` out of `xpcom.common.js` and only sends what the portal declares | fixed set | **ES** (nice idea, fragile) |
-| 5 | Handshake | 2 shapes (with/without explicit `mac=`), `"missing"` → fake bearer + `prehash=sha1(fake)` retry, reads `js.random`, `js.not_valid` | 1 shape, `prehash=0`, no `mac` param, no prehash dance | **ES** |
-| 6 | `get_profile` | full MAG250 fingerprint (sn, device_id, device_id2, signature, hw_version, hw_version_2, metrics, api_signature, prehash, not_valid_token) + minimal fallback | no fingerprint request at all — the old `profile()` had no caller and was deleted in R5 | **ES** (R1) |
-| 7 | Account state | `account_info` expiry **plus** `js.status`, `js.blocked`, `force_ch_link_check`; playlist marked invalid if `blocked==1` | expiry only (`account_expires`); no blocked/status/force flags anywhere | **ES** |
+| 5 | Handshake | 2 shapes (with/without explicit `mac=`), `"missing"` → fake bearer + `prehash=sha1(fake)` retry, reads `js.random`, `js.not_valid` | the same three stages (R1 ✅), plus the `Bearer` header **and** `token=` cookie set together, `js.not_valid` echoed back on the next call, and one transparent re-handshake when the panel expires the bearer under HTTP 200 (R4) — which EStalker does not handle | **us**, narrowly |
+| 6 | `get_profile` | full MAG250 fingerprint (sn, device_id, device_id2, signature, hw_version, hw_version_2, metrics, api_signature, prehash, not_valid_token) + minimal fallback | same fingerprint, derived deterministically per MAC (22 params) with the same no-`id` → minimal fallback, plus a per-portal `identity_mode` switch and a `SPM_STB_PROFILE=0` kill switch EStalker has no equivalent of | **us**: equal announcement, and it can be turned off without a code change |
+| 7 | Account state | `account_info` expiry **plus** `js.status`, `js.blocked`, `force_ch_link_check`; playlist marked invalid if `blocked==1` | all of it (R3 ✅): `blocked`/`status`/`force_ch_link_check`/`play_token` persisted per MAC, expiry parsed from either source, `banned`/`expired` excluded from chains, and the panel's own reason surfaced in the badge tooltip | **us**: same truth, and it survives the request that read it |
 | 8 | Token/session lifecycle | token+headers persisted to JSON, re-`handshake` via `reauthorize_portal()` on **any** failed call, exactly 1 retry (24 call sites) | pooled client per (portal,MAC), TTL 3000 s, `401/403` → re-handshake + 1 retry, idle reap 900 s, hit/miss stats | **us** (TTL, pooling, reuse, stats); ES wins on "retry on transport errors too" |
 | 9 | Catalogue fetch | lazy, scroll-driven paging (14/page), `pages_downloaded` set, `all_data[total_items]` positional array, `/tmp/allchannels.json` | background jobs, `get_all_channels` first, 4-way concurrent paging, budget, per-page bulk upsert, resumable, progress in GUI | **us** (server-side need); ES's positional page placement is a good idea we already get from `gather` ordering |
 | 10 | Series/VOD type duality | hardcodes `type=vod` for VOD, `type=series` for series | tries `series` then `vod`, validates season/episode rows, id-shape tolerance | **us** |
@@ -61,7 +61,7 @@ bouquet writing, aspect-ratio handling, i18n) I ignore it.
 | 18 | Multi-MAC / fairness | one MAC per playlist; N playlists fetched with **one in-flight request per domain per round**, ≤30 threads, sequential fallback | MAC order per portal, occupancy locks (1 stream/MAC), `macs_first`/`portal_first`, `FETCH_PAGE_CONCURRENCY=4` | **us** for MAC semantics; ES's per-domain round-robin is the missing fairness piece |
 | 19 | Transport/TLS | `verify=False` everywhere, `HTTPAdapter(max_retries=0/1)`, GET `(8,8)` timeouts | TLS verification **on** for every outbound call, `PORTAL_HTTP_TIMEOUT=10`; portal traffic shares the one TLS policy with EPG/logos, plus a per-portal `tls_insecure` opt-out in the GUI (R5 ✅) | **us**, decisively |
 | 20 | Xtream interop | harvests `/movie/<user>/<pass>/` from a `create_link` answer, then queries `player_api.php` for status/`created_at`/`exp_date`/`active_cons`/`max_connections`; auto-delete of invalid playlists | we *serve* Xtream, we do not *ingest* it | **ES** (see R7) |
-| 21 | Code quality | screen-centric, `print()` debugging, broad `except`, mixed Py2/Py3, no tests | typed, module loggers with masked tokens, 20 pytest files (3141 LOC), CI smoke test, mock portal with toggleable failure modes | **us**, decisively |
+| 21 | Code quality | screen-centric, `print()` debugging, broad `except`, mixed Py2/Py3, no tests | typed, module loggers with masked tokens, 21 pytest files (184 tests), CI smoke test, mock portal that also *records what it received* (R1/R3 ✅) | **us**, decisively |
 
 ---
 
@@ -115,7 +115,7 @@ bouquet writing, aspect-ratio handling, i18n) I ignore it.
 
 Effort is in *senior-dev hours including tests*. R1–R4 are the ones worth doing.
 
-### R1 — Emulate the STB properly (fingerprint + full auth dance + headers) — **DO, highest value**
+### R1 — Emulate the STB properly (fingerprint + full auth dance + headers) — **DO, highest value** ✅ *delivered* (see §6.2 for the three deviations)
 
 *Effort ≈ 6–10 h. Risk: low if derived per MAC and persisted.*
 
@@ -186,7 +186,7 @@ expire. Proposed compromise:
 * always `create_link` when a real ffmpeg pipe is opened (we want the fresh `play_token` and the
   liveness check) — plus `%mac%` substitution and `.m3u8` detection (see R4).
 
-### R3 — Consume portal truth in Portal/MAC status — **DO**
+### R3 — Consume portal truth in Portal/MAC status — **DO** ✅ *delivered* (see §6.2)
 
 *Effort ≈ 3–5 h.*
 
@@ -333,7 +333,9 @@ of a hope.
 
 ---
 
-## 6. Delivered: R5 + R4
+## 6. Delivered
+
+### 6.1 R5 + R4
 
 What actually landed, including two deviations from the plan and two real bugs the wiring exposed.
 
@@ -403,7 +405,82 @@ import/typing slips of exactly one line; a `ruff check` (F821 catches all of the
 possible guard, and it is not in this repo's CI yet — that is now the only thing in this document I'd
 add to the backlog that EStalker never mentioned.
 
-Not done, deliberately: R1, R2, R3, R6, R7, R8, R9 — see the ranking above for why.
+Not done, deliberately: R2, R6, R7, R8, R9 — see the ranking above for why.
+
+---
+
+### 6.2 R1 + R3 — the box the portal thinks it is serving
+
+`app/portal/identity.py` and `app/portal/account.py` (both new, both pure functions), then
+`client.py`, `pool.py`, `resolver.py`, `api_portals.py`, `fetch_jobs.py`, `item_info.py`,
+`stream_manager.py`, `portals.html`, `api_misc.py` (backups), `mock_portal.py`.
+Tests: `tests/test_stb_identity.py` (50), 19 more cases in `dev/check-links.py` (58 total),
+and the full suite at 184.
+
+**R1 — what the portal is told.**
+* The handshake is three stages, as prescribed: today's request; the same with `mac=`; and, only
+  when `js.msg` says `missing`, a 32-char `A-Z0-9` invented bearer plus `prehash=sha1(that bearer)`
+  in a third request. `js.random` is kept as `token_random` and quoted inside the `metrics` blob,
+  `js.not_valid` is kept and echoed as `not_valid_token=1`. The answer is *data*, not an exception:
+  a refusal-shaped handshake reply (no token) leaves the client unauthenticated and says so.
+* `stb_profile()` sends the 22-parameter fingerprint (`sn=md5(mac).upper()[:13]`,
+  `device_id=sha256(mac).upper()`, `device_id2`, `signature=sha256(device_id+device_id).upper()`,
+  `hw_version_2=sha1(mac)`, `prehash=sha1(sn+mac)`, `api_signature=262`, `num_banks`, `hd`,
+  `video_out`, `auth_second_step`, `hw_version`, `ver`, `metrics`, `timestamp`) and falls back to the
+  `sn`/`device_id=""`/`timestamp` minimal shape when the answer has no `id` — EStalker's own
+  fallback, including its silent one.
+* **Every** portal request, discovery included, carries `User-Agent`, `X-User-Agent: Model: MAG250;
+  Link: WiFi`, `Referer: <portal dir>/index.html`, `Pragma`, `Accept-Language`, `Accept-Encoding` and
+  the `mac`/`stb_lang`/`timezone`/(`adid`) cookies; after a token, `Authorization: Bearer` and the
+  `token=` cookie are set and cleared together.
+* Deviations from the plan, all three deliberate:
+  1. **`identity_mode` and `stb_timezone` live on the Portal, not per MAC.** The plan asked for a
+     per-MAC escape hatch; MACs are edited through a textarea in the portal modal, which cannot host
+     a select, and the mode describes what *this panel* wants to see — which is a property of the
+     portal. `sn`/`device_id` stayed per MAC, because a serial belongs to one box. GUI: MACs → ⚙ → 🎩.
+  2. **The `mac` cookie is not percent-encoded** (EStalker sends `quote(mac, safe='')`). Colon form is
+     what our portals have always accepted; a device that suddenly looks unknown is worse than a
+     slightly less faithful cookie. The mock decodes both, so either spelling works against it.
+  3. **`sn`/`device_id` are derived, not persisted, and only *overrides* are stored.** The plan said
+     "persist them so a regenerated value cannot re-enrol the box" — but a value derived from the MAC
+     cannot drift across restarts in the first place, so persisting it would only add a state file to
+     lose. A captured real serial is stored as an override on the MAC row (and exported in backups).
+* Two things EStalker announces that we refuse on purpose: `Connection: Close` (we hold pooled
+  keep-alive sessions; asking every request to close doubles our handshake load) and a `Host`
+  override (our client may be talking to a proxy, which sets its own).
+
+**R3 — what the portal's answer is allowed to do.**
+* `account_verdict(profile=…, info=…, token=…)` is the single decision function: a blocked panel
+  wins over every date (`banned`), an unusable MAC is one whose *own* verdict said no, expiry is
+  parsed from `account_info.phone` or `end_date` in both ISO and `DD.MM.YYYY` forms, and "no token"
+  is `unauthorized` rather than an outage. `mac_is_usable()` deliberately only excludes
+  `banned`/`expired` — our own `offline`/`error` verdicts stay retryable, because a portal that timed
+  out is not a portal that said no.
+* Check Portal and the nightly portal sync both call `refresh_account()`, store
+  `status`/`force_ch_link_check`/`last_error` per MAC, and the GUI badge reads the panel's word
+  (`banned`, `expired`) with the reason in its tooltip. `force_ch_link_check` is stored, not acted
+  on: that is R2's job, and R2 is still open.
+* The stream chain (`_pick_macs`) and a fetch job's starting MAC skip `banned`/`expired`. Both keep a
+  documented escape: if *every* MAC looks unusable, fall back to the plain first MAC — a status that
+  went stale while the panel was rude must not disable a portal forever.
+
+**The bug this round found is mine, and it is worth keeping in the record.** The first implementation
+hung the suite for 300 s: a `get_profile` that answers **403** went through the ordinary request path,
+whose 401/403 branch calls `handshake()` — which calls `get_profile`. `_may_reauth()` now forbids
+re-authenticating from inside a handshake, and best-effort calls on the handshake path pass
+`retry_on_auth=False`. The rule generalises: *any* call added to the handshake path has to say whether
+it may re-enter it. The regression test asserts a portal whose `get_profile` 404s/403s still yields a
+working session, so nobody re-invents the loop.
+
+**Test harness change (`tests/conftest.py`), and why it is here rather than in a chore commit.**
+Adding DB-touching tests turned a latent order-dependency into 23 `ERROR at setup` entries
+(`sqlite3.OperationalError: database is locked`) in one of every three full runs: `drop_all` needs
+SQLite's exclusive lock, and `test_get_db_survives_an_abandoned_request` intentionally abandons a
+connection, which holds a shared one until the GC terminates it. The fixture now drains the log writer
+queue and retries the DDL through a forced `gc.collect()`. 5/5 clean full runs afterwards, versus a
+baseline that had already been failing `test_deregister_deletes_row_even_when_its_task_is_cancelled`
+in roughly one run in three for the same reason. A suite whose failures depend on which files ran
+first teaches you nothing, and mine was the change that made it loud.
 
 ---
 
@@ -415,5 +492,7 @@ must assume **all rights reserved**: take the *protocol knowledge* (endpoint nam
 quirk handling — facts and interfaces, not expression), re-implement in our own style, and keep the
 attribution comment in commit messages (e.g. "behaviour observed in kiddac/EStalker @032967f")
 without pasting their code or strings verbatim. The long `ver`/`ImageDescription` string in R1 is a
-device-advertisement value used by real MAG firmware, not original authorship — still worth writing
-ours from a captured `set_profile` rather than lifting the literal from their source.
+device-advertisement value used by real MAG firmware, not original authorship — what we ship is our
+own composition of the same *field names* (`ImageDescription`/`ImageDate`/`PORTAL version`/
+`API Version`/`Player Engine version`) with our own values, env-overridable via `SPM_STB_VER`; no
+literal from their source was copied.

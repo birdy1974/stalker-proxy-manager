@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # ============================================================================
-# Self-check for the Stalker link helpers in app/portal/client.py
+# Self-check for the portal plumbing that decides whether a channel plays:
+# the link helpers in app/portal/client.py, the STB identity in
+# app/portal/identity.py, and the account verdict in app/portal/account.py.
 #
 #   python3 dev/check-links.py
 #
@@ -19,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -28,9 +31,13 @@ logging.disable(logging.CRITICAL)
 os.environ.setdefault("SPM_DATA_DIR", tempfile.mkdtemp(prefix="spm-check-links-"))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.portal.account import (account_verdict, mac_is_usable,  # noqa: E402
+                                mac_status, parse_expiry)
 from app.portal.client import (apply_mac_placeholder, extract_url, is_hls,  # noqa: E402
                                js_error, mask_token, merge_link, normalize_error,
                                sanitize_cmd, strip_volatile)
+from app.portal.identity import (cookies_for, derive_identity, normalize_mac,  # noqa: E402
+                                 profile_params, referer_for)
 
 CASES: list[tuple[str, object, object]] = []
 
@@ -168,26 +175,86 @@ check("error: usable payload keeps an informational msg",
       js_error({"js": {"msg": "wait", "total_items": 0, "data": []}}), "wait")
 
 # --------------------------------------------------------------------------- #
-# dead code stays dead
+# the STB identity: derived, stable, and visible to the portal
 # --------------------------------------------------------------------------- #
-# `profile()` and `short_epg()` were methods nothing ever called, and they each
-# carried their own http client - i.e. a second path that quietly ignored the
-# portal proxy and the per-portal TLS policy. `_network_identity` was renamed
-# when it grew the HLS input options (it is no longer only about identity).
-# If one of these names comes back, someone re-added a bypass.
+import hashlib  # noqa: E402
+MAC0 = "00:1A:79:AA:AA:01"
+check("identity: any spelling of the MAC is the same box",
+      (lambda a, b: (a.sn, a.prehash) == (b.sn, b.prehash))(
+          derive_identity("00:1a:79:aa:aa:01"), derive_identity("001A79AAAA01")), True)
+_i = derive_identity(MAC0)
+check("identity: prehash is sha1(sn+mac), so a pin stays consistent",
+      _i.prehash, hashlib.sha1((_i.sn + MAC0).encode()).hexdigest())
+check("identity: a pinned serial is used, not the derived one",
+      derive_identity(MAC0, sn="REAL-SN").sn, "REAL-SN")
+_q = profile_params(_i, not_valid=True, timestamp=1700000000)
+check("identity: get_profile carries the fingerprint fields",
+      all(k in _q for k in ("sn", "device_id", "signature", "prehash", "metrics",
+                            "hw_version_2", "api_signature")), True)
+check("identity: js.not_valid is echoed as not_valid_token", _q["not_valid_token"], "1")
+check("identity: cookies carry the MAC in colon form (panels compare it verbatim)",
+      cookies_for("http://h/c/portal.php", "00:1a:79:aa:aa:01")["mac"], MAC0)
+check("identity: referer points at the portal's own index.html",
+      referer_for("http://h:8080/stalker_portal/c/portal.php"),
+      "http://h:8080/stalker_portal/c/index.html")
+check("identity: normalize_mac is idempotent", normalize_mac(normalize_mac(MAC0)), MAC0)
+
+# --------------------------------------------------------------------------- #
+# what the portal says about the account becomes a decision
+# --------------------------------------------------------------------------- #
+check("account: a panel's 'blocked' is a ban, whatever the expiry says",
+      account_verdict(profile={"blocked": "1"}, info={"phone": "2032-12-31"}, token="t").status,
+      "banned")
+check("account: string '0' is not blocked (bool('0') would say otherwise)",
+      account_verdict(profile={"blocked": "0"}, token="t").status, "active")
+check("account: a past expiry is expired, and it removes the MAC from the chains",
+      (account_verdict(profile={}, info={"phone": "2024-01-01"}, token="t").status,
+       mac_is_usable("expired")), ("expired", False))
+check("account: our own transport verdicts stay retryable",
+      mac_is_usable("offline"), True)
+check("account: no token is an authorization problem, not an outage",
+      mac_status(account_verdict(profile={}, info={}, token="")), "unauthorized")
+check("account: an unreadable expiry is no verdict at all",
+      parse_expiry("Unknown"), None)
+check("account: European billing dates are parsed",
+      str(parse_expiry("31.12.2032")), "2032-12-31 00:00:00+00:00")
+
+# --------------------------------------------------------------------------- #
+# dead code stays dead, and the answers that matter stay consumed
+# --------------------------------------------------------------------------- #
+# `profile()` and `short_epg()` were methods nothing ever called, and each built
+# its own http client - a second path that quietly ignored the portal proxy and
+# the TLS policy. `_network_identity` was renamed when it grew the HLS input
+# options (it is no longer only about identity). Any of them coming back means a
+# bypass is being reintroduced, so grep for them instead of trusting a review.
 FORBIDDEN = {
-    "profile(": "use StalkerClient.handshake/account_expires, or wire a real caller",
-    "short_epg(": "dead code: it ignored the portal proxy and TLS policy",
+    "def profile(": "dead code; the fingerprint call lives in stb_profile()",
+    "def short_epg(": "dead code: it ignored the portal proxy and TLS policy",
     "_network_identity": "renamed to _network_input_options (HLS opts are not identity)",
 }
-import subprocess  # noqa: PLC0415
-hits = []
-for sym, why in FORBIDDEN.items():
-    r = subprocess.run(["grep", "-rn", "--include=*.py", "--", sym, "app"],
+
+
+def _grep(sym: str, where: str) -> list[str]:
+    r = subprocess.run(["grep", "-rn", "--include=*.py", "--", sym, where],
                        capture_output=True, text=True)
-    if r.stdout.strip():
-        hits += [f"{sym} ({why})\n          {line}" for line in r.stdout.strip().splitlines()]
-check("no dead portal helpers came back", hits, [])
+    return [line for line in r.stdout.strip().splitlines() if "__pycache__" not in line]
+
+
+for sym, why in FORBIDDEN.items():
+    hits = _grep(sym, "app")
+    check(f"no {sym!r} in app/ ({why})", hits, [])
+
+# The mirror-image rule, and the one EStalker itself breaks: if the portal told
+# us something we can act on, something must act on it. An identity call whose
+# answer is discarded is how `get_profile` was dead here for its whole life, and
+# "read blocked, ignore blocked" is how an expired MAC stayed in every chain.
+WIRED = {
+    "stb_profile(": "the fingerprint must be sent from the handshake, not on request",
+    "refresh_account(": "test_portal and the fetch job must both consume the verdict",
+}
+for sym, why in WIRED.items():
+    hits = _grep(sym, "app")
+    check(f"{sym} has a caller ({why})", bool(hits), True)
 
 # --------------------------------------------------------------------------- #
 failed = 0

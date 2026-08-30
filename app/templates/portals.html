@@ -29,8 +29,27 @@
 /* ============================= portals table ============================= */
 let table;
 function statusBadge(m) {
-  const cls = { online: "st-online", offline: "st-offline", unauthorized: "st-unauthorized", expired: "st-expired", error: "st-error" }[m.status] || "st-unknown";
-  return `<span class="badge badge-status ${cls}">${m.online ? "online" : m.status}</span>`;
+  // `banned` / `expired` are what the PANEL says about the account (they come from
+  // get_profile / account_info) and take the MAC out of every fallback chain;
+  // `offline` / `error` are our own verdicts about transport and stay retryable.
+  // The tooltip is the panel's own wording, so "why" needs no log dive.
+  const cls = { online: "st-online", offline: "st-offline", unauthorized: "st-unauthorized",
+                expired: "st-expired", banned: "st-unauthorized", error: "st-error" }[m.status] || "st-unknown";
+  const why = esc(m.last_error || "");
+  return `<span class="badge badge-status ${cls}" ${why ? `title="${why}"` : ""}>${m.online ? "online" : m.status}</span>`;
+}
+function pinIdentity(pid, mid, mac, sn, deviceId) {
+  // Derived-from-MAC is the default and the right answer for almost every panel;
+  // this exists for the box whose real serial the portal has already enrolled.
+  const next = prompt(`Pinned STB identity for ${mac} - leave a field empty to derive it from the MAC again.\n\nFormat: [serial][, device id]`,
+                      [sn || "", deviceId || ""].filter(Boolean).join(", "));
+  if (next === null) return;
+  const parts = next.split(/[,\s]+/).filter(Boolean);
+  const p = table.items.find(x => x.id === pid);
+  const macs = p.macs.map(m => m.id === mid
+    ? { mac: m.mac, sn: parts[0] || "", device_id: parts[1] || "" }
+    : { mac: m.mac, sn: m.sn || "", device_id: m.device_id || "" });
+  api(`/api/portals/${pid}`, { method: "PUT", body: { macs } }).then(() => { toast("STB identity updated", "ok"); table.reload(); });
 }
 function makeTable() {
   table = new DataTable($("#portals-table"), {
@@ -54,6 +73,8 @@ function makeTable() {
           <div class="d-flex align-items-center gap-2 mb-1">
             <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
             <span class="small text-muted">${esc(m.expire_date || "")}</span>
+            <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="STB identity this portal is told (serial, device id) - pin the values your box really sends"
+              onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
             <button class="btn btn-xs btn-outline-danger py-0 px-1" title="delete mac"
               onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
           </div>`).join("") || '<span class="text-muted small">none</span>' },
@@ -95,7 +116,7 @@ function renderJobs(jobs) {
 
 /* ============================= add / edit modal ============================= */
 async function editPortal(id) {
-  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false };
+  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false, identity_mode: "mag250", stb_timezone: "" };
   const body = el("div");
   body.innerHTML = `
     <div>
@@ -118,6 +139,18 @@ async function editPortal(id) {
           <label class="form-check-label" for="p-tls">Allow broken TLS</label>
           <div class="small text-muted">off by default - only for a panel with a self-signed /
             incomplete cert chain; it disables certificate verification for THIS portal only</div></div></div>
+        <div class="col-md-4"><label class="muted-label" for="p-identity">Portal identity we advertise</label>
+          <select class="form-select form-select-sm" id="p-identity">
+            <option value="mag250"${(p.identity_mode || "mag250") === "mag250" ? " selected" : ""}>MAG250 fingerprint (default)</option>
+            <option value="minimal"${(p.identity_mode || "") === "minimal" ? " selected" : ""}>minimal (no fingerprint)</option>
+          </select>
+          <div class="small text-muted">a panel decides how much to answer partly by how much we look
+            like the box it enrolled. Switch to <b>minimal</b> if a portal only started refusing us
+            after we began sending a serial it never enrolled</div></div>
+        <div class="col-md-4"><label class="muted-label" for="p-tz">STB timezone cookie</label>
+          <input class="form-control form-control-sm" id="p-tz" value="${esc(p.stb_timezone || "")}" placeholder="Europe/Amsterdam">
+          <div class="small text-muted">the <span class="mono">timezone</span> cookie a real box sends;
+            blank keeps the server default</div></div>
         <div class="col-md-4 d-flex align-items-end justify-content-end">
           <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch genres</button>
         </div>
@@ -149,6 +182,8 @@ async function editPortal(id) {
     macs: $("#p-macs", body).value, enabled: $("#p-enabled", body).checked,
     proxy_url: $("#p-proxy", body).value.trim() || null,
     tls_insecure: $("#p-tls", body).checked,
+    identity_mode: $("#p-identity", body).value,
+    stb_timezone: $("#p-tz", body).value.trim() || null,
   });
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
                 mBtn("Save", "btn-accent", () => savePortal(state, body, m), "bi-check2"));

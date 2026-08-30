@@ -28,13 +28,11 @@ from urllib.parse import urlparse
 
 from ..config import PORTAL_HTTP_TIMEOUT
 from ..services.http_client import outbound_client
+from .identity import STB_MODEL, STB_UA, normalize_mac
 
 # MAG-styled UA; many portals reject anything else (observed in the wild and
-# during Phase-1 probing: plain curl gets an empty reply from many servers).
-MAG_UA = (
-    "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
-    "(KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2721 Safari/533.3"
-)
+# during Phase-1 probing: plain curl gets an empty reply from many servers)
+MAG_UA = STB_UA
 
 # Ordered base-path candidates (D-B: resolution result is cached in Portal row).
 PATH_CANDIDATES = [
@@ -153,8 +151,20 @@ async def resolve_portal(
     """
     result = ResolveResult()
     base, hint = _normalize_base(raw_url)
-    headers = {"User-Agent": MAG_UA}
-    cookies = {"mac": mac or "00:1A:79:00:00:00", "stb_lang": "en", "timezone": "UTC"}
+    # Discovery carries the *static* half of the box identity (see
+    # app/portal/identity.headers_for). No Referer: during discovery we do not
+    # know whether index.html exists at this path, and a referer pointing at a
+    # 404 page is more suspicious to a WAF than no referer at all. The
+    # authenticated calls in StalkerClient do send it.
+    headers = {
+        "User-Agent": MAG_UA,
+        "X-User-Agent": f"Model: {STB_MODEL}; Link: WiFi",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "Pragma": "no-cache",
+    }
+    cookies = {"mac": normalize_mac(mac) if mac else "00:1A:79:00:00:00",
+               "stb_lang": "en", "timezone": "UTC"}
 
     # Order: user-given path first (if it looks like a real path), then candidates
     paths: list[str] = []
