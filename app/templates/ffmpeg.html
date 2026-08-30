@@ -236,11 +236,41 @@ $("#tpl-delete").addEventListener("click", () => {
   confirmDialog({ title: "Delete template", body: `Delete <b>${esc(current.name)}</b>? Channels using it fall back to the default template.`,
     okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/ffmpeg/${current.id}`, { method: "DELETE" }); current = null; loadList(); } });
 });
-$("#btn-test-cmd").addEventListener("click", () => {
+async function showValidate(result, label) {
+  const box = $("#validate-out");
+  box.classList.remove("d-none");
+  const ok = result.ok;
+  const header = ok
+    ? `<span class="text-success">✔ ${esc(label)} — ${esc(result.detail || "ok")}</span>`
+    : `<span class="text-danger">✘ ${esc(label)} — ${esc(result.detail || "failed")}</span>`;
+  const meta = result.ms != null
+    ? `\nsource: ${esc(result.source || "")}   ${result.bytes ?? 0} bytes   rc=${result.rc ?? "?"}   ${result.ms} ms`
+    : "";
+  const err = result.stderr ? `\n\n--- ffmpeg stderr (tail) ---\n${esc(result.stderr)}` : "";
+  box.textContent = header + meta + err;
+}
+async function runValidate() {
   const cmd = $("#f-command").value.trim();
-  const ok = cmd.startsWith("ffmpeg") && cmd.includes("<url>");
-  toast(ok ? "looks valid (starts with ffmpeg, contains <url>)" : "command must start with 'ffmpeg' and contain <url>", ok ? "ok" : "warn");
-});
+  try {
+    const r = await api("/api/ffmpeg/validate", { method: "POST", body: { command: cmd } });
+    await showValidate(r, "syntax check");
+  } catch { /* toast already shown */ }
+}
+async function runDemo(mode) {
+  const cmd = $("#f-command").value.trim();
+  if (!cmd) return toast("no command to test", "warn");
+  $("#validate-out").classList.remove("d-none");
+  $("#validate-out").textContent = mode === "lavfi"
+    ? "running ffmpeg with synthetic testsrc2 input (~2 s) …"
+    : "running ffmpeg against test-videos.co.uk clip (~2 s) …";
+  try {
+    const r = await api("/api/ffmpeg/demo", { method: "POST", body: { command: cmd, mode } });
+    await showValidate(r, mode === "lavfi" ? "demo testsrc" : "demo test video");
+  } catch { /* toast already shown */ }
+}
+$("#btn-test-syntax").addEventListener("click", runValidate);
+$("#btn-test-lavfi").addEventListener("click", () => runDemo("lavfi"));
+$("#btn-test-url").addEventListener("click", () => runDemo("url"));
 $("#tpl-import").addEventListener("click", () => $("#tpl-import-file").click());
 $("#tpl-import-file").addEventListener("change", async (e) => {
   const f = e.target.files[0]; if (!f) return;

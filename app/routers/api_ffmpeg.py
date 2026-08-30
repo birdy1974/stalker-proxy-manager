@@ -76,6 +76,22 @@ async def parse(payload: dict):
     return parse_command(payload.get("command", ""))
 
 
+@router.post("/validate")
+async def validate(payload: dict):
+    """Syntax-only check: tokens, placeholder, balanced quotes."""
+    return syntax_check(payload.get("command", ""))
+
+
+@router.post("/demo")
+async def demo(payload: dict):
+    """Run the template command against a short test input (~2 s).
+    mode: 'lavfi' (synthetic testsrc2, no network) or 'url' (real HTTP clip)."""
+    return await run_demo(
+        command=payload.get("command", ""),
+        mode=payload.get("mode", "lavfi"),
+    )
+
+
 def _opts(t: FFmpegTemplate) -> FFmpegOptions:
     return FFmpegOptions(
         **{f: getattr(t, f) for f in FFmpegOptions.__dataclass_fields__ if hasattr(t, f)})

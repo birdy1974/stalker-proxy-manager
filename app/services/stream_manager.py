@@ -344,12 +344,16 @@ class StreamManager:
         return b""
 
     @staticmethod
-    def _ffmpeg_argv(cmd_template: str, url: str) -> list[str] | None:
+    def _ffmpeg_argv(cmd_template: str, url: str, title: str | None = None) -> list[str] | None:
         """Render a template + input into an argv list, or None if unusable.
 
         Local paths are quoted so `shlex.split` keeps spaces/quotes as one
         `-i` argument, and network-only flags are stripped so ffmpeg does not
         abort with "Option reconnect not found" on a file.
+        
+        If title is provided, injects -metadata title=... into the output so
+        players (VLC, etc.) display the correct stream name instead of whatever
+        metadata the source stream contains.
         """
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
             return None
@@ -367,9 +371,25 @@ class StreamManager:
             args = shlex.split(cmd_text)
         except ValueError:
             return None
-        return args or None
+        if not args:
+            return None
+        # Inject metadata title before the output format specifier so players
+        # display the correct stream name instead of source stream metadata
+        if title:
+            try:
+                # Find the last -i (input marker) to locate the output section
+                last_i = max(idx for idx, a in enumerate(args) if a == "-i")
+                # Find -f in the output section (after the last -i)
+                f_idx = args.index("-f", last_i)
+                # Insert metadata before -f
+                args[f_idx:f_idx] = ["-metadata", f"title={title}"]
+            except (ValueError, IndexError):
+                # No -f found, insert before the last argument (the output)
+                if len(args) > 1:
+                    args[-1:-1] = ["-metadata", f"title={title}"]
+        return args
 
-    async def _spawn(self, cmd_template: str, url: str) -> asyncio.subprocess.Process | None:
+    async def _spawn(self, cmd_template: str, url: str, title: str | None = None) -> asyncio.subprocess.Process | None:
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
             await db_log("ERROR", "stream",
                          "cannot spawn the redirect template as ffmpeg "
@@ -378,10 +398,12 @@ class StreamManager:
         if "<out_dir>" in (cmd_template or ""):
             await db_log("ERROR", "stream", "template uses HLS file output; use mpegts for live proxying")
             return None
-        args = self._ffmpeg_argv(cmd_template, url)
+        args = self._ffmpeg_argv(cmd_template, url, title)
         if not args:
             await db_log("ERROR", "stream", "unparseable ffmpeg template")
             return None
+        # Log the full command for debugging
+        await db_log("DEBUG", "ffmpeg", f"spawn command: {' '.join(args)}")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdin=asyncio.subprocess.DEVNULL,
@@ -781,7 +803,7 @@ class StreamManager:
                 if not chain:
                     return
                 _tag, path = chain[0]
-                proc = await self._spawn(h.command, path)
+                proc = await self._spawn(h.command, path, h.item_name)
                 if proc is None:
                     return
                 h.url, h.proc = path, proc
@@ -843,7 +865,7 @@ class StreamManager:
                     # lock the MAC BEFORE starting ffmpeg so parallel requests
                     # see it as occupied immediately
                     self.mac_locks[mac_row.id] = h.id
-                    proc = await self._spawn(h.command, url)
+                    proc = await self._spawn(h.command, url, h.item_name)
                     if proc is None:
                         self.mac_locks.pop(mac_row.id, None)
                         continue
