@@ -59,24 +59,12 @@ _NETONLY_OPTS = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout|user_agent|headers|http_proxy"
     r"|seekable|multiple_requests|referer)\b\s*(?:\S+)?")
 _NET_SCHEMES = ("http://", "https://")
-# Subtitle codecs, by what a transcoded MPEG-TS pipe can do with them:
-# bitmap ones survive a re-encode into the DVB track of the output TS; text
-# ones cannot enter MPEG-TS at all (they can only be BURNED into the picture).
+# Subtitle codecs a transcoded MPEG-TS pipe can keep: bitmap ones survive a
+# re-encode into the DVB track of the output TS. Text subs (SRT/ASS/...) can
+# only be burned into the picture - which needs CPU video frames, so with
+# hardware-only transcoding there is deliberately nothing text subs can do
+# here: they are dropped (safely, by the gate - never by an ffmpeg abort).
 _BITMAP_SUB_CODECS = {"dvb_subtitle", "dvd_subtitle", "hdmv_pgs_subtitle", "xsub"}
-_TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "text", "webvtt", "mov_text"}
-
-
-_FILTER_SENTINEL = "__SPM_BURN_URL__"   # space-free stand-in for <url> in subtitles=
-
-
-def _filter_path(path: str) -> str:
-    """Escape a filename for use INSIDE a filtergraph option value (the
-    subtitles= burn filter). Filter values are not shell: ',', ':', '[', ']',
-    ';', quote and backslash are special there, spaces are not."""
-    out = path.replace("\\", "\\\\").replace("'", "\\'")
-    for ch in (":", ",", "[", "]", ";"):
-        out = out.replace(ch, "\\" + ch)
-    return out
 
 
 class _WithTemplate:
@@ -377,19 +365,20 @@ class StreamManager:
         return b""
 
     @staticmethod
-    def _strip_subs(args: list[str], *, keep_filter: bool = False) -> list[str]:
+    def _strip_subs(args: list[str]) -> list[str]:
         """
         Remove every subtitle OUTPUT mechanism from argv:
 
           * `-map` specs that address a subtitle stream (`:s`)
           * `-c:s` / `-scodec` pairs
-          * the `subtitles=` burn filter inside a -vf value (unless
-            keep_filter=True - the burn-keep path drops the stream machinery
-            but keeps rendering text into the picture)
+          * the `subtitles=` burn filter inside a -vf value (burn-in is gone:
+            it needs CPU video frames, and hardware-only transcoding is the
+            supported path - a legacy command that still carries the filter
+            gets it stripped here instead of dying inside the filtergraph)
 
         Video/audio maps and the rest of the filter chain are untouched;
-        segments split on unescaped commas, so a filter-escaped path with
-        '\,' survives intact.
+        segments split on unescaped commas, so filter-escaped separators
+        ('\,') inside the remaining filters survive intact.
         """
         out: list[str] = []
         i = 0
@@ -402,8 +391,7 @@ class StreamManager:
             if t in ("-c:s", "-scodec") and nxt is not None:
                 i += 2                     # subtitle codec -> dropped
                 continue
-            if t == "-vf" and nxt is not None and "subtitles=" in nxt \
-                    and not keep_filter:
+            if t == "-vf" and nxt is not None and "subtitles=" in nxt:
                 segs = re.split(r"(?<!\\),", nxt)
                 kept = [s for s in segs if s.strip() and not s.strip().startswith("subtitles=")]
                 if kept:
@@ -490,26 +478,19 @@ class StreamManager:
         stops mid-playback. Live inputs are already paced by the encoder on
         the other end and must NOT be throttled.
 
-        Subtitle intents (dvb/burn) are NOT flattened here: they are checked
-        against the real source by the async _subs_gate at spawn time, which
-        alone knows whether the file/link actually carries a convertible
-        track. Everything else gets the plain "no subtitles" net.
+        A dvb subtitle intent (a command text that maps subtitle streams) is
+        NOT flattened here: it is checked against the real source by the
+        async _subs_gate at spawn time, which alone knows whether the
+        file/link actually carries a convertible (bitmap) track. Everything
+        else gets the plain "no subtitles" net (which also strips a legacy
+        subtitles= burn filter from the -vf value).
         """
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
             return None
         is_net = url.lower().startswith(_NET_SCHEMES)
-        wants_burn = "subtitles=" in cmd_template
-        cmd_text = cmd_template
-        if wants_burn:
-            # the burn filter reads the FILE, not a stream. The real path must
-            # NOT go through shlex quoting (a filtergraph is not a shell), so
-            # park a space-free sentinel here and substitute the filter-escaped
-            # path into the -vf token after the split.
-            cmd_text = cmd_text.replace("subtitles=" + URL_PLACEHOLDER,
-                                        "subtitles=" + _FILTER_SENTINEL)
         insert = url if is_net else shlex.quote(url)
         cmd_text = StreamManager._network_input_options(
-            cmd_text.replace(URL_PLACEHOLDER, insert), url)
+            cmd_template.replace(URL_PLACEHOLDER, insert), url)
         if not is_net:
             cmd_text = _NETONLY_OPTS.sub(" ", cmd_text)
         if cmd_text.startswith("ffmpeg"):
@@ -522,10 +503,7 @@ class StreamManager:
             return None
         if not args:
             return None
-        if wants_burn:
-            esc = _filter_path(url)
-            args = [t.replace(_FILTER_SENTINEL, esc) for t in args]
-        if not wants_burn and not StreamManager._has_sub_map(cmd_template):
+        if not StreamManager._has_sub_map(cmd_template):
             args = StreamManager._drop_subtitles(args)
         if pace and not ({"-re", "-readrate", "-readrate_initial"} & set(args)):
             try:
@@ -551,58 +529,26 @@ class StreamManager:
     async def _subs_gate(self, args: list[str], url: str, pace: bool,
                          name: str = "") -> list[str]:
         """
-        Per-source reality check for dvb/burn subtitle intents.
+        Per-source reality check for the dvb subtitle intent.
 
         The template says what it WANTS; whether the source can deliver it is
         a property of the file/link being played. The gate probes the source
-        once (8 s cap, 10 min cache) and degrades to the safe default - no
-        subtitle track in the pipe - instead of letting ffmpeg abort before
-        its first output byte. Live inputs (pace=False) are trusted instead of
-        probed: zapping must stay instant, and live MPEG-TS carries DVB bitmap
-        subs natively - the only kind the dvb mode can keep anyway.
+        once (8 s cap, 10 min cache keyed without the per-play token) and
+        degrades to the safe default - no subtitle track in the pipe - instead
+        of letting ffmpeg abort before its first output byte. Live inputs
+        (pace=False) are trusted instead of probed: zapping must stay instant,
+        and live MPEG-TS carries DVB bitmap subs natively - the only kind the
+        dvb mode can keep anyway.
+
+        dvb is hardware-safe: the subtitle track is demuxed and re-encoded
+        independently of the video, so the VAAPI/QSV pipeline
+        (hw decode -> scale_vaapi/qsv -> hw encode) never touches it.
         """
         tag = f"[{name}] " if name else ""
         is_net = url.lower().startswith(_NET_SCHEMES)
-        vf = next((args[i + 1] for i, t in enumerate(args)
-                   if t == "-vf" and i + 1 < len(args) and "subtitles=" in args[i + 1]),
-                  None)
         mapped = "-c:s" in args or "-scodec" in args
-        if vf is None and not mapped:
+        if not mapped:
             return args
-
-        # ---- burn: libass renders text onto the picture ---------------------
-        if vf is not None:
-            self_ref = _filter_path(url) in vf or url in vf
-            on_gpu = any(t in args for t in ("-init_hw_device", "-hwaccel",
-                                             "-hwaccel_output_format")) \
-                or any("scale_vaapi" in a or "scale_qsv" in a for a in args)
-            if on_gpu:
-                await db_log("INFO", "stream", tag +
-                             "burn-in needs the software (libx264) path "
-                             "-> subtitles dropped")
-                return StreamManager._ensure_sn(StreamManager._strip_subs(args))
-            if not self_ref:
-                # the filter reads an EXTERNAL subtitle file the template
-                # points at - the input's own tracks are irrelevant
-                return StreamManager._ensure_sn(StreamManager._strip_subs(args, keep_filter=True))
-            if is_net:
-                await db_log("INFO", "stream", tag +
-                             "burn-in reads the source file: local files only "
-                             "(the filter cannot re-open a tokenised CDN link "
-                             "with the right identity) -> subtitles dropped")
-                return StreamManager._ensure_sn(StreamManager._strip_subs(args))
-            subs = await subtitle_streams(url, is_url=False)
-            if subs and any(s["codec"] in _TEXT_SUB_CODECS for s in subs):
-                return StreamManager._ensure_sn(StreamManager._strip_subs(args, keep_filter=True))
-            if subs is not None:
-                await db_log("INFO", "stream", tag +
-                             "no text subtitle track to burn ("
-                             + ", ".join(s["codec"] for s in subs) + ")"
-                             " -> subtitles dropped")
-            else:
-                await db_log("INFO", "stream", tag +
-                             "subtitle probe failed -> subtitles dropped (safe default)")
-            return StreamManager._ensure_sn(StreamManager._strip_subs(args))
 
         # ---- dvb / copy: keep BITMAP subtitles as a track in the output TS --
         if not pace:                       # live: opt-in trusted, no probe

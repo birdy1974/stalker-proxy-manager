@@ -328,40 +328,31 @@ def test_dreambox_preset_targets_mpeg2_ts_for_enigma2():
     assert "-f mpegts" in dreambox["command"]
 
 
-def test_templates_drop_subtitles_for_the_ts_pipe():
-    """The output is an mpegts/HLS pipe that cannot carry SRT/ASS/PGS (text
-    subs die at the dvbsub encoder, PGS has no converter, subrip dies at the
-    mpegts muxer) - ffmpeg aborts before the first byte, which used to make
-    every subtitle-bearing VOD/local file fail. Templates therefore pin -sn;
+def test_subtitle_modes_drop_by_default_dvb_as_opt_in():
+    """The default renders -sn (a subtitle track that cannot be encoded
+    aborts ffmpeg before the first byte). The dvb opt-in maps the BITMAP
+    track instead - hardware-safe (independent of the video pipeline);
     redirect is a marker."""
-    variants = [
+    for opts in [
         FFmpegOptions(),
         FFmpegOptions(hw_accel="none", video_codec="libx264"),
-        FFmpegOptions(hw_accel="none", video_codec="copy",
-                      audio_codec="copy", resolution="source"),
         FFmpegOptions(video_codec="hevc_vaapi"),
         FFmpegOptions(hw_accel="qsv", video_codec="h264_qsv"),
         FFmpegOptions(audio_codec="none"),
-    ]
-    for opts in variants:
+    ]:
         cmd = build_command(opts)
         toks = cmd.split()
         assert "-sn" in toks, cmd
         assert "0:s?" not in toks, cmd
         assert "-c:s" not in toks and "dvbsub" not in toks, cmd
         assert "-dn" in toks
-        # 2-way sync stays stable: -sn parses back to -sn, nothing leaks into
-        # extra_output
         parsed = parse_command(cmd)
-        assert "-sn" in build_command(FFmpegOptions(**parsed["options"])).split()
+        assert parsed["options"]["subs"] == "drop"
         assert "-c:s" not in (parsed["options"]["extra_output"] or "")
 
-    for name, p in {p["name"]: p for p in default_presets()}.items():
-        if name == REDIRECT_PRESET_NAME:
-            assert p["command"] == REDIRECT_COMMAND
-            continue
-        toks = p["command"].split()
-        assert "-sn" in toks, name
-        assert "0:s?" not in toks, name
-        assert "-c:s" not in toks and "dvbsub" not in toks, name
-        assert "-dn" in toks, name
+    # the dvb opt-in (what every shipped preset uses)
+    cmd = build_command(FFmpegOptions(hw_accel="vaapi", video_codec="h264_vaapi",
+                                      subs="dvb"))
+    assert "-map 0:s?" in cmd and "-c:s dvbsub" in cmd and "-sn" not in cmd
+    assert parse_command(cmd)["options"]["subs"] == "dvb"
+    assert build_command(FFmpegOptions(**parse_command(cmd)["options"])) == cmd

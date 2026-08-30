@@ -187,7 +187,12 @@ _SUBS_CACHE_TTL = 600.0
 
 
 async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
-    key = f"{target}|{is_url}"
+    # The cache key drops the query string: portal links carry a fresh
+    # play_token per play, but the FILE (and its subtitle tracks) behind the
+    # same path never changes - so a second play of the same movie skips the
+    # probe entirely.
+    base = target.split("?", 1)[0] if is_url else target
+    key = f"{base}|{is_url}"
     hit = _SUBS_CACHE.get(key)
     if hit and time.time() - hit[0] < _SUBS_CACHE_TTL:
         return hit[1]

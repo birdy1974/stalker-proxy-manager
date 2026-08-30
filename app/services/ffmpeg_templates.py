@@ -58,10 +58,14 @@ HW_CHOICES = ["none", "vaapi", "qsv"]
 #   drop  - no subtitles in the output (safe default; the TS/HLS pipe cannot
 #           carry SRT/ASS/PGS at all)
 #   dvb   - keep BITMAP subtitles as a DVB track in the output TS (PGS/DVD/DVB
-#           re-encode bitmap->bitmap; text sources are auto-dropped at spawn)
-#   burn  - render TEXT subtitles into the picture (software transcode of
-#           local files; enforced at spawn time)
-SUB_MODES = ("drop", "dvb", "burn")
+#           re-encode bitmap->bitmap; text sources are auto-dropped at spawn).
+#           Hardware-safe by design: the subtitle track is demuxed and
+#           re-encoded independently of the video, so the VAAPI/QSV pipeline
+#           (hw decode -> scale_vaapi/qsv -> hw encode) is untouched. There is
+#           deliberately NO burn-in mode: rendering text into the picture
+#           needs CPU video frames (libass overlay), which would defeat
+#           hardware-only transcoding.
+SUB_MODES = ("drop", "dvb")
 # VAAPI rate-control modes (h264_vaapi/hevc_vaapi). ffmpeg's encoder aliases
 # are uppercase (see `ffmpeg -h encoder=h264_vaapi`). "AUTO" = let the driver
 # choose; everything else is passed through as-is so the command stays honest.
@@ -214,7 +218,7 @@ class FFmpegOptions:
     audio_channels: str = "2"
     audio_rate: str = "48000"
     output_format: str = "mpegts"           # mpegts | hls
-    subs: str = "drop"                      # drop | dvb | burn (see SUB_MODES)
+    subs: str = "drop"                      # drop | dvb (see SUB_MODES)
     extra_input: str = ""                   # appended after built-in input flags
     extra_output: str = ""                  # appended before -f <format>
 
@@ -234,6 +238,7 @@ def coerce_options(base: dict | None) -> dict:
             out[k] = v if isinstance(v, bool) else (
                 str(v).strip().lower() not in ("", "0", "false", "off", "no"))
         elif k == "subs":
+            # a stale "burn" (removed: software-only) degrades to drop
             out[k] = str(v).strip().lower() if str(v).strip().lower() in SUB_MODES else "drop"
         else:
             out[k] = v if isinstance(v, str) else str(v)
@@ -292,13 +297,6 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
             if opts.fps:
                 filters.append(f"fps={opts.fps}")
             filters.append("format=yuv420p")
-            if mode == "burn":
-                # burn TEXT subtitles into the picture. Software path only:
-                # the overlay needs CPU frames, and vaapi/qsv output frames
-                # cannot feed a libass overlay. StreamManager strips this at
-                # spawn time when the source turns out to carry no text
-                # subtitle track (see StreamManager._subs_gate).
-                filters.append(f"subtitles={URL_PLACEHOLDER}")
         filters.append("setsar=1")      # neutral SAR honours the aspect choice
         c += ["-vf", ",".join(filters)]
 
@@ -314,10 +312,11 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     #     outright;
     #   * bitmap subs (PGS/vobsub) -> there is no bitmap->DVB converter in
     #     ffmpeg, the encode fails the same way.
-    # `subs="burn"` renders TEXT subs into the picture via the subtitles
-    # filter (software transcode branch above); StreamManager re-checks every
-    # dvb/burn mapping at spawn time against the real source (probe) so a
-    # non-convertible source degrades to -sn instead of killing the stream.
+    # dvb is hardware-safe: the track is demuxed and re-encoded independently
+    # of the video, so -hwaccel/-hwaccel_output_format keep applying to the
+    # video alone. StreamManager re-checks every dvb mapping at spawn time
+    # against the real source (probe) so a text-only source degrades to -sn
+    # instead of killing the stream.
     c += ["-map", "0:v:0"]
     c += ["-map", "0:a:0?"] if opts.audio_codec != "none" else ["-an"]
     if mode == "dvb":
@@ -382,8 +381,11 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
 
     # ---- subtitles ----------------------------------------------------------
     # dvb: bitmap (PGS/DVD/DVB) -> DVB subtitles in the output TS. A remux
-    # template (video copy) carries them as-is instead of re-encoding; text
-    # sources are refused at spawn time by the probe gate.
+    # template (video copy) carries already-DVB tracks as-is instead of
+    # re-encoding; text-only sources are degraded to -sn at spawn time by the
+    # probe gate. The tiny bitmap re-encode runs on the CPU in every case
+    # (no GPU does dvbsub), but it is a few kbit/s of palletised bitmap - the
+    # VIDEO pipeline stays 100% hardware.
     if mode == "dvb":
         c += ["-c:s", "copy" if opts.video_codec == "copy" else "dvbsub"]
 
@@ -461,7 +463,6 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
     sub_map = False          # a -map ...:s... spec was seen (dvb intent)
     sub_codec = None         # -c:s/-scodec value seen in the output section
     sn_seen = False          # an explicit -sn was seen
-    burn_seen = False        # a subtitles= video filter was seen
     while i < len(toks):
         t = toks[i]
         if t == "-i":
@@ -526,8 +527,13 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
             if fm:
                 opts.fps = fm.group(1)
             if "subtitles=" in vf:
-                burn_seen = True        # verdict comes at the end
-            if m is None and "format" not in vf and "subtitles=" not in vf:
+                # burn-in was removed (software-only: libass needs CPU video
+                # frames). The filter is dropped from the rendered command and
+                # flagged, not silently kept in extra_output - a filter that
+                # reads <url> would break the shlex-quoted substitution.
+                warnings.append("subtitles= burn filter dropped: software-only, "
+                                "hardware-only transcoding is supported")
+            elif m is None and "format" not in vf:
                 warnings.append(f"unrecognised video filter kept as-is: {vf}")
                 unhandled_out += ["-vf", vf]
             i += 2
@@ -601,15 +607,11 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
 
     opts.extra_input = " ".join(x for x in unhandled_in if x != URL_PLACEHOLDER)
     opts.extra_output = " ".join(x for x in unhandled_out if x not in _OWNED_TARGETS)
-    # Subtitle verdict, order-independent (build_command emits -vf, -map and
-    # -sn in its own order; a hand-written command may use any): a subtitles
-    # filter burns text into the picture (its -sn companion only stops extra
-    # sub STREAMS from reaching the muxer, so burn wins), a subtitle map
-    # without -sn means "keep as DVB", an explicit -sn alone means drop.
+    # Subtitle verdict, order-independent (build_command emits -map and -sn in
+    # its own order; a hand-written command may use any): a subtitle map or
+    # codec without -sn means "keep as DVB", an explicit -sn alone means drop.
     # Nothing mentioned -> the base keeps its value (partial-parse rule).
-    if burn_seen:
-        opts.subs = "burn"
-    elif (sub_map or sub_codec is not None) and not sn_seen:
+    if (sub_map or sub_codec is not None) and not sn_seen:
         opts.subs = "dvb"
     elif sn_seen:
         opts.subs = "drop"
@@ -628,25 +630,32 @@ def default_presets() -> list[dict]:
     # bitrate numbers still filled in - flip the template to VBR or CBR and the
     # tuning above is what you get back, no retyping.
     mk = lambda name, **kw: {**asdict(FFmpegOptions(**kw)), "name": name}   # noqa: E731
+    # Every template ships subs="dvb" (hardware-safe BITMAP subtitle
+    # passthrough): the subtitle track is demuxed and re-encoded independently
+    # of the video, so the hw decode->scale->encode pipeline stays untouched,
+    # and the spawn-time gate degrades text-only sources to -sn instead of
+    # dying. Copy carries already-DVB tracks with -c:s copy; the Dreambox gets
+    # exactly the DVB subs its Enigma2 GUI understands.
     presets = [
-        mk(REFERENCE_PRESET_NAME, low_power=True, async_depth="4"),
+        mk(REFERENCE_PRESET_NAME, low_power=True, async_depth="4", subs="dvb"),
         mk("VAAPI 1080p ~2.5M", resolution="1080p", video_bitrate="2500k",
-           maxrate="2750k", bufsize="5000k", low_power=True, async_depth="4"),
+           maxrate="2750k", bufsize="5000k", low_power=True, async_depth="4",
+           subs="dvb"),
         # No -rc_mode for QSV: h264_qsv drives rate control through its own
         # options (-global_quality/-extbrc) and rejects the VAAPI flag, so
         # build_command keeps this tuning inside VAAPI_ENCODERS. The field says
         # CQP anyway, so the row, the GUI and every other template agree.
-        mk("QSV 720p ~1M", hw_accel="qsv", video_codec="h264_qsv"),
+        mk("QSV 720p ~1M", hw_accel="qsv", video_codec="h264_qsv", subs="dvb"),
         mk("Software 720p ~1.2M (libx264)", hw_accel="none", video_codec="libx264",
-           video_bitrate="1200k", maxrate="1300k", bufsize="2400k"),
+           video_bitrate="1200k", maxrate="1300k", bufsize="2400k", subs="dvb"),
         mk(COPY_PRESET_NAME, hw_accel="none", video_codec="copy",
-           audio_codec="copy", resolution="source"),
+           audio_codec="copy", resolution="source", subs="dvb"),
         mk("Dreambox DM800se (Enigma2 / MPEG2-SD)", hw_accel="vaapi",
            resolution="576p", aspect="16:9", video_codec="h264_vaapi",
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k",
            fps="25", gop="50", profile="main", level="3.1",
            low_power=True, async_depth="4",
-           audio_codec="mp2", audio_bitrate="192k"),
+           audio_codec="mp2", audio_bitrate="192k", subs="dvb"),
     ]
     for p in presets:
         opts = {k: v for k, v in p.items() if k != "name"}
