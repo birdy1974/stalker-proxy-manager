@@ -90,6 +90,11 @@
                 <select class="form-select form-select-sm ff-field" id="f-audio_channels"><option selected>2</option><option>1</option><option>6</option></select></div>
               <div class="col-3"><label class="muted-label">Sample rate</label>
                 <select class="form-select form-select-sm ff-field" id="f-audio_rate"><option selected>48000</option><option>44100</option></select></div>
+              <div class="col-4"><label class="muted-label" title="drop = no subtitles in the output pipe (safe default). dvb = keep BITMAP subtitles (PGS/DVD/DVB) as a DVB track in the TS - hardware-safe, the video stays fully VAAPI/QSV; text-only sources are auto-dropped. Burn-in is not offered: it needs CPU video frames (software transcoding).">Subtitles</label>
+                <select class="form-select form-select-sm ff-field" id="f-subs">
+                  <option value="drop" selected>Drop (-sn)</option>
+                  <option value="dvb">Keep as DVB (bitmap, hw-safe)</option>
+                </select></div>
               <div class="col-4"><label class="muted-label">Output</label>
                 <select class="form-select form-select-sm ff-field" id="f-output_format"><option value="mpegts">MPEG-TS (pipe)</option><option value="hls">HLS (files)</option></select></div>
               <div class="col-6"><label class="muted-label">Extra input flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_input"></div>
@@ -130,7 +135,7 @@
 const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","video_codec","video_bitrate",
   "maxrate","bufsize","fps","gop","profile","level","low_power","rc_mode","global_quality","async_depth",
   "audio_codec","audio_bitrate","audio_channels",
-  "audio_rate","output_format","extra_input","extra_output"];
+  "audio_rate","output_format","subs","extra_input","extra_output"];
 let current = null, templates = [];
 const isRedirectTpl = (t) => (t.command || "").trim() === "@redirect";
 

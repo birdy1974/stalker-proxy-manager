@@ -8,7 +8,11 @@ that make VAAPI encoding actually fast and deterministic on that silicon:
   * -rc_mode CQP   -> explicit rate control, quality-pinned (AUTO is
                       driver-dependent, and CQP needs -global_quality)
   * -async_depth 4 -> more frames in flight
-  * -map 0:s? / -c:s dvbsub -> keep DVB subtitles when the source has them
+  * -sn            -> subtitles dropped: the mpegts/HLS pipe cannot carry the
+                      SRT/ASS/PGS tracks found in VOD/local containers, and
+                      the old `-map 0:s? -c:s dvbsub` mapping made ffmpeg die
+                      at output init on exactly those files (live TS kept
+                      working, which is why only VOD appeared broken)
 
 These tests pin both directions of the 2-way sync so a GUI edit can never
 silently drop them.
@@ -324,33 +328,31 @@ def test_dreambox_preset_targets_mpeg2_ts_for_enigma2():
     assert "-f mpegts" in dreambox["command"]
 
 
-def test_persistent_templates_carry_optional_dvb_subtitles():
-    """Every real ffmpeg command maps optional DVB subs; redirect is a marker."""
-    variants = [
+def test_subtitle_modes_drop_by_default_dvb_as_opt_in():
+    """The default renders -sn (a subtitle track that cannot be encoded
+    aborts ffmpeg before the first byte). The dvb opt-in maps the BITMAP
+    track instead - hardware-safe (independent of the video pipeline);
+    redirect is a marker."""
+    for opts in [
         FFmpegOptions(),
         FFmpegOptions(hw_accel="none", video_codec="libx264"),
-        FFmpegOptions(hw_accel="none", video_codec="copy",
-                      audio_codec="copy", resolution="source"),
         FFmpegOptions(video_codec="hevc_vaapi"),
         FFmpegOptions(hw_accel="qsv", video_codec="h264_qsv"),
         FFmpegOptions(audio_codec="none"),
-    ]
-    for opts in variants:
+    ]:
         cmd = build_command(opts)
         toks = cmd.split()
-        assert "-sn" not in toks
-        assert "-map" in toks and "0:s?" in toks
-        assert "-c:s" in toks and "dvbsub" in toks
+        assert "-sn" in toks, cmd
+        assert "0:s?" not in toks, cmd
+        assert "-c:s" not in toks and "dvbsub" not in toks, cmd
         assert "-dn" in toks
         parsed = parse_command(cmd)
+        assert parsed["options"]["subs"] == "drop"
         assert "-c:s" not in (parsed["options"]["extra_output"] or "")
 
-    for name, p in {p["name"]: p for p in default_presets()}.items():
-        if name == REDIRECT_PRESET_NAME:
-            assert p["command"] == REDIRECT_COMMAND
-            continue
-        toks = p["command"].split()
-        assert "-sn" not in toks, name
-        assert "0:s?" in toks, name
-        assert "-c:s" in toks and "dvbsub" in toks, name
-        assert "-dn" in toks, name
+    # the dvb opt-in (what every shipped preset uses)
+    cmd = build_command(FFmpegOptions(hw_accel="vaapi", video_codec="h264_vaapi",
+                                      subs="dvb"))
+    assert "-map 0:s?" in cmd and "-c:s dvbsub" in cmd and "-sn" not in cmd
+    assert parse_command(cmd)["options"]["subs"] == "dvb"
+    assert build_command(FFmpegOptions(**parse_command(cmd)["options"])) == cmd

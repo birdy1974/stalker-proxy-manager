@@ -74,7 +74,12 @@ function openModal({ title, body, footer, size = "lg", onClose, extraClass = "",
       el("button", { type: "button", class: "btn-close", "aria-label": "Close", onclick: close }));
   }
   modal.show();
-  return { close, root: wrap, modal };
+  // `footer` is the LIVE .modal-footer node: callers (the player popup)
+  // append their buttons after openModal returns. Returning the modal without
+  // it made `m.footer.append(...)` throw a TypeError right after the popup
+  // opened - the player was never attached, the footer stayed empty and the
+  // popup was a dead black box (the original "preview gets no input" bug).
+  return { close, root: wrap, modal, footer: $(".modal-footer", wrap) };
 }
 const mBtn = (label, cls, fn, icon = "") =>
   el("button", { class: `btn btn-sm ${cls}`, type: "button", onclick: fn, html: (icon ? `<i class="bi ${icon} me-1"></i>` : "") + esc(label) });
@@ -370,27 +375,62 @@ const MSE_OK_AUDIO = /^(mp4a|aac)$/i;
 const browserPlayable = (codec) => !codec || MSE_OK_VIDEO.test(codec) || MSE_OK_AUDIO.test(codec);
 
 function playInModal(url, title) {
-  const video = el("video", { controls: "", autoplay: "", class: "w-100", style: "background:#000;max-height:65vh" });
+  /* Muted + playsinline autoplay: Chromium (Chrome/Brave/Edge) and every
+     iframe-embedded player block UNMUTED autoplay, which rendered this popup
+     as a black box "that does not get any input" even while the stream was
+     flowing. Sound comes back via the sound button (a user gesture, so the
+     browser allows it). */
+  const video = el("video", { controls: "", autoplay: "", muted: "", playsinline: "",
+                              class: "w-100", style: "background:#000;max-height:65vh" });
   const status = el("div", { class: "small text-muted mt-1" }, `Source: ${url}`);
-  const diag = el("div", { class: "small mt-2 d-none" });
+  const diag = el("div", { class: "small mt-2 p-2 bg-dark text-light mono",
+                           style: "max-height:180px;overflow:auto;white-space:pre-wrap;border-radius:4px" });
   const body = el("div", {}, video, status, diag);
-  let engine = null, settled = false;
+  let engine = null, settled = false, ticker = null, received = 0, lastStats = "";
+  let soundBtn = null;
 
+  const diagLines = [];
+  const pushDiag = (line) => {
+    const t = new Date().toLocaleTimeString();
+    diagLines.push(`[${t}] ${line}`);
+    if (diagLines.length > 40) diagLines.splice(0, diagLines.length - 40);
+    diag.textContent = diagLines.join("\n");
+    diag.scrollTop = diag.scrollHeight;
+  };
   const say = (html, cls) => {
     diag.className = `small mt-2 alert ${cls || "alert-warning"} mb-0 py-2`;
     diag.innerHTML = html;
   };
+  const backToLog = () => {
+    diag.className = "small mt-2 p-2 bg-dark text-light mono";
+    diag.style.cssText = "max-height:180px;overflow:auto;white-space:pre-wrap;border-radius:4px";
+    diag.textContent = diagLines.join("\n");
+  };
   const ok = (txt) => { if (!settled) { settled = true; status.textContent = txt; } };
-  const fail = (why, hint) => say(
-    `<div><b>Not playing:</b> ${esc(why)}</div>` +
-    (hint ? `<div class="mt-1 text-muted">${hint}</div>` : ""), "alert-warning");
+  const fail = (why, hint) => {
+    pushDiag("FAIL: " + why);
+    say(`<div><b>Not playing:</b> ${esc(why)}</div>` +
+        (hint ? `<div class="mt-1 text-muted">${hint}</div>` : "") +
+        `<div class="mt-1 text-muted">Technical detail below - scroll the log.</div>`, "alert-warning");
+  };
 
   const m = openModal({
     title: `▶ ${title}`, body, footer: el("div"), size: "xl", extraClass: "player-modal",
     closeButton: true,
-    onClose: () => { try { engine?.destroy(); } catch {} video.pause(); video.src = ""; },
+    onClose: () => {
+      clearInterval(ticker);
+      try { engine?.destroy(); } catch {}
+      try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+    },
   });
   m.footer.append(mBtn("Stop & Close", "btn-outline-secondary", m.close, "bi-stop-circle"));
+  soundBtn = mBtn("Enable sound", "btn-outline-secondary", () => {
+    video.muted = false;
+    video.volume = 1;
+    soundBtn.disabled = true;
+    pushDiag("sound enabled by user gesture");
+  }, "bi-volume-up-fill");
+  m.footer.append(soundBtn);
 
   // The preview runs the source through an FFmpeg template, same as the real
   // output. If it stays black on copy (HEVC / AC3 / anything MediaSource cannot
@@ -423,19 +463,57 @@ function playInModal(url, title) {
                 "The player library is served from /static/vendor/ - a blocked or stale " +
                 "static mount leaves the popup with nothing to decode the transport stream.");
 
-  video.addEventListener("playing", () => ok(`▶ playing · ${url}`));
-  video.addEventListener("error", () => fail(
-    `the <video> element rejected the stream (code ${video.error?.code ?? "?"}).`,
-    "Usually an unsupported codec after transmux - see the stream probe for the " +
-    "video/audio codec, or pick a transcode template instead of copy."));
-  video.addEventListener("stalled", () => {
-    if (!settled) say("Waiting for data - the proxy has not produced any yet.", "alert-secondary");
+  // surface the player library's INTERNAL log (probe result, MSE init,
+  // appendBuffer errors, loader errors) - this is what says exactly why a
+  // given browser refuses a stream that the server is demonstrably sending.
+  if (window.mpegts && mpegts.LoggingControl && mpegts.LoggingControl.addLogListener) {
+    if (!window.__spmMpegtsLogHook) {
+      window.__spmMpegtsLogHook = true;
+      mpegts.LoggingControl.addLogListener((tag, type, msg) => {
+        if (window.__spmActiveDiag) window.__spmActiveDiag(`${type}: ${msg}`);
+      });
+    }
+    window.__spmActiveDiag = pushDiag;
+  }
+
+  video.addEventListener("playing", () => { pushDiag("event: playing"); ok(`▶ playing · ${url}`); });
+  video.addEventListener("error", () => {
+    pushDiag(`event: video.error code=${video.error?.code} ${video.error?.message || ""}`);
+    fail(`the <video> element rejected the stream (code ${video.error?.code ?? "?"}).`,
+      "Usually an unsupported codec after transmux - see the stream probe for the " +
+      "video/audio codec, or pick a transcode template instead of copy.");
   });
+  video.addEventListener("stalled", () => pushDiag("event: stalled"));
+  video.addEventListener("waiting", () => pushDiag("event: waiting (buffer empty)"));
+
+  // 1s health ticker: proves (or refutes) data flow + decode in THIS browser
+  ticker = setInterval(() => {
+    let bufEnd = 0;
+    try { bufEnd = video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0; } catch {}
+    status.textContent =
+      `${settled ? "▶" : "…"} rt${video.readyState} t=${video.currentTime.toFixed(1)}s ` +
+      `buf=${bufEnd.toFixed(1)}s rx=${(received / 1024).toFixed(0)} KB ${lastStats} · ${url}`;
+    if (settled) return;
+    if (received === 0 && performance.now() - t0 > 10000) {
+      settled = true;
+      fail("no stream bytes reached the browser in 10 s.",
+        "The popup DID open the stream (the server log shows it) - something between " +
+        "the server and this tab dropped it: a reverse proxy buffering the response, " +
+        "or a browser shield. Check Logs → stream; try outside Brave/iframes.");
+    } else if (received > 0 && video.readyState <= 1 && performance.now() - t0 > 12000) {
+      settled = true;
+      fail("stream data arrives but the browser never starts decoding it.",
+        "Read the mpegts.js lines below: a codec MediaSource cannot take (HEVC/MPEG-2/AC3) " +
+        "or an MSE error. Retry with a transcode template (H.264 + AAC).");
+    }
+  }, 1000);
+  const t0 = performance.now();
 
   try {
     if (isHls) {
       engine = new Hls({ enableWorker: true, lowLatencyMode: true });
       engine.on(Hls.Events.ERROR, (_e, d) => {
+        pushDiag(`hls ${d.type}/${d.details}${d.fatal ? " FATAL" : ""}`);
         if (d.fatal) fail(`HLS ${d.type}: ${d.details}`,
                           "A fatal HLS error means the variant playlist or segments are not " +
                           "reaching the player - check the proxy log for the stream.");
@@ -445,23 +523,36 @@ function playInModal(url, title) {
     } else {
       engine = mpegts.createPlayer({ type: "mpegts", isLive: true, url },
                                    { enableStashBuffer: false, stashInitialSize: 384 });
-      engine.on(mpegts.Events.ERROR, (type, detail, info) => fail(
-        `${type}${detail ? " / " + detail : ""}${info && info.msg ? ": " + info.msg : ""}`,
-        "mpegts.js transmuxes MPEG-TS into fMP4 for MediaSource, which only accepts " +
-        "H.264 video and AAC audio. A HEVC, MPEG-2 video or AC3/E-AC3/DTS audio stream " +
-        "will stay black on copy - use a transcode template that converts it."));
+      engine.on(mpegts.Events.ERROR, (type, detail, info) => {
+        pushDiag(`mpegts ERROR ${type}/${detail || ""} ${info?.msg || ""}`);
+        fail(`${type}${detail ? " / " + detail : ""}${info && info.msg ? ": " + info.msg : ""}`,
+          "mpegts.js transmuxes MPEG-TS into fMP4 for MediaSource, which only accepts " +
+          "H.264 video and AAC audio. A HEVC, MPEG-2 video or AC3/E-AC3/DTS audio stream " +
+          "will stay black on copy - use a transcode template that converts it.");
+      });
       engine.on(mpegts.Events.MEDIA_INFO, (mi) => {
+        pushDiag(`media info: video=${mi.videoCodec} audio=${mi.audioCodec} ` +
+                 `${mi.width}x${mi.height}`);
         const v = mi.videoCodec || "", a = mi.audioCodec || "";
         const bad = [v, a].filter(c => c && !browserPlayable(c));
         if (bad.length) say(`Codec ${bad.join(", ")} is not playable through MediaSource. ` +
           "Switch this item to a transcode template (H.264 + AAC) instead of copy.", "alert-danger");
-        else if (!settled) status.textContent = `▶ ${v || "?"} / ${a || "?"} · ${url}`;
       });
+      engine.on(mpegts.Events.STATISTICS_INFO, (s) => {
+        received = (s.receivedBytes ?? s.totalBytes ?? received);
+        const kbps = s.speed ?? s.speedKBps ?? 0;
+        lastStats = kbps ? `@${kbps.toFixed(0)} KB/s` : "";
+      });
+      engine.on(mpegts.Events.LOADING_COMPLETE, () => pushDiag("loader: server ended the stream"));
       engine.attachMediaElement(video); engine.load();
-      engine.play().catch((e) => { if (!settled) say("Autoplay blocked - press play. " + (e || ""), "alert-secondary"); });
+      engine.play().catch((e) => {
+        pushDiag(`play() rejected: ${e}`);
+        say("Autoplay was blocked - <b>press ▶ on the player</b> (the stream keeps loading).", "alert-secondary");
+      });
     }
   } catch (e) {
     fail(`player setup threw ${e && e.message ? e.message : e}.`, "");
   }
+  pushDiag(`player started: ${isHls ? "hls.js" : "mpegts.js"} · ${navigator.userAgent.slice(0, 90)}`);
   return m;
 }

@@ -192,12 +192,27 @@ ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed
        -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi
        -hwaccel_device intel -hwaccel_output_format vaapi -i <url>
        -vf scale_vaapi=w=1280:h=720:format=nv12,fps=25,setsar=1
-       -map 0:v:0 -map 0:a:0? -map 0:s? -dn
+       -map 0:v:0 -map 0:a:0? -dn -sn
        -c:v h264_vaapi -profile:v high -level 4.1
        -g 50 -r 25 -low_power 1 -rc_mode CQP -global_quality 26 -async_depth 4
-       -c:a aac -b:a 128k -ac 2 -ar 48000 -c:s dvbsub
+       -c:a aac -b:a 128k -ac 2 -ar 48000
        -f mpegts -mpegts_flags +resend_headers pipe:1
 ```
+
+**Subtitles: bitmap tracks are kept as DVB (`subs=dvb`, hardware-safe) — text tracks are dropped.** The proxy's output is an MPEG-TS/HLS pipe, and that pipe can only carry **bitmap DVB subtitles**; the text formats found in VOD/local containers (SRT/ASS/SSA) die at the `dvbsub` re-encode (`Subtitle encoding currently only possible from text to text or bitmap to bitmap`) or at the mpegts muxer, and bitmap PGS/vobsub have no text converter. Any such track aborts ffmpeg **before the first output byte** — which is why, with the old unguarded `-map 0:s? -c:s dvbsub` mapping, *every movie file with a text subtitle track* looked like "ffmpeg templates don't work for VOD/local files" while live MPEG-TS (DVB subs or none) kept playing. The 23.976 fps vs 50 fps difference people notice in the same breath is only the fingerprint of that split: film content in files vs broadcast TV over UDP/TS — the frame rate itself transcodes fine either way.
+
+**Transcoding is hardware-only here, and the subtitle support is chosen to match.** The template editor's **Subtitles** field has exactly two values:
+
+| Mode | What it does | Guarantees |
+|---|---|---|
+| **Drop** (`-sn`) | no subtitle track in the output | the safe default; never interacts with the source |
+| **Keep as DVB** (`subs=dvb`) | maps the source's subtitle track and re-encodes **bitmap** subs (PGS / DVD / DVB) into a **DVB subtitle track** in the output TS — players that decode DVB subs (VLC, Kodi, Enigma2, most MAG boxes) show them in their subtitle menu. A remux template (`-c copy`) carries already-DVB tracks through with `-c:s copy` | **hardware-safe by construction**: the subtitle track is demuxed and re-encoded *independently of the video*, so the VAAPI/QSV pipeline (`-hwaccel …` → `scale_vaapi/qsv` → hardware encode) never touches it — the only CPU work is a few kbit/s of palletised bitmap, which no GPU encoder does anyway |
+
+There is deliberately **no burn-in mode**: rendering text into the picture (libass `subtitles=` filter) requires CPU video frames, which would defeat hardware-only transcoding. A stored command that still contains a `subtitles=` filter has it stripped at spawn time, and the parser flags it (`subtitles= burn filter dropped: software-only`). Text subtitles therefore have exactly two supported routes: keep them in the *original file* (local items served with the Copy/Redirect templates play the untouched MKV/MP4, and the player loads them as usual), or pre-burn them into the file outside this proxy. Sources whose only tracks are text get their mapping **automatically degraded to `-sn` at spawn** — the spawn gate probes the file/link once (8 s cap; the 10-min cache is keyed without the per-play token, so a second play of the same movie skips the probe) and logs `no convertible (bitmap) subtitle track -> subtitles dropped` instead of letting ffmpeg die. Live plays are never probed (zapping stays instant; live TS carries DVB subs natively). Every shipped transcoding preset (VAAPI 720p/1080p, QSV, Copy, Dreambox) ships with `subs=dvb`; set the field back to *Drop* on any template if you prefer no subtitle track at all.
+
+**VOD/episode/local inputs are paced (`-re`), live never is.** A file input would otherwise be drained at *encode* speed — ffmpeg pushes a whole movie through the pipe as fast as the encoder allows, the player's buffer fills, ffmpeg hits EOF long before the viewer reaches the end, and the stream stops mid-playback. For `vod`/`episode`/`local` plays the manager therefore inserts `-re` in front of `-i` (unless the template sets its own `-re`/`-readrate`), so the file streams at its own frame rate and lasts exactly as long as the content. Live inputs are already paced by their encoder and are never throttled.
+
+
 
 **The VAAPI presets ship on `-rc_mode CQP` — constant quantiser.** Quality is pinned at the QP beside the mode dropdown (default 26) and the bitrate floats with the content: a hard scene does not get smeared into mush to protect a rate target, and a static news card does not burn bandwidth it does not need. CQP is the price of that: the encoder ignores `-b:v`/`-maxrate`/`-bufsize` in this mode, so **the renderer leaves them out of the command entirely** (a command that carries flags the encoder ignores is a command that lies — this text is also what the GUI shows and what you paste into a shell). The numbers stay filled in the template's fields: switch the mode to `VBR` or `CBR` and the tuning below is what you get back. The QP field is only rendered for `CQP`, only for VAAPI encoders, and empty (`AUTO`) means "leave the flag out and let the driver choose".
 
@@ -508,6 +523,7 @@ docker logs stalker-proxy-manager 2>&1 \
 | `[stream] no data within 12s from portal/mac` | the portal accepted the request but sends nothing (MAC busy *on the panel*, expired account, IP/geo block) | *Check Portal* in the GUI; try another MAC of the same portal |
 | `[stream] … portal said limit - connection limit for this MAC (panel says it is already streaming)` | the panel is right: that MAC already has a stream open (often a previous player that has not been timed out yet) | the chain moves to the next MAC on its own; if every MAC says `limit`, the panel's quota is the real limit |
 | `[stream] … portal said nothing_to_play` / `link_fault` | the source is dead or the CDN is unhappy — retrying with another MAC cannot help | *Fetch Sources* for that channel, or drop it from the chain |
+| `[stream] ffmpeg exited rc=1 before sending data` **only on VOD/series/local, live plays fine** | a template (usually one stored before the `-sn` fix) still maps subtitle streams: an SRT/ASS/PGS track in the movie aborts ffmpeg at output init before the first byte | re-save the template (fields side re-renders it with `-sn`), or let the spawn-time net handle it — a restart on this build fixes it without any action |
 | `create_link: portal left a mac placeholder in the link -> filled in from our MAC` | the panel serves one template for every box and expects the client to insert its MAC | informational; the URL ffmpeg got already contains the right MAC |
 | `[portal] TLS error / unable to get local issuer certificate` | the panel has a self-signed or incomplete certificate chain | tick **Allow broken TLS** for that portal (keeps every *other* portal verified) or fix the chain; do not disable verification globally |
 | `[stream] [Ch] playing the stored link via portal/mac: the channel flags say nothing needs rebuilding…` | no `create_link` was asked, by design (see *Fallback engine semantics*) | if that channel is black, the panel lied about its links: tick **Play stored links when the panel allows** off for that portal, or re-fetch the sources |

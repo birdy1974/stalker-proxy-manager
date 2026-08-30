@@ -347,6 +347,7 @@ class FFmpegTemplate(Base):
     audio_channels: Mapped[str] = mapped_column(String(4), default="2")
     audio_rate: Mapped[str] = mapped_column(String(8), default="48000")
     output_format: Mapped[str] = mapped_column(String(10), default="mpegts")  # mpegts|hls
+    subs: Mapped[str] = mapped_column(String(6), default="drop")            # drop|dvb (burn removed: software-only)
     # ----- two-way sync -----
     extra_input: Mapped[str | None] = mapped_column(Text)                  # raw extra input flags
     extra_output: Mapped[str | None] = mapped_column(Text)                 # raw extra output flags
