@@ -16,10 +16,13 @@ driver on Apollo Lake (J3455):
     (VAEntrypointEncSliceLP) - faster and far cheaper than the EU path, and
     it is exactly the entrypoint the iHD driver advertises for H.264 on the
     DS918+ (see vainfo below).
-  * `-rc_mode VBR|CBR|...` makes rate control explicit (ffmpeg's VAAPI encoder
-    aliases are uppercase). VAAPI's "AUTO" mode is undocumented and
+  * `-rc_mode CQP|VBR|CBR|...` makes rate control explicit (ffmpeg's VAAPI
+    encoder aliases are uppercase). VAAPI's "AUTO" mode is undocumented and
     driver-dependent; without an explicit mode `-b:v`/`-maxrate` are not
-    guaranteed to be honoured the same way across driver versions.
+    guaranteed to be honoured the same way across driver versions. The shipped
+    templates ask for **CQP** - constant quantiser, so picture quality is
+    pinned and the bitrate floats with the content - and a QP only means
+    something beside `-global_quality`, which is emitted in that mode.
   * `-async_depth 4` keeps more frames in flight, raising throughput and
     cutting time-to-first-frame.
 
@@ -60,6 +63,19 @@ REDIRECT_PRESET_NAME = "Redirect (bypass ffmpeg)"
 REDIRECT_COMMAND = "@redirect"
 COPY_PRESET_NAME = "Copy / passthrough (no transcode)"
 URL_PLACEHOLDER = "<url>"
+
+# Input options an HLS *playlist* needs and a plain stream does not. ffmpeg
+# refuses a .m3u8 whose segments are reached over a protocol outside the
+# whitelist ("Protocol not on whitelist") and rejects the fMP4/init segments
+# that Ministra panels like to reference ("EXT-X-MAP ... not allowed"), so a
+# perfectly valid portal link dies before a single byte is read. Added by
+# StreamManager only when the resolved link actually is a playlist, and never
+# over a user's own flag (an explicit -protocol_whitelist in the template
+# always wins).
+HLS_PROTOCOL_WHITELIST = "file,http,https,tcp,tls,crypto"
+HLS_ALLOWED_EXTENSIONS = "ALL"
+HLS_INPUT_OPTS = ["-protocol_whitelist", HLS_PROTOCOL_WHITELIST,
+                  "-allowed_extensions", HLS_ALLOWED_EXTENSIONS]
 
 
 def serves_original_file(command: str | None) -> bool:
@@ -127,6 +143,10 @@ class FFmpegOptions:
     # cannot underrun a weak download link) and carries a ~2-second VBV buffer
     # (bufsize = 2x bitrate) so brief congestion is absorbed instead of stalling
     # the player. See default_presets() for the per-resolution values.
+    # They are the rate-driven knobs, so build_command() renders them for
+    # VBR/CBR/... and NOT for -rc_mode CQP: a constant-QP encoder sets its own
+    # bitrate from the quantiser and would ignore them. They stay in the
+    # template's fields, because flipping the mode back restores the tuning.
     video_bitrate: str = "1000k"
     maxrate: str = "1100k"
     bufsize: str = "2000k"
@@ -135,7 +155,11 @@ class FFmpegOptions:
     profile: str = "high"
     level: str = "4.1"
     low_power: bool = True           # h264_vaapi: use EncSliceLP (fixed-function)
-    rc_mode: str = "VBR"             # VAAPI rate control: AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
+    rc_mode: str = "CQP"             # VAAPI rate control: AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
+    # QP for -rc_mode CQP (0-51, lower = better quality and more bits). Emitted
+    # only in CQP, because a constant-QP mode without a QP has no target at all
+    # and leaves the number to the driver. "" or "AUTO" = skip the flag on purpose.
+    global_quality: str = "26"
     async_depth: str = "4"           # VAAPI frames in flight (throughput / startup)
     audio_codec: str = "aac"
     audio_bitrate: str = "128k"
@@ -205,12 +229,22 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
 
     # ---- video encoder ------------------------------------------------------
     c += ["-c:v", opts.video_codec]
+    rc = (opts.rc_mode or "").upper()
+    # -rc_mode is a VAAPI tuning: libx264 and the QSV encoder do not know the
+    # flag at all, so for them the bitrate knobs stay in charge whatever the
+    # template's rate-control field says. Only where the mode is honoured can it
+    # make the rate flags redundant.
+    cqp = transcode and rc == "CQP" and opts.video_codec in VAAPI_ENCODERS
     if transcode:
-        if opts.video_bitrate:
+        # CQP pins the quantiser instead of the rate: -b:v/-maxrate/-bufsize are
+        # not honoured in that mode, so they are not rendered either. This text
+        # is what the GUI shows and what the user pastes into a shell, and a
+        # command carrying flags the encoder ignores is a command that lies.
+        if not cqp and opts.video_bitrate:
             c += ["-b:v", opts.video_bitrate]
-        if opts.maxrate:
+        if not cqp and opts.maxrate:
             c += ["-maxrate", opts.maxrate]
-        if opts.bufsize:
+        if not cqp and opts.bufsize:
             c += ["-bufsize", opts.bufsize]
         # profile/level only make sense for h.264-family encoders
         if opts.video_codec in ("libx264", "h264_vaapi", "h264_qsv"):
@@ -228,9 +262,10 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
         if opts.video_codec in VAAPI_ENCODERS:
             if opts.video_codec == "h264_vaapi" and opts.low_power:
                 c += ["-low_power", "1"]
-            rc = (opts.rc_mode or "").upper()
             if rc and rc != "AUTO":
                 c += ["-rc_mode", rc]
+            if cqp and str(opts.global_quality or "") not in ("", "AUTO"):
+                c += ["-global_quality", str(opts.global_quality)]
             if opts.async_depth:
                 c += ["-async_depth", opts.async_depth]
 
@@ -264,6 +299,9 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
 # --------------------------------------------------------------------------- #
 _KNOWN_WITH_VALUE = {
     "-b:v": "video_bitrate", "-maxrate": "maxrate", "-bufsize": "bufsize",
+    # both spellings of the QP: the generic codec option (what build_command
+    # renders) and the per-stream alias a user pastes in. One GUI field.
+    "-global_quality": "global_quality", "-q:v": "global_quality",
     "-g": "gop", "-r": "fps", "-profile:v": "profile", "-level": "level",
     "-b:a": "audio_bitrate", "-ac": "audio_channels", "-ar": "audio_rate",
 }
@@ -411,12 +449,19 @@ def default_presets() -> list[dict]:
     # Rate control for external (internet) streaming: maxrate stays ~10% above
     # the target so bitrate spikes cannot underrun a weak viewer link, while
     # bufsize = 2x bitrate (~2 seconds of VBV) absorbs short-lived congestion
-    # instead of freezing the player.
+    # instead of freezing the player. The VAAPI presets ship on CQP (a fixed QP:
+    # quality never dips on a hard scene, whatever the network does) with those
+    # bitrate numbers still filled in - flip the template to VBR or CBR and the
+    # tuning above is what you get back, no retyping.
     mk = lambda name, **kw: {**asdict(FFmpegOptions(**kw)), "name": name}   # noqa: E731
     presets = [
-        mk(REFERENCE_PRESET_NAME, low_power=True, rc_mode="VBR", async_depth="4"),
+        mk(REFERENCE_PRESET_NAME, low_power=True, async_depth="4"),
         mk("VAAPI 1080p ~2.5M", resolution="1080p", video_bitrate="2500k",
-           maxrate="2750k", bufsize="5000k", low_power=True, rc_mode="VBR", async_depth="4"),
+           maxrate="2750k", bufsize="5000k", low_power=True, async_depth="4"),
+        # No -rc_mode for QSV: h264_qsv drives rate control through its own
+        # options (-global_quality/-extbrc) and rejects the VAAPI flag, so
+        # build_command keeps this tuning inside VAAPI_ENCODERS. The field says
+        # CQP anyway, so the row, the GUI and every other template agree.
         mk("QSV 720p ~1M", hw_accel="qsv", video_codec="h264_qsv"),
         mk("Software 720p ~1.2M (libx264)", hw_accel="none", video_codec="libx264",
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k"),
@@ -426,7 +471,7 @@ def default_presets() -> list[dict]:
            resolution="576p", aspect="16:9", video_codec="h264_vaapi",
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k",
            fps="25", gop="50", profile="main", level="3.1",
-           low_power=True, rc_mode="VBR", async_depth="4",
+           low_power=True, async_depth="4",
            audio_codec="mp2", audio_bitrate="192k"),
     ]
     for p in presets:

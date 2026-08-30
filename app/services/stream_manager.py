@@ -40,10 +40,13 @@ from ..models import (
     SeriePlaylistSource, SerieSeason, SerieSource, VodPlaylist, VodPlaylistSource,
     VodSource,
 )
-from ..portal.pool import POOL
-from ..portal.client import MAG_UA, PortalError, StalkerClient
+from ..portal.account import mac_is_usable
+from ..portal.pool import POOL, PortalSession
+from ..portal.client import MAG_UA, PortalError, is_hls
+from ..portal.links import plan_adopted, plan_for
 from .db_logging import db_log
-from .ffmpeg_templates import REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file
+from .ffmpeg_templates import (HLS_ALLOWED_EXTENSIONS, HLS_PROTOCOL_WHITELIST,
+                               REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file)
 from .item_info import local_file_path
 
 log = logging.getLogger("spm.stream")
@@ -283,15 +286,21 @@ class StreamManager:
 
     # --------------------------------------------------------- ffmpeg spawn
     @staticmethod
-    def _network_identity(cmd_text: str, url: str) -> str:
+    def _network_input_options(cmd_text: str, url: str) -> str:
         """
-        Give ffmpeg the identity of the STB it is impersonating.
+        Give ffmpeg the identity of the STB it is impersonating, and the input
+        options the resolved link itself requires.
 
-        ffmpeg announces itself as "Lavf/61.x" and sends no Referer; plenty of
-        Stalker panels - and the CDNs in front of them - answer that with 403
-        or 405 ("Method Not Allowed") on an otherwise perfectly valid link.
-        Inject the MAG user-agent and the stream's own origin unless the
-        template already says otherwise (user edits always win).
+        Identity: ffmpeg announces itself as "Lavf/61.x" and sends no Referer;
+        plenty of Stalker panels - and the CDNs in front of them - answer that
+        with 403 or 405 ("Method Not Allowed") on an otherwise perfectly valid
+        link.
+
+        Per-input options: an HLS playlist additionally needs its segment
+        protocols whitelisted or ffmpeg refuses to open it at all (see
+        ffmpeg_templates.HLS_INPUT_OPTS). A user who wrote their own
+        -protocol_whitelist/-user_agent/-referer/-headers into the template is
+        never overridden.
         """
         if not url.lower().startswith(_NET_SCHEMES):
             return cmd_text
@@ -301,6 +310,11 @@ class StreamManager:
         if "-referer" not in cmd_text and "-headers" not in cmd_text:
             origin = url.split("://", 1)[-1].split("/", 1)[0]
             add.append(f'-referer "{url.split("://", 1)[0]}://{origin}/"')
+        if is_hls(url):                                 # two independent flags
+            if "-protocol_whitelist" not in cmd_text:
+                add.append(f'-protocol_whitelist "{HLS_PROTOCOL_WHITELIST}"')
+            if "-allowed_extensions" not in cmd_text:
+                add.append(f"-allowed_extensions {HLS_ALLOWED_EXTENSIONS}")
         if not add:
             return cmd_text
         # options belong directly in front of the input they apply to
@@ -359,7 +373,7 @@ class StreamManager:
             return None
         is_net = url.lower().startswith(_NET_SCHEMES)
         insert = url if is_net else shlex.quote(url)
-        cmd_text = StreamManager._network_identity(
+        cmd_text = StreamManager._network_input_options(
             cmd_template.replace(URL_PLACEHOLDER, insert), url)
         if not is_net:
             cmd_text = _NETONLY_OPTS.sub(" ", cmd_text)
@@ -451,7 +465,18 @@ class StreamManager:
                        appeared earlier in the chain as a different source).
         portal_first -> one MAC per portal; later sources on the same portal
                        are skipped so we hop to the next portal immediately.
+
+        MACs the *portal* says are unusable (banned / expired subscription) are
+        dropped first: opening a stream through one costs a create_link, a
+        refusal, and - on a panel that counts connections per MAC - a slot that a
+        working MAC could have used. `offline`/`error` stay in the list because
+        those are our own verdicts about transport, usually transient.
         """
+        usable = [m for m in macs if mac_is_usable(getattr(m, "status", None))]
+        if len(usable) != len(macs):
+            log.info("skipping %d mac(s) the portal says are unusable for portal %s",
+                     len(macs) - len(usable), portal_id)
+        macs = usable
         if not macs:
             return None
         if strategy == "portal_first":
@@ -678,6 +703,39 @@ class StreamManager:
               name=f"dur-local-{ref_id}")
         return h
 
+    # ---------------------------------------------------------- link (R2)
+    @staticmethod
+    def _macs_for(portal, src, macs):
+        """The MAC rows a chain step may walk, or the one thing that replaces them.
+
+        An adopted Xtream source needs no MAC at all (its URL carries the Xtream
+        credentials), and a user who adopted a portal and then removed its MACs -
+        the honest thing to do, since the panel no longer needs them - must still
+        be able to watch it. `None` means exactly that, and every MAC-slot path
+        below is guarded by `adopted`; an adopted step never touches one.
+        """
+        if macs:
+            return macs
+        if getattr(portal, "xtream_adopted", False) and getattr(src, "xtream_url", None):
+            return [None]
+        return macs
+
+    @staticmethod
+    def _plan(src, mac_row, portal, *, ffmpeg: bool = False):
+        """(ask or play as stored) for one (source, MAC), decided the same way by
+        every path. See app/portal/links.py for the rules and their reasons.
+
+        An adopted portal (R7) with a per-channel Xtream URL outranks everything,
+        including the "ffmpeg always asks" rule: there is nothing to ask for, since
+        the harvested URL *is* the stream the portal would have built.
+        """
+        if getattr(portal, "xtream_adopted", False):
+            adopted = str(getattr(src, "xtream_url", "") or "")
+            if adopted:
+                return plan_adopted(adopted, src=src, mac_row=mac_row)
+        return plan_for(src, mac_row, ffmpeg=ffmpeg,
+                        allow_direct=bool(getattr(portal, "direct_links", True)))
+
     # ------------------------------------------------------------ the pump
     async def resolve(self, kind: str, ref_id: int) -> tuple[str | None, str]:
         """
@@ -707,24 +765,38 @@ class StreamManager:
             raise ValueError(f"kind {kind!r} cannot be redirected (no portal URL)")
 
         for _src, portal, macs in chain:
-            for mac_row in macs:
-                if mac_row.id in self.mac_locks:
+            for mac_row in self._macs_for(portal, _src, macs):
+                if mac_row is not None and mac_row.id in self.mac_locks:
                     continue                      # occupied by one of our own pipes
-                client = await POOL.get(portal.resolved_url or portal.base_url,
-                                        mac_row.mac, mac_row.password, portal.proxy_url)
+                # Decided first, before any portal session exists: the point of
+                # R2 is that a channel the panel described as permanent costs the
+                # player one redirect and us *nothing* - no handshake reuse, no
+                # token, no create_link. The old shape paid for all of that and
+                # then threw the answer away in favour of the stored URL anyway.
+                plan = self._plan(_src, mac_row, portal)
+                if plan.policy.direct:
+                    await db_log("INFO", "stream",
+                                 f"[{item_name}] playing the stored link via "
+                                 f"{portal.name}/{mac_row.mac}: {plan.policy.reason}")
+                    return plan.direct_url, item_name
+                client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                 try:
                     if not portal.resolved_url:
                         from ..portal.resolver import resolve_portal
-                        res = await resolve_portal(portal.base_url, mac=mac_row.mac)
+                        res = await resolve_portal(portal.base_url, mac=mac_row.mac,
+                                                  proxy=portal.proxy_url,
+                                                  tls_insecure=portal.tls_insecure)
                         if res.ok:
                             portal.resolved_url = res.portal_url
                             client.portal_url = res.portal_url
                             client.invalidate()   # token was for the old URL
                     await client.ensure_auth()
-                    url = await client.create_link(getattr(_src, "cmd", "") or "", link_kind)
+                    url = await client.create_link(plan.cmd, link_kind,
+                                                   **plan.request_kwargs())
                 except PortalError as exc:
                     await db_log("WARNING", "stream",
-                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: {exc} -> next")
+                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
+                                 f"{exc.detail()} -> next")
                     continue
                 except Exception as exc:  # noqa: BLE001
                     await db_log("WARNING", "stream",
@@ -823,53 +895,90 @@ class StreamManager:
             for idx, (src, portal, macs) in enumerate(chain, 1):
                 if h.dead:
                     return
-                for mac_row in macs:
+                for mac_row in self._macs_for(portal, src, macs):
                     if h.dead:
                         return
-                    if mac_row.id in self.mac_locks:
+                    # Decided before the portal is touched, for the same reason the
+                    # redirect path decides first: for a source the user adopted onto
+                    # the panel's Xtream side (R7) there is no MAC to spend and no
+                    # session to open, and reaching for a client "just in case"
+                    # would put the portal back in the loop we removed.
+                    plan = self._plan(src, mac_row, portal, ffmpeg=True)
+                    adopted = plan.adopted
+                    if not adopted and mac_row.id in self.mac_locks:
                         await db_log("INFO", "stream",
                                      f"[{h.item_name}] mac {mac_row.mac} busy -> skip "
                                      f"(fallback step {idx}/{len(chain)})")
                         continue
                     await db_log("INFO", "stream",
                                  f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
-                                 f"portal '{portal.name}' mac {mac_row.mac}")
-                    client = await POOL.get(portal.resolved_url or portal.base_url,
-                                     mac_row.mac, mac_row.password, portal.proxy_url)
+                                 + (f"portal '{portal.name}' - {plan.policy.reason}" if adopted
+                                    else f"portal '{portal.name}' mac {mac_row.mac}"))
                     url = None
-                    try:
-                        if not portal.resolved_url:
-                            from ..portal.resolver import resolve_portal  # local import: avoids cycle
-                            res = await resolve_portal(portal.base_url, mac=mac_row.mac)
-                            if res.ok:
-                                portal.resolved_url = res.portal_url
-                                client.portal_url = res.portal_url
-                                client.invalidate()   # token was for the old URL
-                        await client.ensure_auth()
-                        link_kind = "live" if kind == "live" else "vod"
-                        url = await client.create_link(getattr(src, "cmd", "") or "", link_kind)
-                    except PortalError as exc:
-                        await db_log("WARNING", "stream",
-                                     f"[{h.item_name}] {portal.name}/{mac_row.mac}: {exc} -> next")
-                        continue
-                    except Exception as exc:  # noqa: BLE001
-                        await db_log("WARNING", "stream",
-                                     f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
-                                     f"unexpected {type(exc).__name__}: {exc} -> next")
-                        continue
-                    finally:
-                        await client.close()
+                    if adopted:
+                        url = plan.direct_url
+                    else:
+                        client = await POOL.get(PortalSession.from_rows(portal, mac_row))
+                        try:
+                            if not portal.resolved_url:
+                                from ..portal.resolver import resolve_portal  # local import: avoids cycle
+                                res = await resolve_portal(portal.base_url, mac=mac_row.mac,
+                                                           proxy=portal.proxy_url,
+                                                           tls_insecure=portal.tls_insecure)
+                                if res.ok:
+                                    portal.resolved_url = res.portal_url
+                                    client.portal_url = res.portal_url
+                                    client.invalidate()   # token was for the old URL
+                            await client.ensure_auth()
+                            link_kind = "live" if kind == "live" else "vod"
+                            # ffmpeg owns this stream, so the plan is always "ask"
+                            # (fresh token + the liveness answer); the flags still
+                            # decide what we tell the panel about ads and re-checks
+                            url = await client.create_link(plan.cmd, link_kind,
+                                                           **plan.request_kwargs())
+                        except PortalError as exc:
+                            # The code decides what this means for the rest of the
+                            # chain: `limit` is "this MAC is busy over there", so
+                            # the next MAC is the right move, while `nothing_to_play`
+                            # is "this source is dead", so hopping MACs is pointless.
+                            await db_log("WARNING", "stream",
+                                         f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
+                                         f"{exc.detail()}"
+                                         f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
+                            continue
+                        except Exception as exc:  # noqa: BLE001
+                            await db_log("WARNING", "stream",
+                                         f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
+                                         f"unexpected {type(exc).__name__}: {exc} -> next")
+                            continue
+                        finally:
+                            await client.close()
                     if not url:
+                        # An Xtream URL that will not open is not a MAC problem:
+                        # the next MAC would be handed exactly the same URL, so
+                        # move on to the next source instead of walking the list.
+                        if adopted:
+                            break
                         continue
 
                     # lock the MAC BEFORE starting ffmpeg so parallel requests
-                    # see it as occupied immediately
-                    self.mac_locks[mac_row.id] = h.id
+                    # see it as occupied immediately. An adopted play owns no MAC,
+                    # and `locked` is what keeps the three release sites below from
+                    # popping a slot that a *different* stream on this MAC is holding.
+                    locked = None
+                    if not adopted:
+                        self.mac_locks[mac_row.id] = h.id
+                        locked = mac_row.id
                     proc = await self._spawn(h.command, url, h.item_name)
                     if proc is None:
-                        self.mac_locks.pop(mac_row.id, None)
+                        if locked is not None:
+                            self.mac_locks.pop(locked, None)
+                        if adopted:
+                            break
                         continue
-                    h.portal_name, h.mac, h.url, h.proc = portal.name, mac_row.mac, url, proc
+                    h.portal_name, h.mac, h.url, h.proc = (
+                        f"{portal.name} (xtream)" if adopted else portal.name,
+                        "" if adopted else mac_row.mac, url, proc)
                     if not registered:
                         await self._register(h)
                         registered = True
@@ -886,7 +995,10 @@ class StreamManager:
                                          f"[{h.item_name}] ffmpeg exited rc={proc.returncode} before sending "
                                          f"data ({portal.name}/{mac_row.mac}) -> fallback")
                         await self._kill_quiet(proc)
-                        self.mac_locks.pop(mac_row.id, None)
+                        if locked is not None:
+                            self.mac_locks.pop(locked, None)
+                        if adopted:
+                            break
                         continue
                     await db_log("INFO", "stream",
                                  f"[{h.item_name}] playing via {portal.name}/{mac_row.mac} "
@@ -895,7 +1007,8 @@ class StreamManager:
                     async for chunk in self._read_proc(h, proc):
                         yield chunk
                     # EOF: stream ended/died -> move to next fallback silently
-                    self.mac_locks.pop(mac_row.id, None)
+                    if locked is not None:
+                        self.mac_locks.pop(locked, None)
                     await self._kill_quiet(proc)
                     if not h.dead:
                         await db_log("WARNING", "stream",

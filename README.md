@@ -46,6 +46,7 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here �
 | `SPM_VAAPI_DEVICE` | `/dev/dri/renderD128` | Intel Quick Sync render node |
 | `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
 | `SPM_MOCK_PORTAL` | `0` | `1` boots a built-in demo portal (test data, busy-MAC emulation) |
+| `SPM_EPG_NOW_TTL` | `120` | how long a "what's on now" answer is reused per channel, in seconds (see *What's on now*) |
 | `SPM_LOG_LEVEL` | `INFO` | Python log level (all records go to container stdout) |
 | `SPM_SKIP_LOGIN` | `0` | **Mockup/preview only**: bypass admin login (`*** LOGIN DISABLED ***` banner in log). Never set on a real deployment |
 | `PUID` / `PGID` | `2000` / `2000` | uid/gid the app runs as — must match the owner of your `./media` bind mount (see below) |
@@ -133,7 +134,7 @@ and, when the ids do not match:
 
 ## The workflow
 
-1. **Portals** – add each Stalker portal base URL and its MAC addresses (optionally per-MAC password). *Check Portal* resolves the real endpoint (`/c/`, `/client/`, `/portal.php`, …) and verifies each MAC online (busy-ness and subscription expiry included). *Delete* offers a replacement-dialog cleanup for playlists that reference it.
+1. **Portals** – add each Stalker portal base URL and its MAC addresses (optionally per-MAC password). *Check Portal* resolves the real endpoint (`/c/`, `/client/`, `/portal.php`, …) and verifies each MAC online (busy-ness and subscription expiry included); the per-MAC result now carries **why** a failure happened (`code` + the panel's own wording), not just "failed". Two per-portal network switches live in the same editor: **HTTP proxy** and **Allow broken TLS** (certificate verification is ON for every portal unless that box is ticked — a `TLS unverified` badge then marks the portal in the list, because it is a deliberate exception, not a setting to forget). *Delete* offers a replacement-dialog cleanup for playlists that reference it.
 2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season. In the **Edit portal** popup this is a two-step flow: *Fetch genres* loads the live/VOD/series genre lists (all disabled by default — including the synthetic *(All VOD)* / *(All series)* a portal without categories gets), you tick the genres you want (the filter box narrows the list as you type), and **Save** then fetches the items of exactly those enabled genres.
 3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels. Clicking a **VOD** or **Series** row (or its ⓘ button) opens the same detail popup as Input Sources — stored portal metadata, a lazy **stream probe** (codec/resolution/bitrate) and **TMDB** enrichment. The ▶ *test stream* buttons (here and in Input Sources) open the preview player, which closes via its header **×** or the **Stop & Close** button.
 4. **Users** – each user gets `username/password` and can receive **M3U** and/or **Xtream** URLs (copy-buttons in the GUI). Per-user active-connection caps enforced.
@@ -155,13 +156,13 @@ Users only ever talk to port **8880** — GUI, streams, playlists and APIs share
 
 ## ffmpeg templates & transcoding (DS918+ Quick Sync)
 
-Templates are full editable ffmpeg commands with GUI field ↔ command **2-way sync**: the option fields (encoder, bitrate, resolution, fps, GOP, audio, container, rate control, extra args) rebuild the command text, and editing the text parses back into the fields.
+Templates are full editable ffmpeg commands with GUI field ↔ command **2-way sync**: the option fields (encoder, bitrate, resolution, fps, GOP, audio, container, rate control + QP, extra args) rebuild the command text, and editing the text parses back into the fields.
 
 Shipped presets (stored as rows in the database and **re-seeded on every boot** — see below):
 
 | Template | Use |
 |---|---|
-| VAAPI 720p ~1M (DS918+ reference) | hardware H.264 via `/dev/dri/renderD128` |
+| VAAPI 720p ~1M (DS918+ reference) | hardware H.264 via `/dev/dri/renderD128`, CQP 26 |
 | VAAPI 1080p ~2.5M | hardware, full HD |
 | QSV 720p ~1M | Quick Sync via `-hwaccel qsv` (alternative syntax) |
 | Software 720p (libx264) | no-GPU fallback |
@@ -188,14 +189,16 @@ ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed
        -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi
        -hwaccel_device intel -hwaccel_output_format vaapi -i <url>
        -vf scale_vaapi=w=1280:h=720:format=nv12,fps=25,setsar=1
-       -map 0:v:0 -map 0:a:0? -sn -dn
-       -c:v h264_vaapi -b:v 1000k -maxrate 1100k -bufsize 2000k -profile:v high -level 4.1
-       -g 50 -r 25 -low_power 1 -rc_mode vbr -async_depth 4
-       -c:a aac -b:a 128k -ac 2 -ar 48000
+       -map 0:v:0 -map 0:a:0? -map 0:s? -dn
+       -c:v h264_vaapi -profile:v high -level 4.1
+       -g 50 -r 25 -low_power 1 -rc_mode CQP -global_quality 26 -async_depth 4
+       -c:a aac -b:a 128k -ac 2 -ar 48000 -c:s dvbsub
        -f mpegts -mpegts_flags +resend_headers pipe:1
 ```
 
-**Bitrate numbers are tuned for external (internet) streaming.** On a LAN the NAS uploads as fast as it likes; over the internet a bursty stream underruns the viewer's download link and stalls. Every transcode preset therefore caps spikes close to the target (`maxrate` ≈ bitrate + 10 %) and carries a ~2-second VBV buffer (`bufsize` = 2× bitrate) so short-lived congestion is absorbed by the encoder instead of freezing the player. The shipped values:
+**The VAAPI presets ship on `-rc_mode CQP` — constant quantiser.** Quality is pinned at the QP beside the mode dropdown (default 26) and the bitrate floats with the content: a hard scene does not get smeared into mush to protect a rate target, and a static news card does not burn bandwidth it does not need. CQP is the price of that: the encoder ignores `-b:v`/`-maxrate`/`-bufsize` in this mode, so **the renderer leaves them out of the command entirely** (a command that carries flags the encoder ignores is a command that lies — this text is also what the GUI shows and what you paste into a shell). The numbers stay filled in the template's fields: switch the mode to `VBR` or `CBR` and the tuning below is what you get back. The QP field is only rendered for `CQP`, only for VAAPI encoders, and empty (`AUTO`) means "leave the flag out and let the driver choose".
+
+**Bitrate numbers are tuned for external (internet) streaming** — that is, for the rate-driven modes. On a LAN the NAS uploads as fast as it likes; over the internet a bursty stream underruns the viewer's download link and stalls. Every transcode preset therefore caps spikes close to the target (`maxrate` ≈ bitrate + 10 %) and carries a ~2-second VBV buffer (`bufsize` = 2× bitrate) so short-lived congestion is absorbed by the encoder instead of freezing the player. The shipped values (used as-is by QSV/software and by the VAAPI presets once the mode is VBR/CBR):
 
 | Preset | `-b:v` | `-maxrate` | `-bufsize` |
 |---|---|---|---|
@@ -206,7 +209,8 @@ ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed
 | Dreambox DM800se | 1200k | 1300k | 2400k |
 
 * `-low_power 1` selects the **fixed-function H.264 encoder** (`VAEntrypointEncSliceLP` in `vainfo`) instead of the EU/3D path — faster, lower power, and it leaves the GPU's shader units free for more concurrent streams. On this silicon it only exists for **H.264**, so the flag is emitted for `h264_vaapi` only (an HEVC low-power entrypoint would fail).
-* `-rc_mode vbr` makes rate control **explicit** — VAAPI's implicit "auto" mode is driver-dependent, so `-b:v`/`-maxrate` are otherwise not guaranteed to be honoured the same way across driver versions. `cbr` is there too when you need a hard bandwidth ceiling (set *maxrate = bitrate* for true CBR).
+* `-rc_mode CQP -global_quality 26` makes rate control **explicit** — VAAPI's implicit "auto" mode is driver-dependent, so the mode and its target are spelled out instead. `QVBR`/`VBR`/`CBR` are there when you need the rate instead of the quality (set *maxrate = bitrate* for true CBR); `ICQ` on the newer drivers behaves like CQP but keeps the rate flags it does honour.
+* `-global_quality` is ffmpeg's generic "encode at this quantiser" option; for `h264_vaapi`/`hevc_vaapi` in CQP it is the QP (0–51, lower = better picture and bigger stream). Live IPTV around 22–30 is the usable band — 26 is where a 720p downscale of broadcast material stops being visible at sane sizes.
 * `-async_depth 4` keeps more frames in flight → higher throughput and a faster time-to-first-frame.
 
 **Reading your `vainfo` output:** `VAEntrypointVLD` = hardware *decode*; `EncSlice`/`EncSliceLP` = hardware *encode*. On the DS918+ that means **H.264 encode is the sweet spot** (`EncSlice` + `EncSliceLP`), HEVC/VP8 encode is 8-bit only (`HEVCMain` has `EncSlice`, no `Main10` encode, no low-power), and VP9 is decode-only. Use `h264_vaapi` for live transcoding; avoid `hevc_vaapi` for realtime use.
@@ -238,13 +242,219 @@ At boot the app performs a **hardware sanity check**: if the default template ne
 - Per play request the ordered chain is walked (source priority → MAC order); a `global setting` decides whether *all MACs of a portal are tried before moving to the next portal*.
 - No data within 12 s (configurable) or an ffmpeg exit → next step; when the chain exhausts, the client gets a clean end-of-stream and the GUI log shows every step. An ffmpeg that dies *before* the first byte (bad URL, 405, missing GPU) is detected immediately — the log then says `ffmpeg exited rc=8 before sending data` instead of a misleading "no data within 12s", so you do not wait 12 s per dead source.
 - **Link repair:** some panels rebuild the `create_link` answer instead of echoing it and lose parameters on the way (`&stream=392166` → `&stream=`). The request is stripped of its stale `play_token` before asking, and the answer is repaired against the request (missing/blanked parameters restored, the fresh token always wins). See `dev/check-links.py`.
+- **Portal refusals keep their code.** A panel rarely answers a refusal with a 4xx: the usual shape is HTTP 200 + `{"js":{"error":"limit"}}`. `PortalError.code` carries it through to the fallback log, so `limit` / `account is in use` (→ *this MAC is busy over there, try the next one*) are never mistaken for `nothing_to_play` or `link_fault` (→ *this source is gone*). A bearer the panel expired — also a 200 + `{"error":"token"}` — triggers exactly one transparent re-handshake and retry, like a 401 does, instead of looking like a broken portal until the local token TTL runs out.
+- **`%mac%` in a resolved link is filled in.** Portals that keep one link template for every box hand out `…/ch/%mac%/1234.ts` and expect the set-top box to substitute its own MAC; anything else is a 404 that reads as a dead channel.
+- **HLS links get the input options they need.** When the resolved link is a `.m3u8` playlist, ffmpeg receives `-protocol_whitelist file,http,https,tcp,tls,crypto` and `-allowed_extensions ALL` (unless the template already sets them) — without those two, a valid portal playlist dies before the first byte.
+- **`create_link` is asked only when it has to be asked.** A channel whose own flags (`use_http_tmp_link`, `use_load_balancing`) say its link is permanent, and whose stored `cmd` is a complete `http(s)` URL with no session token in it, is handed to the player as-is: a redirect play of such a channel costs the portal **zero** requests (no handshake, no token, no link). Every other case asks, including the ffmpeg path — where the request is worth making twice over, because it hands ffmpeg a fresh `play_token` *and* answers "is this source alive right now", which is what the chain above walks. `Portal.direct_links` (on by default) turns the shortcut off for a panel whose flags lie. The stream log says which rule fired and why.
+- **One trust policy for every outbound call.** Portal, EPG and logo fetches all go through `app/services/http_client.outbound_client()` (OS CA store, verification on). `Portal.tls_insecure` is the only opt-out, it is per portal, and it is part of the pooled-session key so flipping it cannot leave an old session behind.
+- **The panel's own account state is honoured.** Per MAC the panel reports `blocked`, `status` and an expiry, and Check Portal / the nightly portal sync now store that verdict: `banned` and `expired` MACs are dropped from fallback chains and from a fetch job's starting MAC, the Portals tab shows the badge, and the *reason* the portal gave is on the MAC row (`last_error`, shown in the badge tooltip). `offline`/`error` — our transport verdicts — stay retryable, because a portal that timed out is not a portal that said no.
 - Client disconnects (and the Dashboard *kill* button) deterministically free the MAC and kill ffmpeg via a disconnect watchdog.
+
+---
+
+## What the portal is told about the box (STB identity)
+
+A Stalker portal does not authenticate a user, it authenticates a *set-top box* — so a
+proxy that announces itself as `python-httpx/0.28` gets a token and a playlist, and then
+either 403s on the stream or starts behaving in ways no box ever does. Every portal request
+now carries the identity of a MAG250, per MAC and derived from the MAC itself
+(`md5(mac)` for the serial, `sha256(mac)` for the device id, …) so it is **stable across
+restarts and unique per MAC** — nothing is stored on disk, and two MACs never look like the
+same box:
+
+- **The full handshake dance.** Some panels answer the first handshake with
+  `{"js":{"msg":"missing"}}` plus a random seed and expect a *second* request carrying
+  `mac=` and `prehash=sha1(<the bearer we just invented>)`. Both steps are performed, and the
+  `Authorization: Bearer` header and the `token=` cookie are set together, as the stalker
+  app does.
+- **`get_profile` with the device fingerprint** (serial, device id, signature, hw versions,
+  `api_signature=262`, a `metrics` blob quoting the random seed), and `not_valid_token`
+  echoed from the handshake. The answer's `blocked` / `status` / `force_ch_link_check` are
+  consumed (see above). A panel that answers nothing usable falls back to the minimal
+  `sn`/`device_id`/`timestamp` request, because some panels 403 the full one.
+- **Headers and cookies on every request, including portal *discovery*:** the MAG200
+  `User-Agent`, `X-User-Agent: Model: MAG250; Link: WiFi`, `Referer: <portal>/index.html`,
+  and `mac=…; stb_lang=en; timezone=<yours>` cookies (plus `adid=<md5(sn+mac)>` for
+  `/stalker_portal/` panels). A wrong or missing cookie MAC is a 403 on *any* action, so the
+  `mac` cookie is always in colon form and never rewritten.
+
+Per portal you can tune what it is told, in the portal dialog or via the API:
+
+| Field | Default | why you would change it |
+|---|---|---|
+| `identity_mode` | `mag250` | `minimal` sends only `sn`/`device_id`/`timestamp` to `get_profile` — some panels 403 the full fingerprint |
+| `stb_timezone` | `Europe/Amsterdam` | what the box's `timezone=` cookie says; some panels key content or sessions on it |
+| per-MAC `sn` | derived | the box's **real** serial, if you captured one (see below) |
+| per-MAC `device_id` | derived | same, for `device_id`/`device_id2`/`signature` |
+
+To pin a real serial: **MACs → ⚙ → 🎩** on the MAC's row, then type
+`SERIAL123, DEVICEID456` (device id optional). A panel that has seen the box's real serial
+once will notice a changed one, so pinning it is what makes moving a subscription to this
+proxy invisible.
+
+Environment knobs, when a panel wants something different again: `SPM_STB_UA` (the portal
+calls, the stream probes and ffmpeg's `-user_agent` all use this one value),
+`SPM_STB_MODEL`, `SPM_STB_IMAGE_VERSION`, `SPM_STB_HW_VERSION`, `SPM_STB_VER` (the whole
+`ver=` ImageDescription block), `SPM_STB_PORTAL_VERSION`, `SPM_STB_LANG`, `SPM_STB_TIMEZONE`. `SPM_STB_PROFILE=0` stops the `get_profile` call
+entirely (handshake and play links keep working) — for the panel that treats an unexpected
+`get_profile` as a reason to be rude.
+
+---
+
+## What the portal says about itself (version, modules, links)
+
+Pressing **Resolve** on a portal does three things beyond finding the working `portal.php` path,
+and all three are stored on the portal so the answer survives a restart and reaches a backup:
+
+- **`version.js` is scraped.** No token is needed for a static file, so it is read during discovery
+  — the one moment we know for sure the panel is answering us — and the badge says
+  `Ministra portal 5.4.2 image 0.2.20-r3-250`. It is the single most useful line in a bug report
+  ("the playlist works but the EPG is empty" is a different question on 5.2 than on 5.4), and the
+  resolve box shows the `Referer:` every later request will claim and the winning path prefix sits
+  in the table next to it, so "it works but why" is answerable from the GUI instead of from tcpdump. A body that looks like
+  HTML is *rejected*, not parsed: a captive portal or WAF serving that file has `ver = '…'` in its
+  markup, and printing a fragment of it as a version would send you off debugging your panel.
+- **`type=stb&action=get_modules` is asked** (it needs an authenticated session, so it happens after
+  the handshake, from the same click). `all_modules − disabled_modules` is kept on the portal, and a
+  module that is absent **gates the work that would fail anyway**: a portal with no `sclub` gets no
+  series genre sync and no series item fetch — the fetch log records `series categories skipped: the
+  panel says it has no sclub/series module (get_modules offered: tv, vclub)` instead of a progress
+  bar that ends in an empty catalogue. A portal that never answered is treated as *unknown* and is
+  fetched in full: skipping a catalogue because a cosmetic probe did not reply is how a proxy
+  "loses" channels nobody removed.
+- **Per-channel link flags are stored on each live/VOD/episode row** (`link_flags`:
+  `use_http_tmp_link`, `use_load_balancing`, `disable_ad`, as a readable comma list rather than four
+  bits nobody can interpret — so a `curl` of `/api/sources/live` answers "why does *this* channel
+  skip the portal"), and the stream path reads them as described under *Fallback engine
+  semantics*. A row fetched before this existed carries NULL = "never told", which asks every time —
+  exactly the old behaviour — and the flags arrive with the next fetch.
+
+| Field | Default | why you would change it |
+|---|---|---|
+| `direct_links` | on | off forces `create_link` before every play, on both paths: for a panel that reports its links as permanent and rotates them anyway |
+
+The Portals table gained a **Panel** column for this (version badge · "N modules" with the list in
+its tooltip · `no vclub` for what the panel switched off · "capabilities unknown" · "press Resolve"),
+because "why is this portal's VOD empty" should be answerable without opening a container shell.
+
+---
+
+## When the portal is an Xtream account in disguise
+
+Some Stalker panels are a thin front on an ordinary Xtream/ministrales account, and they admit it in
+the one place nobody reads carefully: the `create_link` answer. Instead of a token URL the panel
+returns `/live/john/s3cr3t/12345.ts` — the same credentials the panel's own `player_api.php` accepts.
+An app that has those needs no MAC session to play a channel: no handshake reuse, no token, no
+`create_link` per channel switch, no connection slot held by a fallback chain, no
+`mac_locks` entry. That is a lot of failure surface removed — and it is also somebody's paid login,
+so this app only ever **detects and offers**.
+
+- **Detection is one request, on purpose.** `Portal → Check Portal` (or the *Xtream bridge* panel in
+  the portal editor, "Detect") asks for a single stream link, reads the credential out of it and —
+  only then — queries `player_api.php` for `status`, `exp_date`, `created_at`, `active_cons`,
+  `max_connections`, `is_trial`. VOD is asked first and live second, like EStalker does, because a
+  movie `cmd` is the plain file path panels sign. The base is the origin **plus whatever path prefix
+  the panel put in front of the credential segment** (`http://h/xtream/live/u/p/1.ts` → ask
+  `http://h/xtream/player_api.php`), because a server that streams from behind a prefix answers its
+  API there too, and stripping to the origin — what EStalker does — sends the harvested password to a
+  vhost that never issued it. The result is stored on the portal
+  (`Portal.xtream` + `xtream_at`) with `player_api.php`'s `server_info.http_live_url` **outranking**
+  the origin in the link: a panel that streams from `:8000` and serves the portal on `:80` is common,
+  and a bridge that used the portal origin would write URLs that 404 forever.
+- **Nothing changes until you press Adopt.** `xtream_adopted` is a separate column, and playback reads
+  only that. Detecting an account and rewriting how a household watches TV are two decisions, and the
+  second one is yours: some operators deliberately do not want a long-lived credential in the stream
+  path, and a panel that hands out `/movie/<u>/<p>/` links today may rotate the account next month.
+- **Adoption matches, it does not guess.** `get_live_streams` / `get_vod_streams` (one request each)
+  are matched against the channels already in the database: **channel number first, then the title**,
+  and a title that more than one stream shares is reported `ambiguous` and left alone rather than
+  resolved by coin flip. Every row is rewritten by a re-adopt, including to *nothing* — a channel the
+  panel dropped must lose its Xtream URL, or the next adopt looks like a fix while the user still
+  gets yesterday's stream id. The API returns the counts (`matched`, `by_number`, `by_name`,
+  `ambiguous`, `unmatched`) so "why is 1 of 40 channels still asking" is answerable.
+- **The portal link is never destroyed.** Adoption writes `xtream_url` *beside* `cmd` and `link_flags`
+  on the live/VOD row, so Detach is one flag — and it keeps the URLs by default (`…/xtream/detach`)
+  so switching back does not cost the panel another catalogue walk; `?clear=1` drops them. Series are
+  out of scope on purpose: a per-episode mapping needs `get_series_info` for every title, which is a
+  different trade than "one request, whole catalogue".
+- **An adopted play** skips `create_link` and the busy-MAC check entirely, takes no per-MAC lock, and
+  shows up in *Active streams* as `Portal (xtream)` with an empty MAC. It is also the one documented
+  **exception to "an ffmpeg template always asks"**: there is nothing left to ask for, since the
+  harvested URL *is* the stream the panel would have built. If it fails, the chain moves to the next
+  source instead of re-asking the panel through a MAC.
+- **Adopt refuses a bad account**: `expired`, `banned`, or a `player_api.php` that would not confirm
+  the credentials (including the classic `{"user_info": []}` answer to a wrong password). `?force=1`
+  overrides it for a panel that lies about its own state — the same escape hatch `status` needs, and
+  equally not a default.
+- **The password is stored, masked everywhere else.** `Portal.xtream` keeps it in full, because a
+  bridge whose secret was stored as `****` would restore from a backup as a silently dead portal;
+  every API response, tooltip and log line masks it (`…/john/mo***…`), and `/api/export` carries it
+  unmasked for the same reason — so that file is a secret-bearing backup, like the user list in it
+  already is. A credential that looks like a 32-hex `play_token` is **refused**, not adopted: that is
+  a link signature, and adopting it builds a playlist that dies at 3 a.m. and then re-asks a panel
+  that is refusing it — which is how an IP gets banned.
+
+| Endpoint | Effect |
+|---|---|
+| `POST /api/portals/{id}/xtream[?force=1]` | detect (one `create_link` + one `player_api.php`); stores, changes no playback |
+| `POST /api/portals/{id}/xtream/adopt[?force=1]` | fetch both stream lists, match, write `xtream_url`, set the flag |
+| `POST /api/portals/{id}/xtream/detach[?clear=1]` | clear the flag (and optionally the per-channel URLs) |
+
+In the GUI this is one **Xtream** column in the Portals table (`offered` / `adopted` / `—`, with the
+account line in its tooltip) and a panel in the portal editor with the Detect / Adopt / Detach
+buttons and their two checkboxes. `xtream_adopted` is deliberately *not* a field of `PUT
+/api/portals/{id}`: a boolean flipped on its own would leave playback depending on per-channel URLs
+that endpoint cannot maintain.
+
+---
+
+## "What's on now" from the portal (no XMLTV required)
+
+Stalker panels answer `type=itv&action=get_short_epg&ch_id=…&size=10` with the next few programmes
+of one channel. That is enough for a tooltip, and it is the only guide many users have — but it is
+**one request per channel**, which is exactly the pattern that gets an IP banned. So it exists here as
+a fallback with an accounting layer in front of it, and *not* as a way to build an XMLTV guide:
+
+- `GET /api/epg/now?live=1,2,3` (and/or `playlist=…`, ≤ 60 ids per call) answers
+  `{"items": {"live:1": {found, now, next, source}}, counts, ttl, truncated}` — the keys are prefixed
+  by kind because "row 7" means two different things on two tabs.
+- **XMLTV is tried first, and it wins.** A configured guide source is a local `SELECT` covering every
+  channel at once; the portal is asked only for rows the guide has no `tvg-id` for. On a normal
+  install, where every channel is matched, **this feature costs the portal nothing** — the `source`
+  field tells you which answer you got (`xmltv` / `portal`), and a guide that knows only what comes
+  next is still an answer (`found: false`, `next: …`) rather than a wasted request.
+- Then the **cache** (2 minutes, `SPM_EPG_NOW_TTL`), then the portal — and a second call for the same
+  rows costs zero requests. A channel whose portal refuses is *not* retried: `PortalError.code` (see
+  *What the portal says about itself*) says whether this was a busy box (`503`, retried twice inside
+  the batch) or a rude one (`no such action`, `403`, `bad_json` — never retried).
+- **Three failures and the batch stops for that portal.** A panel that refuses `get_short_epg` does
+  not become friendly on request 14, so the remaining channels of that portal are answered from the
+  cache of the refusal instead: `"not asked: this portal already failed 3 short-epg requests in this
+  batch"`. Per portal, not globally — a broken panel must not blank the tooltip on a working one.
+- Concurrency inside a batch is 6, one session per portal (so at most **one re-handshake per batch**),
+  and one `INFO` log line per batch: `what's-on-now: 3 asked, 41 from the guide source, 0 cached,
+  2 skipped`. If this ever shows up twice a minute, the GUI is asking for more than the visible page.
+- **A panel that said it has no `epg` module is not asked at all** (R6's answer, spent here): those
+  rows come back `{"found": false, "gated": true, "why": "…"}`, which the GUI draws as a dash rather
+  than as a failure — a skipped row for a reason is not a broken channel.
+- Guide times from a portal carry **no offset**, so they are read in `stb_timezone` for that portal —
+  the same value sent as the `timezone=` cookie, which is *why* the panel chose them. Assuming UTC is
+  what makes a guide look two hours wrong for everyone except the person in London.
+
+The GUI half is a **Now** column on *Sources → Live*: after each page renders, the visible ids are sent
+in one request and the cell fills with `hh:mm title`, its tooltip carrying the progress, the minutes
+left, and the next programme. Paging and sorting re-ask only what is on screen; the server-side cache
+and the id cap are what make that safe to leave wired to a table.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SPM_EPG_NOW_TTL` | `120` | seconds a short-EPG answer stays fresh per channel (min 15). Raise it for a big household that scrolls a lot; set it low if you would rather re-ask |
 
 ---
 
 ## Built-in mock portal (testing without a real subscription)
 
-`SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02` (plus expired `…BB:BB:01`), 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {"offline":…, "slow":…, "max_per_mac":…}` emulates outages and account-in-use errors for fallback testing.
+`SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02`, expired `…BB:BB:01` and blocked `…CC:CC:01`, 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {...}` emulates what the portal can do to you, so the client's behaviour is testable without a subscription: `offline`, `slow`, `max_per_mac`, `http_status`, `require_prehash` (demand the second handshake step), `fingerprint_required` (403 a `get_profile` with no serial), `profile_mode` (`full`/`no_id`/`none`), `not_valid` (short-lived token), `token_rejects` (answer 200 + `{"error":"token"}`), `js_error`, `empty_reply`, `corrupt_stream`, `require_tls`, `require_host`, `reject_no_cookie`, `reject_no_referer`. `version_mode` (`full`/`none`/`html` — the last one is a captive portal answering `version.js`), `modules`, `modules_disabled` and `no_modules` (404 the action, which means *we do not know*, not *it has nothing*) emulate what the panel *says about itself*, `xtream_mode=1` makes its `create_link` answers carry `/live/<user>/<pass>/…` (with `xtream_user`/`xtream_pass`, `xtream_status`, `xtream_exp_days` and `xtream_refuse` — the last answers `player_api.php` with `{"user_info": []}`, i.e. "wrong password"), and `epg_mode` (`normal`/`empty`/`absent`/`flaky` — busy twice then fine) is what "no guide", "no such action" and "try again" look like separately. `GET /mock/player_api.php` serves the Xtream account, stream lists (with the two flaws the matcher needs: a channel that is not on the Xtream side, and a duplicated `Sky Sports` name) and media at `/mock/live/…`, `/mock/movie/…`, `/mock/series/…` **with the credentials enforced** — under `/mock/`, never at the root, because `/live/<u>/<p>/<id>.ts` and `/player_api.php` are *our own* Xtream output API and a mock route there would be shadowed by it (a lesson learned from the demo 403ing while every test passed), and `get_short_epg` renders its schedule in the timezone from the `timezone=` cookie so the identity→guide chain is exercised rather than assumed, and the live catalogue ships five deliberate link shapes — permanent, tmp-link, load-balanced, no flags at all, and a "permanent" URL that still carries a `play_token` — so the conditional-`create_link` rules are testable instead of theoretical. `GET /mock/_state` answers with those settings *and* what the portal actually received (`seen_profile`, the handshake `prehash`es, `seen_create_link`, the `handshakes`/`version_calls`/`modules_calls`/`create_links`/`player_api`/`short_epg` counters and the `seen_player_api` query, and per-MAC usage) — which is how the identity and link tests prove a request arrived, or that one deliberately did not, instead of trusting the client.
 
 Tip: the GUI shows the ready-to-copy mock portal URL/MACs in the Portals tab when enabled.
 
@@ -293,6 +503,12 @@ docker logs stalker-proxy-manager 2>&1 \
 | `[ffmpeg] … HTTP error 405 Method Not Allowed` / `Error opening input file …&stream=&…` | ffmpeg was handed an incomplete URL | update to a build with the link repair, or re-fetch the sources |
 | `[stream] ffmpeg exited rc=8 before sending data` | ffmpeg could not open the source at all (dead link, 403/405, template needs a GPU that is not mapped) | read the `[ffmpeg]` line just above it — it carries ffmpeg's stderr tail |
 | `[stream] no data within 12s from portal/mac` | the portal accepted the request but sends nothing (MAC busy *on the panel*, expired account, IP/geo block) | *Check Portal* in the GUI; try another MAC of the same portal |
+| `[stream] … portal said limit - connection limit for this MAC (panel says it is already streaming)` | the panel is right: that MAC already has a stream open (often a previous player that has not been timed out yet) | the chain moves to the next MAC on its own; if every MAC says `limit`, the panel's quota is the real limit |
+| `[stream] … portal said nothing_to_play` / `link_fault` | the source is dead or the CDN is unhappy — retrying with another MAC cannot help | *Fetch Sources* for that channel, or drop it from the chain |
+| `create_link: portal left a mac placeholder in the link -> filled in from our MAC` | the panel serves one template for every box and expects the client to insert its MAC | informational; the URL ffmpeg got already contains the right MAC |
+| `[portal] TLS error / unable to get local issuer certificate` | the panel has a self-signed or incomplete certificate chain | tick **Allow broken TLS** for that portal (keeps every *other* portal verified) or fix the chain; do not disable verification globally |
+| `[stream] [Ch] playing the stored link via portal/mac: the channel flags say nothing needs rebuilding…` | no `create_link` was asked, by design (see *Fallback engine semantics*) | if that channel is black, the panel lied about its links: tick **Play stored links when the panel allows** off for that portal, or re-fetch the sources |
+| `[fetch] series categories skipped: the panel says it has no sclub` | the portal's own `get_modules` answer gated the fetch | informational; if the panel *does* have series, press Resolve to re-read the answer |
 | `[output] user … exceeded max_connections` | a previous stream of that user was still counted when the player reconnected | raise `max_connections` for that user; the slot frees as soon as the disconnect watchdog notices the client is gone (≤0.5 s) |
 
 Two things the proxy does for you here: the outgoing `create_link` cmd is stripped of its stale `play_token` (panels that receive their own token back tend to mangle the answer), and ffmpeg gets the MAG user-agent plus a referer for `http(s)` inputs, because `Lavf/61.x` is refused by quite a few panels with a 403/405.
@@ -305,7 +521,8 @@ Two things the proxy does for you here: the outgoing `create_link` cmd is stripp
 |---|---|
 | `bash dev/smoke.sh` | Runs the freshly built image with `SPM_MOCK_PORTAL=1` and checks: GUI answers `/login` (200), mock handshake returns a token, the boot marker is in the container log **and on container stdout** (the single-stream rule above). This is what the `docker` workflow's smoke job runs. `SPM_SMOKE_IMAGE` / `SPM_SMOKE_NAME` / `SPM_SMOKE_PORT` override it for a local run against any port. |
 | `bash dev/smoke-puid.sh` | Bind-mounts a directory owned by a foreign uid (mode 750) and checks both sides of the PUID/PGID story: **without** `PUID`/`PGID` the app must *not* be able to list `/media`, **with** them it must (and PID 1 must run as those ids, `/config` must be chowned to them). Needs root/sudo; skips itself otherwise. `SPM_SMOKE_PUID_IMAGE` / `SPM_TEST_UID` override. |
-| `python3 dev/check-links.py` | Pins the Stalker `create_link` URL rules (prefix stripping, stale-token removal, repair of a mangled answer) without needing pytest — run it after touching `app/portal/client.py`. |
+| `python3 dev/check-links.py` | Pins the portal plumbing that decides whether a channel plays: the `create_link` URL rules (prefix stripping, stale-token removal, repair of a mangled answer), the STB fingerprint and account verdict, the link-flag policy table and the `version.js`/`get_modules` parsers — plus greps that no probe's answer is discarded and that the link policy is not re-inlined at a call site. No pytest needed, so it also runs on a NAS. Run it after touching `app/portal/`. |
+| `node dev/check-js.js` | Syntax-checks the JavaScript inside every template's `<script>` block (and `app/static/js/app.js`) with the real parser, after a text-level Jinja pass that keeps one branch of each `{% if %}`. A broken template script is invisible to every Python test — the page renders, the API answers 200, and the table is simply empty. Needs `node`; skip it if your box has none. |
 | `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies `dev/docker-publish.yml.example` is byte-identical to the real workflow. Run it before pushing anything under `.github/workflows/`. |
 | `bash dev/seed-demo.sh [BASE_URL]` | Seeds a *running* instance with a full demo setup against the built-in mock portal (portal → genres → live/VOD/series → users). Idempotent; dev/mockup use (`SPM_SKIP_LOGIN=1`), default base `http://127.0.0.1:8880`. |
 

@@ -98,4 +98,8 @@ def _ctx(request: Request, active: str, title: str) -> dict:
             "admin": request.session.get("admin", ""), "port": HTTP_PORT,
             "mock_enabled": MOCK_PORTAL_ENABLED,
             "mock_portal_url": f"{mock_base}/mock/c/",
-            "mock_macs": "00:1A:79:AA:AA:01, 00:1A:79:AA:AA:02"}
+            # the demo portal deliberately contains one MAC per account state the
+            # portal can report (active / active / expired / banned), so *Check
+            # Portal* shows the whole status vocabulary without a real panel
+            "mock_macs": ("00:1A:79:AA:AA:01, 00:1A:79:AA:AA:02, "
+                          "00:1A:79:BB:BB:01, 00:1A:79:CC:CC:01")}

@@ -5,7 +5,8 @@ The reference spec command is kept reproducible, extended with the three knobs
 that make VAAPI encoding actually fast and deterministic on that silicon:
 
   * -low_power 1   -> VAEntrypointEncSliceLP (fixed-function H.264 encoder)
-  * -rc_mode VBR   -> explicit rate control (AUTO is driver-dependent)
+  * -rc_mode CQP   -> explicit rate control, quality-pinned (AUTO is
+                      driver-dependent, and CQP needs -global_quality)
   * -async_depth 4 -> more frames in flight
   * -map 0:s? / -c:s dvbsub -> keep DVB subtitles when the source has them
 
@@ -36,7 +37,8 @@ def test_vaapi_720p_command_is_the_optimised_reference():
     # the optimisations this change adds
     assert "-c:v h264_vaapi" in cmd
     assert "-low_power 1" in cmd
-    assert "-rc_mode VBR" in cmd
+    assert "-rc_mode CQP" in cmd
+    assert "-global_quality 26" in cmd
     assert "-async_depth 4" in cmd
     assert "-f mpegts" in cmd and "+resend_headers" in cmd
     assert URL_PLACEHOLDER in cmd
@@ -47,7 +49,7 @@ def test_low_power_is_emitted_only_for_h264_vaapi():
     EncSlice but no EncSliceLP), so -low_power must not leak into hevc_vaapi."""
     hevc = build_command(FFmpegOptions(video_codec="hevc_vaapi"))
     assert "-low_power" not in hevc
-    assert "-rc_mode VBR" in hevc and "-async_depth 4" in hevc
+    assert "-rc_mode CQP" in hevc and "-async_depth 4" in hevc
     # but it is there for h264_vaapi
     assert "-low_power 1" in build_command(FFmpegOptions(video_codec="h264_vaapi"))
 
@@ -72,6 +74,52 @@ def test_low_power_and_rc_mode_are_toggleable():
     assert "-rc_mode" not in build_command(FFmpegOptions(rc_mode="AUTO"))
 
 
+def test_cqp_drops_the_rate_flags_the_encoder_would_ignore():
+    """CQP is constant quantiser: -b:v/-maxrate/-bufsize do not reach the wire,
+    so rendering them would put flags in the command that the encoder ignores -
+    and this text is what the user reads in the GUI and pastes into a shell."""
+    cqp = build_command(FFmpegOptions(rc_mode="CQP"))
+    for flag in ("-b:v", "-maxrate", "-bufsize"):
+        assert flag not in cqp, flag
+    assert "-global_quality 26" in cqp
+    # ...and the rate-driven modes keep the bitrate tuning untouched
+    vbr = build_command(FFmpegOptions(rc_mode="VBR"))
+    assert "-b:v 1000k" in vbr and "-maxrate 1100k" in vbr and "-bufsize 2000k" in vbr
+    assert "-global_quality" not in vbr
+    assert "-b:v 1000k" in build_command(FFmpegOptions(rc_mode="CBR"))
+    assert "-b:v 1000k" in build_command(FFmpegOptions(rc_mode="AUTO"))
+
+
+def test_cqp_on_a_non_vaapi_encoder_leaves_the_rate_flags_alone():
+    """-rc_mode is a VAAPI option; libx264 and QSV do not understand it, so on
+    those templates the rate field is inert and the bitrate stays in charge."""
+    for codec, hw in (("libx264", "none"), ("h264_qsv", "qsv")):
+        cmd = build_command(FFmpegOptions(hw_accel=hw, video_codec=codec, rc_mode="CQP"))
+        assert "-b:v 1000k" in cmd, codec
+        assert "-rc_mode" not in cmd and "-global_quality" not in cmd, codec
+
+
+def test_the_qp_can_be_switched_off_and_only_serves_cqp():
+    assert "-global_quality" not in build_command(FFmpegOptions(global_quality=""))
+    assert "-global_quality" not in build_command(FFmpegOptions(global_quality="AUTO"))
+    assert "-global_quality 20" in build_command(FFmpegOptions(global_quality="20"))
+    # a QP on a rate-driven template is stored but not rendered
+    assert "-global_quality" not in build_command(FFmpegOptions(rc_mode="VBR", global_quality="20"))
+
+
+def test_parse_command_recovers_the_qp_field():
+    cmd = build_command(FFmpegOptions(global_quality="20"))
+    res = parse_command(cmd)
+    assert res["options"]["global_quality"] == "20"
+    assert res["warnings"] == []
+    # it must not fall through to the "unknown flag" bucket, or re-syncing the
+    # GUI would append a second -global_quality to the command on every pass
+    assert "-global_quality" not in res["options"]["extra_output"]
+    # the per-stream alias parses to the same field
+    alias = parse_command("ffmpeg -i <url> -c:v h264_vaapi -rc_mode CQP -q:v 30 -f mpegts pipe:1")
+    assert alias["options"]["global_quality"] == "30"
+
+
 def test_parse_command_recovers_the_new_fields():
     cmd = build_command(FFmpegOptions())
     res = parse_command(cmd)
@@ -79,8 +127,10 @@ def test_parse_command_recovers_the_new_fields():
     assert o["hw_accel"] == "vaapi"
     assert o["video_codec"] == "h264_vaapi"
     assert o["low_power"] is True
-    assert o["rc_mode"] == "VBR"
+    assert o["rc_mode"] == "CQP"
+    assert o["global_quality"] == "26"
     assert o["async_depth"] == "4"
+    # the bitrate tuning survives even though CQP does not render it
     assert o["video_bitrate"] == "1000k"
     assert o["resolution"] == "720p"
     assert res["warnings"] == []
@@ -101,8 +151,17 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
     presets = {p["name"]: p for p in default_presets()}
     vaapi = presets[REFERENCE_PRESET_NAME]
     assert "-low_power 1" in vaapi["command"]
-    assert "-rc_mode VBR" in vaapi["command"]
+    assert "-rc_mode CQP" in vaapi["command"]
+    assert "-global_quality 26" in vaapi["command"]
     assert "-async_depth 4" in vaapi["command"]
+    # every template the app owns asks for CQP, and none of them renders a
+    # -rc_mode the encoder would ignore
+    for name, p in presets.items():
+        if p["video_codec"].endswith("_vaapi"):
+            assert "-rc_mode CQP" in p["command"], name
+            assert "-b:v" not in p["command"], name
+        else:
+            assert "-rc_mode" not in p["command"], name
     # every preset's stored command must match its structured fields (2-way sync);
     # the redirect preset is exempt: it is a marker, not an ffmpeg command.
     for name, p in presets.items():

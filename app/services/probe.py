@@ -13,7 +13,8 @@ import re
 import time
 
 from ..config import FFMPEG_BIN, log
-from ..portal.client import MAG_UA
+from ..portal.client import MAG_UA, is_hls
+from .ffmpeg_templates import HLS_INPUT_OPTS
 
 _RE_DURATION = re.compile(
     r"Duration:\s*(\d+):(\d+):([\d.]+)(?:,.*?bitrate:\s*(\d+)\s*kb/s)?", re.I)
@@ -35,20 +36,24 @@ _CACHE_TTL = 300  # seconds — probing live streams is expensive
 
 
 def _probe_args(target: str, *, is_url: bool) -> list[str]:
-    """ffmpeg argv for one probe. Network streams get the MAG identity (same
-    as the real pipeline, so the probe reflects what the stream path sees)."""
+    """ffmpeg argv for one probe. Network streams get the MAG identity and the
+    per-input options of the real pipeline (same rules, so the probe reflects
+    what the stream path sees - a probe that cannot open an HLS playlist would
+    report "no metadata" for a channel that plays fine)."""
     args = [FFMPEG_BIN, "-hide_banner", "-nostdin"]
     if is_url:
         # generous read timeout but a hard wall-clock cap in probe_media
         args += ["-rw_timeout", "15000000", "-reconnect", "1"]
         args += ["-analyzeduration", "2500000", "-probesize", "2500000"]
         # Impersonate the MAG box exactly like the real pipeline does
-        # (stream_manager._network_identity): panels/CDNs refuse or stall the
-        # default Lavf user-agent, which used to make the probe time out even
-        # though the stream itself was fine.
+        # (stream_manager._network_input_options): panels/CDNs refuse or stall
+        # the default Lavf user-agent, which used to make the probe time out
+        # even though the stream itself was fine.
         args += ["-user_agent", MAG_UA]
         origin = target.split("://", 1)[-1].split("/", 1)[0]
         args += ["-referer", f"{target.split('://', 1)[0]}://{origin}/"]
+        if is_hls(target):
+            args += HLS_INPUT_OPTS
     args += ["-i", target, "-t", "1", "-f", "null", "-"]
     return args
 

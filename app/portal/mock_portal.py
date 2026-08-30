@@ -13,7 +13,13 @@ the demo MACs listed in MOCK_MACS. The mock emulates:
                              episodes / create_link
   * /mock/ts/<file>.ts       infinite MPEG-TS testsrc stream (via ffmpeg)
   * behaviours: per-MAC concurrency limit (default 1) so the fallback logic is
-    really triggered, plus /mock/_control toggles: offline, slow, busy
+    really triggered, plus /mock/_control toggles: offline, slow, busy, and
+    the three that reproduce how real panels *refuse*:
+      create_link_error  answer create_link with HTTP 200 + {"js":{"error":X}}
+      token_rejects=N    the next N calls reject the bearer with a 200
+                         {"js":{"error":"token"}} - exactly how Ministra
+                         expires a session - then behave again
+      mac_placeholder    hand out links containing %mac% instead of a MAC
 
 The dataset is deterministic: 3 live genres x 4 channels, 2 vod genres x 12
 movies, 2 series genres x 6 series (2-3 seasons x 5 episodes).
@@ -22,10 +28,13 @@ movies, 2 series genres x 6 series (2-3 seasons x 5 episodes).
 from __future__ import annotations
 
 import asyncio
-import json
+import hashlib
 import logging
-import random
+import re
 import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
@@ -38,10 +47,18 @@ router = APIRouter(tags=["mock-portal"])
 # ---------------------------------------------------------------------------
 # Demo dataset (deterministic - no randomness between restarts)
 # ---------------------------------------------------------------------------
+# `phone` is the expiry, in the field name real portals use (see
+# app/portal/account.py); `blocked` is what `get_profile` reports and what no
+# amount of retrying can change. One MAC per account state, so the GUI and the
+# tests can exercise the whole vocabulary against a single portal.
+#: what a Ministra panel offers out of the box; `_STATE["modules"]` overrides it
+DEFAULT_MODULES = ("tv", "vclub", "sclub", "epg", "tv_archive", "portal_time", "watchdog")
+
 MOCK_MACS = {
     "00:1A:79:AA:AA:01": {"phone": "2032-12-31 00:00:00"},
     "00:1A:79:AA:AA:02": {"phone": "2032-12-31 00:00:00"},
     "00:1A:79:BB:BB:01": {"phone": "2024-01-01 00:00:00"},   # expired on purpose
+    "00:1A:79:CC:CC:01": {"phone": "2032-12-31 00:00:00", "blocked": 1},   # banned
 }
 
 LIVE_GENRES = {"1": "News", "2": "Sport", "3": "Kids", "4": "Movies & Series",
@@ -93,12 +110,83 @@ _SERIE_NAMES = {
 
 PAGE_SIZE = 14  # exactly what real portals use
 
-# runtime state: mac -> in-flight stream count, plus behaviour toggles
-_STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note": ""}
+# runtime state: mac -> in-flight stream count, plus behaviour toggles.
+#   create_link_error  portal-level refusal code answered with HTTP 200 on
+#                      create_link ("limit", "nothing_to_play", "link_fault",
+#                      "access_denied") - the shape real panels use and the one
+#                      that used to reach the log as "no usable url"
+#   token_rejects      number of following non-handshake calls that reject the
+#                      bearer with a 200 {"js":{"error":"token"}}
+#   mac_placeholder    hand out `%mac%` inside the link instead of a real MAC
+#   require_prehash      second-step auth: a handshake without `prehash` is
+#                        answered {"js":{"msg":"missing"}}, and only an invented
+#                        bearer + sha1(bearer) as `prehash` gets a token. A
+#                        client that does not know the dance cannot use this
+#                        portal at all - and the panel never says why, which is
+#                        exactly why the gap is invisible in a log.
+#   require_mac_param    answer only when `mac=` is a query parameter (some
+#                        panels key the session on it and return no token otherwise)
+#   fingerprint_required get_profile must carry the device fingerprint
+#   profile_mode         "full" | "no_id" (panel answers without `id`, so a
+#                        client must fall back to the minimal shape) | "none"
+#                        (no get_profile at all -> 404; the common case)
+#   not_valid            handshake answers js.not_valid=1, which a box must echo
+#                        back as not_valid_token=1
+#   version_mode         "full" (a Ministra version.js) | "none" (404, the common
+#                        case) | "html" (a captive portal or WAF page - the shape
+#                        that must NEVER be shown as "the portal version")
+#   modules              comma list the panel offers ("" = the default set below)
+#   modules_disabled     comma list it offers but switched off (get_modules
+#                        reports both, and `disabled` is what gates a fetch)
+#   no_modules           404 get_modules: the panel has no such action, which is
+#                        "we do not know", not "it has nothing" - the difference
+#                        that decides whether a catalogue stays visible
+#   xtream_mode          "off" (links carry no credentials) | "on" (the panel
+#                        builds <origin>/mock/live|movie/<user>/<pass>/<id> URLs,
+#                        i.e. the MAC account IS an Xtream account - the whole
+#                        premise of R7. Under /mock/ on purpose: the root-level
+#                        Xtream paths are this app's own output API, so a mock that
+#                        answered there would be shadowed by output.py and the demo
+#                        would 403 while the unit tests passed. It also exercises a
+#                        panel hosted behind a path prefix, which is real.)
+#                        xtream_user/xtream_pass set the identity, xtream_status and
+#                        xtream_exp_days what player_api.php reports, and
+#                        xtream_refuse answers that API with `{"user_info": []}` -
+#                        the shape a *wrong* password produces.
+#   epg_mode             "normal" (a schedule around now, in the timezone the box
+#                        declared) | "empty" (channel has no guide data) |
+#                        "absent" (404: this portal has no short EPG) |
+#                        "flaky" (503 twice, then answers - the retry discipline)
+_STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note": "",
+          "create_link_error": "", "token_rejects": 0, "mac_placeholder": False,
+          "require_prehash": False, "require_mac_param": False,
+          "fingerprint_required": False, "profile_mode": "full", "not_valid": False,
+          "handshakes": 0, "profile_calls": 0, "profile_seen": {}, "handshake_seen": [],
+          # R6: what the panel says about itself
+          "version_mode": "full", "modules": "", "modules_disabled": "", "no_modules": False,
+          "version_calls": 0, "modules_calls": 0, "create_links": 0,
+          "create_link_seen": {},
+          # R7: the Xtream side of the same account, and R9's short EPG
+          "xtream_mode": "off", "xtream_user": "mockuser", "xtream_pass": "mockpass123",
+          "xtream_exp_days": 30, "xtream_status": "Active", "xtream_refuse": False,
+          "player_api_calls": 0, "seen_player_api": {},
+          "epg_mode": "normal", "short_epg_calls": 0, "flaky_hits": 0}
 
 
 def _usage(mac: str) -> int:
     return _STATE["usage"].get(mac, 0)
+
+
+def _base(request: Request) -> str:
+    """The prefix a panel uses in its own cmds.
+
+    Real panels write an absolute URL pointing at themselves; a mock that wrote
+    `http://mock/...` would be unusable for anything but create_link (which
+    rewrites), so the catalogue rows carry the host the request actually came in
+    on - which is also what makes the "play the stored link" path testable
+    against this portal at all.
+    """
+    return str(request.base_url).rstrip("/") + "/mock/"
 
 
 def _js(payload) -> JSONResponse:  # Stalker envelope: {"js": ...}
@@ -111,17 +199,40 @@ def _paged(items: list, page: int) -> dict:
             "max_page_items": PAGE_SIZE}
 
 
-def _live_rows():
+#: the shapes `link_policy` (app/portal/links.py) has to tell apart, in rotation
+#: so one mock catalogue exercises all of them: permanent, temporary, never
+#: described, CDN-balanced, and "permanent but the stored URL carries a token
+#: from the session that fetched it" - the last one is the case a proxy must not
+#: play, and no fixture but a portal would have shown it.
+_LIVE_SHAPES = (
+    {"use_http_tmp_link": 0, "use_load_balancing": 0, "disable_ad": 0},
+    {"use_http_tmp_link": 1, "use_load_balancing": 0, "disable_ad": 1},
+    {},
+    {"use_http_tmp_link": 0, "use_load_balancing": 1, "disable_ad": 0},
+    {"use_http_tmp_link": 0, "use_load_balancing": 0, "disable_ad": 0, "_stale": True},
+)
+
+
+def _live_rows(base: str = "http://mock/"):
     rows = []
     ch = 1
     for gid, names in _LIVE_NAMES.items():
         for n in names:
-            rows.append({
-                "id": str(1000 + ch), "name": n, "number": str(ch),
-                "cmd": f"ffmpeg http://mock/ts/{1000 + ch}.ts",
+            shape = _LIVE_SHAPES[(ch - 1) % len(_LIVE_SHAPES)]
+            cid = 1000 + ch
+            link = f"{base}ts/{cid}.ts"
+            if shape.get("_stale"):
+                # a real panel does this: the cmd it stores already carries the
+                # play_token of the session that built the list
+                link += "?play_token=from-the-fetch-that-was-days-ago"
+            row = {
+                "id": str(cid), "name": n, "number": str(ch),
+                "cmd": f"ffmpeg {link}",
                 "logo": "", "tv_genre_id": gid, "tv_archive": 0, "censored": 0,
-                "use_http_tmp_link": 1, "status": 1,
-            })
+                "status": 1,
+            }
+            row.update({k: v for k, v in shape.items() if not k.startswith("_")})
+            rows.append(row)
             ch += 1
     return rows
 
@@ -204,6 +315,26 @@ async def xpcom(request: Request):
     )
 
 
+@router.get("/mock/c/version.js", response_class=PlainTextResponse)
+async def version_js(request: Request):
+    """The static file the box reads to learn which build it is talking to.
+
+    No token, no MAC, no `js` envelope - that is why the resolver can read it
+    during discovery, and why a panel that answers this URL with HTML (a WAF, a
+    router login page) has to be recognised as such instead of having its markup
+    printed as a version number.
+    """
+    _STATE["version_calls"] = int(_STATE.get("version_calls", 0)) + 1
+    mode = str(_STATE.get("version_mode") or "full").strip().lower()
+    if mode in ("none", "404"):
+        return PlainTextResponse("no version.js here", status_code=404)
+    if mode == "html":
+        return PlainTextResponse("<!DOCTYPE html><html><head>Access denied</head>"
+                                 "<body>ver = 'blocked'</body></html>", status_code=200)
+    return PlainTextResponse("/* Ministra */\nvar ver = '5.4.2';\n"
+                             "var ImageDescription = '0.2.20-r3-250';\n")
+
+
 async def _guard(request: Request):
     """Common behaviour toggles: offline + latency simulation."""
     if _STATE["offline"]:
@@ -214,16 +345,39 @@ async def _guard(request: Request):
 
 
 def _portal_mac(request: Request) -> str:
-    """Real STBs send the mac as cookie or as query param - accept both."""
-    return request.cookies.get("mac", "") or request.query_params.get("mac", "") or ""
+    """Real STBs send the mac as cookie or as query param - accept both.
+
+    And accept both *spellings*: box firmware puts the percent-encoded form in
+    the cookie (`mac=00%3A1A%3A...`, because its set_cookie escapes the value),
+    other clients send the plain colons. A portal that only understood one of
+    the two would be a broken portal, so the mock must not be stricter than the
+    thing it stands in for - that mismatch reads as "unknown mac" in a test and
+    as a dead account in the field.
+    """
+    raw = request.cookies.get("mac", "") or request.query_params.get("mac", "") or ""
+    return unquote(raw).strip().upper()
 
 
 def _auth(request: Request) -> tuple[str, JSONResponse | None]:
     """Post-handshake authorization: known mac + the bearer token that the
-    handshake issued. The handshake itself is permissive (see portal_php)."""
+    handshake issued. The handshake itself is permissive (see portal_php).
+
+    `token_rejects` emulates the way Ministra actually expires a session: NOT
+    with a 401 but with HTTP 200 + {"js":{"error":"token"}}, which a lenient
+    client reads as "empty result". A client that does not re-handshake on it
+    stalls until its token TTL runs out - which is exactly the bug this toggle
+    guards against.
+    """
     mac = _portal_mac(request)
     if mac not in MOCK_MACS:
         return mac, JSONResponse({"js": {"error": "unknown mac"}}, status_code=403)
+    if _STATE.get("token_rejects", 0):
+        _STATE["token_rejects"] = int(_STATE["token_rejects"]) - 1
+        log.warning("mock portal: rejecting bearer for %s with HTTP 200 token error "
+                    "(%d left)", mac, _STATE["token_rejects"])
+        return mac, JSONResponse({"js": {"error": "token",
+                                         "msg": "timeout of authorization token"}},
+                                 status_code=200)
     auth = request.headers.get("Authorization", "")
     if not auth.startswith("Bearer mock-" + mac.replace(":", "")):
         return mac, JSONResponse({"js": {"error": "token"}}, status_code=401)
@@ -254,10 +408,38 @@ async def portal_php(request: Request):  # noqa: A002
     # We also accept type=stb with a missing/extra action (some emulators drop
     # or rename params), so a handshake is never rejected by param shape.
     if type == "stb" and (action == "handshake" or not action):
+        qp_mac = unquote(request.query_params.get("mac", "") or "").strip().upper()
+        bearer = (request.headers.get("Authorization") or "").replace("Bearer ", "").strip()
+        prehash = (request.query_params.get("prehash") or "").strip()
+        _STATE["handshakes"] = int(_STATE.get("handshakes", 0)) + 1
+        _STATE.setdefault("handshake_seen", []).append(
+            {"mac_param": bool(qp_mac), "prehash": prehash, "bearer": bool(bearer)})
+        _STATE["handshake_seen"] = _STATE["handshake_seen"][-12:]
+
+        if _STATE.get("require_mac_param") and not qp_mac:
+            log.warning("mock portal: handshake without a mac parameter -> no token")
+            return _js({"js_empty": 1})
+        if _STATE.get("require_prehash"):
+            if prehash in ("", "0"):
+                # the exact shape Ministra uses for second-step auth: HTTP 200,
+                # no token, and a one-word msg that means "prove your bearer"
+                log.warning("mock portal: handshake without prehash -> msg=missing")
+                return _js({"msg": "missing", "random": "mock-random-seed"})
+            expected = hashlib.sha1(bearer.encode()).hexdigest()
+            if not bearer or expected != prehash:
+                log.warning("mock portal: prehash %r does not match the bearer -> 403",
+                            prehash[:12] or "-")
+                return JSONResponse({"js": {"error": "invalid prehash"}}, status_code=403)
         token = "mock-" + (mac.replace(":", "") if mac else "000000000000")
         log.info("mock portal: query=%s mac=%s -> handshake token issued",
                  request.url.query or "-", mac or "-")
-        return _js({"token": token})
+        # `random` is the seed the box has to echo inside its get_profile
+        # `metrics`; real panels send it on every handshake, lenient ones just
+        # never look - so the mock always offers it and the client always keeps it
+        js: dict = {"token": token, "random": "mock-random-seed"}
+        if _STATE.get("not_valid"):
+            js["not_valid"] = 1
+        return _js(js)
 
     mac, err = _auth(request)
     if err is not None:
@@ -268,9 +450,53 @@ async def portal_php(request: Request):  # noqa: A002
         return err
     log.debug("mock portal: type=%s action=%s mac=%s -> ok", type, action, mac or "-")
     if type == "stb" and action == "get_profile":
-        return _js({"mac": mac, "locale": "en_GB.utf8", "hd": 1, "ver": "MockPortal 1.0"})
+        mode = str(_STATE.get("profile_mode") or "full").strip().lower()
+        _STATE["profile_calls"] = int(_STATE.get("profile_calls", 0)) + 1
+        seen = dict(request.query_params)
+        _STATE["profile_seen"] = seen
+        if mode == "none":
+            return JSONResponse({"js": {"error": "not implemented"}}, status_code=404)
+        if _STATE.get("fingerprint_required"):
+            missing = [k for k in ("sn", "device_id", "prehash", "signature", "metrics")
+                       if not (seen.get(k) or "").strip()]
+            if not missing and _STATE.get("not_valid") and seen.get("not_valid_token") != "1":
+                missing = ["not_valid_token"]      # the panel asked, the box must echo
+            if missing:
+                log.warning("mock portal: get_profile without a fingerprint (missing %s) -> 403",
+                            ",".join(missing))
+                return JSONResponse({"js": {"error": "no fingerprint", "missing": missing}},
+                                    status_code=403)
+        acct = MOCK_MACS.get(mac, {})
+        if mode == "no_id":
+            # a portal that answers the full shape with nothing usable: the
+            # client has to notice and retry with the minimal profile
+            return _js({"mac": mac, "locale": "en_GB.utf8"})
+        return _js({"id": "7", "mac": mac, "locale": "en_GB.utf8", "hd": 1,
+                    "ver": "MockPortal 1.0", "sn": seen.get("sn", ""),
+                    "play_token": "mock-play-" + mac.replace(":", "")[-6:],
+                    "status": 1, "blocked": int(acct.get("blocked", 0)),
+                    "force_ch_link_check": 0})
+    if type == "stb" and action == "get_modules":
+        _STATE["modules_calls"] = int(_STATE.get("modules_calls", 0)) + 1
+        if _STATE.get("no_modules"):
+            log.warning("mock portal: get_modules -> 404 (no such action)")
+            return JSONResponse({"js": {"error": "no such action"}}, status_code=404)
+        raw = str(_STATE.get("modules") or "").strip()
+        offered = ([m.strip() for m in raw.split(",") if m.strip()] if raw
+                   else list(DEFAULT_MODULES))
+        off = {m.strip().lower() for m in
+               str(_STATE.get("modules_disabled") or "").split(",") if m.strip()}
+        # the dict shape (name + status + title) is what Ministra 5.4 answers,
+        # and it is also the shape a client that only handles a flat list of
+        # names gets wrong - so the mock uses it
+        return _js({"all_modules": [{"name": m, "title": m.replace("_", " ").title(),
+                                    "status": "0" if m.lower() in off else "1"}
+                                   for m in offered],
+                    "disabled_modules": sorted(off)})
+
     if type == "account_info" and action == "get_main_info":
-        return _js({"mac": mac, "phone": MOCK_MACS[mac]["phone"], "fname": "Mock User"})
+        return _js({"mac": mac, "phone": MOCK_MACS.get(mac, {}).get("phone"),
+                    "fname": "Mock User"})
 
     if type == "itv" and action == "get_genres":
         return _js([{"id": gid, "title": name, "number": i * 10, "censored": 0}
@@ -278,12 +504,12 @@ async def portal_php(request: Request):  # noqa: A002
     if type == "itv" and action == "get_ordered_list":
         genre = qp.get("genre")
         page = int(qp.get("p", "1") or "1")
-        rows = _live_rows()
+        rows = _live_rows(_base(request))
         if genre:
             rows = [r for r in rows if r["tv_genre_id"] == genre]
         return _js(_paged(rows, page))
     if type == "itv" and action == "get_all_channels":
-        return _js({"data": _live_rows()})
+        return _js({"data": _live_rows(_base(request))})
 
     if type == "vod" and action == "get_categories":
         return _js([{"id": gid, "title": n, "alias": ""} for gid, n in VOD_GENRES.items()])
@@ -315,21 +541,58 @@ async def portal_php(request: Request):  # noqa: A002
 
     if action == "create_link":
         cmd = qp.get("cmd", "")
+        _STATE["create_links"] = int(_STATE.get("create_links", 0)) + 1
+        # what the client asked for is part of the protocol: `disable_ad` and
+        # `force_ch_link_check` must follow the channel/panel flags (R2), and a
+        # test that cannot see them cannot prove it
+        _STATE["create_link_seen"] = {"disable_ad": qp.get("disable_ad"),
+                                      "force_ch_link_check": qp.get("force_ch_link_check"),
+                                      "series": qp.get("series"), "cmd": cmd}
+        # A portal-level refusal with HTTP 200 (real panels answer exactly
+        # like this, and the code is the only thing that tells "this MAC is
+        # busy" from "this channel is gone").
+        if _STATE.get("create_link_error"):
+            code = str(_STATE["create_link_error"])
+            log.warning("mock portal: create_link refused for %s with 200 + error=%r",
+                        mac, code)
+            return _js({"error": code})
         # busy-MAC emulation: refuse when this MAC already streams something
         if _usage(mac) >= _STATE["max_per_mac"]:
             return JSONResponse({"js": {"error": "account is in use"}}, status_code=403)
+        if _STATE.get("xtream_mode") == "on" and (".ts" in cmd or ".mp4" in cmd):
+            # The R7 premise, verbatim: the panel builds the stream URL out of an
+            # Xtream account. The origin is real for the same reason a real panel's
+            # is, but the path stays under `/mock/`, because the root-level Xtream
+            # vocabulary (`/live/<u>/<p>/<id>.ts`, `/player_api.php`, `/get.php`) is
+            # *this app's own output API* - a mock that answered at the root would be
+            # shadowed by `routers/output.py` and every one of its URLs would 403 in
+            # a running instance while the tests stayed green (the tests mount the
+            # mock bare, with no output router in front of it). `/mock/live/…` also
+            # exercises the panel-behind-a-path-prefix case, which is real: some
+            # servers stream from `http://host/xtream/live/…`.
+            sid = re.search(r"/(?:ts|vod|media)/(\d+)", cmd)
+            stream_id = sid.group(1) if sid else (re.findall(r"\d+", cmd) or ["0"])[-1]
+            seg = "movie" if type == "vod" or ".mp4" in cmd else "live"
+            ext = "mp4" if seg == "movie" else "ts"
+            origin = str(request.base_url).rstrip("/")
+            url = (f"{origin}/mock/{seg}/{_STATE['xtream_user']}/{_STATE['xtream_pass']}"
+                   f"/{stream_id}.{ext}")
+            log.info("mock portal: xtream link %s/%s/*** (the MAC account is an "
+                     "Xtream account)", origin, seg)
+            # a VOD answer is a bare URL, a live answer keeps the ffmpeg prefix -
+            # both shapes are real, and a client that only handles one fails the other
+            return _js({"cmd": url if seg == "movie" else f"ffmpeg {url}"})
         if ".ts" in cmd or ".mp4" in cmd or ".m3u8" in cmd:
-            url = cmd.split()[-1].replace("http://mock/", str(request.base_url).rstrip("/") + "/mock/")
+            base = str(request.base_url).rstrip("/") + "/mock/"
+            if _STATE.get("mac_placeholder"):
+                # one template for every box: the STB has to fill in its own MAC
+                return _js({"cmd": f"ffmpeg {base}ts/%mac%.ts?m=%MAC%"})
+            url = cmd.split()[-1].replace("http://mock/", base)
             return _js({"cmd": "ffmpeg " + url})
         return JSONResponse({"js": {"error": "bad cmd"}}, status_code=404)
 
     if type == "itv" and action == "get_short_epg":
-        ch = qp.get("ch_id", "")
-        now = int(time.time())
-        return _js([{"id": 1, "ch_id": ch, "name": "Mock programme", "descr": "Demo EPG entry",
-                     "time": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now)),
-                     "time_to": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now + 3600)),
-                     "duration": "01:00:00"}])
+        return _short_epg(request, qp)
 
     return JSONResponse({"js": {"error": f"unknown mock call {type}/{action}"}}, status_code=404)
 
@@ -420,17 +683,209 @@ async def mock_vod(name: str):
 
 
 # ---------------------------------------------------------------------------
+# R9: short EPG - "what is on now", in the timezone the box declared
+# ---------------------------------------------------------------------------
+def _epg_tz(request: Request):
+    """The portal renders guide times in the `timezone=` cookie a box sends.
+
+    That is not a courtesy: the answer carries no offset at all
+    (`"time": "2026-08-30 13:20:00"`), so the cookie is the only thing that says
+    what those digits mean. A mock that ignored it would let a client assume UTC
+    and pass, while every real user on a non-UTC panel gets "nothing is on".
+    """
+    name = unquote(request.cookies.get("timezone", "") or
+                   request.query_params.get("timezone", "") or "").strip()
+    try:
+        return ZoneInfo(name) if name else timezone.utc
+    except Exception:  # noqa: BLE001 - a bad tz name is the portal's problem, not ours
+        return timezone.utc
+
+
+def _short_epg(request: Request, qp):
+    """`type=itv&action=get_short_epg&ch_id=&size=` in the four shapes R9 must handle."""
+    _STATE["short_epg_calls"] = int(_STATE.get("short_epg_calls", 0)) + 1
+    mode = str(_STATE.get("epg_mode") or "normal")
+    if mode == "absent":
+        # a portal without the action: "no guide here", not "guide is empty"
+        return JSONResponse({"js": {"error": "no such action"}}, status_code=404)
+    if mode == "flaky":
+        _STATE["flaky_hits"] = int(_STATE.get("flaky_hits", 0)) + 1
+        if _STATE["flaky_hits"] <= 2:
+            return JSONResponse({"js": {"error": "temporarily unavailable"}}, status_code=503)
+    ch = qp.get("ch_id", "")
+    if mode == "empty":
+        return _js([])
+    try:
+        size = max(1, min(int(qp.get("size") or 10), 10))
+    except ValueError:
+        size = 10
+    label = next((r["name"] for r in _live_rows("http://mock/") if r["id"] == ch), "Mock")
+    tz = _epg_tz(request)
+    # the current programme started 20 minutes ago, then hourly rows after it:
+    # a schedule where `now` is always inside something, and the tail is future
+    start = datetime.now(tz).replace(second=0, microsecond=0) - timedelta(minutes=20)
+    rows = []
+    for i in range(size):
+        st, en = start + timedelta(hours=i), start + timedelta(hours=i + 1)
+        rows.append({"id": int(ch or 0) * 100 + i, "ch_id": ch,
+                     "name": f"{label} - {'now' if i == 0 else 'later ' + str(i)}",
+                     "descr": "Mock short-EPG entry",
+                     "time": st.strftime("%Y-%m-%d %H:%M:%S"),
+                     "time_to": en.strftime("%Y-%m-%d %H:%M:%S"),
+                     "duration": "01:00:00",
+                     # only the first hour is catchup-able: R8 will need this field
+                     "has_archive": "1" if i == 0 else "0"})
+    return _js(rows)
+
+
+# ---------------------------------------------------------------------------
+# R7: the Xtream side of the same account
+# ---------------------------------------------------------------------------
+def _xtream_ok(user: str, pw: str) -> bool:
+    return (user == str(_STATE.get("xtream_user") or "")
+            and pw == str(_STATE.get("xtream_pass") or ""))
+
+
+def _xtream_live_streams() -> list[dict]:
+    """The live catalogue, in Xtream shape - with the flaws that make matching hard.
+
+    Deliberately not a clean copy of the portal list: one channel is missing (an
+    adopt must report it, not invent a match), two entries share a name (the
+    `Sky Sports` family, which is what turns "match by name" into a coin flip), and
+    some rows carry no `num` so the name path is exercised too.
+    """
+    rows = []
+    for i, row in enumerate(_live_rows("http://mock/")):
+        if i % 11 == 7:
+            continue                                  # this channel is not on Xtream
+        rows.append({"num": row["number"], "name": row["name"], "stream_id": row["id"],
+                     "stream_type": "live", "category_id": row["tv_genre_id"],
+                     "container_extension": "ts"})
+        if row["name"] == "Sky Sports":
+            rows.append({"num": "", "name": "Sky Sports", "stream_id": "9001",
+                         "stream_type": "live", "category_id": "2",
+                         "container_extension": "ts"})
+    return rows
+
+
+def _xtream_vod_streams() -> list[dict]:
+    return [{"num": "", "name": row["name"], "movie_id": row["id"],
+             "category_id": row["category_id"], "container_extension": "mp4"}
+            for row in _vod_rows()]
+
+
+@router.get("/mock/player_api.php")
+async def player_api(request: Request):
+    """`player_api.php` for the harvested credentials (or `{"user_info": []}`).
+
+    The empty-`user_info` shape matters: that is how an Xtream server answers a
+    wrong password, and a bridge that treats it as "account with no status" would
+    adopt a dead login and call it a source.
+
+    Served under `/mock/` and not at the root, which is where a real panel puts it:
+    `app/routers/output.py` already serves `/player_api.php` for our *own* Xtream
+    output, so a root-level mock route would be shadowed by it and the demo would
+    403 while the unit tests (which mount this router alone) passed. The bridge
+    derives its API URL from the link the panel handed out, so `/mock/live/…` →
+    `/mock/player_api.php` is reached correctly - the same rule that makes a panel
+    hosted under any path prefix work.
+    """
+    qp = request.query_params
+    _STATE["player_api_calls"] = int(_STATE.get("player_api_calls", 0)) + 1
+    _STATE["seen_player_api"] = {"username": qp.get("username", ""),
+                                 "password": qp.get("password", ""),
+                                 "action": qp.get("action", "")}
+    origin = str(request.base_url).rstrip("/")
+    if _STATE.get("xtream_refuse") or not _xtream_ok(qp.get("username", ""),
+                                                     qp.get("password", "")):
+        return JSONResponse({"user_info": []})
+    action = qp.get("action", "")
+    if action == "get_live_streams":
+        return JSONResponse(_xtream_live_streams())
+    if action == "get_vod_streams":
+        return JSONResponse(_xtream_vod_streams())
+    days = int(_STATE.get("xtream_exp_days", 30) or 0)
+    exp = int(time.time()) + days * 86400 if days > 0 else None
+    return JSONResponse({
+        "server_info": {"status": "Active", "hostname": request.url.hostname or "test",
+                        "http_port": request.url.port or 80, "https_port": 443,
+                        "http_live_url": f"{origin}/mock/live",
+                        "https_live_url": f"{origin}/mock/live",
+                        "server_protocol": "http://", "timeshift": 1, "time_shift": 1},
+        "user_info": {"username": qp.get("username", ""), "status": _STATE.get("xtream_status", "Active"),
+                      "exp_date": exp, "created_at": int(time.time()) - 400 * 86400,
+                      "active_cons": 1, "max_connections": 3, "is_trial": "0", "auth": 1,
+                      "allowed_output_formats": ["m3u", "json"]}})
+
+
+@router.get("/mock/live/{user}/{pw}/{name}.ts")
+@router.get("/mock/movie/{user}/{pw}/{name}.mp4")
+@router.get("/mock/series/{user}/{pw}/{name}.mp4")
+async def xtream_media(request: Request, user: str, pw: str, name: str):
+    """The media endpoints an adopted channel points at - credentials enforced.
+
+    A mock that serves these unconditionally would let every R7 test pass while
+    the URLs it produced were nonsense: checking the credential here is what
+    proves that the string we harvested from `create_link` is the string the media
+    host accepts.
+    """
+    if not _xtream_ok(user, pw):
+        return JSONResponse({"errors": "Unauthorized"}, status_code=403)
+    return StreamingResponse(_ts_generator(name), media_type="application/octet-stream")
+
+
+# ---------------------------------------------------------------------------
 # Control endpoint for demos/tests (flip offline/slow/busy on the fly)
 # ---------------------------------------------------------------------------
+#: every knob `/mock/_control` may set. The client tests also poke the failure
+#: knobs directly, but a knob only a test can turn is half a knob: rehearsing a
+#: failing portal from the GUI or a curl is how you learn what your proxy does
+#: before a real one teaches you.
+_TOGGLE_KEYS = ("offline", "slow", "max_per_mac", "create_link_error",
+                "token_rejects", "mac_placeholder", "require_prehash",
+                "require_mac_param", "fingerprint_required", "profile_mode",
+                "not_valid", "http_status", "js_error", "empty_reply",
+                "corrupt_stream", "reject_no_cookie", "reject_no_referer",
+                "require_host", "require_tls", "note", "version_mode", "modules",
+                "modules_disabled", "no_modules", "xtream_mode", "xtream_user",
+                "xtream_pass", "xtream_exp_days", "xtream_status", "xtream_refuse",
+                "epg_mode")
+
+
 @router.post("/mock/_control")
 async def control(payload: dict):
-    for k in ("offline", "slow", "max_per_mac"):
+    for k in _TOGGLE_KEYS:
         if k in payload:
             _STATE[k] = payload[k]
-    log.warning("mock portal control: %s", {k: _STATE[k] for k in ("offline", "slow", "max_per_mac")})
-    return {"state": {k: _STATE[k] for k in ("offline", "slow", "max_per_mac", "note")}}
+    # `.get`, not `[...]`: the failure knobs have no default entry, and a control
+    # endpoint that raises KeyError while *applying* a valid setting is worse than
+    # one that does not accept the knob at all
+    shown = {k: _STATE.get(k) for k in _TOGGLE_KEYS}
+    log.warning("mock portal control: %s", shown)
+    return {"state": shown}
 
 
 @router.get("/mock/_state")
 async def state():
-    return {"state": {**_STATE, "usage": dict(_STATE["usage"])}}
+    """What the mock is configured to do, and what it actually saw.
+
+    `seen_profile` / `seen_handshakes` are the assertions a client test needs:
+    the point of R1 is not that we *intended* to send a fingerprint, it is that
+    the portal received one - so the mock records the queries it was sent.
+    """
+    return {"state": {k: _STATE.get(k) for k in _TOGGLE_KEYS + ("note",)},
+            "counters": {"handshakes": _STATE.get("handshakes", 0),
+                         "profile_calls": _STATE.get("profile_calls", 0),
+                         "version_calls": _STATE.get("version_calls", 0),
+                         "modules_calls": _STATE.get("modules_calls", 0),
+                         "create_links": _STATE.get("create_links", 0),
+                         "player_api": int(_STATE.get("player_api_calls", 0)),
+                         "short_epg": int(_STATE.get("short_epg_calls", 0))},
+            "seen_profile": _STATE.get("profile_seen") or {},
+            "seen_handshakes": _STATE.get("handshake_seen") or [],
+            # R7/R9: how many times the panel was asked for its Xtream side and for
+            # a guide. These are assertions, not decoration - "we do not re-ask" and
+            # "one request per visible channel" are only provable by counting.
+            "seen_create_link": _STATE.get("create_link_seen") or {},
+            "seen_player_api": _STATE.get("seen_player_api") or {},
+            "usage": dict(_STATE["usage"])}

@@ -17,10 +17,15 @@ from ..models import (
     LiveGenre, LivePlaylistSource, LiveSource, MacAddress, Portal, SerieGenre,
     SeriePlaylistSource, SerieSource, VodGenre, VodPlaylistSource, VodSource,
 )
-from ..portal.pool import POOL
-from ..portal.client import PortalError, StalkerClient
+from ..portal.pool import POOL, PortalSession
+from ..portal.client import PortalError, status_for_error
+from ..portal.account import mac_status
+from ..portal.capabilities import (dumps_modules, loads_modules, supports,
+                                   version_js_url)
+from ..portal.identity import IDENTITY_MODES
 from ..portal.resolver import resolve_portal
 from ..security import require_admin
+from ..services import xtream_bridge
 from ..services.db_logging import db_log
 from ..services.fetch_jobs import cancel as cancel_job, list_jobs, submit
 
@@ -28,6 +33,46 @@ router = APIRouter(prefix="/api/portals", tags=["portals"], dependencies=[Depend
 
 MAC_RE = re.compile(r"(?i)\b([0-9a-f]{2}[:\-][0-9a-f]{2}[:\-][0-9a-f]{2}[:\-]"
                     r"[0-9a-f]{2}[:\-][0-9a-f]{2}[:\-][0-9a-f]{2})\b")
+
+
+def parse_mac_entries(value) -> list[dict]:
+    """The `macs` payload -> [{mac, sn, device_id}], in order.
+
+    Accepts the GUI textarea (one string), a list of MAC strings, and a list of
+    objects - the last one because a user who captured their box's real `sn` /
+    `device_id` needs a way to pin them, and a MAC list that only holds strings
+    would force that through a code change. Unknown keys are ignored, and pins
+    are trimmed empties -> None so the client derives them from the MAC.
+    """
+    raw: list = []
+    if isinstance(value, str):
+        raw = [{"mac": m} for m in parse_macs(value)]
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if isinstance(item, str):
+                raw.append({"mac": item})
+            elif isinstance(item, dict) and item.get("mac"):
+                raw.append(dict(item))
+    out, seen = [], set()
+    for entry in raw:
+        found = parse_macs(str(entry.get("mac") or ""))
+        if not found:
+            continue
+        mac = found[0]
+        if mac in seen:
+            continue
+        seen.add(mac)
+        out.append({"mac": mac,
+                    "sn": (str(entry.get("sn") or "").strip() or None),
+                    "device_id": (str(entry.get("device_id") or "").strip() or None)})
+    return out
+
+
+def _identity_mode(value) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in IDENTITY_MODES:
+        raise HTTPException(400, f"identity_mode must be one of: {', '.join(IDENTITY_MODES)}")
+    return mode
 
 
 def parse_macs(text: str) -> list[str]:
@@ -46,8 +91,30 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
     return {"id": p.id, "name": p.name, "base_url": p.base_url,
             "resolved_url": p.resolved_url, "resolved_path": p.resolved_path,
             "enabled": p.enabled, "proxy_url": p.proxy_url,
+            "tls_insecure": bool(p.tls_insecure),
+            "identity_mode": p.identity_mode or "mag250",
+            "stb_timezone": p.stb_timezone or "",
+            "direct_links": bool(getattr(p, "direct_links", True)),
+            # R6: what the panel said about itself. `modules` is None until a
+            # resolve asked, and the GUI has to tell that apart from "the panel
+            # has nothing" - a tab greyed out for a reason nobody can explain is
+            # worse than no grey-out at all.
+            "portal_version": p.portal_version or "",
+            "modules": loads_modules(p.modules),
+            "capabilities_at": p.capabilities_at.isoformat() if p.capabilities_at else None,
+            "features": {name: supports(loads_modules(p.modules), name)
+                         for name in ("live", "vod", "series", "epg", "archive")},
+            # R7: the Xtream side of this portal, if it has one. Everything here is
+            # masked - the row feeds a GUI table, and a harvested password in a
+            # list endpoint is a password in a browser's history.
+            "xtream": xtream_bridge.public_observation(xtream_bridge.loads_observation(p.xtream)),
+            "xtream_adopted": bool(p.xtream_adopted),
+            "xtream_at": p.xtream_at.isoformat() if p.xtream_at else None,
             "macs": [{"id": m.id, "mac": m.mac, "order": m.order, "status": m.status,
                       "online": m.online, "expire_date": m.expire_date,
+                      "last_error": m.last_error or "",
+                      "force_ch_link_check": bool(m.force_ch_link_check),
+                      "sn": m.sn or "", "device_id": m.device_id or "",
                       "fail_count": m.fail_count,
                       "last_checked": m.last_checked.isoformat() if m.last_checked else None}
                      for m in macs]}
@@ -71,11 +138,15 @@ async def create_portal(payload: dict, db=Depends(get_db)):
     if not name or not base_url:
         raise HTTPException(400, "name and url are required")
     p = Portal(name=name, base_url=base_url, enabled=bool(payload.get("enabled", True)),
-               proxy_url=(payload.get("proxy_url") or None))
+               proxy_url=(payload.get("proxy_url") or None),
+               tls_insecure=bool(payload.get("tls_insecure", False)),
+               identity_mode=_identity_mode(payload.get("identity_mode", "mag250")),
+               stb_timezone=(str(payload.get("stb_timezone") or "").strip() or None),
+               direct_links=bool(payload.get("direct_links", True)))
     db.add(p)
     await db.flush()
-    for i, mac in enumerate(parse_macs(payload.get("macs", ""))):
-        db.add(MacAddress(portal_id=p.id, mac=mac, order=i))
+    for i, entry in enumerate(parse_mac_entries(payload.get("macs", ""))):
+        db.add(MacAddress(portal_id=p.id, order=i, **entry))
     await db.commit()
     await db_log("INFO", "portal", f"portal '{name}' created ({base_url})")
     return {"id": p.id}
@@ -86,25 +157,43 @@ async def update_portal(pid: int, payload: dict, db=Depends(get_db)):
     p = await db.get(Portal, pid)
     if not p:
         raise HTTPException(404, "portal not found")
-    for f in ("name", "base_url", "enabled", "proxy_url"):
+    # `xtream_adopted` is deliberately NOT settable here: adoption writes per-channel
+    # URLs, and a boolean flipped on its own would put the portal in a state where
+    # playback depends on data this endpoint cannot maintain. Use /xtream/adopt.
+    for f in ("name", "base_url", "enabled", "proxy_url", "tls_insecure",
+              "stb_timezone", "direct_links"):
         if f in payload:
-            setattr(p, f, payload[f])
-    if "base_url" in payload:                    # URL changed -> re-resolve later
-        p.resolved_url = p.resolved_path = None
+            val = bool(payload[f]) if f in ("tls_insecure", "direct_links") else payload[f]
+            if f == "stb_timezone":
+                val = str(val or "").strip() or None
+            setattr(p, f, val)
+    if "identity_mode" in payload:
+        # validated separately: a typo here must say so, not silently change what
+        # every stream on this portal looks like to the panel
+        p.identity_mode = _identity_mode(payload["identity_mode"])
+    if "base_url" in payload or "tls_insecure" in payload:
+        p.resolved_url = p.resolved_path = None   # endpoint/TLS policy changed -> re-resolve
     p.updated = datetime.now(timezone.utc)
     if "macs" in payload:                        # replace full mac list, keep order/status of existing
         existing = {m.mac: m for m in (await db.execute(
             select(MacAddress).where(MacAddress.portal_id == pid))).scalars().all()}
-        wanted = parse_macs(payload["macs"])
+        entries = parse_mac_entries(payload["macs"])
+        wanted = [e["mac"] for e in entries]
         for mac, row in existing.items():
             if mac not in wanted:
                 await db.delete(row)
         have = set(existing) & set(wanted)
-        for i, mac in enumerate(wanted):
+        for i, entry in enumerate(entries):
+            mac = entry["mac"]
             if mac in have:
-                existing[mac].order = i
+                row = existing[mac]
+                row.order = i
+                # a textarea edit re-sends bare MACs; that must not wipe a pin
+                for field in ("sn", "device_id"):
+                    if entry.get(field) is not None:
+                        setattr(row, field, entry[field])
             else:
-                db.add(MacAddress(portal_id=pid, mac=mac, order=i))
+                db.add(MacAddress(portal_id=pid, order=i, **entry))
     await db.commit()
     return {"ok": True}
 
@@ -202,17 +291,84 @@ async def resolve(pid: int, db=Depends(get_db)):
     first_mac = (await db.execute(select(MacAddress).where(MacAddress.portal_id == pid)
                                   .order_by(MacAddress.order))).scalars().first()
     res = await resolve_portal(p.base_url, mac=first_mac.mac if first_mac else None,
-                               proxy=p.proxy_url)
+                               proxy=p.proxy_url, tls_insecure=p.tls_insecure)
     for line in res.attempts:
         await db_log("DEBUG", "resolve", f"[{p.name}] {line}")
+    caps: dict = {}
     if res.ok:
         p.resolved_url, p.resolved_path = res.portal_url, res.path
+        if res.version.known:
+            p.portal_version = res.version.label[:120]
+        p.capabilities_at = datetime.now(timezone.utc)
         await db.commit()
-        await db_log("INFO", "resolve", f"[{p.name}] resolved -> {res.portal_url}")
+        await db_log("INFO", "resolve",
+                     f"[{p.name}] resolved -> {res.portal_url}"
+                     + (f" ({res.version.label})" if res.version.known else ""))
+        # The module list needs a token, so it comes from a client session and
+        # not from the resolver - but only here, where a user is *looking* at the
+        # portal: an IP-locked panel is best asked once, on purpose.
+        caps = await _probe_capabilities(p, first_mac, res.portal_url, db)
     else:
         await db_log("ERROR", "resolve", f"[{p.name}] resolve failed: {res.error}")
     return {"ok": res.ok, "resolved_url": res.portal_url, "path": res.path,
-            "attempts": res.attempts, "error": res.error}
+            "attempts": res.attempts, "error": res.error,
+            "referer": res.referer, "version": res.version.public(),
+            "version_url": version_js_url(res.portal_url) if res.ok else "",
+            **caps}
+
+
+async def _probe_capabilities(p: Portal, mac_row, portal_url: str, db) -> dict:
+    """Ask the panel what it offers, and store the answer. Never fails a resolve.
+
+    Both probes are one cheap GET, and both are *information*: `version.js` needs
+    no token at all. That is the whole argument for doing it on Resolve - the
+    user is already watching this portal - and the whole argument for letting
+    every failure pass silently: an information request must not be able to turn
+    a working portal red.
+    """
+    out: dict = {"modules": loads_modules(p.modules), "features": {}, "modules_error": ""}
+    if not mac_row:
+        out["modules_error"] = "no MAC to ask with"
+        return out
+    try:
+        client = await POOL.get(PortalSession.from_rows(p, mac_row, portal_url=portal_url))
+        try:
+            await client.ensure_auth()
+            caps = await client.refresh_capabilities()
+        finally:
+            await client.close()
+    except PortalError as exc:
+        out["modules_error"] = exc.code
+        await db_log("DEBUG", "resolve",
+                     f"[{p.name}] capabilities unavailable ({exc.code}) - nothing is "
+                     f"gated off on an answer we never got")
+        return out
+    except Exception as exc:  # noqa: BLE001 - information only, never fatal
+        out["modules_error"] = type(exc).__name__
+        return out
+    modules = caps.get("modules")
+    if modules:
+        p.modules = dumps_modules(modules)
+    version = caps.get("version") or {}
+    if version.get("label"):
+        p.portal_version = str(version["label"])[:120]
+    p.capabilities_at = datetime.now(timezone.utc)
+    await db.commit()
+    if modules is None:
+        await db_log("INFO", "resolve",
+                     f"[{p.name}] get_modules said nothing ({caps.get('modules_error')})"
+                     f" - no catalogue is gated off")
+    else:
+        missing = [f for f in ("vod", "series", "epg", "archive")
+                   if supports(modules, f) is False]
+        await db_log("INFO", "resolve",
+                     f"[{p.name}] modules: {', '.join(modules)}"
+                     + (f" | nothing for: {', '.join(missing)}" if missing else ""))
+    out["modules"] = modules
+    out["modules_error"] = str(caps.get("modules_error") or "")
+    out["features"] = {name: supports(modules, name) for name in
+                       ("live", "vod", "series", "epg", "archive")}
+    return out
 
 
 @router.post("/{pid}/test")
@@ -226,7 +382,8 @@ async def test_portal(pid: int, db=Depends(get_db)):
     results = []
     url = p.resolved_url
     if not url:
-        res = await resolve_portal(p.base_url, mac=macs[0].mac if macs else None, proxy=p.proxy_url)
+        res = await resolve_portal(p.base_url, mac=macs[0].mac if macs else None,
+                                   proxy=p.proxy_url, tls_insecure=p.tls_insecure)
         if not res.ok:
             for m in macs:
                 m.status, m.online = "offline", False
@@ -238,28 +395,112 @@ async def test_portal(pid: int, db=Depends(get_db)):
         url = res.portal_url
         p.resolved_url, p.resolved_path = res.portal_url, res.path
     for m in macs:
-        client = await POOL.get(url, m.mac, m.password, p.proxy_url)
+        client = await POOL.get(PortalSession.from_rows(p, m, portal_url=url))
+        code = ""
         try:
             await client.handshake()
-            exp = await client.account_expires()
-            m.status, m.online, m.expire_date, m.fail_count = "online", True, exp, 0
-            detail = f"expires: {exp or 'unknown'}"
-            await db_log("INFO", "portal", f"[{p.name}] mac {m.mac} online ({detail})")
+            # The panel's own verdict, not "the handshake worked". A MAC can
+            # handshake all day and still be banned or out of subscription -
+            # and while it stays in the chains it burns a portal connection slot
+            # on every attempt and the user sees a black channel.
+            verdict = await client.refresh_account()
+            m.expire_date = verdict.expire_date
+            m.force_ch_link_check = verdict.force_ch_link_check
+            m.status, m.online = mac_status(verdict), verdict.online
+            m.last_error = None if m.online else verdict.reason[:200]
+            m.fail_count = 0 if m.online else m.fail_count
+            detail = verdict.reason
+            if not m.online:
+                code = verdict.status
+            await db_log("INFO" if m.online else "WARNING", "portal",
+                         f"[{p.name}] mac {m.mac} {m.status} ({detail})")
         except PortalError as exc:
-            msg = str(exc).lower()
-            m.status = ("unauthorized" if "401" in msg or "403" in msg or "token" in msg
-                        else "offline" if "request failed" in msg or "http 5" in msg else "error")
+            # Was: guess from substrings of the message ("401" in msg, "token"
+            # in msg). The client now carries the portal's own code, so the
+            # status is decided from what the panel actually said.
+            code = exc.code
+            m.status = status_for_error(exc)
             m.online = False
             m.fail_count += 1
-            detail = str(exc)
-            await db_log("WARNING", "portal", f"[{p.name}] mac {m.mac} failed: {detail}")
+            detail = exc.detail()
+            m.last_error = detail[:200]
+            await db_log("WARNING", "portal",
+                         f"[{p.name}] mac {m.mac} failed ({m.status}): {detail}")
         finally:
             m.last_checked = datetime.now(timezone.utc)
             await client.close()
         results.append({"mac": m.mac, "status": m.status, "expire_date": m.expire_date,
-                        "detail": detail})
+                        "online": m.online, "code": code or None, "detail": detail,
+                        "force_ch_link_check": bool(m.force_ch_link_check),
+                        "sn": m.sn or client.identity.sn,
+                        "device_id": m.device_id or client.identity.device_id})
+    # A check is also the moment a user wants to know what this portal *is*, and
+    # the two probes cost one request each - so fill them in when they were never
+    # done, and do not re-ask a panel that has already answered. An IP-locked
+    # portal notices both kinds of noise, and `portal_version`/`modules` do not
+    # change minute to minute.
+    caps = {}
+    if results and (not p.modules or not p.portal_version) \
+            and any(r["online"] for r in results):
+        online = next((m for m in macs if m.online), macs[0] if macs else None)
+        caps = await _probe_capabilities(p, online, url, db)
+    # R7, same occasion and the same discipline: if this portal has never been
+    # looked at for an Xtream side, look once while we already have a working
+    # session. Nothing here can fail the check - a portal without the bridge is the
+    # ordinary case, and "we found one" is information the user acts on, not an
+    # automatic change to how their TV plays.
+    xt = {}
+    if results and not p.xtream and any(r["online"] for r in results):
+        try:
+            xt = await xtream_bridge.probe(db, p)
+        except Exception as exc:  # noqa: BLE001
+            await db_log("DEBUG", "portal", f"[{p.name}] xtream probe crashed: {exc}")
     await db.commit()
-    return {"results": results}
+    return {"results": results, "capabilities": caps or None, "xtream": xt or None}
+
+
+# ------------------------------------------------------------------ xtream bridge (R7)
+@router.post("/{pid}/xtream")
+async def xtream_probe(pid: int, force: bool = False, db=Depends(get_db)):
+    """Look for the Xtream account hidden inside this portal's stream links.
+
+    Read-only by design: this stores what it finds and changes no playback. The
+    harvest asks the panel for exactly one `create_link` answer - which is a real
+    request against a real account, so it happens on demand (here, or during Check
+    Portal when nothing is known yet) and not on a timer.
+    """
+    p = await db.get(Portal, pid)
+    if not p:
+        raise HTTPException(404, "portal not found")
+    out = await xtream_bridge.probe(db, p, force=force)
+    return {**out, "portal": _portal_row(p, [])}
+
+
+@router.post("/{pid}/xtream/adopt")
+async def xtream_adopt(pid: int, force: bool = False, db=Depends(get_db)):
+    """The explicit step: match the Xtream catalogue and let its links bypass the MAC path.
+
+    `force=1` is the only way to adopt an account the panel reports as expired or
+    banned, and it exists because some panels report their own account state
+    wrongly - not because adopting a dead login should be easy by accident.
+    """
+    p = await db.get(Portal, pid)
+    if not p:
+        raise HTTPException(404, "portal not found")
+    out = await xtream_bridge.adopt(db, p, force=force)
+    if not out.get("ok") and out.get("error"):
+        raise HTTPException(400, out["error"])
+    return {**out, "portal": _portal_row(p, [])}
+
+
+@router.post("/{pid}/xtream/detach")
+async def xtream_detach(pid: int, clear: bool = False, db=Depends(get_db)):
+    """Stop using the harvested links. `clear=1` also drops them from the rows."""
+    p = await db.get(Portal, pid)
+    if not p:
+        raise HTTPException(404, "portal not found")
+    out = await xtream_bridge.detach(db, p, clear=clear)
+    return {**out, "portal": _portal_row(p, [])}
 
 
 @router.post("/test-batch")
