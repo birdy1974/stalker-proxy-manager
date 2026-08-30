@@ -236,7 +236,7 @@ $("#tpl-delete").addEventListener("click", () => {
   confirmDialog({ title: "Delete template", body: `Delete <b>${esc(current.name)}</b>? Channels using it fall back to the default template.`,
     okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/ffmpeg/${current.id}`, { method: "DELETE" }); current = null; loadList(); } });
 });
-$("#btn-test-cmd").addEventListener("click", () => {
+$("#btn-test-syntax").addEventListener("click", () => {
   const cmd = $("#f-command").value.trim();
   const ok = cmd.startsWith("ffmpeg") && cmd.includes("<url>");
   toast(ok ? "looks valid (starts with ffmpeg, contains <url>)" : "command must start with 'ffmpeg' and contain <url>", ok ? "ok" : "warn");
