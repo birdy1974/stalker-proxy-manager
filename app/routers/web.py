@@ -6,6 +6,8 @@ except /login.
 
 from __future__ import annotations
 
+import os
+
 from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -15,6 +17,31 @@ from ..security import check_credentials, require_admin
 
 templates = Jinja2Templates(directory="app/templates")
 router = APIRouter(tags=["gui"])
+
+
+def _static_versions() -> dict:
+    """Per-boot fingerprint (size-mtime) of the GUI's own assets, used as a
+    cache-busting ?v= on the <script>/<link> tags in base.html.
+
+    Without it browsers keep serving a WEEKS-old cached app.js after an
+    upgrade, and 'fixed' bugs (like the preview player rewrite) look unfixed
+    because the page still runs the old code. mtime+size changes whenever the
+    file changes; the value stays stable across requests so the URL (and its
+    cache entry) only rotates when the asset really did."""
+    import hashlib
+
+    out: dict[str, str] = {}
+    for key, rel in (("js", "app/static/js/app.js"),
+                     ("css", "app/static/css/app.css")):
+        try:
+            st = os.stat(rel)
+            out[key] = hashlib.sha1(f"{st.st_mtime_ns}:{st.st_size}".encode()).hexdigest()[:10]
+        except OSError:
+            out[key] = "dev"
+    return out
+
+
+templates.env.globals["static_v"] = _static_versions()
 
 PAGES = {
     "/": ("dashboard.html", "Dashboard", "dashboard"),
