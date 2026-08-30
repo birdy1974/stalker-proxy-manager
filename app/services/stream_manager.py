@@ -47,6 +47,7 @@ from ..portal.links import plan_adopted, plan_for
 from .db_logging import db_log
 from .ffmpeg_templates import (HLS_ALLOWED_EXTENSIONS, HLS_PROTOCOL_WHITELIST,
                                REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file)
+from .probe import subtitle_streams
 from .item_info import local_file_path
 
 log = logging.getLogger("spm.stream")
@@ -58,6 +59,24 @@ _NETONLY_OPTS = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout|user_agent|headers|http_proxy"
     r"|seekable|multiple_requests|referer)\b\s*(?:\S+)?")
 _NET_SCHEMES = ("http://", "https://")
+# Subtitle codecs, by what a transcoded MPEG-TS pipe can do with them:
+# bitmap ones survive a re-encode into the DVB track of the output TS; text
+# ones cannot enter MPEG-TS at all (they can only be BURNED into the picture).
+_BITMAP_SUB_CODECS = {"dvb_subtitle", "dvd_subtitle", "hdmv_pgs_subtitle", "xsub"}
+_TEXT_SUB_CODECS = {"subrip", "srt", "ass", "ssa", "text", "webvtt", "mov_text"}
+
+
+_FILTER_SENTINEL = "__SPM_BURN_URL__"   # space-free stand-in for <url> in subtitles=
+
+
+def _filter_path(path: str) -> str:
+    """Escape a filename for use INSIDE a filtergraph option value (the
+    subtitles= burn filter). Filter values are not shell: ',', ':', '[', ']',
+    ';', quote and backslash are special there, spaces are not."""
+    out = path.replace("\\", "\\\\").replace("'", "\\'")
+    for ch in (":", ",", "[", "]", ";"):
+        out = out.replace(ch, "\\" + ch)
+    return out
 
 
 class _WithTemplate:
@@ -358,6 +377,61 @@ class StreamManager:
         return b""
 
     @staticmethod
+    def _strip_subs(args: list[str], *, keep_filter: bool = False) -> list[str]:
+        """
+        Remove every subtitle OUTPUT mechanism from argv:
+
+          * `-map` specs that address a subtitle stream (`:s`)
+          * `-c:s` / `-scodec` pairs
+          * the `subtitles=` burn filter inside a -vf value (unless
+            keep_filter=True - the burn-keep path drops the stream machinery
+            but keeps rendering text into the picture)
+
+        Video/audio maps and the rest of the filter chain are untouched;
+        segments split on unescaped commas, so a filter-escaped path with
+        '\,' survives intact.
+        """
+        out: list[str] = []
+        i = 0
+        while i < len(args):
+            t = args[i]
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            if t == "-map" and nxt is not None and ":s" in nxt:
+                i += 2                     # subtitle map -> dropped
+                continue
+            if t in ("-c:s", "-scodec") and nxt is not None:
+                i += 2                     # subtitle codec -> dropped
+                continue
+            if t == "-vf" and nxt is not None and "subtitles=" in nxt \
+                    and not keep_filter:
+                segs = re.split(r"(?<!\\),", nxt)
+                kept = [s for s in segs if s.strip() and not s.strip().startswith("subtitles=")]
+                if kept:
+                    out += ["-vf", ",".join(kept)]
+                i += 2
+                continue
+            out.append(t)
+            i += 1
+        return out
+
+    @staticmethod
+    def _ensure_sn(args: list[str]) -> list[str]:
+        """Pin -sn into the OUTPUT section so ffmpeg's default stream
+        selection cannot auto-pick a subtitle stream either - an
+        unmapped-but-auto-selected subrip track dies at the mpegts muxer just
+        the same."""
+        if "-sn" in args:
+            return args
+        out = list(args)
+        try:
+            last_i = max(idx for idx, a in enumerate(out) if a == "-i")
+            f_idx = out.index("-f", last_i) if "-f" in out[last_i:] else len(out) - 1
+        except ValueError:
+            f_idx = len(out) - 1
+        out.insert(f_idx, "-sn")
+        return out
+
+    @staticmethod
     def _drop_subtitles(args: list[str]) -> list[str]:
         """
         Enforce 'the TS/HLS pipe carries no subtitles' at spawn time.
@@ -372,31 +446,28 @@ class StreamManager:
         video/audio streams are untouched; whole-program maps like `-map 0`
         are the user's own statement and are left alone.
         """
-        out: list[str] = []
-        i = 0
-        while i < len(args):
-            t = args[i]
-            nxt = args[i + 1] if i + 1 < len(args) else None
-            if t == "-map" and nxt is not None and ":s" in nxt:
-                i += 2                     # subtitle map -> dropped
+        return StreamManager._ensure_sn(StreamManager._strip_subs(args))
+
+    @staticmethod
+    def _has_sub_map(cmd_template: str) -> bool:
+        """True when the command's OUTPUT side maps subtitle streams (dvb
+        intent). Tolerant tokenising: a half-typed command must not raise."""
+        try:
+            toks = shlex.split(cmd_template or "")
+        except ValueError:
+            toks = (cmd_template or "").split()
+        output_side = False
+        for i, t in enumerate(toks):
+            if t == "-i":
+                output_side = True
                 continue
-            if t in ("-c:s", "-scodec") and nxt is not None:
-                i += 2                     # subtitle codec -> dropped
+            if not output_side:
                 continue
-            out.append(t)
-            i += 1
-        if "-sn" not in out:
-            # pin -sn into the OUTPUT section (after the last -i value) so
-            # ffmpeg's default stream selection cannot auto-pick a subtitle
-            # stream either - an unmapped-but-auto-selected subrip track dies
-            # at the mpegts muxer just the same.
-            try:
-                last_i = max(idx for idx, a in enumerate(out) if a == "-i")
-                f_idx = out.index("-f", last_i) if "-f" in out[last_i:] else len(out) - 1
-            except ValueError:
-                f_idx = len(out) - 1
-            out.insert(f_idx, "-sn")
-        return out
+            nxt = toks[i + 1] if i + 1 < len(toks) else None
+            if (t == "-map" and nxt is not None and ":s" in nxt) \
+                    or (t in ("-c:s", "-scodec") and nxt is not None):
+                return True
+        return False
 
     @staticmethod
     def _ffmpeg_argv(cmd_template: str, url: str, title: str | None = None,
@@ -418,13 +489,27 @@ class StreamManager:
         hits EOF long before the viewer reaches the end and the stream just
         stops mid-playback. Live inputs are already paced by the encoder on
         the other end and must NOT be throttled.
+
+        Subtitle intents (dvb/burn) are NOT flattened here: they are checked
+        against the real source by the async _subs_gate at spawn time, which
+        alone knows whether the file/link actually carries a convertible
+        track. Everything else gets the plain "no subtitles" net.
         """
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
             return None
         is_net = url.lower().startswith(_NET_SCHEMES)
+        wants_burn = "subtitles=" in cmd_template
+        cmd_text = cmd_template
+        if wants_burn:
+            # the burn filter reads the FILE, not a stream. The real path must
+            # NOT go through shlex quoting (a filtergraph is not a shell), so
+            # park a space-free sentinel here and substitute the filter-escaped
+            # path into the -vf token after the split.
+            cmd_text = cmd_text.replace("subtitles=" + URL_PLACEHOLDER,
+                                        "subtitles=" + _FILTER_SENTINEL)
         insert = url if is_net else shlex.quote(url)
         cmd_text = StreamManager._network_input_options(
-            cmd_template.replace(URL_PLACEHOLDER, insert), url)
+            cmd_text.replace(URL_PLACEHOLDER, insert), url)
         if not is_net:
             cmd_text = _NETONLY_OPTS.sub(" ", cmd_text)
         if cmd_text.startswith("ffmpeg"):
@@ -437,7 +522,11 @@ class StreamManager:
             return None
         if not args:
             return None
-        args = StreamManager._drop_subtitles(args)
+        if wants_burn:
+            esc = _filter_path(url)
+            args = [t.replace(_FILTER_SENTINEL, esc) for t in args]
+        if not wants_burn and not StreamManager._has_sub_map(cmd_template):
+            args = StreamManager._drop_subtitles(args)
         if pace and not ({"-re", "-readrate", "-readrate_initial"} & set(args)):
             try:
                 args.insert(args.index("-i"), "-re")   # input option: before -i
@@ -459,6 +548,101 @@ class StreamManager:
                     args[-1:-1] = ["-metadata", f"title={title}"]
         return args
 
+    async def _subs_gate(self, args: list[str], url: str, pace: bool,
+                         name: str = "") -> list[str]:
+        """
+        Per-source reality check for dvb/burn subtitle intents.
+
+        The template says what it WANTS; whether the source can deliver it is
+        a property of the file/link being played. The gate probes the source
+        once (8 s cap, 10 min cache) and degrades to the safe default - no
+        subtitle track in the pipe - instead of letting ffmpeg abort before
+        its first output byte. Live inputs (pace=False) are trusted instead of
+        probed: zapping must stay instant, and live MPEG-TS carries DVB bitmap
+        subs natively - the only kind the dvb mode can keep anyway.
+        """
+        tag = f"[{name}] " if name else ""
+        is_net = url.lower().startswith(_NET_SCHEMES)
+        vf = next((args[i + 1] for i, t in enumerate(args)
+                   if t == "-vf" and i + 1 < len(args) and "subtitles=" in args[i + 1]),
+                  None)
+        mapped = "-c:s" in args or "-scodec" in args
+        if vf is None and not mapped:
+            return args
+
+        # ---- burn: libass renders text onto the picture ---------------------
+        if vf is not None:
+            self_ref = _filter_path(url) in vf or url in vf
+            on_gpu = any(t in args for t in ("-init_hw_device", "-hwaccel",
+                                             "-hwaccel_output_format")) \
+                or any("scale_vaapi" in a or "scale_qsv" in a for a in args)
+            if on_gpu:
+                await db_log("INFO", "stream", tag +
+                             "burn-in needs the software (libx264) path "
+                             "-> subtitles dropped")
+                return StreamManager._ensure_sn(StreamManager._strip_subs(args))
+            if not self_ref:
+                # the filter reads an EXTERNAL subtitle file the template
+                # points at - the input's own tracks are irrelevant
+                return StreamManager._ensure_sn(StreamManager._strip_subs(args, keep_filter=True))
+            if is_net:
+                await db_log("INFO", "stream", tag +
+                             "burn-in reads the source file: local files only "
+                             "(the filter cannot re-open a tokenised CDN link "
+                             "with the right identity) -> subtitles dropped")
+                return StreamManager._ensure_sn(StreamManager._strip_subs(args))
+            subs = await subtitle_streams(url, is_url=False)
+            if subs and any(s["codec"] in _TEXT_SUB_CODECS for s in subs):
+                return StreamManager._ensure_sn(StreamManager._strip_subs(args, keep_filter=True))
+            if subs is not None:
+                await db_log("INFO", "stream", tag +
+                             "no text subtitle track to burn ("
+                             + ", ".join(s["codec"] for s in subs) + ")"
+                             " -> subtitles dropped")
+            else:
+                await db_log("INFO", "stream", tag +
+                             "subtitle probe failed -> subtitles dropped (safe default)")
+            return StreamManager._ensure_sn(StreamManager._strip_subs(args))
+
+        # ---- dvb / copy: keep BITMAP subtitles as a track in the output TS --
+        if not pace:                       # live: opt-in trusted, no probe
+            return args
+        subs = await subtitle_streams(url, is_url=is_net)
+        if subs is None:
+            await db_log("INFO", "stream", tag +
+                         "subtitle probe failed -> subtitles dropped (safe default)")
+            return StreamManager._ensure_sn(StreamManager._strip_subs(args))
+        # ffmpeg's `0:s:N` addresses the Nth SUBTITLE stream, not the Nth
+        # stream of the input: the map needs the ordinal among the subtitle
+        # tracks, not the absolute stream index the probe reports.
+        idxs = [n for n, s in enumerate(subs) if s["codec"] in _BITMAP_SUB_CODECS][:8]
+        if not idxs:
+            await db_log("INFO", "stream", tag +
+                         "no convertible (bitmap) subtitle track ("
+                         + ", ".join(s["codec"] for s in subs) + ")"
+                         " -> subtitles dropped")
+            return StreamManager._ensure_sn(StreamManager._strip_subs(args))
+        # rebuild: explicit maps for the bitmap tracks only, then the codec.
+        # 'copy' is honoured only when every source track is already DVB
+        # (mpegts cannot carry raw PGS/DVD) - anything else re-encodes.
+        codec_tok = next((args[i + 1] for i, t in enumerate(args)
+                          if t in ("-c:s", "-scodec") and i + 1 < len(args)),
+                         "dvbsub")
+        all_dvb = all(s["codec"] == "dvb_subtitle" for s in subs)
+        tok = codec_tok if (codec_tok == "copy" and all_dvb) else "dvbsub"
+        out = StreamManager._strip_subs(args)
+        try:
+            last_map = max(i for i, t in enumerate(out) if t == "-map")
+            at = last_map + 2          # after the map's VALUE token
+        except ValueError:
+            at = out.index("-f") if "-f" in out else len(out)
+        ins: list[str] = []
+        for idx in idxs:
+            ins += ["-map", f"0:s:{idx}"]
+        ins += ["-c:s", tok]
+        out[at:at] = ins
+        return out
+
     async def _spawn(self, cmd_template: str, url: str, title: str | None = None,
                      pace: bool = False) -> asyncio.subprocess.Process | None:
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
@@ -473,6 +657,7 @@ class StreamManager:
         if not args:
             await db_log("ERROR", "stream", "unparseable ffmpeg template")
             return None
+        args = await self._subs_gate(args, url, pace, title or "")
         # Log the full command for debugging
         await db_log("DEBUG", "ffmpeg", f"spawn command: {' '.join(args)}")
         try:

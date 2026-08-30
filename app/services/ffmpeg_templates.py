@@ -54,6 +54,14 @@ ASPECTS = {"4:3": 4 / 3, "16:9": 16 / 9, "21:9": 21 / 9}
 VIDEO_CODECS = ["copy", "libx264", "libx265", "h264_vaapi", "hevc_vaapi", "h264_qsv", "hevc_qsv"]
 AUDIO_CODECS = ["copy", "aac", "ac3", "mp2", "mp3", "none"]
 HW_CHOICES = ["none", "vaapi", "qsv"]
+# What happens to subtitle streams in a transcoded pipe (see build_command):
+#   drop  - no subtitles in the output (safe default; the TS/HLS pipe cannot
+#           carry SRT/ASS/PGS at all)
+#   dvb   - keep BITMAP subtitles as a DVB track in the output TS (PGS/DVD/DVB
+#           re-encode bitmap->bitmap; text sources are auto-dropped at spawn)
+#   burn  - render TEXT subtitles into the picture (software transcode of
+#           local files; enforced at spawn time)
+SUB_MODES = ("drop", "dvb", "burn")
 # VAAPI rate-control modes (h264_vaapi/hevc_vaapi). ffmpeg's encoder aliases
 # are uppercase (see `ffmpeg -h encoder=h264_vaapi`). "AUTO" = let the driver
 # choose; everything else is passed through as-is so the command stays honest.
@@ -206,6 +214,7 @@ class FFmpegOptions:
     audio_channels: str = "2"
     audio_rate: str = "48000"
     output_format: str = "mpegts"           # mpegts | hls
+    subs: str = "drop"                      # drop | dvb | burn (see SUB_MODES)
     extra_input: str = ""                   # appended after built-in input flags
     extra_output: str = ""                  # appended before -f <format>
 
@@ -224,6 +233,8 @@ def coerce_options(base: dict | None) -> dict:
         if k == "low_power":
             out[k] = v if isinstance(v, bool) else (
                 str(v).strip().lower() not in ("", "0", "false", "off", "no"))
+        elif k == "subs":
+            out[k] = str(v).strip().lower() if str(v).strip().lower() in SUB_MODES else "drop"
         else:
             out[k] = v if isinstance(v, str) else str(v)
     return out
@@ -256,6 +267,9 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
 
     c += ["-i", URL_PLACEHOLDER]
 
+    # one normalised lookup: a stale or hand-edited row may carry anything
+    mode = opts.subs if opts.subs in SUB_MODES else "drop"
+
     # ---- video filter chain ------------------------------------------------
     if transcode:
         size = target_size(opts.resolution, opts.aspect)
@@ -278,29 +292,40 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
             if opts.fps:
                 filters.append(f"fps={opts.fps}")
             filters.append("format=yuv420p")
+            if mode == "burn":
+                # burn TEXT subtitles into the picture. Software path only:
+                # the overlay needs CPU frames, and vaapi/qsv output frames
+                # cannot feed a libass overlay. StreamManager strips this at
+                # spawn time when the source turns out to carry no text
+                # subtitle track (see StreamManager._subs_gate).
+                filters.append(f"subtitles={URL_PLACEHOLDER}")
         filters.append("setsar=1")      # neutral SAR honours the aspect choice
         c += ["-vf", ",".join(filters)]
 
-    # ---- stream mapping (first video + optional audio; NO subtitles) --------
-    # Subtitles are deliberately dropped (-sn). The proxy's output is an
-    # MPEG-TS/HLS pipe, and neither container can carry the subtitle formats
-    # found in typical VOD/local files:
+    # ---- stream mapping (first video + optional audio + subtitles per mode)
+    # Subtitles in a transcoded MPEG-TS/HLS pipe are the exception, not the
+    # rule: the pipe can only carry DVB bitmap subs, and carrying them at all
+    # is an explicit opt-in (`subs` field: dvb). Everything else drops them
+    # (-sn) - a subtitle track that cannot be encoded aborts ffmpeg before the
+    # first output byte (the old "templates do not work for VOD" failure):
     #   * text subs (SRT/ASS/SSA)  -> text->bitmap dvbsub re-encode aborts at
     #     output init ("Subtitle encoding currently only possible from text to
     #     text or bitmap to bitmap"), and the mpegts muxer rejects subrip/ass
     #     outright;
     #   * bitmap subs (PGS/vobsub) -> there is no bitmap->DVB converter in
     #     ffmpeg, the encode fails the same way.
-    # Every one of those aborts kills ffmpeg BEFORE the first output byte, so
-    # any movie file with a subtitle track made the whole transcode template
-    # look broken for VOD/local while live MPEG-TS (DVB subs or none) kept
-    # working. StreamManager re-applies this at spawn time so templates whose
-    # command text still carries the old `-map 0:s? ... -c:s dvbsub` behave
-    # the same way.
+    # `subs="burn"` renders TEXT subs into the picture via the subtitles
+    # filter (software transcode branch above); StreamManager re-checks every
+    # dvb/burn mapping at spawn time against the real source (probe) so a
+    # non-convertible source degrades to -sn instead of killing the stream.
     c += ["-map", "0:v:0"]
     c += ["-map", "0:a:0?"] if opts.audio_codec != "none" else ["-an"]
+    if mode == "dvb":
+        # optional map: a source without any subtitle track keeps playing
+        c += ["-map", "0:s?"]
     c += ["-dn"]
-    c += ["-sn"]
+    if mode != "dvb":
+        c += ["-sn"]
 
     # ---- video encoder ------------------------------------------------------
     c += ["-c:v", opts.video_codec]
@@ -354,6 +379,13 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
                 c += ["-ac", opts.audio_channels]
             if opts.audio_rate:
                 c += ["-ar", opts.audio_rate]
+
+    # ---- subtitles ----------------------------------------------------------
+    # dvb: bitmap (PGS/DVD/DVB) -> DVB subtitles in the output TS. A remux
+    # template (video copy) carries them as-is instead of re-encoding; text
+    # sources are refused at spawn time by the probe gate.
+    if mode == "dvb":
+        c += ["-c:s", "copy" if opts.video_codec == "copy" else "dvbsub"]
 
     if opts.extra_output.strip():
         c += shlex.split(opts.extra_output)
@@ -426,6 +458,10 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
     input_side = True
     unhandled_in: list[str] = []
     unhandled_out: list[str] = []
+    sub_map = False          # a -map ...:s... spec was seen (dvb intent)
+    sub_codec = None         # -c:s/-scodec value seen in the output section
+    sn_seen = False          # an explicit -sn was seen
+    burn_seen = False        # a subtitles= video filter was seen
     while i < len(toks):
         t = toks[i]
         if t == "-i":
@@ -489,22 +525,32 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
             fm = re.search(r"fps=(\d+)", vf)
             if fm:
                 opts.fps = fm.group(1)
-            if m is None and "format" not in vf:
+            if "subtitles=" in vf:
+                burn_seen = True        # verdict comes at the end
+            if m is None and "format" not in vf and "subtitles=" not in vf:
                 warnings.append(f"unrecognised video filter kept as-is: {vf}")
                 unhandled_out += ["-vf", vf]
             i += 2
             continue
         if t == "-map":
+            nxt = toks[i + 1] if i + 1 < len(toks) else None
+            if nxt is not None and ":s" in nxt:
+                sub_map = True            # a subtitle stream is mapped in
             i += 2
             continue
         if t == "-an":
             opts.audio_codec = "none"
             i += 1
             continue
-        if t in ("-sn", "-dn"):
+        if t == "-sn":
+            sn_seen = True          # verdict comes at the end (order-independent)
             i += 1
             continue
-        if t == "-c:s" and i + 1 < len(toks):
+        if t in ("-dn",):
+            i += 1
+            continue
+        if t in ("-c:s", "-scodec") and i + 1 < len(toks):
+            sub_codec = toks[i + 1]
             i += 2
             continue
         if t == "-c:v" and i + 1 < len(toks):
@@ -555,6 +601,18 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
 
     opts.extra_input = " ".join(x for x in unhandled_in if x != URL_PLACEHOLDER)
     opts.extra_output = " ".join(x for x in unhandled_out if x not in _OWNED_TARGETS)
+    # Subtitle verdict, order-independent (build_command emits -vf, -map and
+    # -sn in its own order; a hand-written command may use any): a subtitles
+    # filter burns text into the picture (its -sn companion only stops extra
+    # sub STREAMS from reaching the muxer, so burn wins), a subtitle map
+    # without -sn means "keep as DVB", an explicit -sn alone means drop.
+    # Nothing mentioned -> the base keeps its value (partial-parse rule).
+    if burn_seen:
+        opts.subs = "burn"
+    elif (sub_map or sub_codec is not None) and not sn_seen:
+        opts.subs = "dvb"
+    elif sn_seen:
+        opts.subs = "drop"
     return {"options": asdict(opts), "warnings": warnings}
 
 

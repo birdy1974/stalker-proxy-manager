@@ -361,6 +361,9 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "local_files": {
         "duration_s": ("FLOAT", "NULL"),
     },
+    "ffmpeg_templates": {
+        "subs": ("VARCHAR(6)", "'drop'"),
+    },
     "serie_sources": {
         "raw_series": ("TEXT", "NULL"),
     },

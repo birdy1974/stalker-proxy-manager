@@ -24,6 +24,8 @@ _RE_STREAM_VIDEO = re.compile(
 _RE_STREAM_AUDIO = re.compile(
     r"Stream .*?:\s*Audio:\s*(\w+)[^,]*,\s*(\d+)\s*Hz,\s*([^,]+)(?:.*?(\d+)\s*kb/s)?", re.I)
 _RE_DAR = re.compile(r"DAR\s+([0-9]+:[0-9]+)")
+_RE_STREAM_SUBTITLE = re.compile(
+    r"Stream\s+#\d+:(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*Subtitle:\s*([A-Za-z0-9_]+)", re.I)
 
 # Wall-clock cap on a single probe. Network streams can be slow to connect and
 # to deliver enough data for analysis, so 10s was far too tight; 30s is the
@@ -159,9 +161,63 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
                              "rate_hz": int(m.group(2)),
                              "channels": m.group(3).strip(),
                              "kbps": int(m.group(4)) if m.group(4) else None})
+    out["subtitles"] = [{"index": int(m.group(1)), "codec": m.group(2).lower()}
+                        for m in _RE_STREAM_SUBTITLE.finditer(text)]
     if not out["video"] and not out["audio"] and "duration_s" not in out:
         out = {"error": "no stream info parsed — unreachable or unsupported input"}
         log.warning("probe: unparsed ffmpeg output probably; first lines: %s",
                     "\n".join(text.splitlines()[-3:]))
     _CACHE[key] = (time.time(), out)
     return out
+
+
+# --------------------------------------------------------------------------
+# Subtitle-track detection for the dvb/burn template modes.
+#
+# Unlike probe_media (GUI detail popups, generous timeout) this runs in the
+# STREAM START path: a dvb/burn template asks "does this source carry a
+# subtitle track we can keep?" before ffmpeg is spawned, and the answer must
+# come back fast (8 s cap) and cached (10 min). Returns [{'index', 'codec'}]
+# ([] = no subtitle track) or None when the probe itself failed - the caller
+# treats None as "no subtitles" so a slow portal can never wedge a play.
+# --------------------------------------------------------------------------
+SUBS_PROBE_TIMEOUT = float(os.environ.get("SPM_SUBS_PROBE_TIMEOUT", "8"))
+_SUBS_CACHE: dict[str, tuple[float, list | None]] = {}
+_SUBS_CACHE_TTL = 600.0
+
+
+async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
+    key = f"{target}|{is_url}"
+    hit = _SUBS_CACHE.get(key)
+    if hit and time.time() - hit[0] < _SUBS_CACHE_TTL:
+        return hit[1]
+    args = _probe_args(target, is_url=is_url)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(),
+                                            timeout=SUBS_PROBE_TIMEOUT)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:  # noqa: PERF203
+                pass
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    text = err.decode("utf-8", errors="replace")
+    i = text.find("\nOutput #")     # only the input section describes the source
+    if i != -1:
+        text = text[:i]
+    # The bundled static ffmpeg build can die inside its (flaky) TS demuxer
+    # AFTER printing the stream list - parse whatever was printed.
+    subs = [{"index": int(m.group(1)), "codec": m.group(2).lower()}
+            for m in _RE_STREAM_SUBTITLE.finditer(text)]
+    if not subs and proc.returncode not in (0, None):
+        # nothing parsed AND ffmpeg unhappy: report failure, not "no subs",
+        # so the caller logs the difference
+        _SUBS_CACHE[key] = (time.time(), None)
+        return None
+    _SUBS_CACHE[key] = (time.time(), subs)
+    return subs

@@ -79,17 +79,33 @@ async def test_legacy_dvbsub_templates_are_neutralised_at_spawn():
     """Templates written before the -sn change stored command text with
     `-map 0:s?` + `-c:s dvbsub` (for live DVB subs). On a VOD/local container
     with SRT/ASS/PGS subtitles that mapping aborts ffmpeg at output init with
-    zero bytes - the reported "templates do not work for vod". The spawn-time
-    net must defuse it without touching video/audio maps."""
+    zero bytes - the reported "templates do not work for vod". They are dvb
+    intent now: argv keeps the mapping and the gate degrades it per source
+    (text-only movie -> dropped; live -> kept without a probe)."""
     cmd = (f"ffmpeg -i {URL_PLACEHOLDER} -vf scale=1280:720 -map 0:v:0 "
            "-map 0:a:0? -map 0:s? -dn -c:v libx264 -c:a aac -c:s dvbsub "
            "-f mpegts pipe:1")
     args = StreamManager._ffmpeg_argv(cmd, "/media/movie.mkv")
     assert args is not None
+    assert "-c:s" in args and "dvbsub" in args          # intent survives argv
     specs = [args[i + 1] for i, t in enumerate(args) if t == "-map"]
+    assert "0:s?" in specs
+
+    async def fake_probe(target, *, is_url):
+        return [{"index": 2, "codec": "subrip"}]        # a text-sub movie file
+
+    orig = sm_subs = None
+    from app.services import stream_manager as smod
+    orig = smod.subtitle_streams
+    smod.subtitle_streams = fake_probe
+    try:
+        out = await StreamManager()._subs_gate(args, "/media/movie.mkv", True, "Test")
+    finally:
+        smod.subtitle_streams = orig
+    specs = [out[i + 1] for i, t in enumerate(out) if t == "-map"]
     assert specs == ["0:v:0", "0:a:0?"], specs
-    assert "-c:s" not in args and "dvbsub" not in args
-    assert "-sn" in args, "no subtitle stream may reach the mpegts pipe"
+    assert "-c:s" not in out and "dvbsub" not in out
+    assert "-sn" in out, "no subtitle stream may reach the mpegts pipe"
 
 
 async def test_file_inputs_are_paced_with_re_and_live_is_not():
