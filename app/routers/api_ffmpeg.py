@@ -11,7 +11,8 @@ from sqlalchemy import select
 from ..database import get_db
 from ..models import FFmpegTemplate
 from ..security import require_admin
-from ..services.ffmpeg_templates import FFmpegOptions, build_command, parse_command
+from ..services.ffmpeg_templates import (FFmpegOptions, REDIRECT_COMMAND,
+                                     build_command, coerce_options, parse_command)
 from ..services.ffmpeg_validate import TEST_VIDEO_URL, run_demo, syntax_check
 
 router = APIRouter(prefix="/api/ffmpeg", tags=["ffmpeg"], dependencies=[Depends(require_admin)])
@@ -46,9 +47,22 @@ async def update_template(tid: int, payload: dict, db=Depends(get_db)):
     t = await db.get(FFmpegTemplate, tid)
     if not t:
         raise HTTPException(404, "template not found")
+    touched_opts = False
     for f in FIELDS:
         if f in payload:
             setattr(t, f, payload[f])
+            touched_opts = touched_opts or f in FFmpegOptions.__dataclass_fields__
+    # `command` is derived state while command_source says it was rendered from
+    # the fields, so a caller that edits those fields without resending the text
+    # (a script, an import, a PATCH-style UI widget) must not be left with a
+    # command that contradicts the row - it is what the stream path runs. A
+    # payload that carries its own command wins as sent, and a manual command is
+    # the user's text and stays byte-for-byte theirs. The redirect preset is not
+    # a command at all: rendering one would quietly turn the 302 marker back into
+    # an ffmpeg invocation.
+    if (touched_opts and "command" not in payload and t.command_source == "fields"
+            and (t.command or "").strip() != REDIRECT_COMMAND):
+        t.command = build_command(_opts(t))
     await db.commit()
     return {"item": _row(t)}
 
@@ -66,14 +80,18 @@ async def delete_template(tid: int, db=Depends(get_db)):
 @router.post("/build")
 async def build(payload: dict):
     """fields -> command (2-way sync, left side of the editor)."""
-    opts = {k: v for k, v in payload.items() if hasattr(FFmpegOptions, k)}
-    return {"command": build_command(FFmpegOptions(**opts))}
+    return {"command": build_command(FFmpegOptions(**coerce_options(payload)))}
 
 
 @router.post("/parse")
 async def parse(payload: dict):
-    """command -> fields (right side of the editor)."""
-    return parse_command(payload.get("command", ""))
+    """command -> fields (right side of the editor).
+
+    `base` is the editor's current field state: what the command text cannot
+    say (a rate-control mode it never mentions, a bitrate CQP does not render)
+    is kept from there instead of being reset to the shipped defaults.
+    """
+    return parse_command(payload.get("command", ""), base=payload.get("base"))
 
 
 @router.post("/validate")
@@ -93,5 +111,8 @@ async def demo(payload: dict):
 
 
 def _opts(t: FFmpegTemplate) -> FFmpegOptions:
-    return FFmpegOptions(
-        **{f: getattr(t, f) for f in FFmpegOptions.__dataclass_fields__ if hasattr(t, f)})
+    """The row's structured columns as options - coerced, because a JSON import
+    can put anything into a text column and re-rendering a template must not
+    crash on it."""
+    return FFmpegOptions(**coerce_options(
+        {f: getattr(t, f) for f in FFmpegOptions.__dataclass_fields__ if hasattr(t, f)}))

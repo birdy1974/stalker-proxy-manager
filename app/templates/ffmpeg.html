@@ -180,7 +180,10 @@ let parseTimer;
 $("#f-command").addEventListener("input", () => {
   clearTimeout(parseTimer);
   parseTimer = setTimeout(async () => {
-    const r = await api("/api/ffmpeg/parse", { method: "POST", body: { command: $("#f-command").value } });
+    // send the current fields along: anything the typed command does not mention
+    // (no -rc_mode, no -b:v under CQP) must stay as the row had it
+    const r = await api("/api/ffmpeg/parse", { method: "POST",
+      body: { command: $("#f-command").value, base: readFields() } });
     writeFields(r.options);
     $("#sync-state").innerHTML = '<span class="text-success">command → fields</span>' +
       (r.warnings.length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");

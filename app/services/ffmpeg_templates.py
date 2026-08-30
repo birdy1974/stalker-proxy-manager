@@ -8,6 +8,14 @@ sync at all times (spec requirement):
                         are preserved in extra_input / extra_output so nothing
                         the user typed is ever lost)
 
+The two directions have to meet at a fixed point: a command that is looked at
+(fields -> text -> fields -> text) must not grow. That is why the renderer and
+the parser agree on one rule - the pairs listed in RESILIENT_INPUT_OPTS and
+_OWNED_OUT are ours, not the user's, so the parser consumes them and the
+renderer skips any it finds already set in the raw extra args (an explicit
+`-reconnect 0` or `-mpegts_flags +discont_start` therefore wins, and neither
+direction duplicates it).
+
 The DS918+-validated command from the spec is exactly reproducible here (see
 tests/test_ffmpeg_templates.py). The VAAPI presets are tuned for the Intel iHD
 driver on Apollo Lake (J3455):
@@ -32,6 +40,7 @@ substitutes the real input before spawning.
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass, field, asdict
 
@@ -76,6 +85,37 @@ HLS_PROTOCOL_WHITELIST = "file,http,https,tcp,tls,crypto"
 HLS_ALLOWED_EXTENSIONS = "ALL"
 HLS_INPUT_OPTS = ["-protocol_whitelist", HLS_PROTOCOL_WHITELIST,
                   "-allowed_extensions", HLS_ALLOWED_EXTENSIONS]
+
+
+# The resilience flags build_command() adds to every transcoding input. The
+# parser consumes them (they are re-rendered from the fields, so keeping them in
+# extra_input would duplicate them on every sync pass), but a *different* value
+# typed into the command text is kept verbatim: it is the user's override, and
+# the renderer then steps aside for it.
+RESILIENT_INPUT_OPTS = (
+    ("-rw_timeout", "10000000"),
+    ("-reconnect", "1"),
+    ("-reconnect_at_eof", "1"),
+    ("-reconnect_streamed", "1"),
+    ("-reconnect_delay_max", "5"),
+    ("-fflags", "+genpts+discardcorrupt"),
+    ("-err_detect", "ignore_err"),
+)
+# Same for the container options the renderer picks from `output_format` alone.
+_HLS_OUTPUT_OPTS = (("-hls_time", "6"), ("-hls_list_size", "6"),
+                    ("-hls_flags", "delete_segments+append_list"))
+_OWNED_OUT = {"-mpegts_flags": "+resend_headers", **dict(_HLS_OUTPUT_OPTS)}
+# Output targets the renderer writes itself; a leftover one is not an extra arg.
+_OWNED_TARGETS = ("pipe:1", "<out_dir>/index.m3u8")
+
+
+def _tokens(raw: str | None) -> list[str]:
+    """shlex for the 'does the template already set this flag?' tests - tolerant,
+    because an unbalanced quote in a half-typed command must not raise here."""
+    try:
+        return shlex.split(raw or "")
+    except ValueError:
+        return (raw or "").split()
 
 
 def serves_original_file(command: str | None) -> bool:
@@ -170,6 +210,25 @@ class FFmpegOptions:
     extra_output: str = ""                  # appended before -f <format>
 
 
+def coerce_options(base: dict | None) -> dict:
+    """Keep only the keys FFmpegOptions really has, and give each the type it
+    declares. Both /build and /parse take a raw JSON dict from the browser, and
+    an API client may well post `{"video_bitrate": 4000}` or `{"low_power":
+    "false"}` - build_command does string work on every one of these fields, so
+    the normalising happens once, here, at the boundary. `low_power` keeps its
+    own rule because bool("false") is True."""
+    out: dict = {}
+    for k, v in (base.items() if isinstance(base, dict) else ()):
+        if k not in FFmpegOptions.__dataclass_fields__ or v is None:
+            continue
+        if k == "low_power":
+            out[k] = v if isinstance(v, bool) else (
+                str(v).strip().lower() not in ("", "0", "false", "off", "no"))
+        else:
+            out[k] = v if isinstance(v, str) else str(v)
+    return out
+
+
 # --------------------------------------------------------------------------- #
 #  fields -> command
 # --------------------------------------------------------------------------- #
@@ -178,9 +237,10 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     c: list[str] = [ffmpeg_bin]
 
     # ---- resilient input flags (portal streams drop/stall all the time) ----
-    c += ["-rw_timeout", "10000000", "-reconnect", "1", "-reconnect_at_eof", "1",
-          "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-          "-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err"]
+    own_in = _tokens(opts.extra_input)
+    for flag, val in RESILIENT_INPUT_OPTS:
+        if flag not in own_in:
+            c += [flag, val]
 
     transcode = opts.video_codec != "copy"
     # ---- hardware init (only needed when actually transcoding) -------------
@@ -286,11 +346,18 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
         c += shlex.split(opts.extra_output)
 
     # ---- output -------------------------------------------------------------
+    own_out = _tokens(opts.extra_output)
     if opts.output_format == "hls":
-        c += ["-f", "hls", "-hls_time", "6", "-hls_list_size", "6",
-              "-hls_flags", "delete_segments+append_list", "<out_dir>/index.m3u8"]
+        c += ["-f", "hls"]
+        for flag, val in _HLS_OUTPUT_OPTS:
+            if flag not in own_out:
+                c += [flag, val]
+        c += ["<out_dir>/index.m3u8"]
     else:
-        c += ["-f", "mpegts", "-mpegts_flags", "+resend_headers", "pipe:1"]
+        c += ["-f", "mpegts"]
+        if "-mpegts_flags" not in own_out:
+            c += ["-mpegts_flags", _OWNED_OUT["-mpegts_flags"]]
+        c += ["pipe:1"]
     return " ".join(c)
 
 
@@ -306,6 +373,8 @@ _KNOWN_WITH_VALUE = {
     "-b:a": "audio_bitrate", "-ac": "audio_channels", "-ar": "audio_rate",
 }
 
+_OWNED_IN = dict(RESILIENT_INPUT_OPTS)
+
 # numeric rc_mode spellings (ffmpeg -h encoder=h264_vaapi) -> names
 _RC_NUM = {"0": "AUTO", "1": "CQP", "2": "CBR", "3": "VBR",
            "4": "ICQ", "5": "QVBR", "6": "AVBR"}
@@ -320,12 +389,20 @@ def _rc_name(value: str) -> str:
     return up if up in RC_MODES else (up or "AUTO")
 
 
-def parse_command(cmd: str) -> dict:
+def parse_command(cmd: str, base: dict | None = None) -> dict:
     """
     Parse a full ffmpeg command back into structured options.
     Returns {"options": {...}, "warnings": [..]} - never raises.
+
+    `base` is the option set to start from - the fields of the template the
+    command came from. It matters because a command cannot express everything:
+    no `-rc_mode` is either AUTO or the shipped default, and a CQP command
+    carries no bitrate at all *by design*. Starting from the dataclass defaults
+    there would rewrite a field the user never touched (an AUTO template
+    flipped to CQP, a 2500k row quietly downgraded to 1000k), so the GUI hands
+    in its own form state and only what the text mentions is overwritten.
     """
-    opts = FFmpegOptions()
+    opts = FFmpegOptions(**coerce_options(base))
     warnings: list[str] = []
     try:
         toks = shlex.split(cmd)
@@ -355,12 +432,22 @@ def parse_command(cmd: str) -> dict:
                         opts.device = spec.split(":", 1)[1].replace("hw:", "") or opts.device
                 i += 2
                 continue
-            if t in ("-hwaccel", "-hwaccel_device", "-hwaccel_output_format",
-                     "-rw_timeout", "-reconnect_delay_max", "-fflags", "-err_detect"):
+            if t in ("-hwaccel", "-hwaccel_device", "-hwaccel_output_format"):
                 i += 2
                 continue
-            if t.startswith("-reconnect"):
-                i += 1
+            if t in _OWNED_IN or t.startswith("-reconnect"):
+                # consume the flag *and* its value - skipping the flag alone left
+                # the value orphaned, and an orphan "1" in extra_input comes back
+                # as a real token on the next render (six of them, per pass)
+                nxt = toks[i + 1] if i + 1 < len(toks) else None
+                owned = _OWNED_IN.get(t)
+                if nxt is None:
+                    i += 1
+                elif owned is not None and nxt == owned:
+                    i += 2
+                else:
+                    unhandled_in += [t, nxt]
+                    i += 2
                 continue
             unhandled_in.append(t)
             i += 1
@@ -371,16 +458,22 @@ def parse_command(cmd: str) -> dict:
             vf = toks[i + 1]
             m = None
             for scale in ("scale_vaapi", "scale_qsv", "scale"):
-                if scale in vf:
-                    opts.hw_accel = {"scale_vaapi": "vaapi", "scale_qsv": "qsv"}.get(scale, opts.hw_accel)
-                    m = True
-                    import re as _re
-                    wh = _re.search(rf"{scale}=(?:w=)?(\d+)(?::h=|x)(\d+)", vf)
-                    if wh:
-                        w, h = int(wh.group(1)), int(wh.group(2))
-                        opts.resolution = next((k for k, (_, vh) in RESOLUTIONS.items() if vh == h), "source")
-                        opts.aspect = next((k for k, a in ASPECTS.items() if abs(w / h - a) < 0.05), "16:9")
-            fm = __import__("re").search(r"fps=(\d+)", vf)
+                if scale not in vf:
+                    continue
+                # A plain `scale=` is the software path's own signature. Reading it
+                # as "unknown" left hw_accel on the dataclass default (vaapi), so
+                # re-syncing a libx264 template put the whole -init_hw_device
+                # block and a scale_vaapi filter back into a command that had
+                # neither - i.e. the CPU fallback quietly asked for a GPU.
+                opts.hw_accel = {"scale_vaapi": "vaapi", "scale_qsv": "qsv"}.get(scale, "none")
+                m = True
+                wh = re.search(rf"{scale}=(?:w=)?(\d+)(?::h=|x)(\d+)", vf)
+                if wh:
+                    w, h = int(wh.group(1)), int(wh.group(2))
+                    opts.resolution = next((k for k, (_, vh) in RESOLUTIONS.items() if vh == h), "source")
+                    opts.aspect = next((k for k, a in ASPECTS.items() if abs(w / h - a) < 0.05), "16:9")
+                break
+            fm = re.search(r"fps=(\d+)", vf)
             if fm:
                 opts.fps = fm.group(1)
             if m is None and "format" not in vf:
@@ -405,6 +498,10 @@ def parse_command(cmd: str) -> dict:
             opts.video_codec = toks[i + 1]
             if opts.video_codec == "copy":
                 opts.hw_accel = "none"
+                # nothing scales a passthrough, and the command says so by having
+                # no scale filter: record that instead of the 720p this dataclass
+                # happens to default to (which the next render would then deny)
+                opts.resolution = "source"
             i += 2
             continue
         if t == "-low_power" and i + 1 < len(toks):
@@ -423,6 +520,12 @@ def parse_command(cmd: str) -> dict:
             opts.audio_codec = toks[i + 1]
             i += 2
             continue
+        if t in _OWNED_OUT and i + 1 < len(toks):
+            nxt = toks[i + 1]
+            i += 2
+            if nxt != _OWNED_OUT[t]:
+                unhandled_out += [t, nxt]      # the user's own container flag
+            continue
         if t in _KNOWN_WITH_VALUE and i + 1 < len(toks):
             setattr(opts, _KNOWN_WITH_VALUE[t], toks[i + 1])
             i += 2
@@ -437,8 +540,8 @@ def parse_command(cmd: str) -> dict:
         unhandled_out.append(t)
         i += 1
 
-    opts.extra_input = " ".join(x for x in unhandled_in if x not in (URL_PLACEHOLDER,))
-    opts.extra_output = " ".join(x for x in unhandled_out if x not in ("pipe:1",))
+    opts.extra_input = " ".join(x for x in unhandled_in if x != URL_PLACEHOLDER)
+    opts.extra_output = " ".join(x for x in unhandled_out if x not in _OWNED_TARGETS)
     return {"options": asdict(opts), "warnings": warnings}
 
 

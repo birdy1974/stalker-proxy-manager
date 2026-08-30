@@ -529,7 +529,7 @@ check("every ffmpeg option the GUI lists is a real field",
       [f for f in _field_ids if f not in FFmpegOptions.__dataclass_fields__] == ["enabled", "name"],
       True)
 check("every structured ffmpeg field has a control in the GUI",
-      [f for f in _opts if f'id="f-' + f + '"' not in _ff_html], [])
+      [f for f in _opts if 'id="f-' + f + '"' not in _ff_html], [])
 check("the GUI's field list covers every structured ffmpeg field",
       [f for f in _opts if f not in _field_ids], [])
 

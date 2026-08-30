@@ -17,7 +17,7 @@ silently drop them.
 from __future__ import annotations
 
 from app.services.ffmpeg_templates import (
-    COPY_PRESET_NAME, FFmpegOptions, REDIRECT_COMMAND, REDIRECT_PRESET_NAME,
+    COPY_PRESET_NAME, FFmpegOptions, REDIRECT_COMMAND, REDIRECT_PRESET_NAME, asdict,
     REFERENCE_PRESET_NAME, build_command, default_presets, parse_command,
     serves_original_file, URL_PLACEHOLDER,
 )
@@ -169,6 +169,112 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
             continue
         fields = {k: v for k, v in p.items() if k in FFmpegOptions.__dataclass_fields__}
         assert build_command(FFmpegOptions(**fields)) == p["command"], name
+
+
+def test_the_two_way_sync_reaches_a_fixed_point():
+    """Looking at a template must not change it. build -> parse -> build used to
+    drift: the parser skipped the resilience flags without eating their values, so
+    every pass appended another '1 1 1' to extra_input and another
+    -mpegts_flags to extra_output - and a template opened twice in the GUI
+    carried doubled flags into the stream path."""
+    cases = [
+        {},                                                 # the shipped CQP default
+        {"rc_mode": "VBR"},
+        {"rc_mode": "AUTO"},
+        {"output_format": "hls"},
+        {"hw_accel": "none", "video_codec": "libx264"},
+        {"hw_accel": "none", "video_codec": "copy", "audio_codec": "copy",
+         "resolution": "source"},
+        {"extra_input": "-reconnect 0"},
+        {"extra_output": "-mpegts_flags +discont_start"},
+        {"output_format": "hls", "extra_output": "-hls_time 2"},
+        {"extra_input": "-headers", "extra_output": "User-Agent: x"},   # half-typed text
+    ]
+    for kw in cases:
+        c1 = build_command(FFmpegOptions(**kw))
+        o1 = parse_command(c1)["options"]
+        c2 = build_command(FFmpegOptions(**o1))
+        o2 = parse_command(c2)["options"]
+        assert o1 == o2, f"{kw}: options still drifting on the second pass"
+        assert c2 == build_command(FFmpegOptions(**o2)), f"{kw}: the command grew again"
+        if kw != {"rc_mode": "AUTO"}:
+            # The one case a stateless parse cannot get back exactly: a command
+            # with no -rc_mode does not say whether the mode is AUTO or our
+            # default. That is what `base` is for (see the test above), not a
+            # duplication bug - and it converges on the second pass either way.
+            assert c1 == c2, f"{kw}: {c1}\n -> {c2}"
+
+
+def test_parse_command_keeps_what_the_command_cannot_say():
+    """A command is not a full description of a template: `-rc_mode` absent can
+    mean AUTO, and a CQP command carries no bitrate *by design* while the row
+    still holds the numbers to switch back to. `base` is the editor's current
+    state, so the fields the text is silent about stay as they were."""
+    auto = asdict(FFmpegOptions(rc_mode="AUTO"))
+    o = parse_command(build_command(FFmpegOptions(**auto)), base=auto)["options"]
+    assert o["rc_mode"] == "AUTO"
+    assert "-rc_mode" not in build_command(FFmpegOptions(**o))
+    # stateless, the same command reads back as our default
+    assert parse_command(build_command(FFmpegOptions(**auto)))["options"]["rc_mode"] == "CQP"
+
+    big = asdict(FFmpegOptions(resolution="1080p", video_bitrate="2500k",
+                               maxrate="2750k", bufsize="5000k"))
+    kept = parse_command(build_command(FFmpegOptions(**big)), base=big)["options"]
+    assert (kept["video_bitrate"], kept["maxrate"], kept["bufsize"]) == ("2500k", "2750k", "5000k")
+
+    # a base posted by a script is coerced, not trusted
+    loose = parse_command("ffmpeg -i <url> -c:v h264_vaapi -f mpegts pipe:1",
+                          base={"low_power": "false", "video_bitrate": 4000, "junk": 1})["options"]
+    assert loose["low_power"] is False and loose["video_bitrate"] == "4000"
+    assert "junk" not in loose
+    # and a base that is not an options dict at all stays harmless
+    assert parse_command("ffmpeg -i <url> -c:v h264_vaapi -f mpegts pipe:1",
+                         base=["nope"])["options"]["rc_mode"] == "CQP"
+
+
+def test_a_software_template_does_not_borrow_the_gpu_on_the_second_pass():
+    """`scale=` without a _vaapi/_qsv suffix is the CPU path's own signature. The
+    parser used to leave hw_accel on the shipped default, so re-syncing a libx264
+    template in the editor added -init_hw_device and a scale_vaapi filter to a
+    command that had asked for neither - the CPU fallback turning into a GPU job."""
+    sw = build_command(FFmpegOptions(hw_accel="none", video_codec="libx264"))
+    assert "-init_hw_device" not in sw and "scale_vaapi" not in sw
+    back = parse_command(sw)["options"]
+    assert back["hw_accel"] == "none"
+    assert back["resolution"] == "720p" and back["aspect"] == "16:9"
+    assert build_command(FFmpegOptions(**back)) == sw
+    # and the two GPU paths still read back as themselves
+    assert parse_command(build_command(FFmpegOptions()))["options"]["hw_accel"] == "vaapi"
+    qsv = build_command(FFmpegOptions(hw_accel="qsv", video_codec="h264_qsv"))
+    assert parse_command(qsv)["options"]["hw_accel"] == "qsv"
+
+
+def test_a_flag_typed_into_the_extra_args_wins_over_ours():
+    """The app's resilience and container flags are defaults, not policy: the
+    template that says `-reconnect 0` means it, and the command text shows one
+    occurrence of the flag rather than ours and theirs."""
+    reconnect = build_command(FFmpegOptions(extra_input="-reconnect 0"))
+    assert "-reconnect 0" in reconnect
+    assert "-reconnect 1" not in reconnect
+    # ...and it survives the round trip instead of being eaten by our own flag
+    assert parse_command(reconnect)["options"]["extra_input"] == "-reconnect 0"
+
+    ts = build_command(FFmpegOptions(extra_output="-mpegts_flags +discont_start"))
+    assert "-mpegts_flags +discont_start" in ts and "+resend_headers" not in ts
+    hls = build_command(FFmpegOptions(output_format="hls", extra_output="-hls_time 2"))
+    assert "-hls_time 2" in hls and "-hls_time 6" not in hls
+    assert parse_command(hls)["options"]["extra_output"] == "-hls_time 2"
+
+
+def test_a_passthrough_command_does_not_invent_a_resolution():
+    """`-c:v copy` has no scale filter to read a size from, and parsing from
+    scratch used to hand back the dataclass default - a 720p the command never
+    claimed, which the next render then denied."""
+    cmd = build_command(FFmpegOptions(hw_accel="none", video_codec="copy",
+                                      audio_codec="copy", resolution="source"))
+    o = parse_command(cmd)["options"]
+    assert o["resolution"] == "source"
+    assert o["video_bitrate"] == "1000k"      # a field the command does not carry stays put
 
 
 def test_serves_original_file_covers_redirect_and_copy():

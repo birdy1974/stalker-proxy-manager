@@ -156,7 +156,10 @@ Users only ever talk to port **8880** — GUI, streams, playlists and APIs share
 
 ## ffmpeg templates & transcoding (DS918+ Quick Sync)
 
-Templates are full editable ffmpeg commands with GUI field ↔ command **2-way sync**: the option fields (encoder, bitrate, resolution, fps, GOP, audio, container, rate control + QP, extra args) rebuild the command text, and editing the text parses back into the fields.
+Templates are full editable ffmpeg commands with GUI field ↔ command **2-way sync**: the option fields (encoder, bitrate, resolution, fps, GOP, audio, container, rate control + QP, extra args) rebuild the command text, and editing the text parses back into the fields. Two rules make that loop safe:
+
+* **Your flags win.** The resilience options (`-reconnect …`, `-rw_timeout`, `-fflags`, `-err_detect`) and the container options (`-mpegts_flags`, `-hls_time`, `-hls_list_size`, `-hls_flags`) are defaults, not policy: if the command already sets one, the renderer leaves it alone instead of adding a second occurrence — so `-reconnect 0` in the extra args means 0.
+* **Looking at a template does not change it.** Parsing is a fixed point (no flag piles up on the second pass), and it is deliberately *partial*: the editor sends the row's own fields along as the base, so a CQP command — which carries no bitrate by design — does not reset the template's tuning, and a command with no `-rc_mode` at all stays `AUTO` rather than inheriting the shipped default.
 
 Shipped presets (stored as rows in the database and **re-seeded on every boot** — see below):
 
