@@ -8,7 +8,11 @@ that make VAAPI encoding actually fast and deterministic on that silicon:
   * -rc_mode CQP   -> explicit rate control, quality-pinned (AUTO is
                       driver-dependent, and CQP needs -global_quality)
   * -async_depth 4 -> more frames in flight
-  * -map 0:s? / -c:s dvbsub -> keep DVB subtitles when the source has them
+  * -sn            -> subtitles dropped: the mpegts/HLS pipe cannot carry the
+                      SRT/ASS/PGS tracks found in VOD/local containers, and
+                      the old `-map 0:s? -c:s dvbsub` mapping made ffmpeg die
+                      at output init on exactly those files (live TS kept
+                      working, which is why only VOD appeared broken)
 
 These tests pin both directions of the 2-way sync so a GUI edit can never
 silently drop them.
@@ -324,8 +328,12 @@ def test_dreambox_preset_targets_mpeg2_ts_for_enigma2():
     assert "-f mpegts" in dreambox["command"]
 
 
-def test_persistent_templates_carry_optional_dvb_subtitles():
-    """Every real ffmpeg command maps optional DVB subs; redirect is a marker."""
+def test_templates_drop_subtitles_for_the_ts_pipe():
+    """The output is an mpegts/HLS pipe that cannot carry SRT/ASS/PGS (text
+    subs die at the dvbsub encoder, PGS has no converter, subrip dies at the
+    mpegts muxer) - ffmpeg aborts before the first byte, which used to make
+    every subtitle-bearing VOD/local file fail. Templates therefore pin -sn;
+    redirect is a marker."""
     variants = [
         FFmpegOptions(),
         FFmpegOptions(hw_accel="none", video_codec="libx264"),
@@ -338,11 +346,14 @@ def test_persistent_templates_carry_optional_dvb_subtitles():
     for opts in variants:
         cmd = build_command(opts)
         toks = cmd.split()
-        assert "-sn" not in toks
-        assert "-map" in toks and "0:s?" in toks
-        assert "-c:s" in toks and "dvbsub" in toks
+        assert "-sn" in toks, cmd
+        assert "0:s?" not in toks, cmd
+        assert "-c:s" not in toks and "dvbsub" not in toks, cmd
         assert "-dn" in toks
+        # 2-way sync stays stable: -sn parses back to -sn, nothing leaks into
+        # extra_output
         parsed = parse_command(cmd)
+        assert "-sn" in build_command(FFmpegOptions(**parsed["options"])).split()
         assert "-c:s" not in (parsed["options"]["extra_output"] or "")
 
     for name, p in {p["name"]: p for p in default_presets()}.items():
@@ -350,7 +361,7 @@ def test_persistent_templates_carry_optional_dvb_subtitles():
             assert p["command"] == REDIRECT_COMMAND
             continue
         toks = p["command"].split()
-        assert "-sn" not in toks, name
-        assert "0:s?" in toks, name
-        assert "-c:s" in toks and "dvbsub" in toks, name
+        assert "-sn" in toks, name
+        assert "0:s?" not in toks, name
+        assert "-c:s" not in toks and "dvbsub" not in toks, name
         assert "-dn" in toks, name

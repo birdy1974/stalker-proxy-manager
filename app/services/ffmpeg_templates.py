@@ -281,11 +281,26 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
         filters.append("setsar=1")      # neutral SAR honours the aspect choice
         c += ["-vf", ",".join(filters)]
 
-    # ---- stream mapping (first video + optional audio + optional DVB subs)
+    # ---- stream mapping (first video + optional audio; NO subtitles) --------
+    # Subtitles are deliberately dropped (-sn). The proxy's output is an
+    # MPEG-TS/HLS pipe, and neither container can carry the subtitle formats
+    # found in typical VOD/local files:
+    #   * text subs (SRT/ASS/SSA)  -> text->bitmap dvbsub re-encode aborts at
+    #     output init ("Subtitle encoding currently only possible from text to
+    #     text or bitmap to bitmap"), and the mpegts muxer rejects subrip/ass
+    #     outright;
+    #   * bitmap subs (PGS/vobsub) -> there is no bitmap->DVB converter in
+    #     ffmpeg, the encode fails the same way.
+    # Every one of those aborts kills ffmpeg BEFORE the first output byte, so
+    # any movie file with a subtitle track made the whole transcode template
+    # look broken for VOD/local while live MPEG-TS (DVB subs or none) kept
+    # working. StreamManager re-applies this at spawn time so templates whose
+    # command text still carries the old `-map 0:s? ... -c:s dvbsub` behave
+    # the same way.
     c += ["-map", "0:v:0"]
     c += ["-map", "0:a:0?"] if opts.audio_codec != "none" else ["-an"]
-    c += ["-map", "0:s?"]
     c += ["-dn"]
+    c += ["-sn"]
 
     # ---- video encoder ------------------------------------------------------
     c += ["-c:v", opts.video_codec]
@@ -339,8 +354,6 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
                 c += ["-ac", opts.audio_channels]
             if opts.audio_rate:
                 c += ["-ar", opts.audio_rate]
-
-    c += ["-c:s", "dvbsub"]
 
     if opts.extra_output.strip():
         c += shlex.split(opts.extra_output)

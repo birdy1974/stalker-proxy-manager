@@ -75,6 +75,40 @@ async def test_ffmpeg_argv_quotes_local_paths_with_spaces():
     assert StreamManager._ffmpeg_argv("@redirect", "/media/x.mp4") is None
 
 
+async def test_legacy_dvbsub_templates_are_neutralised_at_spawn():
+    """Templates written before the -sn change stored command text with
+    `-map 0:s?` + `-c:s dvbsub` (for live DVB subs). On a VOD/local container
+    with SRT/ASS/PGS subtitles that mapping aborts ffmpeg at output init with
+    zero bytes - the reported "templates do not work for vod". The spawn-time
+    net must defuse it without touching video/audio maps."""
+    cmd = (f"ffmpeg -i {URL_PLACEHOLDER} -vf scale=1280:720 -map 0:v:0 "
+           "-map 0:a:0? -map 0:s? -dn -c:v libx264 -c:a aac -c:s dvbsub "
+           "-f mpegts pipe:1")
+    args = StreamManager._ffmpeg_argv(cmd, "/media/movie.mkv")
+    assert args is not None
+    specs = [args[i + 1] for i, t in enumerate(args) if t == "-map"]
+    assert specs == ["0:v:0", "0:a:0?"], specs
+    assert "-c:s" not in args and "dvbsub" not in args
+    assert "-sn" in args, "no subtitle stream may reach the mpegts pipe"
+
+
+async def test_file_inputs_are_paced_with_re_and_live_is_not():
+    """A movie file read without -re is drained at encode speed: the player
+    hits EOF long before the end. VOD/episode/local are paced; live (paced by
+    its own encoder) is never throttled. A user's own -re/-readrate wins."""
+    cmd = f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1"
+    local = StreamManager._ffmpeg_argv(cmd, "/media/movie.mkv", pace=True)
+    assert local[local.index("-i") - 1] == "-re"
+    net = StreamManager._ffmpeg_argv(cmd, "http://cdn/movie.mkv", pace=True)
+    assert net[net.index("-i") - 1] == "-re"
+    live = StreamManager._ffmpeg_argv(cmd, "http://cdn/live.ts")
+    assert "-re" not in live and "-readrate" not in live
+    own = StreamManager._ffmpeg_argv(
+        f"ffmpeg -readrate 1.5 -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1",
+        "/media/movie.mkv", pace=True)
+    assert "-re" not in own and own.count("-readrate") == 1
+
+
 async def test_m3u_uses_real_duration_and_original_extension(tmp_path):
     pid, _ = await _seed_file(tmp_path, duration_s=125.4)
     user = await _user()
@@ -143,7 +177,8 @@ async def test_transcode_template_goes_through_ffmpeg_with_quoted_path(
     await _seed_defaults()
     seen: list[str] = []
 
-    async def _spawn_stub(self, cmd_template: str, url: str, title: str | None = None):
+    async def _spawn_stub(self, cmd_template: str, url: str, title: str | None = None,
+                          pace: bool = False):
         seen.append(url)
         return await asyncio.create_subprocess_exec(
             "sh", "-c", "printf MPEGTS",

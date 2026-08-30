@@ -358,7 +358,49 @@ class StreamManager:
         return b""
 
     @staticmethod
-    def _ffmpeg_argv(cmd_template: str, url: str, title: str | None = None) -> list[str] | None:
+    def _drop_subtitles(args: list[str]) -> list[str]:
+        """
+        Enforce 'the TS/HLS pipe carries no subtitles' at spawn time.
+
+        build_command() renders `-sn` for this reason (see there for the full
+        story: text->bitmap and text->mpegts both abort ffmpeg before the
+        first output byte, which killed every VOD/local transcode of a movie
+        with an SRT/ASS/PGS track). This net does the same for command TEXT
+        stored before that change: templates written for live MPEG-TS used to
+        carry `-map 0:s?` + `-c:s dvbsub`, and a user who pasted a sub-mapping
+        command from elsewhere deserves the same protection. Explicitly mapped
+        video/audio streams are untouched; whole-program maps like `-map 0`
+        are the user's own statement and are left alone.
+        """
+        out: list[str] = []
+        i = 0
+        while i < len(args):
+            t = args[i]
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            if t == "-map" and nxt is not None and ":s" in nxt:
+                i += 2                     # subtitle map -> dropped
+                continue
+            if t in ("-c:s", "-scodec") and nxt is not None:
+                i += 2                     # subtitle codec -> dropped
+                continue
+            out.append(t)
+            i += 1
+        if "-sn" not in out:
+            # pin -sn into the OUTPUT section (after the last -i value) so
+            # ffmpeg's default stream selection cannot auto-pick a subtitle
+            # stream either - an unmapped-but-auto-selected subrip track dies
+            # at the mpegts muxer just the same.
+            try:
+                last_i = max(idx for idx, a in enumerate(out) if a == "-i")
+                f_idx = out.index("-f", last_i) if "-f" in out[last_i:] else len(out) - 1
+            except ValueError:
+                f_idx = len(out) - 1
+            out.insert(f_idx, "-sn")
+        return out
+
+    @staticmethod
+    def _ffmpeg_argv(cmd_template: str, url: str, title: str | None = None,
+                     pace: bool = False) -> list[str] | None:
         """Render a template + input into an argv list, or None if unusable.
 
         Local paths are quoted so `shlex.split` keeps spaces/quotes as one
@@ -368,6 +410,14 @@ class StreamManager:
         If title is provided, injects -metadata title=... into the output so
         players (VLC, etc.) display the correct stream name instead of whatever
         metadata the source stream contains.
+
+        pace=True (VOD/episode/local: the input is a FILE that ffmpeg would
+        otherwise read as fast as it can transcode) inserts `-re` so the file
+        streams at its own frame rate - without it a 2-hour movie is pushed
+        through the pipe at encode speed, the player's buffer fills, ffmpeg
+        hits EOF long before the viewer reaches the end and the stream just
+        stops mid-playback. Live inputs are already paced by the encoder on
+        the other end and must NOT be throttled.
         """
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
             return None
@@ -387,6 +437,12 @@ class StreamManager:
             return None
         if not args:
             return None
+        args = StreamManager._drop_subtitles(args)
+        if pace and not ({"-re", "-readrate", "-readrate_initial"} & set(args)):
+            try:
+                args.insert(args.index("-i"), "-re")   # input option: before -i
+            except ValueError:
+                pass
         # Inject metadata title before the output format specifier so players
         # display the correct stream name instead of source stream metadata
         if title:
@@ -403,7 +459,8 @@ class StreamManager:
                     args[-1:-1] = ["-metadata", f"title={title}"]
         return args
 
-    async def _spawn(self, cmd_template: str, url: str, title: str | None = None) -> asyncio.subprocess.Process | None:
+    async def _spawn(self, cmd_template: str, url: str, title: str | None = None,
+                     pace: bool = False) -> asyncio.subprocess.Process | None:
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
             await db_log("ERROR", "stream",
                          "cannot spawn the redirect template as ffmpeg "
@@ -412,7 +469,7 @@ class StreamManager:
         if "<out_dir>" in (cmd_template or ""):
             await db_log("ERROR", "stream", "template uses HLS file output; use mpegts for live proxying")
             return None
-        args = self._ffmpeg_argv(cmd_template, url, title)
+        args = self._ffmpeg_argv(cmd_template, url, title, pace)
         if not args:
             await db_log("ERROR", "stream", "unparseable ffmpeg template")
             return None
@@ -875,7 +932,7 @@ class StreamManager:
                 if not chain:
                     return
                 _tag, path = chain[0]
-                proc = await self._spawn(h.command, path, h.item_name)
+                proc = await self._spawn(h.command, path, h.item_name, pace=True)
                 if proc is None:
                     return
                 h.url, h.proc = path, proc
@@ -969,7 +1026,11 @@ class StreamManager:
                     if not adopted:
                         self.mac_locks[mac_row.id] = h.id
                         locked = mac_row.id
-                    proc = await self._spawn(h.command, url, h.item_name)
+                    # VOD/episode links are FILES (mkv/mp4 over the CDN): pace
+                    # them to real time like local files, or the player hits
+                    # EOF early. Live is paced by its own encoder - never -re.
+                    proc = await self._spawn(h.command, url, h.item_name,
+                                             pace=(kind != "live"))
                     if proc is None:
                         if locked is not None:
                             self.mac_locks.pop(locked, None)
