@@ -74,7 +74,12 @@ function openModal({ title, body, footer, size = "lg", onClose, extraClass = "",
       el("button", { type: "button", class: "btn-close", "aria-label": "Close", onclick: close }));
   }
   modal.show();
-  return { close, root: wrap, modal };
+  // `footer` is the LIVE .modal-footer node: callers (the player popup)
+  // append their buttons after openModal returns. Returning the modal without
+  // it made `m.footer.append(...)` throw a TypeError right after the popup
+  // opened - the player was never attached, the footer stayed empty and the
+  // popup was a dead black box (the original "preview gets no input" bug).
+  return { close, root: wrap, modal, footer: $(".modal-footer", wrap) };
 }
 const mBtn = (label, cls, fn, icon = "") =>
   el("button", { class: `btn btn-sm ${cls}`, type: "button", onclick: fn, html: (icon ? `<i class="bi ${icon} me-1"></i>` : "") + esc(label) });
