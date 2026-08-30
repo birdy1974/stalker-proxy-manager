@@ -382,6 +382,8 @@ class StreamManager:
         if not args:
             await db_log("ERROR", "stream", "unparseable ffmpeg template")
             return None
+        # Log the full command for debugging
+        await db_log("DEBUG", "ffmpeg", f"spawn command: {' '.join(args)}")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdin=asyncio.subprocess.DEVNULL,
