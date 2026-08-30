@@ -454,17 +454,51 @@ def _season_number(item: dict) -> int:
 
 
 def _episode_number(item: dict) -> int | None:
-    """Episode number from `series` pair [season, episode], `series_number`, or name 'S01E05'."""
+    """Episode number from `series` pair [season, episode], `episode_number`, or name 'S01E05'.
+    
+    Validation order:
+    1. `series` list [season, episode] - most reliable (explicit structure)
+    2. `episode_number` - specifically named for episodes
+    3. `series_number` - ambiguous (could be season), validate against season number
+    4. `episode_id`, `episode` - portal IDs, may not be sequential
+    5. Name parsing (S01E05, Episode 5, etc.) - fallback
+    
+    The key fix: `episode_number` is checked BEFORE `series_number` because on many
+    portals `series_number` actually contains the season number, not the episode number.
+    """
     meta = item.get("series") or []
     if isinstance(meta, (list, tuple)) and len(meta) > 1:
         try:
             return int(meta[1])
         except (TypeError, ValueError):
             pass
-    for key in ("series_number", "episode_number", "episode_id", "episode"):
+    
+    # Check episode_number first (specifically named for episodes)
+    ep_num = item.get("episode_number")
+    if ep_num is not None and str(ep_num).strip().isdigit():
+        return int(ep_num)
+    
+    # Check series_number, but validate it's not the season number
+    # If both series_number and season_number exist and are the same, it's likely
+    # the season number, not the episode number
+    series_num = item.get("series_number")
+    if series_num is not None and str(series_num).strip().isdigit():
+        season_num = item.get("season_number") or item.get("season_id") or item.get("season")
+        # If series_number differs from season_number, it's likely the episode number
+        if season_num is not None and str(season_num).strip().isdigit():
+            if int(series_num) != int(season_num):
+                return int(series_num)
+        else:
+            # No season_number to compare, accept series_number as episode number
+            return int(series_num)
+    
+    # Check episode_id and episode
+    for key in ("episode_id", "episode"):
         val = item.get(key)
         if val is not None and str(val).strip().isdigit():
             return int(val)
+    
+    # Fallback: parse from name (S01E05, Episode 5, etc.)
     name = str(item.get("name") or "")
     import re
     m = re.search(r"(?:episode|ep|e)\s*(\d+)", name, re.IGNORECASE)
