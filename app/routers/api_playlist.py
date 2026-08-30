@@ -647,19 +647,24 @@ async def local_pl(db=Depends(get_db), q: str = "", group: str = "", page: int =
 
 # ------------------------------------------------- detail popup enrichment
 async def _source_cmd_and_portal(db, kind: str, pid: int):
-    """Return (cmd, portal_id, is_url) for the item's PRIMARY source."""
+    """Return (cmd, portal_id, is_url, source_row) for the item's PRIMARY source.
+
+    The row itself comes along because its stored link flags decide whether the
+    portal has to be asked for a link at all (R2) - a popup that ignores that
+    answers with a URL the stream path will never use.
+    """
     if kind == "live":
         link = (await db.execute(select(LivePlaylistSource).where(
             LivePlaylistSource.live_playlist_id == pid)
             .order_by(LivePlaylistSource.priority))).scalars().first()
         src = await db.get(LiveSource, link.live_source_id) if link else None
-        return (src.cmd if src else None), (src.portal_id if src else None), True
+        return (src.cmd if src else None), (src.portal_id if src else None), True, src
     if kind == "vod":
         link = (await db.execute(select(VodPlaylistSource).where(
             VodPlaylistSource.vod_playlist_id == pid)
             .order_by(VodPlaylistSource.priority))).scalars().first()
         src = await db.get(VodSource, link.vod_source_id) if link else None
-        return (src.cmd if src else None), (src.portal_id if src else None), True
+        return (src.cmd if src else None), (src.portal_id if src else None), True, src
     if kind == "series":
         # first enabled season's first episode of the playlist's source
         pl = await db.get(SeriePlaylist, pid)
@@ -676,17 +681,18 @@ async def _source_cmd_and_portal(db, kind: str, pid: int):
                 if eps:
                     break
         if not eps or not eps[0].cmd:
-            return None, None, True
+            return None, None, True, None
         season = await db.get(SerieSeason, eps[0].serie_season_id)
         ssrc = await db.get(SerieSource, season.serie_source_id) if season else None
-        return eps[0].cmd, (ssrc.portal_id if ssrc else None), True
+        # the *episode* row carries the flags (a series link is per episode)
+        return eps[0].cmd, (ssrc.portal_id if ssrc else None), True, eps[0]
     if kind == "local":
         r = await db.get(LocalPlaylist, pid)
         lf = await db.get(LocalFile, r.local_file_id) if r else None
         ls = await db.get(LocalSource, lf.local_source_id) if lf else None
         path = item_info.local_file_path(ls.directory, lf.relative_path) if ls and lf else None
-        return path, None, False
-    return None, None, True
+        return path, None, False, None
+    return None, None, True, None
 
 
 @router.get("/info")
@@ -699,10 +705,10 @@ async def playlist_item_info(kind: str = "", id: int = 0, db=Depends(get_db)):  
     row = await db.get(models[kind], id)
     if not row:
         raise HTTPException(404, "item not found")
-    cmd, portal_id, is_url = await _source_cmd_and_portal(db, kind, id)
+    cmd, portal_id, is_url, src = await _source_cmd_and_portal(db, kind, id)
     probe = {"error": "no usable source stream"}
     if cmd and is_url:
-        url = await item_info.playable_url(db, cmd, portal_id, kind)
+        url = await item_info.playable_url(db, cmd, portal_id, kind, src=src)
         if url:
             probe = await item_info.probe_target(url, is_url=True)
     elif cmd:

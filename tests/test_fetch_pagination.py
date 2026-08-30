@@ -155,3 +155,32 @@ async def test_cancellation_stops_the_walk():
     finally:
         cfg.FETCH_PAGE_CONCURRENCY = old
     assert state["calls"] < 20, f"cancellation ignored: {state['calls']} pages fetched"
+
+
+async def test_bookkeeping_failure_is_not_a_fetch_failure(monkeypatch):
+    """`_sync_season_links` promises "never fail a fetch over bookkeeping".
+
+    Its handler used `log.exception`, but this module has no `log` - it reports
+    through `db_log`. The handler therefore raised `NameError` *from inside the
+    except block*, so a transient DB hiccup in season-link sync surfaced as a
+    failed fetch job with a misleading error. A swallowed error that is not
+    logged anywhere is worse than a crash: a promise needs a test.
+    """
+    from sqlalchemy import select
+
+    from app.database import SessionLocal
+    from app.models import Log
+    from app.services import playlist_sync
+    from app.services.db_logging import flush_logs
+    from app.services.fetch_jobs import _sync_season_links
+
+    async def boom(session):
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(playlist_sync, "sync_season_links", boom)
+    await _sync_season_links("nexusconnects")            # must NOT raise
+
+    await flush_logs()
+    async with SessionLocal() as s:
+        msgs = list((await s.execute(select(Log.message))).scalars().all())
+    assert any("season link sync failed: RuntimeError: db hiccup" in m for m in msgs), msgs

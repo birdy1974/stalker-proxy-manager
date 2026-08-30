@@ -244,6 +244,11 @@ class DataTable {
     this._renderBody();
     this._renderPager();
     this._clientFilter();
+    /* one hook after the body exists, for columns whose content is filled by a
+       second request (the "Now" tooltip on the sources page): the component owns
+       when a row is in the DOM, and a page that guessed by polling would refetch
+       on a timer for a table that has not changed */
+    if (this.opts.onRender) this.opts.onRender(this);
   }
   _renderBody() {
     const o = this.opts; this.tbody.innerHTML = "";

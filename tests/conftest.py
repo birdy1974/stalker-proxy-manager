@@ -5,6 +5,7 @@ SPM_DATA_DIR / SPM_DATABASE_URL at import time and builds the engine from them.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import pathlib
 import sys
@@ -27,11 +28,48 @@ from app.services.db_logging import flush_logs  # noqa: E402
 
 @pytest.fixture(autouse=True)
 async def _schema_and_flush():
-    """Fresh tables per test; make sure no log row is left in the queue."""
+    """Fresh tables per test - quietly, so the NEXT test is not punished for them.
+
+    `drop_all` needs SQLite's exclusive lock, so it fails with `database is
+    locked` if anything still holds a shared one. Two things legitimately do, at
+    the moment a test ends:
+
+    * log rows queued for the writer task, which commits in its OWN session a
+      moment after the test that produced them is over -> drain the queue first;
+    * a connection checked out and then abandoned, which is exactly what
+      `test_get_db_survives_an_abandoned_request` is written to create. It is not
+      returned to the pool, so `dispose()` cannot reclaim it; only the garbage
+      collector terminating it releases the lock -> collect, yield to the
+      aiosqlite thread, and retry the DDL a few times while that happens.
+
+    Before this, one intentional leak turned into a dozen `ERROR at setup` entries
+    in whatever files happened to run after it - a suite whose failures depend on
+    file order teaches you nothing about your change.
+    """
+    import gc
+
     from app import models
-    async with engine.begin() as conn:
-        await conn.run_sync(models.Base.metadata.drop_all)
-        await conn.run_sync(models.Base.metadata.create_all)
+
+    await flush_logs()
+    last: Exception | None = None
+    for attempt in range(6):
+        try:
+            async with engine.begin() as conn:
+                await conn.run_sync(models.Base.metadata.drop_all)
+                await conn.run_sync(models.Base.metadata.create_all)
+            break
+        except Exception as exc:  # noqa: BLE001 - only "locked" is retryable
+            text = str(exc).lower()
+            if "locked" not in text:
+                raise
+            last = exc
+            await engine.dispose()
+            gc.collect()
+            await asyncio.sleep(0.05 * (attempt + 1))
+    else:
+        raise AssertionError(
+            "schema reset kept losing the SQLite file lock; a test is leaking a "
+            f"session instead of closing it: {last}")
     yield
     await flush_logs()
 

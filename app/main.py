@@ -12,6 +12,7 @@ Everything is also mirrored to stdout, so Portainer shows the full story.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 import time
@@ -172,7 +173,7 @@ async def startup() -> None:
                      "*** LOGIN DISABLED (SPM_SKIP_LOGIN=1) - mockup/preview mode ***")
     # Phase 3: background EPG refresher (checks due sources hourly)
     from .services.epg import epg_scheduler
-    import asyncio
+    import asyncio  # noqa: PLC0415 - the task set is built at startup
     asyncio.create_task(epg_scheduler())
     # Reaps streams whose teardown was lost, so a MAC or a user's connection
     # slot can never stay occupied until the next restart.
@@ -180,13 +181,21 @@ async def startup() -> None:
     _bg.add(asyncio.create_task(_reap_sessions(), name="spm-session-reaper"))
 
 
-async def _reap_sessions() -> None:
+async def _reap_sessions(interval: float = 300.0) -> None:
     """Close portal sessions nothing has asked for in a while (keeps the pool
-    from holding a socket open per MAC forever)."""
+    from holding a socket open per MAC forever).
+
+    `asyncio` has to be a module-level import for this to run at all: it used to
+    be imported only inside the startup function, so every pass of this loop died
+    with `NameError` inside the `except Exception` below - the reaper logged
+    "session reaper failed" every 300 s and never closed a session, which is
+    exactly the leak the loop exists to prevent. The interval is a parameter
+    rather than a literal so a test can watch one pass.
+    """
     from .portal.pool import POOL
     while True:
         try:
-            await asyncio.sleep(300)
+            await asyncio.sleep(interval)
             await POOL.reap()
         except asyncio.CancelledError:
             raise

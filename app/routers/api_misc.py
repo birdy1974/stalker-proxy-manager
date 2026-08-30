@@ -188,10 +188,24 @@ async def export_config(section: str = "all", db=Depends(get_db)):
 
     if section in ("all", "portals"):
         from ..models import MacAddress
-        data["portals"] = await dump(Portal, ["name", "base_url", "enabled", "proxy_url"])
+        # portal_version / modules ride along: they are what gates a fetch job,
+        # so a restored install that lost them would re-gate on a fresh probe of
+        # a panel that may be unreachable from the machine that restored it
+        # `xtream` rides along *unmasked*, deliberately: it is a harvested Xtream
+        # login, and a backup that restored `****` would hand back a portal that
+        # cannot authenticate - a silent dead bridge. That makes this export a
+        # secret-bearing file; it is admin-only and it already carries user rows.
+        data["portals"] = await dump(Portal, ["name", "base_url", "enabled", "proxy_url",
+                                              "tls_insecure", "identity_mode", "stb_timezone",
+                                              "direct_links", "portal_version", "modules",
+                                              "xtream", "xtream_at", "xtream_adopted"])
         macs = (await db.execute(select(MacAddress, Portal)
                                  .join(Portal, Portal.id == MacAddress.portal_id))).all()
-        data["macs"] = [{"portal": p.name, "mac": m.mac, "order": m.order}
+        # sn / device_id travel with the MAC on purpose: they are the serial this
+        # portal enrolled, so a backup that drops them would hand the panel a new
+        # device the next time it is restored.
+        data["macs"] = [{"portal": p.name, "mac": m.mac, "order": m.order,
+                         "sn": m.sn, "device_id": m.device_id}
                         for m, p in macs]
         data["live_genres"] = await dump(LiveGenre, ["portal_id", "genre_portal_id", "name", "enabled"])
         data["vod_genres"] = await dump(VodGenre, ["portal_id", "genre_portal_id", "name", "enabled"])
@@ -252,12 +266,16 @@ async def import_config(payload: dict, db=Depends(get_db)):
         db.add(User(**{k: v for k, v in u.items() if k != "id"}))
         applied["imported"] += 1
 
+    known = {c.name for c in Portal.__table__.columns} - {"id"}
     for p in data.get("portals", []):
         exists = (await db.execute(select(Portal).where(Portal.name == p.get("name")))).scalar_one_or_none()
         if exists:
             applied["skipped"].append(f"portal:{p.get('name')}")
             continue
-        db.add(Portal(**p))
+        # filtered, not splatted: a backup written by a *newer* image carries
+        # columns this one does not have, and `Portal(**p)` answers that with a
+        # TypeError inside an import that the user cannot inspect
+        db.add(Portal(**{k: v for k, v in p.items() if k in known}))
         applied["imported"] += 1
 
     for e in data.get("epg_sources", []):

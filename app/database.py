@@ -226,9 +226,47 @@ async def init_db() -> None:
 # with "no such column" on the next SELECT. (name, sql-type, default) - the
 # default is dialect-specific for booleans, hence the tiny branch below.
 _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
+    "portals": {
+        "tls_insecure": ("BOOLEAN", "0"),
+        "identity_mode": ("VARCHAR(12)", "'mag250'"),
+        "stb_timezone": ("VARCHAR(64)", "NULL"),
+        "direct_links": ("BOOLEAN", "1"),
+        "portal_version": ("VARCHAR(120)", "NULL"),
+        "modules": ("TEXT", "NULL"),
+        "capabilities_at": ("TIMESTAMP", "NULL"),
+        # R7. `xtream` holds the harvested identity + what player_api.php said
+        # (credentials included: this database already stores MACs and passwords,
+        # and a backup without them would restore a portal that cannot play).
+        "xtream": ("TEXT", "NULL"),
+        "xtream_at": ("TIMESTAMP", "NULL"),
+        "xtream_adopted": ("BOOLEAN", "0"),
+    },
+    # R2: which of a channel's links the panel has to rebuild. NULL is not "":
+    # NULL means the row predates the flags, and a fetch will fill them in.
+    "live_sources": {"link_flags": ("VARCHAR(60)", "NULL"),
+                     # R7: per-channel Xtream URL (NULL = not adopted, so playback
+                     # keeps going through the portal exactly as before)
+                     "xtream_url": ("VARCHAR(600)", "NULL")},
+    "vod_sources": {"link_flags": ("VARCHAR(60)", "NULL"),
+                    "xtream_url": ("VARCHAR(600)", "NULL")},
+    "serie_episodes": {"link_flags": ("VARCHAR(60)", "NULL")},
+    "mac_addresses": {
+        "last_error": ("VARCHAR(200)", "NULL"),
+        "force_ch_link_check": ("BOOLEAN", "0"),
+        "sn": ("VARCHAR(40)", "NULL"),
+        "device_id": ("VARCHAR(80)", "NULL"),
+    },
     "ffmpeg_templates": {
         "low_power": ("BOOLEAN", "1"),
+        # VBR on purpose, not the CQP the app ships with now: this default only
+        # fills the column on databases that predate it, where the stored command
+        # text has no -rc_mode at all. Claiming CQP there would put a QP-less
+        # rate-control mode on rows nobody asked about; VBR is what those rows
+        # were tuned for. Built-in presets are a different matter - they are
+        # re-seeded from default_presets() on every boot (app/main.py), so they
+        # pick up CQP without a migration.
         "rc_mode": ("VARCHAR(10)", "'VBR'"),
+        "global_quality": ("VARCHAR(6)", "'26'"),
         "async_depth": ("VARCHAR(4)", "'4'"),
         "is_builtin": ("BOOLEAN", "0"),
     },

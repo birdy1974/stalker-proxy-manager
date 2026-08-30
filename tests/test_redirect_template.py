@@ -20,6 +20,7 @@ from app.models import (
 )
 from app.services.ffmpeg_templates import (
     REDIRECT_COMMAND, REDIRECT_PRESET_NAME, REFERENCE_PRESET_NAME,
+    FFmpegOptions, build_command,
 )
 from app.services.stream_manager import MANAGER
 
@@ -117,3 +118,49 @@ async def test_mode_param_still_overrides_the_template():
     async with AsyncClient(transport=transport, base_url=BASE) as c:
         r = await c.get(f"/play/live/{redir}.ts?u=u2&p=pw&mode=proxy")
         assert r.status_code == 404, f"expected 404 proxy, got {r.status_code}: {r.text}"
+
+
+async def test_boot_seed_moves_builtins_to_the_shipped_rate_control():
+    """The built-in templates live in the database, so the shipped default for
+    `-rc_mode` only reaches an existing install through this re-seed. A template
+    the user created themselves is left exactly as they set it - same rule the
+    other VAAPI fields follow."""
+    await _seed_defaults()
+    async with SessionLocal() as s:
+        s.add(FFmpegTemplate(name="My VAAPI 720p", video_codec="h264_vaapi",
+                             rc_mode="VBR", global_quality="",
+                             command=build_command(FFmpegOptions(rc_mode="VBR")),
+                             command_source="fields"))
+        await s.commit()
+    await _seed_defaults()          # second boot
+    async with SessionLocal() as s:
+        builtin = (await s.execute(select(FFmpegTemplate).where(
+            FFmpegTemplate.name == REFERENCE_PRESET_NAME))).scalar_one()
+        assert builtin.rc_mode == "CQP"
+        assert "-rc_mode CQP -global_quality 26" in builtin.command
+        assert "-b:v" not in builtin.command        # CQP does not honour it
+        mine = (await s.execute(select(FFmpegTemplate).where(
+            FFmpegTemplate.name == "My VAAPI 720p"))).scalar_one()
+        assert mine.is_builtin is False
+        assert mine.rc_mode == "VBR" and "-b:v 1000k" in mine.command
+
+
+async def test_boot_seed_never_rewrites_a_hand_edited_builtin_command():
+    """A built-in whose command text was edited by hand keeps that text: the
+    structured fields are refreshed (so the GUI reflects what the app ships)
+    but the command the stream path actually runs is the user's."""
+    await _seed_defaults()
+    custom = ("ffmpeg -i <url> -c:v h264_vaapi -b:v 1800k -rc_mode VBR "
+              "-f mpegts pipe:1")
+    async with SessionLocal() as s:
+        row = (await s.execute(select(FFmpegTemplate).where(
+            FFmpegTemplate.name == REFERENCE_PRESET_NAME))).scalar_one()
+        row.command = custom
+        row.command_source = "manual"
+        await s.commit()
+    await _seed_defaults()
+    async with SessionLocal() as s:
+        row = (await s.execute(select(FFmpegTemplate).where(
+            FFmpegTemplate.name == REFERENCE_PRESET_NAME))).scalar_one()
+        assert row.command == custom
+        assert row.rc_mode == "CQP"     # the field says what the app now ships

@@ -11,22 +11,30 @@ resource object per connection.
 
 After the pool: 2 handshakes for 18 create_links (0.11), 16 of 36 portal round
 trips gone. These tests pin the pieces that make that true.
+
+A session is `PortalSession(...)` - one value carrying everything that
+identifies a connection (url, MAC, password, proxy, TLS policy, claimed device
+identity) - rather than five arguments repeated at every call site, which is how
+a portal's proxy came to be applied to one call and not the next.
 """
 
 from __future__ import annotations
 
 import time
 
-import pytest
-
 from app.portal.client import TOKEN_VALIDITY, StalkerClient
-from app.portal.pool import ClientPool
+from app.portal.pool import ClientPool, PortalSession
+
+
+def S(url: str, mac: str, **kw) -> PortalSession:
+    """Shorthand: these tests are about identity, not about typing."""
+    return PortalSession(url, mac, **kw)
 
 
 async def test_pool_returns_the_same_client_for_the_same_key():
     pool = ClientPool()
-    a = await pool.get("http://p/c/", "00:11:22:33:44:55")
-    b = await pool.get("http://p/c/", "00:11:22:33:44:55")
+    a = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
+    b = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
     assert a is b, "the whole point is that the session survives between calls"
     assert a.shared is True, "a pooled client must not be torn down by its caller"
     assert pool.stats()["sessions_open"] == 1
@@ -35,11 +43,23 @@ async def test_pool_returns_the_same_client_for_the_same_key():
 
 async def test_pool_keys_separate_macs_and_portals_apart():
     pool = ClientPool()
-    a = await pool.get("http://p/c/", "00:11:22:33:44:55")
-    b = await pool.get("http://p/c/", "00:11:22:33:44:66")     # other MAC
-    c = await pool.get("http://q/c/", "00:11:22:33:44:55")     # other portal
+    a = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
+    b = await pool.get(S("http://p/c/", "00:11:22:33:44:66"))      # other MAC
+    c = await pool.get(S("http://q/c/", "00:11:22:33:44:55"))      # other portal
     assert len({id(a), id(b), id(c)}) == 3
     assert pool.stats()["sessions_open"] == 3
+
+
+async def test_pool_keys_separate_identities_apart():
+    """Two clients that differ only in what they claim to be are not one session."""
+    pool = ClientPool()
+    a = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
+    b = await pool.get(S("http://p/c/", "00:11:22:33:44:55", identity_mode="minimal"))
+    c = await pool.get(S("http://p/c/", "00:11:22:33:44:55", sn="PINNED-SN"))
+    d = await pool.get(S("http://p/c/", "00:11:22:33:44:55", timezone="Europe/Oslo"))
+    assert len({id(a), id(b), id(c), id(d)}) == 4, (
+        "identity, pinned serial and timezone change what the panel sees, so they "
+        "must not share a connection that was opened under different answers")
 
 
 async def test_ensure_auth_handshakes_once_across_many_calls(monkeypatch):
@@ -102,38 +122,40 @@ async def test_invalidate_drops_the_token(monkeypatch):
 async def test_caller_close_does_not_kill_a_shared_session():
     """Call sites still do `finally: await client.close()` - that must be inert."""
     pool = ClientPool()
-    a = await pool.get("http://p/c/", "00:11:22:33:44:55")
+    a = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
     await a.close()
     assert pool.stats()["sessions_open"] == 1, "caller close() must not drop a shared session"
-    b = await pool.get("http://p/c/", "00:11:22:33:44:55")
+    b = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
     assert b is a
 
 
 async def test_reap_closes_idle_sessions_and_keeps_fresh_ones():
     pool = ClientPool()
-    old = await pool.get("http://p/c/", "00:11:22:33:44:55")
-    new = await pool.get("http://p/c/", "00:11:22:33:44:66")
-    pool._used[("http://p/c/", "00:11:22:33:44:55", "", "")] = time.monotonic() - 10_000
+    old = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
+    new = await pool.get(S("http://p/c/", "00:11:22:33:44:66"))
+    # keyed through the session itself: the tuple is an implementation detail (it
+    # carries the TLS policy and the claimed identity, not just url + MAC)
+    pool._used[S("http://p/c/", "00:11:22:33:44:55").key] = time.monotonic() - 10_000
 
     assert await pool.reap(idle_ttl=60) == 1
     assert pool.stats()["sessions_open"] == 1
     # the survivor is still the same object, and a later get() reuses it
-    assert await pool.get("http://p/c/", "00:11:22:33:44:66") is new
+    assert await pool.get(S("http://p/c/", "00:11:22:33:44:66")) is new
     assert old._client is None or True          # closed, or never opened - both fine
 
 
 async def test_drop_forgets_one_session():
     pool = ClientPool()
-    await pool.get("http://p/c/", "00:11:22:33:44:55")
-    await pool.get("http://p/c/", "00:11:22:33:44:66")
-    await pool.drop("http://p/c/", "00:11:22:33:44:55")
+    await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
+    await pool.get(S("http://p/c/", "00:11:22:33:44:66"))
+    await pool.drop(S("http://p/c/", "00:11:22:33:44:55"))
     assert pool.stats()["sessions_open"] == 1
 
 
 async def test_close_all_empties_the_pool():
     pool = ClientPool()
     for mac in ("00:11:22:33:44:55", "00:11:22:33:44:66"):
-        await pool.get("http://p/c/", mac)
+        await pool.get(S("http://p/c/", mac))
     assert pool.stats()["sessions_open"] == 2
     await pool.close_all()
     assert pool.stats()["sessions_open"] == 0

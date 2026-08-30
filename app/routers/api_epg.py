@@ -16,6 +16,7 @@ from ..database import get_db
 from ..models import EpgChannel, EpgProgramme, EpgSource, LivePlaylist
 from ..security import require_admin
 from ..services import epg as epg_svc
+from ..services import epg_now as now_svc
 from ..services.db_logging import db_log
 
 router = APIRouter(prefix="/api/epg", tags=["epg"], dependencies=[Depends(require_admin)])
@@ -129,6 +130,34 @@ async def list_epg_channels(q: str = "", page: int = 1, per_page: int = 50, db=D
     return {"total": total or 0,
             "rows": [{"tvg_id": r.tvg_id, "name": r.name, "icon": r.icon,
                       "source_id": r.epg_source_id} for r in rows]}
+
+
+@router.get("/now")
+async def what_is_on_now(live: str = "", playlist: str = "", refresh: bool = False):
+    """"What is on this channel right now", for the tooltips that ask it in bulk.
+
+    `live` / `playlist` are comma lists of row ids - **the rows the page is
+    showing**, not the whole catalogue, because `get_short_epg` costs one portal
+    request per channel and a guide tooltip is not worth an IP ban. The service
+    answers from the configured XMLTV source whenever it has the row, from its
+    2-minute cache whenever that is fresh, and only then from the portal.
+
+    No `db`: the service opens its own short sessions per batch on purpose, so a
+    request-scoped session would be held across portal round-trips and sit on a
+    pooled connection while waiting for a panel that may take 30 s to answer.
+    """
+    def _ids(raw: str) -> list[int]:
+        out = []
+        for tok in str(raw or "").split(","):
+            tok = tok.strip()
+            if tok.isdigit():
+                out.append(int(tok))
+        return out
+
+    live_ids, pl_ids = _ids(live), _ids(playlist)
+    if not live_ids and not pl_ids:
+        raise HTTPException(400, "pass live=<ids> and/or playlist=<ids>")
+    return await now_svc.now_for(live_ids or None, pl_ids or None, refresh=refresh)
 
 
 @router.patch("/channels/assign/{live_id}")

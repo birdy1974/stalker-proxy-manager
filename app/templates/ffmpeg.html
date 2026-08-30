@@ -48,16 +48,16 @@
                   <option value="h264_vaapi">h264_vaapi (QSync/VAAPI)</option><option value="hevc_vaapi">hevc_vaapi</option>
                   <option value="h264_qsv">h264_qsv</option><option value="hevc_qsv">hevc_qsv</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label">Bitrate</label>
+              <div class="col-4 rc-rate"><label class="muted-label">Bitrate</label>
                 <select class="form-select form-select-sm ff-field" id="f-video_bitrate">
                   <option>500k</option><option>750k</option><option selected>1000k</option><option>1500k</option>
                   <option>2500k</option><option>4000k</option><option>6000k</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label">Maxrate</label>
+              <div class="col-4 rc-rate"><label class="muted-label">Maxrate</label>
                 <select class="form-select form-select-sm ff-field" id="f-maxrate">
                   <option value="">—</option><option>750k</option><option selected>1100k</option><option>1300k</option><option>1800k</option><option>2750k</option><option>3000k</option><option>4800k</option><option>8000k</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label">Bufsize</label>
+              <div class="col-4 rc-rate"><label class="muted-label">Bufsize</label>
                 <select class="form-select form-select-sm ff-field" id="f-bufsize">
                   <option value="">—</option><option selected>2000k</option><option>2400k</option><option>2700k</option><option>4500k</option><option>5000k</option><option>7200k</option>
                 </select></div>
@@ -70,14 +70,18 @@
                 <select class="form-select form-select-sm ff-field" id="f-level"><option>4.1</option><option>4.0</option><option>3.1</option><option>5.1</option></select></div>
               <div class="col-4 d-flex align-items-end"><div class="form-check form-switch">
                 <input class="form-check-input ff-field" type="checkbox" id="f-low_power"><label class="form-check-label small">VAAPI low-power (LP encoder)</label></div></div>
-              <div class="col-4"><label class="muted-label">VAAPI rate control</label>
+              <div class="col-3"><label class="muted-label">VAAPI rate control</label>
                 <select class="form-select form-select-sm ff-field" id="f-rc_mode">
-                  <option value="AUTO">AUTO</option><option value="CQP">CQP</option><option value="CBR">CBR</option>
-                  <option value="VBR" selected>VBR</option><option value="ICQ">ICQ</option><option value="QVBR">QVBR</option><option value="AVBR">AVBR</option>
+                  <option value="AUTO">AUTO</option><option value="CQP" selected>CQP</option><option value="CBR">CBR</option>
+                  <option value="VBR">VBR</option><option value="ICQ">ICQ</option><option value="QVBR">QVBR</option><option value="AVBR">AVBR</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label">VAAPI async depth</label>
+              <div class="col-2 rc-qp"><label class="muted-label" title="the quantiser CQP encodes at - ignored by every other mode">QP</label>
+                <input class="form-control form-control-sm ff-field" id="f-global_quality" value="26" inputmode="numeric"></div>
+              <div class="col-3"><label class="muted-label">VAAPI async depth</label>
                 <input class="form-control form-control-sm ff-field" id="f-async_depth" value="4" inputmode="numeric"></div>
-              <div class="col-12 small text-muted mb-1">Low-power / rate-control / async-depth apply to <code>h264_vaapi</code>·<code>hevc_vaapi</code> encoders (the DS918+ hardware path).</div>
+              <div class="col-12 small text-muted mb-1">Low-power / rate-control / async-depth apply to <code>h264_vaapi</code>·<code>hevc_vaapi</code> encoders (the DS918+ hardware path).
+                <b>CQP</b> pins picture quality at the QP beside it (0-51, lower = better and bigger) and lets the bitrate float, so Bitrate/Maxrate/Bufsize are not rendered;
+                pick VBR or CBR to drive the rate instead.</div>
               <div class="col-4"><label class="muted-label">Audio codec</label>
                 <select class="form-select form-select-sm ff-field" id="f-audio_codec"><option>aac</option><option>ac3</option><option>mp2</option><option>mp3</option><option value="copy">copy</option><option value="none">none</option></select></div>
               <div class="col-3"><label class="muted-label">Audio bitrate</label>
@@ -124,12 +128,20 @@
 {% block scripts %}
 <script>
 const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","video_codec","video_bitrate",
-  "maxrate","bufsize","fps","gop","profile","level","low_power","rc_mode","async_depth",
+  "maxrate","bufsize","fps","gop","profile","level","low_power","rc_mode","global_quality","async_depth",
   "audio_codec","audio_bitrate","audio_channels",
   "audio_rate","output_format","extra_input","extra_output"];
 let current = null, templates = [];
 const isRedirectTpl = (t) => (t.command || "").trim() === "@redirect";
 
+/* CQP makes the rate flags redundant and every other mode makes the QP
+   redundant; the encoder ignores whichever group is out of play, so the form
+   dims it instead of inviting edits that go nowhere. */
+function syncRcFields() {
+  const live = $("#f-rc_mode").value === "CQP" && ($("#f-video_codec").value || "").endsWith("_vaapi");
+  $$(".rc-rate").forEach(n => n.style.opacity = live ? "0.4" : "");
+  $$(".rc-qp").forEach(n => n.style.opacity = live ? "" : "0.4");
+}
 function readFields() {
   const o = {};
   for (const k of FIELD_IDS) {
@@ -168,7 +180,10 @@ let parseTimer;
 $("#f-command").addEventListener("input", () => {
   clearTimeout(parseTimer);
   parseTimer = setTimeout(async () => {
-    const r = await api("/api/ffmpeg/parse", { method: "POST", body: { command: $("#f-command").value } });
+    // send the current fields along: anything the typed command does not mention
+    // (no -rc_mode, no -b:v under CQP) must stay as the row had it
+    const r = await api("/api/ffmpeg/parse", { method: "POST",
+      body: { command: $("#f-command").value, base: readFields() } });
     writeFields(r.options);
     $("#sync-state").innerHTML = '<span class="text-success">command → fields</span>' +
       (r.warnings.length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
@@ -176,6 +191,7 @@ $("#f-command").addEventListener("input", () => {
   }, 350);
 });
 $$(".ff-field").forEach(n => n.addEventListener("change", fieldsToCommand));
+$$(".ff-field").forEach(n => n.addEventListener("change", syncRcFields));
 $$(".ff-field").forEach(n => n.addEventListener("input", fieldsToCommand));
 
 async function loadList() {
@@ -199,6 +215,7 @@ async function selectTemplate(id) {
   writeFields(current);
   $("#f-command").value = current.command || "";
   $("#sync-state").textContent = "";
+  syncRcFields();
   /* the redirect preset is a marker, not an ffmpeg command: lock the option
      fields and command text so a stray edit cannot turn it back into a real
      command (name + enabled stay editable) */
@@ -219,7 +236,8 @@ $("#tpl-new").addEventListener("click", () => {
   $("#btn-test-lavfi").disabled = false;
   $("#btn-test-url").disabled = false;
   writeFields({ name: "New template", enabled: true, hw_accel: "vaapi",
-                low_power: true, rc_mode: "VBR", async_depth: "4" });
+                low_power: true, rc_mode: "CQP", global_quality: "26", async_depth: "4" });
+  syncRcFields();
   fieldsToCommand();
 });
 $("#tpl-save").addEventListener("click", async () => {

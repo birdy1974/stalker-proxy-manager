@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import select
 
@@ -28,7 +29,10 @@ from ..models import (
     LiveGenre, LiveSource, MacAddress, Portal, SerieEpisode, SerieGenre,
     SerieSeason, SerieSource, VodGenre, VodSource,
 )
-from ..portal.pool import POOL
+from ..portal.account import mac_is_usable, mac_status
+from ..portal.capabilities import gate_feature, loads_modules
+from ..portal.links import parse_link_flags
+from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, StalkerClient
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
@@ -154,18 +158,24 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
         if not portal:
             raise PortalError("portal not found")
         portal_name, base, resolved = portal.name, portal.base_url, portal.resolved_url
+        insecure, portal_proxy = portal.tls_insecure, portal.proxy_url
         macs = (await s.execute(
             select(MacAddress).where(MacAddress.portal_id == portal.id)
             .order_by(MacAddress.order))).scalars().all()
     if not macs:
         raise PortalError("portal has no MAC addresses")
 
-    mac = macs[0]
+    # The first MAC the panel does NOT consider dead. A banned or expired one
+    # cannot authenticate, so a 30-minute catalogue job started on it would
+    # simply fail at page 1; falling back to macs[0] when all of them look
+    # unusable keeps a stale status from disabling the portal forever.
+    mac = next((m for m in macs if mac_is_usable(getattr(m, "status", None))), macs[0])
     # ---- resolve once per job if needed ------------------------------------
     if not resolved:
         job.stage = "resolving portal url"
         await db_log("INFO", "fetch", f"[{portal_name}] resolving portal path for {base}")
-        res = await resolve_portal(base, mac=mac.mac)
+        res = await resolve_portal(base, mac=mac.mac, proxy=portal_proxy,
+                                   tls_insecure=insecure)
         for line in res.attempts:
             await db_log("DEBUG", "resolve", f"[{portal_name}] {line}")
         if not res.ok:
@@ -177,18 +187,39 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
             await s.commit()
         await db_log("INFO", "fetch", f"[{portal_name}] resolved -> {resolved}")
 
-    client = await POOL.get(resolved, mac.mac, mac.password)
+    # One profile, built from the rows: this call used to hand POOL.get a proxy
+    # and a TLS policy by hand, which is how catalogue fetches ended up the one
+    # path that ignored a portal's proxy. PortalSession.from_rows is the only
+    # way to get a session now, so it cannot be half-applied again.
+    client = await POOL.get(PortalSession.from_rows(portal, mac, portal_url=resolved))
     await client.handshake()
-    try:                                    # refresh MAC expiry/status while we are here
-        exp = await client.account_expires()
+    try:          # refresh what the panel says about this MAC while we are here
+        verdict = await client.refresh_account()
         async with SessionLocal() as s:
             m = await s.get(MacAddress, mac.id)
-            m.expire_date, m.status, m.online = exp, "online", True
+            m.expire_date = verdict.expire_date
+            m.status, m.online = mac_status(verdict), verdict.online
+            m.force_ch_link_check = verdict.force_ch_link_check
+            m.last_error = None if verdict.online else verdict.reason[:200]
             m.last_checked = datetime.now(timezone.utc)
             await s.commit()
     except PortalError:
         pass
     return client, portal_name
+
+
+async def _feature_gate(portal_id: int, feature: str) -> tuple[bool, str]:
+    """May this portal be asked for `feature` at all? (R6)
+
+    The answer comes from the panel's own `get_modules`, stored on the Portal row
+    by a resolve. A portal that never answered is allowed: skipping a catalogue
+    because a *cosmetic* probe did not reply is how a proxy ends up "losing"
+    channels nobody removed.
+    """
+    async with SessionLocal() as s:
+        p = await s.get(Portal, portal_id)
+        modules = loads_modules(getattr(p, "modules", None)) if p else None
+    return gate_feature(modules, feature)
 
 
 async def _sync_all_genres(job: Job, client: StalkerClient, portal_id: int,
@@ -206,7 +237,12 @@ async def _sync_all_genres(job: Job, client: StalkerClient, portal_id: int,
         await s.commit()
 
     job.stage = "vod genres"
-    cats = await client.vod_genres()
+    ok, why = await _feature_gate(portal_id, "vod")
+    if not ok:
+        await db_log("INFO", "fetch", f"[{portal_name}] vod categories skipped: {why}")
+        cats = []
+    else:
+        cats = await client.vod_genres()
     async with SessionLocal() as s:
         known = await _sync_genres(s, VodGenre, portal_id, cats)
         if not known:                      # no usable categories -> synthetic "all"
@@ -219,7 +255,12 @@ async def _sync_all_genres(job: Job, client: StalkerClient, portal_id: int,
         await s.commit()
 
     job.stage = "series genres"
-    cats = await client.series_genres()
+    ok, why = await _feature_gate(portal_id, "series")
+    if not ok:
+        await db_log("INFO", "fetch", f"[{portal_name}] series categories skipped: {why}")
+        cats = []
+    else:
+        cats = await client.series_genres()
     async with SessionLocal() as s:
         known = await _sync_genres(s, SerieGenre, portal_id, cats)
         if not known:
@@ -242,8 +283,12 @@ async def _sync_season_links(portal_name: str) -> None:
         if added:
             await db_log("INFO", "fetch",
                          f"[{portal_name}] linked {added} new season(s) to playlist series")
-    except Exception:  # noqa: BLE001 - never fail a fetch over bookkeeping
-        log.exception("season link sync failed")
+    except Exception as exc:  # noqa: BLE001 - never fail a fetch over bookkeeping
+        # There is no module logger in this file (it reports through db_log).
+        # `log.exception` here used to raise NameError *inside the handler*,
+        # which turned a bookkeeping hiccup into a failed fetch job.
+        await db_log("ERROR", "fetch",
+                     f"[{portal_name}] season link sync failed: {type(exc).__name__}: {exc}")
 
 
 async def _run_portal_fetch(job: Job) -> None:
@@ -283,10 +328,20 @@ async def _run_items_fetch(job: Job, client: StalkerClient | None = None,
         await _fetch_live(job, client, job.portal_id, portal_name)
         if job._cancel.is_set():
             return
-        await _fetch_vod(job, client, job.portal_id, portal_name)
-        if job._cancel.is_set():
-            return
-        await _fetch_series(job, client, job.portal_id, portal_name)
+        # The two halves below are the expensive ones (a big VOD catalogue is
+        # hours of paging), and a panel that has no `vclub`/`sclub` module has
+        # been telling us so, in its own answer, since R6. Honouring it is not
+        # skipping them is not an optimisation: the alternative is a green progress
+        # bar that ends in an empty genre and a user who assumes the proxy broke.
+        for feature, run in (("vod", _fetch_vod), ("series", _fetch_series)):
+            ok, why = await _feature_gate(job.portal_id, feature)
+            if not ok:
+                await db_log("INFO", "fetch",
+                             f"[{portal_name}] {feature} items skipped: {why}")
+                continue
+            await run(job, client, job.portal_id, portal_name)
+            if job._cancel.is_set():
+                return
         # Seasons arrive after the series were added to the playlist, so their
         # link rows have to be reconciled here - otherwise the series stay in
         # the builder but contribute no episodes to any playlist.
@@ -613,10 +668,12 @@ def _live_fields(row, item, genre_db_id: int) -> None:
     row.logo_original = (item.get("logo") or "")[:600] or None
     row.epg_original = (item.get("epg_channel_id") or item.get("tvg_id") or "")[:200] or None
     row.tv_archive = str(item.get("tv_archive", "0")) == "1"
+    row.link_flags = parse_link_flags(item)      # R2: what the panel says about its links
 
 
 def _vod_fields(row, item, genre_db_id: int) -> None:
     row.vod_genre_id = genre_db_id
+    row.link_flags = parse_link_flags(item)
     row.original_name = portal_item_title(item, limit=400)
     row.cmd = item.get("cmd")
     row.position = item.get("position") if isinstance(item.get("position"), int) else None
@@ -913,6 +970,7 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
                             erow.name = (e.get("name") or f"E{en:02d}")[:400]
                             erow.cmd = e.get("cmd")
                             erow.duration = str(e.get("time", "") or "")[:20] or None
+                            erow.link_flags = parse_link_flags(e)
                         row.episodes_fetched = True
 
                     srow = await s2.get(SerieSource, sid)

@@ -49,6 +49,39 @@ class Portal(Base):
     resolved_path: Mapped[str | None] = mapped_column(String(120))        # the path that won (/c/, ...)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     proxy_url: Mapped[str | None] = mapped_column(String(300))            # optional http proxy
+    # What we tell the panel we are. "mag250" sends the device fingerprint a real
+    # box sends (see app/portal/identity.py); "minimal" is the escape hatch for a
+    # panel that rejects an identity it never enrolled - a WRONG fingerprint is
+    # worse than none, so the user has to be able to switch without a code change.
+    identity_mode: Mapped[str] = mapped_column(String(12), default="mag250")
+    stb_timezone: Mapped[str | None] = mapped_column(String(64))          # cookie a MAG sends
+    # Opt-out for panels with a broken/self-signed certificate chain. False by
+    # default: verification is ON for every portal, and this only ever widens
+    # trust for ONE portal the user explicitly says is misconfigured.
+    tls_insecure: Mapped[bool] = mapped_column(Boolean, default=False)
+    # What the panel says about *itself* (R6). Read from version.js, which needs
+    # no token, and from get_modules, which does. Both are informational unless
+    # `modules` is non-NULL: a portal that never answered has not told us it
+    # lacks series, and gating on that would hide a working catalogue.
+    #: R2: play a stored link when the channel's own flags say it is permanent,
+    #: instead of asking for a new one on every open. On by default, and the
+    #: switch exists because a panel that answers `use_http_tmp_link=0` and then
+    #: 403s the URL is worth one checkbox, not a code change.
+    direct_links: Mapped[bool] = mapped_column(Boolean, default=True)
+    portal_version: Mapped[str | None] = mapped_column(String(120))
+    modules: Mapped[str | None] = mapped_column(Text)        # JSON list, NULL = unknown
+    capabilities_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # R7: what the panel's own stream links gave away. Some Stalker portals build
+    # `/live/<user>/<pass>/…` URLs, i.e. the MAC account *is* an Xtream account,
+    # and reading that turns a 14-items-per-page crawl into a `player_api.php`
+    # catalogue. `xtream` is the observation (JSON: base/user/pass + what
+    # player_api reported), NULL when we looked and found nothing to find.
+    xtream: Mapped[str | None] = mapped_column(Text)
+    xtream_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: the ONLY thing that makes portal playback use those URLs. Detection is
+    #: opportunistic and read-only by design; switching a portal onto harvested
+    #: credentials changes how a user watches TV, so a human presses it.
+    xtream_adopted: Mapped[bool] = mapped_column(Boolean, default=False)
     notes: Mapped[str | None] = mapped_column(Text)
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -70,11 +103,23 @@ class MacAddress(Base):
     mac: Mapped[str] = mapped_column(String(17))
     password: Mapped[str | None] = mapped_column(String(120))             # rare, some portals need it
     order: Mapped[int] = mapped_column(Integer, default=0)                # try order within portal
-    status: Mapped[str] = mapped_column(String(20), default="unknown")    # unknown/online/offline/unauthorized/expired/error
+    # `banned` (the panel disabled this MAC) and `expired` (its subscription
+    # ended) come from the portal itself and take the MAC out of every fallback
+    # chain; the rest are our own verdicts about transport and stay retryable.
+    status: Mapped[str] = mapped_column(String(20), default="unknown")    # unknown/online/offline/unauthorized/expired/banned/error
     online: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     expire_date: Mapped[str | None] = mapped_column(String(40))           # as reported by the portal
+    last_error: Mapped[str | None] = mapped_column(String(200))           # why, in the panel's own words
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
     last_checked: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The panel asks every link to be re-validated for this account (create_link
+    # with force_ch_link_check=1). Stored so the stream path can honour it.
+    force_ch_link_check: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Pinned STB identity: derived from the MAC when empty, kept stable forever
+    # when the real box's values were captured (a re-generated serial is how a
+    # working account gets flagged as a new device).
+    sn: Mapped[str | None] = mapped_column(String(40))
+    device_id: Mapped[str | None] = mapped_column(String(80))
 
     portal: Mapped[Portal] = relationship(back_populates="macs")
 
@@ -145,6 +190,16 @@ class LiveSource(Base):
     epg_original: Mapped[str | None] = mapped_column(String(200))         # tvg id hint from portal
     tv_archive: Mapped[bool] = mapped_column(Boolean, default=False)
     censored: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: the channel's own link flags (`use_http_tmp_link,disable_ad`), as the
+    #: panel sent them. NULL means the panel said nothing - which is NOT the same
+    #: as "" (it said nothing applies), and the difference is what decides
+    #: whether a stream open costs a create_link. See app/portal/links.py.
+    link_flags: Mapped[str | None] = mapped_column(String(60))
+    #: R7: the Xtream URL this channel has on the harvested account, when the
+    #: user adopted this portal. Kept *beside* `cmd` rather than in it, so the
+    #: portal's own cmd survives a re-fetch and un-adopting is one flag, not a
+    #: restore operation. See app/services/xtream_bridge.py.
+    xtream_url: Mapped[str | None] = mapped_column(String(600))
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)  # user: include in output pool
 
 
@@ -168,6 +223,8 @@ class VodSource(Base):
     rating: Mapped[str | None] = mapped_column(String(10))
     duration: Mapped[str | None] = mapped_column(String(20))
     added: Mapped[str | None] = mapped_column(String(40))
+    link_flags: Mapped[str | None] = mapped_column(String(60))   # see LiveSource.link_flags
+    xtream_url: Mapped[str | None] = mapped_column(String(600))  # see LiveSource.xtream_url
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
@@ -225,6 +282,7 @@ class SerieEpisode(Base):
     name: Mapped[str | None] = mapped_column(String(400))
     cmd: Mapped[str | None] = mapped_column(Text)                          # set on real portals, empty on pure series-rows
     duration: Mapped[str | None] = mapped_column(String(20))
+    link_flags: Mapped[str | None] = mapped_column(String(60))    # see LiveSource.link_flags
 
     season: Mapped[SerieSeason] = relationship(back_populates="episodes")
 
@@ -281,7 +339,8 @@ class FFmpegTemplate(Base):
     profile: Mapped[str] = mapped_column(String(12), default="high")
     level: Mapped[str] = mapped_column(String(8), default="4.1")
     low_power: Mapped[bool] = mapped_column(Boolean, default=True)          # h264_vaapi EncSliceLP (DS918+ fixed-function encoder)
-    rc_mode: Mapped[str] = mapped_column(String(10), default="VBR")         # AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
+    rc_mode: Mapped[str] = mapped_column(String(10), default="CQP")         # AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
+    global_quality: Mapped[str] = mapped_column(String(6), default="26")     # QP for -rc_mode CQP (0-51), VAAPI only
     async_depth: Mapped[str] = mapped_column(String(4), default="4")        # VAAPI frames in flight
     audio_codec: Mapped[str] = mapped_column(String(12), default="aac")    # aac|ac3|mp3|copy|none
     audio_bitrate: Mapped[str] = mapped_column(String(10), default="128k")
