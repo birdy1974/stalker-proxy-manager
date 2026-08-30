@@ -54,7 +54,11 @@ def _live_item(r: LiveSource, genre_names, portal_names) -> dict:
     return {"id": r.id, "name": r.original_name, "number": r.number,
             "portal_id": r.portal_id, "portal": portal_names.get(r.portal_id, "?"),
             "genre_id": r.live_genre_id, "genre": genre_names.get(r.live_genre_id, ""),
-            "logo": r.logo_original, "cmd": r.cmd, "enabled": r.enabled}
+            "logo": r.logo_original, "cmd": r.cmd, "enabled": r.enabled,
+            # what the panel said about this channel's links (R2). Readable, and
+            # in the row rather than only in the decision, because "why did this
+            # one skip create_link" is a question asked with a curl in hand
+            "link_flags": r.link_flags}
 
 
 def _vod_item(r: VodSource, genre_names, portal_names) -> dict:
@@ -170,7 +174,7 @@ async def sources_media_info(kind: str = "", id: int = 0, db=Depends(get_db)):  
         r = await db.get(VodSource, id)
         if not r:
             raise HTTPException(404, "vod not found")
-        url = await item_info.playable_url(db, r.cmd or "", r.portal_id, "vod")
+        url = await item_info.playable_url(db, r.cmd or "", r.portal_id, "vod", src=r)
         probe = await item_info.probe_target(url, is_url=True) if url else \
             {"error": "no playable URL in cmd"}
         return {"probe": probe, "tmdb": await item_info.enrich(r.original_name, r.year, "vod")}
@@ -183,7 +187,8 @@ async def sources_media_info(kind: str = "", id: int = 0, db=Depends(get_db)):  
                                .where(SerieSeason.serie_source_id == id)
                                .order_by(SerieSeason.season_number,
                                          SerieEpisode.episode_number).limit(1))).scalars().first()
-        url = await item_info.playable_url(db, ep.cmd or "", r.portal_id, "series") if ep else None
+        url = (await item_info.playable_url(db, ep.cmd or "", r.portal_id, "series", src=ep)
+               if ep else None)
         probe = await item_info.probe_target(url, is_url=True) if url else \
             {"error": "seasons/episodes not fetched yet (enable the series, then Fetch)"
              if not ep else "no playable URL in cmd"}
@@ -192,7 +197,7 @@ async def sources_media_info(kind: str = "", id: int = 0, db=Depends(get_db)):  
         r = await db.get(LiveSource, id)
         if not r:
             raise HTTPException(404, "channel not found")
-        url = await item_info.playable_url(db, r.cmd or "", r.portal_id, "live")
+        url = await item_info.playable_url(db, r.cmd or "", r.portal_id, "live", src=r)
         probe = await item_info.probe_target(url, is_url=True) if url else \
             {"error": "no playable URL in cmd"}
         return {"probe": probe, "tmdb": None}

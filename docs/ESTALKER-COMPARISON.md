@@ -164,7 +164,7 @@ params = {"type": "stb", "action": "get_profile", "JsHttpRequest": "1-xml",
 *Why:* our single biggest unknown is real-portal tolerance. This buys us the same "unfair advantage"
 EStalker has (it is a client, so panels accept it) while keeping our architecture.
 
-### R2 — Make `create_link` conditional and *correctly* so — **DO**
+### R2 — Make `create_link` conditional and *correctly* so — **DO** ✅ *delivered* (see §6.3, which corrects the flag list below)
 
 *Effort ≈ 4 h. Risk: medium — must not break the fallback semantics.*
 
@@ -183,6 +183,8 @@ expire. Proposed compromise:
   them — the mock portal at `mock_portal.py:123` even sets `use_http_tmp_link: 1`);
 * in `stream_manager`, when `cmd` is a complete `http(s)://` URL **and** none of the three flags is
   set **and** the template is `@redirect`, skip `create_link` (saves a round trip on the hot path);
+  *(correction, from the implementation: the gate is `use_http_tmp_link or use_load_balancing or
+  force_ch_link_check` — `disable_ad` is not part of it, it is a `create_link` parameter. See §6.3.)*
 * always `create_link` when a real ffmpeg pipe is opened (we want the fresh `play_token` and the
   liveness check) — plus `%mac%` substitution and `.m3u8` detection (see R4).
 
@@ -234,7 +236,7 @@ account is blocked or expired. Adopt EStalker's decision function instead:
 * `client.profile()` and `client.short_epg()` are dead code — either wire them up (R1, R8) or delete
   them; both are currently a trap for the next reader. *(deleted, since nothing ever called them)*
 
-### R6 — Capability & version probing on *Resolve* — **DO (cheap, big DX win)**
+### R6 — Capability & version probing on *Resolve* — **DO (cheap, big DX win)** ✅ *delivered* (see §6.3)
 
 *Effort ≈ 3 h.*
 
@@ -316,20 +318,21 @@ gets an IP banned. Cheap version: an `/api/epg/now?source_id=` endpoint feeding 
 | 2 | ~~**R4**~~ ✅ error codes + `%mac%` + classified `PortalError` | turns "black channel" into an actionable log | 2–3 h | very low |
 | 3 | **R3** consume `blocked`/expiry in MAC status & chain | stops burning quota on dead MACs | 3–5 h | low |
 | 4 | ~~**R5**~~ ✅ `outbound_client` for portal + per-portal TLS flag, drop dead code | fixes a latent TLS failure mode | 1 h | very low |
-| 5 | **R6** `version.js` + `get_modules` capability panel | self-documenting portals | 3 h | low |
-| 6 | **R2** conditional `create_link` + link flags in DB | halves portal load on redirect path | 4 h | medium (fallback semantics) |
+| 5 | ~~**R6**~~ ✅ `version.js` + `get_modules` capability panel | self-documenting portals | 3 h | low |
+| 6 | ~~**R2**~~ ✅ conditional `create_link` + link flags in DB | halves portal load on redirect path | 4 h | medium (fallback semantics) |
 | 7 | **R8** TV archive / catch-up | real user-visible feature | 12–20 h | medium |
 | 8 | **R7** MAC→Xtream harvest + adopt-as-source | much cheaper second source type | 5–8 h | medium (opt-in only) |
 | 9 | **R9** short-EPG "now" | nice-to-have | 4 h | low |
 | — | **R10** list | *guardrail: what not to copy* | — | — |
 
-Suggested order: ~~R5~~ ✅ → ~~R4~~ ✅ → **R1** → R3 → R6 → R2 → R8 (cheap-and-safe first, then the
-identity work that changes request shapes, then the feature). The mock portal gained the knobs for
-the two delivered items (`create_link_error`, `token_rejects`, `mac_placeholder`, next to the
-pre-existing `offline` / `slow` / `max_per_mac`, all echoed by `GET /mock/_state`);
-still worth adding for the rest: `require_prehash`, `get_modules`, `version.js`,
-`get_week`/`get_simple_data_table` and `type=tv_archive`, so each R above lands with a test instead
-of a hope.
+Suggested order: ~~R5~~ ✅ → ~~R4~~ ✅ → ~~**R1**~~ ✅ → ~~R3~~ ✅ → ~~R6~~ ✅ → ~~R2~~ ✅ → **R8**
+(cheap-and-safe first, then the identity work that changes request shapes, then the feature).
+The mock portal grew a knob set per delivered item: `create_link_error`, `token_rejects`,
+`mac_placeholder` (R4), `require_prehash`/`require_mac_param`/`fingerprint_required`/`profile_mode`/
+`not_valid` (R1+R3), and `version_mode`/`modules`/`modules_disabled`/`no_modules` with the counters
+`version_calls`/`modules_calls`/`create_links`/`create_link_seen` (R6+R2) — all next to the
+pre-existing `offline` / `slow` / `max_per_mac`, and all echoed by `GET /mock/_state`.
+Still worth adding for the open items: `get_week`/`get_simple_data_table` and `type=tv_archive`.
 
 ---
 
@@ -481,6 +484,126 @@ queue and retries the DDL through a forced `gc.collect()`. 5/5 clean full runs a
 baseline that had already been failing `test_deregister_deletes_row_even_when_its_task_is_cancelled`
 in roughly one run in three for the same reason. A suite whose failures depend on which files ran
 first teaches you nothing, and mine was the change that made it loud.
+
+---
+
+### 6.3 R6 + R2 — what the panel says about itself, and what we do about it
+
+Two halves of the same idea, landed together: the portal is asked what it has (R6) and what it
+expects us to do about each channel (R2), and the answers are *stored* so the next request can be
+skipped or refused on evidence instead of on a guess.
+
+**R6 — `app/portal/capabilities.py`** (pure, stdlib only, importable from `dev/check-links.py`):
+`PortalVersion` (frozen; `.known`, one-line `.label`, `.public()` for JSON), `read_version_js()`,
+`parse_version_js()`, `enabled_modules()`, `FEATURE_MODULES` + `supports()`/`gate_feature()`,
+`dumps_modules()`/`loads_modules()`. The split between the two probes follows what they cost:
+`version.js` is a static file needing no token, so the **resolver** reads it while discovering the
+portal (`resolver._read_version()`, both success paths; `ResolveResult.version`/`.referer`), which is
+the one moment we know the panel is answering. `get_modules` needs an authed session, so it is
+`StalkerClient.version_info()`/`portal_modules()`/`refresh_capabilities()`, called from
+`POST /api/portals/{pid}/resolve`, which persists `Portal.portal_version` / `modules` /
+`capabilities_at` and answers `referer`, `version`, `version_url`, `modules`, `features` and
+`modules_error`. Check Portal probes only when nothing is stored yet, so a nightly check does not
+turn two extra requests into 200 portals × 2 requests. The GUI got a **Panel** column in the portals
+table (version badge · "N modules" with the list in its tooltip · `no vclub` badge for what is
+switched off · "capabilities unknown" · "press Resolve") and the resolve box now shows version,
+modules and the Referer we will claim.
+
+Three rules that carry this feature:
+
+* **NULL is not `[]`.** `dumps_modules(None) is None`: "the panel has no modules" and "the panel
+  never answered" must not share a value, because the second one would hide catalogues that nobody
+  removed. `_feature_gate()` allows a fetch when the row is NULL, and a `version.js`/`get_modules`
+  failure may never fail a portal check — the same principle as `get_profile` in §6.2, asserted by a
+  test that turns both answers off and expects the resolve to succeed.
+* **A refusal-shaped answer is still data.** `parse_version_js` rejects a body that looks like HTML
+  (`<html`/`<!doctype`): a captive portal or WAF serving that file has `ver = '…'` in its markup, and
+  printing a fragment of it as "the portal version" sends the user off to debug their panel.
+* The first version of that guard **crashed on its own immutability**: `read_version_js` annotated the
+  frozen `PortalVersion` with `version.error = …`, raising `FrozenInstanceError`, which the resolver
+  swallowed — so the *only* case the guard existed for was the one that broke, and it broke into
+  "no version" (indistinguishable from a panel with no file). `dataclasses.replace()` is now used, and
+  the test asserts the message, not just the absence. It is recorded here because "the exception path
+  is the untested path" is the same lesson as the handshake recursion in §6.2.
+
+**R2 — `app/portal/links.py`** (which also *took over* the link helpers `client.py` re-exports, so
+`VOLATILE_PARAMS`/`extract_url`/`apply_mac_placeholder` have one home): `parse_link_flags()`,
+`split_flags()`/`has_flag()`/`flags_known()`, `why_not_self_served()`, `link_policy()`,
+`LinkPlan`/`plan_for()`, `link_request_params()`. Storage is **one column per table** —
+`link_flags String(60)`, a comma string, written by `fetch_jobs._live_fields`/`_vod_fields` and the
+episode mapping — and `Portal.direct_links` (default on) is the per-portal escape hatch.
+`stream_manager._plan()` is the single place a source row and a MAC row are read: `resolve()` decides
+**before** `POOL.get`/`ensure_auth`, and `_pump()` passes `ffmpeg=True`.
+
+* A permanent channel on a redirect play now costs the portal **zero requests** — asserted against
+  the mock's `handshakes` counter, not against a mock of our own code, because "we skipped
+  `create_link`" while still authenticating would have been an easy way to pass a weaker test.
+* A transcode always asks: it wants the fresh `play_token` *and* the liveness answer, which is what
+  the fallback chain is built on. This was in the plan and is the reason the fast path lives in the
+  redirect branch only.
+* `MacAddress.force_ch_link_check`, stored by R3 and unused since, now forces a rebuild *and* is
+  forwarded as `force_ch_link_check=true`; `disable_ad` is forwarded as `disable_ad=true`. A flag the
+  panel set that we neither honour nor forward is a flag we should not have read.
+
+**Corrections to the rule text in §R2**, found while implementing it (the bullet above came from a
+quick read of two files; the code disagrees, and the difference is user-visible):
+
+* `disable_ad` is **not** a rebuild flag. The gate is `use_http_tmp_link or use_load_balancing or
+  force_ch_link_check` (`live.py:1712`, `liveplayer.py:946`); `disable_ad` is one of the parameters
+  EStalker *sends back* with `forced_storage`/`download`/`series` — hence `link_request_params()`.
+  Gating on it would send every ad-free channel through `create_link` on every play, forever.
+* `-1` means "this channel does not use tmp links", not "no". `parse_link_flags()` folds any `-1`
+  into NULL (never told) rather than `""` (told: nothing applies). A client that inherits PHP's
+  truthiness rebuilds links forever on such a panel; a client that reads it as "no" plays a link the
+  panel may still be rotating. `""` and NULL stay distinct end to end — one takes the fast path, one
+  does not.
+* The plan's "skip when the template is `@redirect`" is where the policy lives, but the guard that
+  makes the fast path *safe* is not in the plan: **a URL that carries a session token
+  (`play_token`, `usertoken`, `hash`, … — the same `VOLATILE_PARAMS` list `strip_volatile()` removes
+  when asking) is never played directly**, even when its flags are clean. A 302 to a dead token is a
+  black screen with no fallback chain behind it, and we cannot tell from a stored URL whether it is
+  still alive. That rule is what the earlier "unknown flags ⇒ always ask" decision was really
+  protecting, so unknown rows could in principle take the fast path when their URL is plainly
+  self-served (EStalker's own legacy heuristic); the shipped code stays stricter — NULL flags always
+  ask — so a database that has not been re-fetched behaves *exactly* as before, and the fast path
+  arrives with the fetch rather than with a migration.
+* `%mac%` is deliberately **not** a blocker (we substitute it, R4). `localhost`, `///`, `/ch/` and
+  "no absolute http(s) URL" are, and the template check runs *before* the scheme check so
+  `/ch/101.ts` is reported as "a template the panel finishes" rather than as a malformed URL.
+* `why_not_self_served()` and `link_policy()` return a *sentence*, and that sentence goes into the
+  stream log (`[Ch] playing the stored link via portal/MAC: the channel flags say nothing needs
+  rebuilding…`). "We skipped the portal" without "because" is a mystery for the next reader, which by
+  then will be whoever reports that a channel broke after an update.
+
+**A finding from the mock, kept because it would otherwise have been a false green.** The fixture's
+`cmd`s were `http://mock/…`, which only ever *worked* because `create_link` rewrote the host — so a
+fast-path play would have handed the player an unresolvable hostname, and the test for it could only
+pass by avoiding the assertion. `_live_rows()` now builds absolute URLs from `request.base_url`, and
+the catalogue ships five deliberate shapes (permanent · tmp+`disable_ad` · **no flags at all** ·
+`use_load_balancing` · permanent-but-token-carrying) with a test asserting the shapes still exist, so
+tidying the fixture cannot silently un-test the policy. In the field, a portal that hands out a link
+pointing at a name the player cannot resolve is the same failure, and it is the http(s)-plus-host
+requirement — not the flags — that keeps us from forwarding one.
+
+The flag column is also *visible*: `_live_item()` puts `link_flags` in the sources API row, since
+"why did this channel skip `create_link`" is a question asked with a curl in hand, not with a sqlite
+prompt.
+
+**Two consumers added beyond the plan.** `item_info.playable_url()` (the detail popup) now reads the
+same policy and takes the source row, so the popup reports the URL the player would really get
+instead of paying for a link nobody uses; its private `cmd_to_url()` copy of the extractor is gone
+(it missed percent-encoded cmds, so the popup could disagree with the stream path about what the URL
+*is*). And `api_misc` exports/imports `direct_links`, `portal_version` and `modules`, with the import
+filtered to the columns this build has — a newer backup must not kill a restore.
+
+Verification: `278 passed` (94 of them new: 42 in `tests/test_portal_capabilities.py`, 52 in
+`tests/test_link_flags_and_direct_play.py`, plus `tests/mockclient.py` — the `Wired` harness moved
+there so the portal test files share one transport patch, including `resolver.outbound_client`, which
+is what keeps a resolve test from calling the internet and being "proved" by the sandbox proxy's 404);
+`dev/check-links.py` grew from 58 to 122 cases, including grep guards that `read_version_js(`,
+`portal_modules(`, `gate_feature(`, `parse_link_flags(` and `why_not_self_served(` all have callers —
+the mirror-image rule of §6.1, *an answer nobody reads is dead code* — and that the link policy is
+imported by at least two call sites rather than re-implemented inline.
 
 ---
 

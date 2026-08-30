@@ -2,7 +2,9 @@
 # ============================================================================
 # Self-check for the portal plumbing that decides whether a channel plays:
 # the link helpers in app/portal/client.py, the STB identity in
-# app/portal/identity.py, and the account verdict in app/portal/account.py.
+# app/portal/identity.py, the account verdict in app/portal/account.py, the link
+# policy in app/portal/links.py, and the capability probe in
+# app/portal/capabilities.py.
 #
 #   python3 dev/check-links.py
 #
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -36,8 +39,16 @@ from app.portal.account import (account_verdict, mac_is_usable,  # noqa: E402
 from app.portal.client import (apply_mac_placeholder, extract_url, is_hls,  # noqa: E402
                                js_error, mask_token, merge_link, normalize_error,
                                sanitize_cmd, strip_volatile)
+from app.portal.capabilities import (dumps_modules, enabled_modules,  # noqa: E402
+                                     gate_feature, loads_modules, parse_modules,
+                                     parse_version_js, supports, version_js_url)
 from app.portal.identity import (cookies_for, derive_identity, normalize_mac,  # noqa: E402
                                  profile_params, referer_for)
+from app.portal.links import (FLAG_DISABLE_AD, FLAG_LOAD_BALANCING,  # noqa: E402
+                              FLAG_TMP_LINK, REBUILD_FLAGS, has_flag,
+                              link_policy, link_request_params,
+                              parse_link_flags, plan_for, split_flags,
+                              why_not_self_served)
 
 CASES: list[tuple[str, object, object]] = []
 
@@ -220,6 +231,148 @@ check("account: European billing dates are parsed",
       str(parse_expiry("31.12.2032")), "2032-12-31 00:00:00+00:00")
 
 # --------------------------------------------------------------------------- #
+# links.py - what the panel said about a channel, and what follows from it
+# --------------------------------------------------------------------------- #
+# R2 turns a per-channel flag into "do we pay the portal a create_link on every
+# play?". Both directions are cheap to get wrong: ask always and the flags are
+# pointless; skip always and a stale token becomes a black screen with no
+# fallback chain behind it. So the table is pinned here, where a NAS can run it.
+URL = "http://host/play/live.php?stream=392166&extension=ts"
+
+check("flag -1 is 'not told', not 'no'",
+      parse_link_flags({"use_http_tmp_link": -1, "disable_ad": -1}), None)
+check("absent flags are 'not told'", parse_link_flags({"name": "Ch"}), None)
+check("zeros are 'nothing applies'",
+      parse_link_flags({"use_http_tmp_link": 0, "disable_ad": 0}), "")
+check("the set flags are named",
+      parse_link_flags({"use_load_balancing": "1", "disable_ad": "true"}),
+      f"{FLAG_LOAD_BALANCING},{FLAG_DISABLE_AD}")
+check("a non-dict row tells us nothing", parse_link_flags("ffmpeg http://h"), None)
+check("flags split tolerantly", split_flags(' "use_http_tmp_link" , DISABLE_AD '),
+      [FLAG_TMP_LINK, FLAG_DISABLE_AD])
+check("unknown flags are not 'no flags'",
+      (split_flags(None) == [], has_flag(None, FLAG_TMP_LINK)), (True, False))
+
+check("a permanent link plays as stored",
+      link_policy(url=URL, link_flags="").direct, True)
+check("an un-fetched row still asks",
+      link_policy(url=URL, link_flags=None).create_link, True)
+check("a tmp link must be rebuilt",
+      link_policy(url=URL, link_flags=FLAG_TMP_LINK).create_link, True)
+check("load balancing must be rebuilt",
+      link_policy(url=URL, link_flags=FLAG_LOAD_BALANCING).create_link, True)
+check("disable_ad must NOT be a rebuild flag",
+      link_policy(url=URL, link_flags=FLAG_DISABLE_AD).direct, True)
+check("the MAC's force_ch_link_check wins",
+      link_policy(url=URL, link_flags="", force_ch_link_check=True).create_link, True)
+check("the portal's distrust wins",
+      link_policy(url=URL, link_flags="", allow_direct=False).create_link, True)
+check("ffmpeg always asks",
+      link_policy(url=URL, link_flags="", ffmpeg=True).create_link, True)
+check("every answer explains itself",
+      bool(link_policy(url=URL, link_flags="").reason)
+      and bool(link_policy(url="", link_flags=None).reason), True)
+
+check("a session token forbids the fast path",
+      "session token" in why_not_self_served(URL + "&play_token=abc"), True)
+check("a usertoken forbids it too",
+      "session token" in why_not_self_served("http://h/a.ts?usertoken=1"), True)
+check("a template cmd forbids it",
+      "template" in why_not_self_served("/ch/101.ts"), True)
+check("a relative path is not a URL",
+      "absolute" in why_not_self_served("play/live.php?stream=1"), True)
+check("the clean URL is allowed", why_not_self_served(URL), "")
+check("%mac% is ours to fill, not a blocker",
+      why_not_self_served("http://h/a.ts?mac=%mac%"), "")
+check("%mac% is filled in the stored link",
+      apply_mac_placeholder("http://h/a.ts?m=%25MAC%25", "00:1A:79:AA:AA:01"),
+      "http://h/a.ts?m=00:1A:79:AA:AA:01")
+
+# the plan is the one place a row is read; a call site that reaches for
+# `src.cmd` itself is how the two stream paths grew different rules once
+Plan = type("R", (), {})
+
+
+def _row(cmd, flags):
+    r = Plan()
+    r.cmd, r.link_flags = cmd, flags
+    return r
+
+
+def _mac(force=False):
+    m = Plan()
+    m.mac, m.force_ch_link_check = "00:1A:79:AA:AA:01", force
+    return m
+
+
+check("the plan keeps the whole cmd for asking",
+      plan_for(_row(f"ffmpeg {URL}", FLAG_TMP_LINK), _mac()).cmd, f"ffmpeg {URL}")
+check("the plan hands out the extracted URL for playing",
+      plan_for(_row(f"ffmpeg {URL}", ""), _mac()).direct_url, URL)
+check("the plan refuses when the MAC is watched",
+      plan_for(_row(f"ffmpeg {URL}", ""), _mac(force=True)).policy.create_link, True)
+check("a row without the column behaves as un-fetched",
+      plan_for(_row(f"ffmpeg {URL}", None), _mac()).policy.flags_known, False)
+check("the request keeps the channel's own flags",
+      link_request_params(link_flags=FLAG_DISABLE_AD, force_ch_link_check=False),
+      {"series": "0", "forced_storage": "false", "disable_ad": "true",
+       "download": "false", "force_ch_link_check": "false"})
+check("a forced check reaches the panel",
+      link_request_params(link_flags=None, force_ch_link_check=True, series=True)
+      ["force_ch_link_check"], "true")
+check("the volatile params are the same list both sides use",
+      FLAG_DISABLE_AD in REBUILD_FLAGS, False)
+check("stripping the token is what makes the comparison possible",
+      strip_volatile(URL + "&play_token=OLD") + "|", URL + "|")
+
+# --------------------------------------------------------------------------- #
+# capabilities.py - what the panel says about itself
+# --------------------------------------------------------------------------- #
+check("version.js var form", parse_version_js("var ver = '5.4.2';").portal, "5.4.2")
+check("xpcom object form",
+      parse_version_js('xpcom.version = { portal: "5.3.14" };').portal, "5.3.14")
+check("the ver-string fragment",
+      parse_version_js("PORTAL version: 5.2.0; API Version: 343;").portal, "5.2.0")
+check("the image version is kept",
+      parse_version_js("var ver='5.4.2'; var ImageDescription = '0.2.20';").image, "0.2.20")
+check("the product is named",
+      parse_version_js("/* Ministra */ var ver='5.4.2';").product, "ministra")
+check("an HTML page is never a version",
+      parse_version_js("<html><body>var ver = '9.9';</body></html>").known, False)
+check("an empty file is not a version", parse_version_js("").known, False)
+check("the version file is next to portal.php",
+      version_js_url("http://h/stalker_portal/c/portal.php"),
+      "http://h/stalker_portal/c/version.js")
+
+check("modules minus disabled",
+      enabled_modules({"js": {"all_modules": ["tv", "vclub", "sclub"],
+                              "disabled_modules": ["sclub"]}}), ["tv", "vclub"])
+check("a dict of modules is read",
+      enabled_modules({"js": {"all_modules": {"tv": {"status": 1}, "vclub": {"status": 0}},
+                              "disabled_modules": []}}), ["tv"])
+check("a module marked off inside all_modules is disabled, not lost",
+      parse_modules({"js": {"all_modules": {"tv": {"status": 0}, "sclub": {"status": 1}}}}),
+      (["sclub"], ["tv"]))
+check("a json string list is read",
+      enabled_modules({"js": {"all_modules": '["tv", "vclub"]'}}), ["tv", "vclub"])
+check("a comma string is read",
+      enabled_modules({"js": {"all_modules": "tv, vclub"}}), ["tv", "vclub"])
+check("an empty answer is unknown, not 'nothing'",
+      enabled_modules({"js": {"all_modules": []}}), None)
+check("no answer at all is unknown", enabled_modules({"js": {"error": "no action"}}), None)
+check("the gate allows an unknown panel", gate_feature(None, "vod"), (True, ""))
+check("the gate refuses without the module", gate_feature(["tv"], "vod")[0], False)
+check("the refusal names the module", "vclub" in gate_feature(["tv"], "vod")[1], True)
+check("live answers to tv or itv", supports(["itv"], "live"), True)
+check("the archive has two spellings",
+      supports(["captured_tv_archive"], "archive"), True)
+check("a module we do not gate on is allowed", supports(["tv"], "whatever"), None)
+check("the stored answer round-trips sorted",
+      loads_modules(dumps_modules(["vclub", "tv"])), ["tv", "vclub"])
+check("unknown is stored as NULL, never as []", dumps_modules(None), None)
+check("junk in a restored backup degrades to unknown", loads_modules("{oops}"), None)
+
+# --------------------------------------------------------------------------- #
 # dead code stays dead, and the answers that matter stay consumed
 # --------------------------------------------------------------------------- #
 # `profile()` and `short_epg()` were methods nothing ever called, and each built
@@ -251,10 +404,35 @@ for sym, why in FORBIDDEN.items():
 WIRED = {
     "stb_profile(": "the fingerprint must be sent from the handshake, not on request",
     "refresh_account(": "test_portal and the fetch job must both consume the verdict",
+    # R6: three probes whose whole value is being *used*. A version nobody stores
+    # is a log line; a module list nobody reads is a 30-minute fetch job against
+    # a panel that has no sclub.
+    "read_version_js(": "the resolver must store the answer while discovering the portal",
+    "portal_modules(": "Resolve must ask get_modules, or the GUI has nothing to grey out",
+    "gate_feature(": "the fetch jobs must refuse, or the answer changes nothing",
+    # R2: one policy, read by every path that opens a stream.
+    "parse_link_flags(": "the fetch must store the flags, or the policy has nothing to read",
+    "why_not_self_served(": "the policy must consult the URL shape, or a token is played as fresh",
 }
 for sym, why in WIRED.items():
     hits = _grep(sym, "app")
     check(f"{sym} has a caller ({why})", bool(hits), True)
+
+# The decision itself may not be re-implemented at a call site: `links.py` is
+# imported by the stream manager (plan) and by the popup probe (policy), and one
+# file means one behaviour. Two callers is the floor; a third copy is the bug.
+_policy_files = {line.split(":")[0] for line in _grep("plan_for(", "app")
+                 + _grep("link_policy(", "app")} - {"app/portal/links.py"}
+check("the link policy is shared, not inlined", len(_policy_files) >= 2, True)
+check("the stream manager consults it", "app/services/stream_manager.py" in _policy_files, True)
+
+# and the GUI switch must exist next to the column it writes, because a setting
+# reachable only by API is a setting that will be reported as "not working"
+_tpl = pathlib.Path(__file__).resolve().parents[1] / "app" / "templates" / "portals.html"
+check("the portals GUI carries the direct-links switch",
+      "p-direct-links" in _tpl.read_text(), True)
+check("the portals GUI shows what the panel said",
+      "portal_version" in _tpl.read_text(), True)
 
 # --------------------------------------------------------------------------- #
 failed = 0

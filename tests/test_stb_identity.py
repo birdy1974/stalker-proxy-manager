@@ -30,28 +30,21 @@ import string
 from datetime import datetime, timezone
 from urllib.parse import unquote
 
-import httpx
 import pytest
-from fastapi import FastAPI
 
 from app.portal import client as client_mod
 from app.portal.account import (account_verdict, expiry_warning, mac_is_usable,
                                 mac_status, parse_expiry)
-from app.portal.client import StalkerClient
 from app.portal.identity import (MINIMAL, STB_UA, cookies_for, derive_identity,
                                  headers_for, make_fake_bearer,
                                  minimal_profile_params, missing_token,
                                  normalize_mac, profile_params, referer_for,
                                  wants_adid_cookie)
 from app.portal.mock_portal import MOCK_MACS, _STATE
-from app.portal.mock_portal import router as MOCK_ROUTER
 from app.portal.pool import PortalSession
 from app.services.db_logging import flush_logs
+from mockclient import BANNED, EXPIRED, GOOD, PORTAL, Wired
 
-GOOD = "00:1A:79:AA:AA:01"
-EXPIRED = "00:1A:79:BB:BB:01"
-BANNED = "00:1A:79:CC:CC:01"
-PORTAL = "http://test/mock/c/portal.php"
 
 _DEFAULTS = {k: v for k, v in _STATE.items()
              if k in ("offline", "slow", "max_per_mac", "create_link_error", "token_rejects",
@@ -76,41 +69,6 @@ def _mock_reset():
 
 def set_state(**kw):
     _STATE.update(kw)
-
-
-class Wired:
-    """A real StalkerClient whose transport is the built-in mock portal.
-
-    `outbound_client` is a *sync* factory and is the only place the client builds
-    a transport, so patching it is what keeps these tests honest: every request
-    the client makes goes through the code under test.
-    """
-
-    def __init__(self, monkeypatch) -> None:
-        app = FastAPI()
-        app.include_router(MOCK_ROUTER)
-        self._transport = httpx.ASGITransport(app=app)
-        monkeypatch.setattr(client_mod, "outbound_client", self._factory)
-
-    def _factory(self, **kwargs):
-        kwargs.pop("insecure", None)
-        kwargs.pop("verify", None)
-        kwargs.pop("trust_env", None)
-        kwargs.pop("proxy", None)
-        return httpx.AsyncClient(transport=self._transport, base_url="http://test", **kwargs)
-
-    def client(self, mac: str = GOOD, **kw) -> StalkerClient:
-        kw.setdefault("tls_insecure", False)
-        return StalkerClient(PORTAL, mac, **kw)
-
-    async def state(self) -> dict:
-        async with httpx.AsyncClient(transport=self._transport, base_url="http://test") as ac:
-            return (await ac.get("/mock/_state")).json()
-
-    async def control(self, **payload) -> dict:
-        """Drive the portal through the endpoint the GUI and a curl use."""
-        async with httpx.AsyncClient(transport=self._transport, base_url="http://test") as ac:
-            return (await ac.post("/mock/_control", json=payload)).json()
 
 
 # =========================================================================== #

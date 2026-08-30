@@ -69,6 +69,22 @@ function makeTable() {
           + (r.tls_insecure ? '<div><span class="badge text-bg-warning" title="certificate verification is OFF for this portal"><i class="bi bi-shield-exclamation"></i> TLS unverified</span></div>' : ""),
         filter: { type: "text", placeholder: "name…" } },
       { key: "resolved_path", label: "Resolved path", render: r => r.resolved_url ? `<span class="badge text-bg-light mono">${esc(r.resolved_path || "?")}</span>` : '<span class="text-muted small">not resolved</span>' },
+      /* what the panel said about itself (version.js + get_modules, read on
+         Resolve). In the list and not only in the editor, because it is the first
+         line of any "this portal behaves oddly" report - and a VOD catalogue
+         that is empty stops being a mystery once the row says `no vclub`. */
+      { key: "portal_version", label: "Panel", render: r => {
+          const mods = r.modules || null;
+          const off = Object.entries(r.features || {}).filter(([, v]) => v === false).map(([k]) => k);
+          const ver = r.portal_version ? `<span class="badge text-bg-info">${esc(r.portal_version)}</span>` : "";
+          const caps = mods === null
+            ? '<span class="small text-muted" title="get_modules never answered, so nothing about this panel is assumed">capabilities unknown</span>'
+            : `<span class="badge text-bg-light mono" title="modules: ${esc(mods.join(", "))}">${mods.length} modules</span>`;
+          const warn = off.length ? `<span class="badge text-bg-secondary" title="the panel says it has no ${esc(off.join(", "))} - those fetches are skipped">no ${esc(off.join(", "))}</span>` : "";
+          return (ver || caps || warn)
+            ? `<div class="d-flex flex-wrap gap-1">${ver}${caps}${warn}</div>`
+            : '<span class="text-muted small">press Resolve</span>';
+        } },
       { key: "macs", label: "MAC addresses", render: r => r.macs.map(m => `
           <div class="d-flex align-items-center gap-2 mb-1">
             <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
@@ -116,7 +132,7 @@ function renderJobs(jobs) {
 
 /* ============================= add / edit modal ============================= */
 async function editPortal(id) {
-  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false, identity_mode: "mag250", stb_timezone: "" };
+  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false, identity_mode: "mag250", stb_timezone: "", direct_links: true };
   const body = el("div");
   body.innerHTML = `
     <div>
@@ -151,6 +167,13 @@ async function editPortal(id) {
           <input class="form-control form-control-sm" id="p-tz" value="${esc(p.stb_timezone || "")}" placeholder="Europe/Amsterdam">
           <div class="small text-muted">the <span class="mono">timezone</span> cookie a real box sends;
             blank keeps the server default</div></div>
+        <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch">
+          <input class="form-check-input" type="checkbox" id="p-direct-links" ${p.direct_links === false ? "" : "checked"}>
+          <label class="form-check-label" for="p-direct-links">Play stored links when the panel allows</label>
+          <div class="small text-muted">on by default: a channel whose own flags say its link is
+            permanent is handed to the player as-is, with no <span class="mono">create_link</span>
+            round trip. Turn it off for a panel whose flags lie — every stream then asks first,
+            which is also the liveness check the fallback chain uses</div></div></div>
         <div class="col-md-4 d-flex align-items-end justify-content-end">
           <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch genres</button>
         </div>
@@ -184,7 +207,13 @@ async function editPortal(id) {
     tls_insecure: $("#p-tls", body).checked,
     identity_mode: $("#p-identity", body).value,
     stb_timezone: $("#p-tz", body).value.trim() || null,
+    direct_links: $("#p-direct-links", body).checked,
   });
+  /* ONE builder for "what a portal's fields are". `savePortal` used to assemble
+     its own shorter list, so pressing Save dropped the identity and timezone
+     choices filled in two rows above it - a field is either in the payload or it
+     does not exist. */
+  state.payload = portalPayload;
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
                 mBtn("Save", "btn-accent", () => savePortal(state, body, m), "bi-check2"));
 
@@ -221,8 +250,17 @@ async function editPortal(id) {
     if (!pid) { toast("Save the portal first, then resolve.", "warn"); return; }
     $("#p-resolve-out", body).textContent = "probing paths…";
     const r = await api(`/api/portals/${pid}/resolve`, { method: "POST" });
+    /* what the panel told us about itself, right under the URL it answered with:
+       version.js needs no token so it is nearly always available, while "no
+       module answer" is a fact worth seeing rather than a silent null */
+    const caps = (r.version || r.modules)
+      ? `<div class="small mt-1">
+           ${r.version && r.version.label ? `<span class="badge text-bg-info">${esc(r.version.label)}</span>` : `<span class="text-muted small">version.js: ${esc((r.version && r.version.error) || "nothing")}</span>`}
+           ${r.modules ? `<span class="mono small" title="modules the panel offers and has enabled">${esc(r.modules.join(", "))}</span>` : `<span class="text-muted small">no module answer (${esc(r.modules_error || "get_modules")})</span>`}
+           ${r.referer ? `<div class="text-muted mono" title="the Referer every request to this portal claims">${esc(r.referer)}</div>` : ""}
+         </div>` : "";
     $("#p-resolve-out", body).innerHTML = r.ok
-      ? `<span class="text-success">OK → ${esc(r.resolved_url)}</span>`
+      ? `<span class="text-success">OK → ${esc(r.resolved_url)}</span>${caps}`
       : `<span class="text-danger">failed: ${esc(r.error)}</span>` +
         `<details class="mt-1"><summary class="small">probe log</summary><pre class="mono small">${r.attempts.map(esc).join("\n")}</pre></details>`;
   });
@@ -330,12 +368,7 @@ async function anyGenreEnabled(pid, body) {
 
 async function savePortal(state, body, m) {
   if (state.saving) return;
-  const data = {
-    name: $("#p-name", body).value.trim(), base_url: $("#p-url", body).value.trim(),
-    macs: $("#p-macs", body).value, enabled: $("#p-enabled", body).checked,
-    proxy_url: $("#p-proxy", body).value.trim() || null,
-    tls_insecure: $("#p-tls", body).checked,
-  };
+  const data = state.payload();
   if (!data.name || !data.base_url) return toast("name and URL are required", "warn");
   state.saving = true;
   try {
@@ -370,7 +403,8 @@ async function savePortal(state, body, m) {
 async function resolvePortal(id) {
   toast("resolving portal…", "info");
   const r = await api(`/api/portals/${id}/resolve`, { method: "POST" });
-  r.ok ? toast(`resolved: ${r.resolved_url}`, "ok") : toast("resolve failed — see logs", "error");
+  r.ok ? toast(`resolved: ${r.resolved_url}${r.version && r.version.label ? " · " + r.version.label : ""}`, "ok")
+       : toast("resolve failed — see logs", "error");
   table.reload();
 }
 async function fetchPortal(id) {

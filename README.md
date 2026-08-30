@@ -241,6 +241,7 @@ At boot the app performs a **hardware sanity check**: if the default template ne
 - **Portal refusals keep their code.** A panel rarely answers a refusal with a 4xx: the usual shape is HTTP 200 + `{"js":{"error":"limit"}}`. `PortalError.code` carries it through to the fallback log, so `limit` / `account is in use` (→ *this MAC is busy over there, try the next one*) are never mistaken for `nothing_to_play` or `link_fault` (→ *this source is gone*). A bearer the panel expired — also a 200 + `{"error":"token"}` — triggers exactly one transparent re-handshake and retry, like a 401 does, instead of looking like a broken portal until the local token TTL runs out.
 - **`%mac%` in a resolved link is filled in.** Portals that keep one link template for every box hand out `…/ch/%mac%/1234.ts` and expect the set-top box to substitute its own MAC; anything else is a 404 that reads as a dead channel.
 - **HLS links get the input options they need.** When the resolved link is a `.m3u8` playlist, ffmpeg receives `-protocol_whitelist file,http,https,tcp,tls,crypto` and `-allowed_extensions ALL` (unless the template already sets them) — without those two, a valid portal playlist dies before the first byte.
+- **`create_link` is asked only when it has to be asked.** A channel whose own flags (`use_http_tmp_link`, `use_load_balancing`) say its link is permanent, and whose stored `cmd` is a complete `http(s)` URL with no session token in it, is handed to the player as-is: a redirect play of such a channel costs the portal **zero** requests (no handshake, no token, no link). Every other case asks, including the ffmpeg path — where the request is worth making twice over, because it hands ffmpeg a fresh `play_token` *and* answers "is this source alive right now", which is what the chain above walks. `Portal.direct_links` (on by default) turns the shortcut off for a panel whose flags lie. The stream log says which rule fired and why.
 - **One trust policy for every outbound call.** Portal, EPG and logo fetches all go through `app/services/http_client.outbound_client()` (OS CA store, verification on). `Portal.tls_insecure` is the only opt-out, it is per portal, and it is part of the pooled-session key so flipping it cannot leave an old session behind.
 - **The panel's own account state is honoured.** Per MAC the panel reports `blocked`, `status` and an expiry, and Check Portal / the nightly portal sync now store that verdict: `banned` and `expired` MACs are dropped from fallback chains and from a fetch job's starting MAC, the Portals tab shows the badge, and the *reason* the portal gave is on the MAC row (`last_error`, shown in the badge tooltip). `offline`/`error` — our transport verdicts — stay retryable, because a portal that timed out is not a portal that said no.
 - Client disconnects (and the Dashboard *kill* button) deterministically free the MAC and kill ffmpeg via a disconnect watchdog.
@@ -296,9 +297,47 @@ entirely (handshake and play links keep working) — for the panel that treats a
 
 ---
 
+## What the portal says about itself (version, modules, links)
+
+Pressing **Resolve** on a portal does three things beyond finding the working `portal.php` path,
+and all three are stored on the portal so the answer survives a restart and reaches a backup:
+
+- **`version.js` is scraped.** No token is needed for a static file, so it is read during discovery
+  — the one moment we know for sure the panel is answering us — and the badge says
+  `Ministra portal 5.4.2 image 0.2.20-r3-250`. It is the single most useful line in a bug report
+  ("the playlist works but the EPG is empty" is a different question on 5.2 than on 5.4), and the
+  resolve box shows the `Referer:` every later request will claim and the winning path prefix sits
+  in the table next to it, so "it works but why" is answerable from the GUI instead of from tcpdump. A body that looks like
+  HTML is *rejected*, not parsed: a captive portal or WAF serving that file has `ver = '…'` in its
+  markup, and printing a fragment of it as a version would send you off debugging your panel.
+- **`type=stb&action=get_modules` is asked** (it needs an authenticated session, so it happens after
+  the handshake, from the same click). `all_modules − disabled_modules` is kept on the portal, and a
+  module that is absent **gates the work that would fail anyway**: a portal with no `sclub` gets no
+  series genre sync and no series item fetch — the fetch log records `series categories skipped: the
+  panel says it has no sclub/series module (get_modules offered: tv, vclub)` instead of a progress
+  bar that ends in an empty catalogue. A portal that never answered is treated as *unknown* and is
+  fetched in full: skipping a catalogue because a cosmetic probe did not reply is how a proxy
+  "loses" channels nobody removed.
+- **Per-channel link flags are stored on each live/VOD/episode row** (`link_flags`:
+  `use_http_tmp_link`, `use_load_balancing`, `disable_ad`, as a readable comma list rather than four
+  bits nobody can interpret — so a `curl` of `/api/sources/live` answers "why does *this* channel
+  skip the portal"), and the stream path reads them as described under *Fallback engine
+  semantics*. A row fetched before this existed carries NULL = "never told", which asks every time —
+  exactly the old behaviour — and the flags arrive with the next fetch.
+
+| Field | Default | why you would change it |
+|---|---|---|
+| `direct_links` | on | off forces `create_link` before every play, on both paths: for a panel that reports its links as permanent and rotates them anyway |
+
+The Portals table gained a **Panel** column for this (version badge · "N modules" with the list in
+its tooltip · `no vclub` for what the panel switched off · "capabilities unknown" · "press Resolve"),
+because "why is this portal's VOD empty" should be answerable without opening a container shell.
+
+---
+
 ## Built-in mock portal (testing without a real subscription)
 
-`SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02`, expired `…BB:BB:01` and blocked `…CC:CC:01`, 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {...}` emulates what the portal can do to you, so the client's behaviour is testable without a subscription: `offline`, `slow`, `max_per_mac`, `http_status`, `require_prehash` (demand the second handshake step), `fingerprint_required` (403 a `get_profile` with no serial), `profile_mode` (`full`/`no_id`/`none`), `not_valid` (short-lived token), `token_rejects` (answer 200 + `{"error":"token"}`), `js_error`, `empty_reply`, `corrupt_stream`, `require_tls`, `require_host`, `reject_no_cookie`, `reject_no_referer`. `GET /mock/_state` answers with those settings *and* what the portal actually received (`seen_profile`, the handshake `prehash`es, and per-MAC usage) — which is how the identity tests prove a box fingerprint arrived instead of trusting the client.
+`SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02`, expired `…BB:BB:01` and blocked `…CC:CC:01`, 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {...}` emulates what the portal can do to you, so the client's behaviour is testable without a subscription: `offline`, `slow`, `max_per_mac`, `http_status`, `require_prehash` (demand the second handshake step), `fingerprint_required` (403 a `get_profile` with no serial), `profile_mode` (`full`/`no_id`/`none`), `not_valid` (short-lived token), `token_rejects` (answer 200 + `{"error":"token"}`), `js_error`, `empty_reply`, `corrupt_stream`, `require_tls`, `require_host`, `reject_no_cookie`, `reject_no_referer`. `version_mode` (`full`/`none`/`html` — the last one is a captive portal answering `version.js`), `modules`, `modules_disabled` and `no_modules` (404 the action, which means *we do not know*, not *it has nothing*) emulate what the panel *says about itself*, and the live catalogue ships five deliberate link shapes — permanent, tmp-link, load-balanced, no flags at all, and a "permanent" URL that still carries a `play_token` — so the conditional-`create_link` rules are testable instead of theoretical. `GET /mock/_state` answers with those settings *and* what the portal actually received (`seen_profile`, the handshake `prehash`es, `seen_create_link`, the `handshakes`/`version_calls`/`modules_calls`/`create_links` counters, and per-MAC usage) — which is how the identity and link tests prove a request arrived, or that one deliberately did not, instead of trusting the client.
 
 Tip: the GUI shows the ready-to-copy mock portal URL/MACs in the Portals tab when enabled.
 
@@ -351,6 +390,8 @@ docker logs stalker-proxy-manager 2>&1 \
 | `[stream] … portal said nothing_to_play` / `link_fault` | the source is dead or the CDN is unhappy — retrying with another MAC cannot help | *Fetch Sources* for that channel, or drop it from the chain |
 | `create_link: portal left a mac placeholder in the link -> filled in from our MAC` | the panel serves one template for every box and expects the client to insert its MAC | informational; the URL ffmpeg got already contains the right MAC |
 | `[portal] TLS error / unable to get local issuer certificate` | the panel has a self-signed or incomplete certificate chain | tick **Allow broken TLS** for that portal (keeps every *other* portal verified) or fix the chain; do not disable verification globally |
+| `[stream] [Ch] playing the stored link via portal/mac: the channel flags say nothing needs rebuilding…` | no `create_link` was asked, by design (see *Fallback engine semantics*) | if that channel is black, the panel lied about its links: tick **Play stored links when the panel allows** off for that portal, or re-fetch the sources |
+| `[fetch] series categories skipped: the panel says it has no sclub` | the portal's own `get_modules` answer gated the fetch | informational; if the panel *does* have series, press Resolve to re-read the answer |
 | `[output] user … exceeded max_connections` | a previous stream of that user was still counted when the player reconnected | raise `max_connections` for that user; the slot frees as soon as the disconnect watchdog notices the client is gone (≤0.5 s) |
 
 Two things the proxy does for you here: the outgoing `create_link` cmd is stripped of its stale `play_token` (panels that receive their own token back tend to mangle the answer), and ffmpeg gets the MAG user-agent plus a referer for `http(s)` inputs, because `Lavf/61.x` is refused by quite a few panels with a 403/405.
@@ -363,7 +404,7 @@ Two things the proxy does for you here: the outgoing `create_link` cmd is stripp
 |---|---|
 | `bash dev/smoke.sh` | Runs the freshly built image with `SPM_MOCK_PORTAL=1` and checks: GUI answers `/login` (200), mock handshake returns a token, the boot marker is in the container log **and on container stdout** (the single-stream rule above). This is what the `docker` workflow's smoke job runs. `SPM_SMOKE_IMAGE` / `SPM_SMOKE_NAME` / `SPM_SMOKE_PORT` override it for a local run against any port. |
 | `bash dev/smoke-puid.sh` | Bind-mounts a directory owned by a foreign uid (mode 750) and checks both sides of the PUID/PGID story: **without** `PUID`/`PGID` the app must *not* be able to list `/media`, **with** them it must (and PID 1 must run as those ids, `/config` must be chowned to them). Needs root/sudo; skips itself otherwise. `SPM_SMOKE_PUID_IMAGE` / `SPM_TEST_UID` override. |
-| `python3 dev/check-links.py` | Pins the Stalker `create_link` URL rules (prefix stripping, stale-token removal, repair of a mangled answer) without needing pytest — run it after touching `app/portal/client.py`. |
+| `python3 dev/check-links.py` | Pins the portal plumbing that decides whether a channel plays: the `create_link` URL rules (prefix stripping, stale-token removal, repair of a mangled answer), the STB fingerprint and account verdict, the link-flag policy table and the `version.js`/`get_modules` parsers — plus greps that no probe's answer is discarded and that the link policy is not re-inlined at a call site. No pytest needed, so it also runs on a NAS. Run it after touching `app/portal/`. |
 | `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies `dev/docker-publish.yml.example` is byte-identical to the real workflow. Run it before pushing anything under `.github/workflows/`. |
 | `bash dev/seed-demo.sh [BASE_URL]` | Seeds a *running* instance with a full demo setup against the built-in mock portal (portal → genres → live/VOD/series → users). Idempotent; dev/mockup use (`SPM_SKIP_LOGIN=1`), default base `http://127.0.0.1:8880`. |
 

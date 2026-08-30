@@ -20,6 +20,8 @@ from ..models import (
 from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, status_for_error
 from ..portal.account import mac_status
+from ..portal.capabilities import (dumps_modules, loads_modules, supports,
+                                   version_js_url)
 from ..portal.identity import IDENTITY_MODES
 from ..portal.resolver import resolve_portal
 from ..security import require_admin
@@ -91,6 +93,16 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
             "tls_insecure": bool(p.tls_insecure),
             "identity_mode": p.identity_mode or "mag250",
             "stb_timezone": p.stb_timezone or "",
+            "direct_links": bool(getattr(p, "direct_links", True)),
+            # R6: what the panel said about itself. `modules` is None until a
+            # resolve asked, and the GUI has to tell that apart from "the panel
+            # has nothing" - a tab greyed out for a reason nobody can explain is
+            # worse than no grey-out at all.
+            "portal_version": p.portal_version or "",
+            "modules": loads_modules(p.modules),
+            "capabilities_at": p.capabilities_at.isoformat() if p.capabilities_at else None,
+            "features": {name: supports(loads_modules(p.modules), name)
+                         for name in ("live", "vod", "series", "epg", "archive")},
             "macs": [{"id": m.id, "mac": m.mac, "order": m.order, "status": m.status,
                       "online": m.online, "expire_date": m.expire_date,
                       "last_error": m.last_error or "",
@@ -122,7 +134,8 @@ async def create_portal(payload: dict, db=Depends(get_db)):
                proxy_url=(payload.get("proxy_url") or None),
                tls_insecure=bool(payload.get("tls_insecure", False)),
                identity_mode=_identity_mode(payload.get("identity_mode", "mag250")),
-               stb_timezone=(str(payload.get("stb_timezone") or "").strip() or None))
+               stb_timezone=(str(payload.get("stb_timezone") or "").strip() or None),
+               direct_links=bool(payload.get("direct_links", True)))
     db.add(p)
     await db.flush()
     for i, entry in enumerate(parse_mac_entries(payload.get("macs", ""))):
@@ -138,9 +151,9 @@ async def update_portal(pid: int, payload: dict, db=Depends(get_db)):
     if not p:
         raise HTTPException(404, "portal not found")
     for f in ("name", "base_url", "enabled", "proxy_url", "tls_insecure",
-              "stb_timezone"):
+              "stb_timezone", "direct_links"):
         if f in payload:
-            val = bool(payload[f]) if f == "tls_insecure" else payload[f]
+            val = bool(payload[f]) if f in ("tls_insecure", "direct_links") else payload[f]
             if f == "stb_timezone":
                 val = str(val or "").strip() or None
             setattr(p, f, val)
@@ -271,14 +284,81 @@ async def resolve(pid: int, db=Depends(get_db)):
                                proxy=p.proxy_url, tls_insecure=p.tls_insecure)
     for line in res.attempts:
         await db_log("DEBUG", "resolve", f"[{p.name}] {line}")
+    caps: dict = {}
     if res.ok:
         p.resolved_url, p.resolved_path = res.portal_url, res.path
+        if res.version.known:
+            p.portal_version = res.version.label[:120]
+        p.capabilities_at = datetime.now(timezone.utc)
         await db.commit()
-        await db_log("INFO", "resolve", f"[{p.name}] resolved -> {res.portal_url}")
+        await db_log("INFO", "resolve",
+                     f"[{p.name}] resolved -> {res.portal_url}"
+                     + (f" ({res.version.label})" if res.version.known else ""))
+        # The module list needs a token, so it comes from a client session and
+        # not from the resolver - but only here, where a user is *looking* at the
+        # portal: an IP-locked panel is best asked once, on purpose.
+        caps = await _probe_capabilities(p, first_mac, res.portal_url, db)
     else:
         await db_log("ERROR", "resolve", f"[{p.name}] resolve failed: {res.error}")
     return {"ok": res.ok, "resolved_url": res.portal_url, "path": res.path,
-            "attempts": res.attempts, "error": res.error}
+            "attempts": res.attempts, "error": res.error,
+            "referer": res.referer, "version": res.version.public(),
+            "version_url": version_js_url(res.portal_url) if res.ok else "",
+            **caps}
+
+
+async def _probe_capabilities(p: Portal, mac_row, portal_url: str, db) -> dict:
+    """Ask the panel what it offers, and store the answer. Never fails a resolve.
+
+    Both probes are one cheap GET, and both are *information*: `version.js` needs
+    no token at all. That is the whole argument for doing it on Resolve - the
+    user is already watching this portal - and the whole argument for letting
+    every failure pass silently: an information request must not be able to turn
+    a working portal red.
+    """
+    out: dict = {"modules": loads_modules(p.modules), "features": {}, "modules_error": ""}
+    if not mac_row:
+        out["modules_error"] = "no MAC to ask with"
+        return out
+    try:
+        client = await POOL.get(PortalSession.from_rows(p, mac_row, portal_url=portal_url))
+        try:
+            await client.ensure_auth()
+            caps = await client.refresh_capabilities()
+        finally:
+            await client.close()
+    except PortalError as exc:
+        out["modules_error"] = exc.code
+        await db_log("DEBUG", "resolve",
+                     f"[{p.name}] capabilities unavailable ({exc.code}) - nothing is "
+                     f"gated off on an answer we never got")
+        return out
+    except Exception as exc:  # noqa: BLE001 - information only, never fatal
+        out["modules_error"] = type(exc).__name__
+        return out
+    modules = caps.get("modules")
+    if modules:
+        p.modules = dumps_modules(modules)
+    version = caps.get("version") or {}
+    if version.get("label"):
+        p.portal_version = str(version["label"])[:120]
+    p.capabilities_at = datetime.now(timezone.utc)
+    await db.commit()
+    if modules is None:
+        await db_log("INFO", "resolve",
+                     f"[{p.name}] get_modules said nothing ({caps.get('modules_error')})"
+                     f" - no catalogue is gated off")
+    else:
+        missing = [f for f in ("vod", "series", "epg", "archive")
+                   if supports(modules, f) is False]
+        await db_log("INFO", "resolve",
+                     f"[{p.name}] modules: {', '.join(modules)}"
+                     + (f" | nothing for: {', '.join(missing)}" if missing else ""))
+    out["modules"] = modules
+    out["modules_error"] = str(caps.get("modules_error") or "")
+    out["features"] = {name: supports(modules, name) for name in
+                       ("live", "vod", "series", "epg", "archive")}
+    return out
 
 
 @router.post("/{pid}/test")
@@ -344,8 +424,18 @@ async def test_portal(pid: int, db=Depends(get_db)):
                         "force_ch_link_check": bool(m.force_ch_link_check),
                         "sn": m.sn or client.identity.sn,
                         "device_id": m.device_id or client.identity.device_id})
+    # A check is also the moment a user wants to know what this portal *is*, and
+    # the two probes cost one request each - so fill them in when they were never
+    # done, and do not re-ask a panel that has already answered. An IP-locked
+    # portal notices both kinds of noise, and `portal_version`/`modules` do not
+    # change minute to minute.
+    caps = {}
+    if results and (not p.modules or not p.portal_version) \
+            and any(r["online"] for r in results):
+        online = next((m for m in macs if m.online), macs[0] if macs else None)
+        caps = await _probe_capabilities(p, online, url, db)
     await db.commit()
-    return {"results": results}
+    return {"results": results, "capabilities": caps or None}
 
 
 @router.post("/test-batch")

@@ -26,13 +26,21 @@ import time
 import logging
 from dataclasses import dataclass, replace
 from typing import Any
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
 from ..config import PORTAL_HTTP_TIMEOUT
 from ..services.http_client import outbound_client
 from .account import AccountVerdict, account_verdict
+from .capabilities import (FEATURE_MODULES, PortalVersion, enabled_modules,
+                           read_version_js, supports)
+# The link helpers moved to .links so the R2 policy can use them without
+# importing this module (which would be a cycle); the names stay importable from
+# here because probe.py, stream_manager.py, dev/check-links.py and the tests all
+# reach for them on `portal.client`.
+from .links import (VOLATILE_PARAMS, apply_mac_placeholder,  # noqa: F401
+                    extract_url, link_request_params)
 from .identity import (MAG250, MINIMAL, STB_LANG, STB_TIMEZONE, STB_UA, cookies_for,
                        derive_identity, headers_for, make_fake_bearer,
                        minimal_profile_params, missing_token, profile_params)
@@ -64,36 +72,6 @@ MAG_UA = STB_UA   # probe.py / stream_manager.py import this name for ffmpeg
 #     answer    ...&stream=&extension=ts&play_token=<new>       <- id gone!
 # so they are stripped before asking for a link, and the fresh token from the
 # answer is merged into the URL we asked for instead of trusting the answer.
-VOLATILE_PARAMS = frozenset({
-    "play_token", "token", "tok", "auth", "auth_key", "authkey", "key",
-    "signature", "sig", "sign", "session", "sess", "st", "e", "exp",
-    "expires", "expire", "md5", "hash",
-})
-URL_SCHEMES = ("http://", "https://", "rtsp://", "rtsps://", "rtmp://",
-               "rtmps://", "udp://", "rtp://", "mms://")
-
-
-def extract_url(raw: Any) -> str:
-    """
-    Pick the stream URL out of a portal cmd.
-
-    Portals are creative here: 'ffmpeg http://…', 'ffrt http://…', the bare
-    URL, the whole cmd percent-encoded, or the URL followed by extra ffmpeg
-    arguments. Returns '' when no URL is recognisable.
-    """
-    text = str(raw or "").strip().strip("\"'")
-    if not text:
-        return ""
-    # some panels return the cmd fully percent-encoded ('ffmpeg http%3A%2F%2F…')
-    if "://" not in text and "%3a%2f%2f" in text.lower():
-        text = unquote(text)
-    for tok in text.split():
-        candidate = tok.strip("\"'")
-        if candidate.lower().startswith(URL_SCHEMES):
-            return candidate
-    return ""
-
-
 def strip_volatile(url: str) -> str:
     """Remove single-use token parameters from a URL (keeps everything else)."""
     parts = urlsplit(url)
@@ -158,22 +136,6 @@ def mask_token(url: str) -> str:
     masked = [(k, "***" if k.lower() in VOLATILE_PARAMS else v) for k, v in pairs]
     return urlunsplit((parts.scheme, parts.netloc, parts.path,
                        urlencode(masked, safe=":"), parts.fragment))
-
-
-# Panels that keep ONE link template for every box do not substitute the MAC
-# themselves: they hand out 'http://cdn/ch/%mac%/1234.ts' and expect the
-# set-top box - the only party that knows its own MAC - to fill it in. Handing
-# that URL to ffmpeg verbatim produces a 404 that looks like a dead channel.
-# The double-encoded variants appear when a placeholder travels through a
-# query-string round trip (parse_qsl + urlencode in merge_link).
-MAC_PLACEHOLDER = re.compile(r"%(?:25)?mac%(?:25)?", re.I)
-
-
-def apply_mac_placeholder(url: str, mac: str) -> str:
-    """Fill every `%mac%` (any casing, any encoding) in a resolved link."""
-    if not url or "%" not in url or not mac:
-        return url
-    return MAC_PLACEHOLDER.sub(mac, url)
 
 
 def is_hls(url: str) -> bool:
@@ -400,6 +362,13 @@ class StalkerClient:
         self._token_random: str = ""      # `js.random` from the handshake, echoed in metrics
         self._not_valid: bool = False     # `js.not_valid`: the panel wants not_valid_token=1
         self._profile: dict | None = None  # last get_profile payload (account truth lives here)
+        # what the panel *is* and what it offers (R6). Cached on purpose: these
+        # answers do not expire with a bearer, and `invalidate()` deliberately
+        # leaves them alone - re-probing capabilities on every token rotation
+        # would be two pointless requests per stream start.
+        self._version: PortalVersion | None = None
+        self._modules: list[str] | None = None
+        self.modules_error: str = ""      # why modules is None, when it is
         self._client: httpx.AsyncClient | None = None
         self._lock = asyncio.Lock()  # serialize token refresh
         # Set by the pool: a shared client's connection is not owned by the
@@ -723,6 +692,57 @@ class StalkerClient:
         self.account = verdict
         return verdict
 
+    # --------------------------------------------------------- capabilities
+    async def version_info(self, *, force: bool = False) -> PortalVersion:
+        """`version.js` - the one portal answer that needs no token at all.
+
+        Read through this client, so it goes out with the same proxy, TLS policy
+        and box identity as everything else: a panel that answers `version.js`
+        to a MAG and 403s it to `python-httpx` is a panel we want to know that
+        about, and a probe through a different path proves nothing.
+        """
+        if self._version is not None and not force:
+            return self._version
+        self._version = await read_version_js(await self._http(), self.portal_url)
+        return self._version
+
+    async def portal_modules(self, *, force: bool = False) -> list[str] | None:
+        """The modules this panel offers *and* has enabled; None = it did not say.
+
+        Best effort, exactly like `get_profile`: a panel without the action (404)
+        is a normal panel, and "we could not ask" must never turn into "this
+        portal has no series", because that sentence is how a catalogue gets
+        hidden from a user for no reason.
+        """
+        if self._modules is not None and not force:
+            return self._modules
+        try:
+            data = await self._get({"type": "stb", "action": "get_modules",
+                                    "JsHttpRequest": "1-xml"})
+        except PortalError as exc:
+            log.info("get_modules refused: %s", exc.code)
+            self.modules_error = exc.code
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.debug("get_modules failed: %s", exc)
+            self.modules_error = "transport"
+            return None
+        modules = enabled_modules(data)
+        if modules is None:
+            self.modules_error = self.modules_error or "no_modules_answer"
+        else:
+            self.modules_error = ""
+        self._modules = modules
+        return modules
+
+    async def refresh_capabilities(self) -> dict:
+        """version.js + get_modules, as one answer the GUI can just show."""
+        version = await self.version_info(force=True)
+        modules = await self.portal_modules(force=True)
+        return {"version": version.public(), "modules": modules,
+                "modules_error": self.modules_error if modules is None else "",
+                "features": {name: supports(modules, name) for name in FEATURE_MODULES}}
+
     def _may_reauth(self, retry_on_auth: bool = True, retried: bool = False) -> bool:
         """May this failure be answered by a fresh handshake?
 
@@ -949,7 +969,8 @@ class StalkerClient:
         return []
 
     # ---------------------------------------------------------------- links
-    async def create_link(self, cmd: str, kind: str = "itv") -> str:
+    async def create_link(self, cmd: str, kind: str = "itv", *, link_flags: str | None = None,
+                          force_ch_link_check: bool = False) -> str:
         """
         Resolve a portal `cmd` to a playable stream URL.
 
@@ -964,6 +985,12 @@ class StalkerClient:
         3. `%mac%` in the answer is filled in with OUR mac: a panel that keeps
            one link template for every box expects the STB to do this, and a
            literal `%mac%` in a URL is a guaranteed 404 from ffmpeg.
+
+        `link_flags` / `force_ch_link_check` are what the channel and the panel
+        told us (R2): a box asks for an ad-free link only for a channel whose
+        flags say so, and it re-checks the link when the panel set
+        `force_ch_link_check`. Hardcoding `false` for both is a small lie that
+        some panels happily answer with a link we must then not use.
         """
         type_ = {"live": "itv", "itv": "itv", "vod": "vod", "series": "vod", "episode": "vod"}.get(kind, "itv")
         raw_cmd = str(cmd or "").strip()
@@ -972,9 +999,9 @@ class StalkerClient:
         if out_cmd != raw_cmd:
             log.debug("create_link: stripped stale token from cmd")
         data = await self._get({
-            "type": type_, "action": "create_link", "cmd": out_cmd, "series": "0",
-            "forced_storage": "false", "disable_ad": "false", "download": "false",
-            "force_ch_link_check": "false", "JsHttpRequest": "1-xml",
+            "type": type_, "action": "create_link", "cmd": out_cmd, "JsHttpRequest": "1-xml",
+            **link_request_params(link_flags=link_flags,
+                                  force_ch_link_check=force_ch_link_check),
         })
         js = data.get("js")
         raw = ""

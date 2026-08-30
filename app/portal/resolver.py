@@ -28,6 +28,7 @@ from urllib.parse import urlparse
 
 from ..config import PORTAL_HTTP_TIMEOUT
 from ..services.http_client import outbound_client
+from .capabilities import PortalVersion, read_version_js
 from .identity import STB_MODEL, STB_UA, normalize_mac
 
 # MAG-styled UA; many portals reject anything else (observed in the wild and
@@ -55,9 +56,33 @@ class ResolveResult:
     path: str = ""             # winning base path
     attempts: list[str] = field(default_factory=list)
     error: str = ""
+    #: read on the way out of resolution: a static file, no token needed, so we
+    #: know which build this is even when the MAC is not enrolled yet (R6)
+    version: PortalVersion = field(default_factory=PortalVersion)
 
     def log(self, msg: str) -> None:
         self.attempts.append(msg)
+
+    @property
+    def referer(self) -> str:
+        """The `Referer` every later request will claim - printable, because a
+        report of "it resolves but 403s" is usually about this path."""
+        from .identity import referer_for
+        return referer_for(self.portal_url) if self.portal_url else ""
+
+
+async def _read_version(http, portal_url: str, result: ResolveResult) -> None:
+    """Ask `version.js` who we are talking to, and put the answer in the log.
+
+    Best effort with a short timeout - the resolution already succeeded, and a
+    panel that hangs on a static file must not turn a working resolve into a
+    slow one.
+    """
+    result.version = await read_version_js(http, portal_url)
+    if result.version.known:
+        result.log(f"version.js -> {result.version.label}")
+    else:
+        result.log(f"version.js -> {result.version.error or 'unreadable'}")
 
 
 def _normalize_base(url: str) -> tuple[str, str]:
@@ -192,6 +217,7 @@ async def resolve_portal(
                         if portal:
                             result.ok, result.portal_url, result.path = True, portal, path
                             result.log(f"xpcom indirection resolved -> {portal}")
+                            await _read_version(http, portal, result)
                             return result
                         result.log("xpcom found but indirection not parseable (obfuscated?) - trying direct probe")
                     else:
@@ -218,6 +244,7 @@ async def resolve_portal(
                 )
                 if r.status_code == 200 and ok_json:
                     result.ok, result.portal_url, result.path = True, portal_url, path
+                    await _read_version(http, portal_url, result)
                     return result
             except Exception as exc:  # noqa: BLE001
                 result.log(f"handshake probe {portal_url} -> {type(exc).__name__}: {exc}")

@@ -42,7 +42,8 @@ from ..models import (
 )
 from ..portal.account import mac_is_usable
 from ..portal.pool import POOL, PortalSession
-from ..portal.client import MAG_UA, PortalError, StalkerClient, is_hls
+from ..portal.client import MAG_UA, PortalError, is_hls
+from ..portal.links import plan_for
 from .db_logging import db_log
 from .ffmpeg_templates import (HLS_ALLOWED_EXTENSIONS, HLS_PROTOCOL_WHITELIST,
                                REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file)
@@ -702,6 +703,14 @@ class StreamManager:
               name=f"dur-local-{ref_id}")
         return h
 
+    # ---------------------------------------------------------- link (R2)
+    @staticmethod
+    def _plan(src, mac_row, portal, *, ffmpeg: bool = False):
+        """(ask or play as stored) for one (source, MAC), decided the same way by
+        every path. See app/portal/links.py for the rules and their reasons."""
+        return plan_for(src, mac_row, ffmpeg=ffmpeg,
+                        allow_direct=bool(getattr(portal, "direct_links", True)))
+
     # ------------------------------------------------------------ the pump
     async def resolve(self, kind: str, ref_id: int) -> tuple[str | None, str]:
         """
@@ -734,6 +743,17 @@ class StreamManager:
             for mac_row in macs:
                 if mac_row.id in self.mac_locks:
                     continue                      # occupied by one of our own pipes
+                # Decided first, before any portal session exists: the point of
+                # R2 is that a channel the panel described as permanent costs the
+                # player one redirect and us *nothing* - no handshake reuse, no
+                # token, no create_link. The old shape paid for all of that and
+                # then threw the answer away in favour of the stored URL anyway.
+                plan = self._plan(_src, mac_row, portal)
+                if plan.policy.direct:
+                    await db_log("INFO", "stream",
+                                 f"[{item_name}] playing the stored link via "
+                                 f"{portal.name}/{mac_row.mac}: {plan.policy.reason}")
+                    return plan.direct_url, item_name
                 client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                 try:
                     if not portal.resolved_url:
@@ -746,7 +766,8 @@ class StreamManager:
                             client.portal_url = res.portal_url
                             client.invalidate()   # token was for the old URL
                     await client.ensure_auth()
-                    url = await client.create_link(getattr(_src, "cmd", "") or "", link_kind)
+                    url = await client.create_link(plan.cmd, link_kind,
+                                                   **plan.request_kwargs())
                 except PortalError as exc:
                     await db_log("WARNING", "stream",
                                  f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
@@ -874,7 +895,12 @@ class StreamManager:
                                 client.invalidate()   # token was for the old URL
                         await client.ensure_auth()
                         link_kind = "live" if kind == "live" else "vod"
-                        url = await client.create_link(getattr(src, "cmd", "") or "", link_kind)
+                        # ffmpeg owns this stream, so the plan is always "ask"
+                        # (fresh token + the liveness answer); the flags still
+                        # decide what we tell the panel about ads and re-checks
+                        plan = self._plan(src, mac_row, portal, ffmpeg=True)
+                        url = await client.create_link(plan.cmd, link_kind,
+                                                       **plan.request_kwargs())
                     except PortalError as exc:
                         # The code decides what this means for the rest of the
                         # chain: `limit` is "this MAC is busy over there", so

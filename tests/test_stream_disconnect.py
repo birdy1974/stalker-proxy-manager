@@ -71,7 +71,10 @@ class _FakeStalkerClient:
     def invalidate(self) -> None:
         return None
 
-    async def create_link(self, cmd: str, kind: str) -> str:
+    async def create_link(self, cmd: str, kind: str, **kw) -> str:
+        # **kw: the link policy (R2) forwards the channel's own flags to the
+        # portal (`disable_ad`, `force_ch_link_check`), and a stub that only
+        # accepts the old two arguments fails on a call that is otherwise correct
         return "http://portal.invalid/stream/1.ts"
 
     async def close(self) -> None:
@@ -146,7 +149,6 @@ async def test_stream_teardown_is_clean_after_client_disconnect(pool_errors, mon
     # installed there - patching sm.StalkerClient no longer intercepts anything.
     from app.portal import pool as _pool
     monkeypatch.setattr(_pool, "StalkerClient", _FakeStalkerClient)
-    monkeypatch.setattr(sm, "StalkerClient", _FakeStalkerClient)
     monkeypatch.setattr(sm.StreamManager, "_spawn", _spawn_stub)
 
     app = FastAPI()

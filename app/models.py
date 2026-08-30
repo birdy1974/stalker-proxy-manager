@@ -59,6 +59,18 @@ class Portal(Base):
     # default: verification is ON for every portal, and this only ever widens
     # trust for ONE portal the user explicitly says is misconfigured.
     tls_insecure: Mapped[bool] = mapped_column(Boolean, default=False)
+    # What the panel says about *itself* (R6). Read from version.js, which needs
+    # no token, and from get_modules, which does. Both are informational unless
+    # `modules` is non-NULL: a portal that never answered has not told us it
+    # lacks series, and gating on that would hide a working catalogue.
+    #: R2: play a stored link when the channel's own flags say it is permanent,
+    #: instead of asking for a new one on every open. On by default, and the
+    #: switch exists because a panel that answers `use_http_tmp_link=0` and then
+    #: 403s the URL is worth one checkbox, not a code change.
+    direct_links: Mapped[bool] = mapped_column(Boolean, default=True)
+    portal_version: Mapped[str | None] = mapped_column(String(120))
+    modules: Mapped[str | None] = mapped_column(Text)        # JSON list, NULL = unknown
+    capabilities_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     notes: Mapped[str | None] = mapped_column(Text)
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -167,6 +179,11 @@ class LiveSource(Base):
     epg_original: Mapped[str | None] = mapped_column(String(200))         # tvg id hint from portal
     tv_archive: Mapped[bool] = mapped_column(Boolean, default=False)
     censored: Mapped[bool] = mapped_column(Boolean, default=False)
+    #: the channel's own link flags (`use_http_tmp_link,disable_ad`), as the
+    #: panel sent them. NULL means the panel said nothing - which is NOT the same
+    #: as "" (it said nothing applies), and the difference is what decides
+    #: whether a stream open costs a create_link. See app/portal/links.py.
+    link_flags: Mapped[str | None] = mapped_column(String(60))
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)  # user: include in output pool
 
 
@@ -190,6 +207,7 @@ class VodSource(Base):
     rating: Mapped[str | None] = mapped_column(String(10))
     duration: Mapped[str | None] = mapped_column(String(20))
     added: Mapped[str | None] = mapped_column(String(40))
+    link_flags: Mapped[str | None] = mapped_column(String(60))   # see LiveSource.link_flags
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
@@ -247,6 +265,7 @@ class SerieEpisode(Base):
     name: Mapped[str | None] = mapped_column(String(400))
     cmd: Mapped[str | None] = mapped_column(Text)                          # set on real portals, empty on pure series-rows
     duration: Mapped[str | None] = mapped_column(String(20))
+    link_flags: Mapped[str | None] = mapped_column(String(60))    # see LiveSource.link_flags
 
     season: Mapped[SerieSeason] = relationship(back_populates="episodes")
 

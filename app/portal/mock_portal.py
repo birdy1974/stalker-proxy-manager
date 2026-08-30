@@ -48,6 +48,9 @@ router = APIRouter(tags=["mock-portal"])
 # app/portal/account.py); `blocked` is what `get_profile` reports and what no
 # amount of retrying can change. One MAC per account state, so the GUI and the
 # tests can exercise the whole vocabulary against a single portal.
+#: what a Ministra panel offers out of the box; `_STATE["modules"]` overrides it
+DEFAULT_MODULES = ("tv", "vclub", "sclub", "epg", "tv_archive", "portal_time", "watchdog")
+
 MOCK_MACS = {
     "00:1A:79:AA:AA:01": {"phone": "2032-12-31 00:00:00"},
     "00:1A:79:AA:AA:02": {"phone": "2032-12-31 00:00:00"},
@@ -126,15 +129,40 @@ PAGE_SIZE = 14  # exactly what real portals use
 #                        (no get_profile at all -> 404; the common case)
 #   not_valid            handshake answers js.not_valid=1, which a box must echo
 #                        back as not_valid_token=1
+#   version_mode         "full" (a Ministra version.js) | "none" (404, the common
+#                        case) | "html" (a captive portal or WAF page - the shape
+#                        that must NEVER be shown as "the portal version")
+#   modules              comma list the panel offers ("" = the default set below)
+#   modules_disabled     comma list it offers but switched off (get_modules
+#                        reports both, and `disabled` is what gates a fetch)
+#   no_modules           404 get_modules: the panel has no such action, which is
+#                        "we do not know", not "it has nothing" - the difference
+#                        that decides whether a catalogue stays visible
 _STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note": "",
           "create_link_error": "", "token_rejects": 0, "mac_placeholder": False,
           "require_prehash": False, "require_mac_param": False,
           "fingerprint_required": False, "profile_mode": "full", "not_valid": False,
-          "handshakes": 0, "profile_calls": 0, "profile_seen": {}, "handshake_seen": []}
+          "handshakes": 0, "profile_calls": 0, "profile_seen": {}, "handshake_seen": [],
+          # R6: what the panel says about itself
+          "version_mode": "full", "modules": "", "modules_disabled": "", "no_modules": False,
+          "version_calls": 0, "modules_calls": 0, "create_links": 0,
+          "create_link_seen": {}}
 
 
 def _usage(mac: str) -> int:
     return _STATE["usage"].get(mac, 0)
+
+
+def _base(request: Request) -> str:
+    """The prefix a panel uses in its own cmds.
+
+    Real panels write an absolute URL pointing at themselves; a mock that wrote
+    `http://mock/...` would be unusable for anything but create_link (which
+    rewrites), so the catalogue rows carry the host the request actually came in
+    on - which is also what makes the "play the stored link" path testable
+    against this portal at all.
+    """
+    return str(request.base_url).rstrip("/") + "/mock/"
 
 
 def _js(payload) -> JSONResponse:  # Stalker envelope: {"js": ...}
@@ -147,17 +175,40 @@ def _paged(items: list, page: int) -> dict:
             "max_page_items": PAGE_SIZE}
 
 
-def _live_rows():
+#: the shapes `link_policy` (app/portal/links.py) has to tell apart, in rotation
+#: so one mock catalogue exercises all of them: permanent, temporary, never
+#: described, CDN-balanced, and "permanent but the stored URL carries a token
+#: from the session that fetched it" - the last one is the case a proxy must not
+#: play, and no fixture but a portal would have shown it.
+_LIVE_SHAPES = (
+    {"use_http_tmp_link": 0, "use_load_balancing": 0, "disable_ad": 0},
+    {"use_http_tmp_link": 1, "use_load_balancing": 0, "disable_ad": 1},
+    {},
+    {"use_http_tmp_link": 0, "use_load_balancing": 1, "disable_ad": 0},
+    {"use_http_tmp_link": 0, "use_load_balancing": 0, "disable_ad": 0, "_stale": True},
+)
+
+
+def _live_rows(base: str = "http://mock/"):
     rows = []
     ch = 1
     for gid, names in _LIVE_NAMES.items():
         for n in names:
-            rows.append({
-                "id": str(1000 + ch), "name": n, "number": str(ch),
-                "cmd": f"ffmpeg http://mock/ts/{1000 + ch}.ts",
+            shape = _LIVE_SHAPES[(ch - 1) % len(_LIVE_SHAPES)]
+            cid = 1000 + ch
+            link = f"{base}ts/{cid}.ts"
+            if shape.get("_stale"):
+                # a real panel does this: the cmd it stores already carries the
+                # play_token of the session that built the list
+                link += "?play_token=from-the-fetch-that-was-days-ago"
+            row = {
+                "id": str(cid), "name": n, "number": str(ch),
+                "cmd": f"ffmpeg {link}",
                 "logo": "", "tv_genre_id": gid, "tv_archive": 0, "censored": 0,
-                "use_http_tmp_link": 1, "status": 1,
-            })
+                "status": 1,
+            }
+            row.update({k: v for k, v in shape.items() if not k.startswith("_")})
+            rows.append(row)
             ch += 1
     return rows
 
@@ -238,6 +289,26 @@ async def xpcom(request: Request):
         "this.portal_path = pattern.exec(document.location.href)[3];\n"
         "this.ajax_loader = this.portal_protocol + '/' + this.portal_ip + '/portal.php';\n"
     )
+
+
+@router.get("/mock/c/version.js", response_class=PlainTextResponse)
+async def version_js(request: Request):
+    """The static file the box reads to learn which build it is talking to.
+
+    No token, no MAC, no `js` envelope - that is why the resolver can read it
+    during discovery, and why a panel that answers this URL with HTML (a WAF, a
+    router login page) has to be recognised as such instead of having its markup
+    printed as a version number.
+    """
+    _STATE["version_calls"] = int(_STATE.get("version_calls", 0)) + 1
+    mode = str(_STATE.get("version_mode") or "full").strip().lower()
+    if mode in ("none", "404"):
+        return PlainTextResponse("no version.js here", status_code=404)
+    if mode == "html":
+        return PlainTextResponse("<!DOCTYPE html><html><head>Access denied</head>"
+                                 "<body>ver = 'blocked'</body></html>", status_code=200)
+    return PlainTextResponse("/* Ministra */\nvar ver = '5.4.2';\n"
+                             "var ImageDescription = '0.2.20-r3-250';\n")
 
 
 async def _guard(request: Request):
@@ -381,6 +452,24 @@ async def portal_php(request: Request):  # noqa: A002
                     "play_token": "mock-play-" + mac.replace(":", "")[-6:],
                     "status": 1, "blocked": int(acct.get("blocked", 0)),
                     "force_ch_link_check": 0})
+    if type == "stb" and action == "get_modules":
+        _STATE["modules_calls"] = int(_STATE.get("modules_calls", 0)) + 1
+        if _STATE.get("no_modules"):
+            log.warning("mock portal: get_modules -> 404 (no such action)")
+            return JSONResponse({"js": {"error": "no such action"}}, status_code=404)
+        raw = str(_STATE.get("modules") or "").strip()
+        offered = ([m.strip() for m in raw.split(",") if m.strip()] if raw
+                   else list(DEFAULT_MODULES))
+        off = {m.strip().lower() for m in
+               str(_STATE.get("modules_disabled") or "").split(",") if m.strip()}
+        # the dict shape (name + status + title) is what Ministra 5.4 answers,
+        # and it is also the shape a client that only handles a flat list of
+        # names gets wrong - so the mock uses it
+        return _js({"all_modules": [{"name": m, "title": m.replace("_", " ").title(),
+                                    "status": "0" if m.lower() in off else "1"}
+                                   for m in offered],
+                    "disabled_modules": sorted(off)})
+
     if type == "account_info" and action == "get_main_info":
         return _js({"mac": mac, "phone": MOCK_MACS.get(mac, {}).get("phone"),
                     "fname": "Mock User"})
@@ -391,12 +480,12 @@ async def portal_php(request: Request):  # noqa: A002
     if type == "itv" and action == "get_ordered_list":
         genre = qp.get("genre")
         page = int(qp.get("p", "1") or "1")
-        rows = _live_rows()
+        rows = _live_rows(_base(request))
         if genre:
             rows = [r for r in rows if r["tv_genre_id"] == genre]
         return _js(_paged(rows, page))
     if type == "itv" and action == "get_all_channels":
-        return _js({"data": _live_rows()})
+        return _js({"data": _live_rows(_base(request))})
 
     if type == "vod" and action == "get_categories":
         return _js([{"id": gid, "title": n, "alias": ""} for gid, n in VOD_GENRES.items()])
@@ -428,6 +517,13 @@ async def portal_php(request: Request):  # noqa: A002
 
     if action == "create_link":
         cmd = qp.get("cmd", "")
+        _STATE["create_links"] = int(_STATE.get("create_links", 0)) + 1
+        # what the client asked for is part of the protocol: `disable_ad` and
+        # `force_ch_link_check` must follow the channel/panel flags (R2), and a
+        # test that cannot see them cannot prove it
+        _STATE["create_link_seen"] = {"disable_ad": qp.get("disable_ad"),
+                                      "force_ch_link_check": qp.get("force_ch_link_check"),
+                                      "series": qp.get("series"), "cmd": cmd}
         # A portal-level refusal with HTTP 200 (real panels answer exactly
         # like this, and the code is the only thing that tells "this MAC is
         # busy" from "this channel is gone").
@@ -556,7 +652,8 @@ _TOGGLE_KEYS = ("offline", "slow", "max_per_mac", "create_link_error",
                 "require_mac_param", "fingerprint_required", "profile_mode",
                 "not_valid", "http_status", "js_error", "empty_reply",
                 "corrupt_stream", "reject_no_cookie", "reject_no_referer",
-                "require_host", "require_tls", "note")
+                "require_host", "require_tls", "note", "version_mode", "modules",
+                "modules_disabled", "no_modules")
 
 
 @router.post("/mock/_control")
@@ -582,7 +679,11 @@ async def state():
     """
     return {"state": {k: _STATE.get(k) for k in _TOGGLE_KEYS + ("note",)},
             "counters": {"handshakes": _STATE.get("handshakes", 0),
-                         "profile_calls": _STATE.get("profile_calls", 0)},
+                         "profile_calls": _STATE.get("profile_calls", 0),
+                         "version_calls": _STATE.get("version_calls", 0),
+                         "modules_calls": _STATE.get("modules_calls", 0),
+                         "create_links": _STATE.get("create_links", 0)},
             "seen_profile": _STATE.get("profile_seen") or {},
             "seen_handshakes": _STATE.get("handshake_seen") or [],
+            "seen_create_link": _STATE.get("create_link_seen") or {},
             "usage": dict(_STATE["usage"])}

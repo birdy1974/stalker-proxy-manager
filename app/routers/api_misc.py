@@ -188,8 +188,12 @@ async def export_config(section: str = "all", db=Depends(get_db)):
 
     if section in ("all", "portals"):
         from ..models import MacAddress
+        # portal_version / modules ride along: they are what gates a fetch job,
+        # so a restored install that lost them would re-gate on a fresh probe of
+        # a panel that may be unreachable from the machine that restored it
         data["portals"] = await dump(Portal, ["name", "base_url", "enabled", "proxy_url",
-                                              "tls_insecure", "identity_mode", "stb_timezone"])
+                                              "tls_insecure", "identity_mode", "stb_timezone",
+                                              "direct_links", "portal_version", "modules"])
         macs = (await db.execute(select(MacAddress, Portal)
                                  .join(Portal, Portal.id == MacAddress.portal_id))).all()
         # sn / device_id travel with the MAC on purpose: they are the serial this
@@ -257,12 +261,16 @@ async def import_config(payload: dict, db=Depends(get_db)):
         db.add(User(**{k: v for k, v in u.items() if k != "id"}))
         applied["imported"] += 1
 
+    known = {c.name for c in Portal.__table__.columns} - {"id"}
     for p in data.get("portals", []):
         exists = (await db.execute(select(Portal).where(Portal.name == p.get("name")))).scalar_one_or_none()
         if exists:
             applied["skipped"].append(f"portal:{p.get('name')}")
             continue
-        db.add(Portal(**p))
+        # filtered, not splatted: a backup written by a *newer* image carries
+        # columns this one does not have, and `Portal(**p)` answers that with a
+        # TypeError inside an import that the user cannot inspect
+        db.add(Portal(**{k: v for k, v in p.items() if k in known}))
         applied["imported"] += 1
 
     for e in data.get("epg_sources", []):

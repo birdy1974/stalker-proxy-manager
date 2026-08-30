@@ -30,6 +30,8 @@ from ..models import (
     SerieSeason, SerieSource, VodGenre, VodSource,
 )
 from ..portal.account import mac_is_usable, mac_status
+from ..portal.capabilities import gate_feature, loads_modules
+from ..portal.links import parse_link_flags
 from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, StalkerClient
 from ..portal.resolver import resolve_portal
@@ -206,6 +208,20 @@ async def _prepare_client(job: Job) -> tuple[StalkerClient, str]:
     return client, portal_name
 
 
+async def _feature_gate(portal_id: int, feature: str) -> tuple[bool, str]:
+    """May this portal be asked for `feature` at all? (R6)
+
+    The answer comes from the panel's own `get_modules`, stored on the Portal row
+    by a resolve. A portal that never answered is allowed: skipping a catalogue
+    because a *cosmetic* probe did not reply is how a proxy ends up "losing"
+    channels nobody removed.
+    """
+    async with SessionLocal() as s:
+        p = await s.get(Portal, portal_id)
+        modules = loads_modules(getattr(p, "modules", None)) if p else None
+    return gate_feature(modules, feature)
+
+
 async def _sync_all_genres(job: Job, client: StalkerClient, portal_id: int,
                            portal_name: str) -> None:
     """
@@ -221,7 +237,12 @@ async def _sync_all_genres(job: Job, client: StalkerClient, portal_id: int,
         await s.commit()
 
     job.stage = "vod genres"
-    cats = await client.vod_genres()
+    ok, why = await _feature_gate(portal_id, "vod")
+    if not ok:
+        await db_log("INFO", "fetch", f"[{portal_name}] vod categories skipped: {why}")
+        cats = []
+    else:
+        cats = await client.vod_genres()
     async with SessionLocal() as s:
         known = await _sync_genres(s, VodGenre, portal_id, cats)
         if not known:                      # no usable categories -> synthetic "all"
@@ -234,7 +255,12 @@ async def _sync_all_genres(job: Job, client: StalkerClient, portal_id: int,
         await s.commit()
 
     job.stage = "series genres"
-    cats = await client.series_genres()
+    ok, why = await _feature_gate(portal_id, "series")
+    if not ok:
+        await db_log("INFO", "fetch", f"[{portal_name}] series categories skipped: {why}")
+        cats = []
+    else:
+        cats = await client.series_genres()
     async with SessionLocal() as s:
         known = await _sync_genres(s, SerieGenre, portal_id, cats)
         if not known:
@@ -302,10 +328,20 @@ async def _run_items_fetch(job: Job, client: StalkerClient | None = None,
         await _fetch_live(job, client, job.portal_id, portal_name)
         if job._cancel.is_set():
             return
-        await _fetch_vod(job, client, job.portal_id, portal_name)
-        if job._cancel.is_set():
-            return
-        await _fetch_series(job, client, job.portal_id, portal_name)
+        # The two halves below are the expensive ones (a big VOD catalogue is
+        # hours of paging), and a panel that has no `vclub`/`sclub` module has
+        # been telling us so, in its own answer, since R6. Honouring it is not
+        # skipping them is not an optimisation: the alternative is a green progress
+        # bar that ends in an empty genre and a user who assumes the proxy broke.
+        for feature, run in (("vod", _fetch_vod), ("series", _fetch_series)):
+            ok, why = await _feature_gate(job.portal_id, feature)
+            if not ok:
+                await db_log("INFO", "fetch",
+                             f"[{portal_name}] {feature} items skipped: {why}")
+                continue
+            await run(job, client, job.portal_id, portal_name)
+            if job._cancel.is_set():
+                return
         # Seasons arrive after the series were added to the playlist, so their
         # link rows have to be reconciled here - otherwise the series stay in
         # the builder but contribute no episodes to any playlist.
@@ -632,10 +668,12 @@ def _live_fields(row, item, genre_db_id: int) -> None:
     row.logo_original = (item.get("logo") or "")[:600] or None
     row.epg_original = (item.get("epg_channel_id") or item.get("tvg_id") or "")[:200] or None
     row.tv_archive = str(item.get("tv_archive", "0")) == "1"
+    row.link_flags = parse_link_flags(item)      # R2: what the panel says about its links
 
 
 def _vod_fields(row, item, genre_db_id: int) -> None:
     row.vod_genre_id = genre_db_id
+    row.link_flags = parse_link_flags(item)
     row.original_name = portal_item_title(item, limit=400)
     row.cmd = item.get("cmd")
     row.position = item.get("position") if isinstance(item.get("position"), int) else None
@@ -932,6 +970,7 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
                             erow.name = (e.get("name") or f"E{en:02d}")[:400]
                             erow.cmd = e.get("cmd")
                             erow.duration = str(e.get("time", "") or "")[:20] or None
+                            erow.link_flags = parse_link_flags(e)
                         row.episodes_fetched = True
 
                     srow = await s2.get(SerieSource, sid)
