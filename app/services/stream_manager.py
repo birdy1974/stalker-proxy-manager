@@ -45,8 +45,9 @@ from ..portal.pool import POOL, PortalSession
 from ..portal.client import MAG_UA, PortalError, is_hls
 from ..portal.links import plan_adopted, plan_for
 from .db_logging import db_log
-from .ffmpeg_templates import (HLS_ALLOWED_EXTENSIONS, HLS_PROTOCOL_WHITELIST,
-                               REDIRECT_COMMAND, URL_PLACEHOLDER, serves_original_file)
+from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
+                               HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
+                               URL_PLACEHOLDER, serves_original_file)
 from .probe import subtitle_streams
 from .item_info import local_file_path
 
@@ -788,9 +789,28 @@ class StreamManager:
         working VAAPI/QSV transcode template would have played it fine - the
         preview disagreed with reality in exactly the case that matters.
         Pass template_id to force a specific one.
-        """
+
+        ONE exception, and it is the reason the preview popup used to sit
+        there with no input at all: sources carry no ffmpeg_template_id of
+        their own, so without ?tpl= resolution lands on the DEFAULT template -
+        and the shipped default is "Redirect (bypass ffmpeg)" (@redirect),
+        which is a marker, not a command. _spawn refuses it, the pump yields
+        nothing and the popup stares at a 25s "no data" 502. A preview probes
+        the SOURCE, so when the marker comes back the probe falls back to the
+        Copy passthrough command (the same thing the "Retry with" dropdown
+        would otherwise be needed for)."""
         probe = src if template_id is None else _WithTemplate(src, template_id)
         tpl_name, command = await self._template_for(probe)
+        if command == REDIRECT_COMMAND:
+            async with SessionLocal() as s:
+                copy_tpl = (await s.execute(select(FFmpegTemplate).where(
+                    FFmpegTemplate.name == COPY_PRESET_NAME,
+                    FFmpegTemplate.enabled.is_(True)))).scalar_one_or_none()
+            if copy_tpl is not None:
+                tpl_name, command = copy_tpl.name, copy_tpl.command
+            else:
+                tpl_name = "(copy)"
+                command = f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1"
         h = StreamHandle(id=uuid.uuid4().hex, kind="preview",
                          item_name=name or getattr(src, "original_name", None)
                          or getattr(src, "name", "preview"),
