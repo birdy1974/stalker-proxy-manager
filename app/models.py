@@ -600,8 +600,9 @@ class Enigma2Profile(Base):
         those bouquets point at the `.mkv` aliases and are played by
         exteplayer3 (5002). See docs/ENIGMA2-INTEGRATION-OPTIONS.md.
 
-    E2 (this phase) renders and downloads the files; the push transport fields
-    are already here so E3 only adds the transfer itself.
+    The files reach the box either by pull (the installer one-liner, which
+    carries `token`) or by push (E3: FTP as `login`/`password`, then an
+    OpenWebif reload using `owif_auth`/`owif_user`/`owif_pass`).
     """
 
     __tablename__ = "enigma2_profiles"
@@ -619,6 +620,9 @@ class Enigma2Profile(Base):
     host: Mapped[str | None] = mapped_column(String(200))
     web_port: Mapped[int] = mapped_column(Integer, default=80)
     use_https: Mapped[bool] = mapped_column(Boolean, default=False)
+    # an out-of-the-box OpenPLi answers its API without credentials; a box
+    # whose web interface was locked down needs the browser's user/password
+    owif_auth: Mapped[str] = mapped_column(String(6), default="none")   # none|basic
     owif_user: Mapped[str | None] = mapped_column(String(80))
     owif_pass: Mapped[str | None] = mapped_column(String(120))
     transport: Mapped[str] = mapped_column(String(10), default="download")  # download|ftp|ssh

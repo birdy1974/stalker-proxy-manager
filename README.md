@@ -273,13 +273,28 @@ Service type `1` hands the bytes straight to the DVB demuxer, which only underst
 
 **Preview before anything leaves the server.** *Preview* renders the exact file contents (`#SERVICE` / `#DESCRIPTION` / marker lines) plus a summary — *13 bouquets · 114 services* — and flags the classic mistakes: URLs pointing at `localhost` (a receiver cannot reach that — set the public base URL in Settings), a `.mkv` container under player `4097`, or a deleted output user.
 
-**Getting the files onto the box (this release: pull).** Each profile has an opaque token and a one-liner to run on the receiver:
+**Pushing from SPM (transport `ftp`).** Set the receiver's host, keep the login on `root` (the bouquet directory is root-owned; a stock OpenPLi enables the root FTP account) and the tab gets four buttons:
+
+* **Test connection** — logs in, looks at `/etc/enigma2`, counts the bouquets a previous push left there and pings OpenWebif. Writes nothing.
+* **Dry run** — connects and reports exactly what *would* happen: how many files, which stale bouquets would go, whether `bouquets.tv` changes. Still writes nothing.
+* **Push now** — backs up, uploads, removes stale SPM bouquets, merges `bouquets.tv`, reloads the box.
+* **Restore backup** — puts `bouquets.tv.spm-backup` back and deletes the bouquets SPM installed, i.e. the box as it was before the last push.
+
+Three safety rules are built into the push, because a half-written `bouquets.tv` is a receiver that boots into an empty channel list:
+
+1. **Nothing is written in place.** Every file goes to a temporary name *in the same directory* and is then `RNFR`/`RNTO`'d over the target — a rename inside one directory is atomic, so enigma2 always reads either the old file or the new one. (Uploading to `/tmp` and renaming across would fail: `/tmp` is tmpfs, `/etc/enigma2` is flash, and `rename(2)` cannot cross filesystems.)
+2. **One restore point, always.** The box's `bouquets.tv` is copied to `bouquets.tv.spm-backup` before anything changes, every push, overwriting the previous one — the last known-good state, without a pile of dated files on a 512 MB flash.
+3. **Only our own files are deleted.** `userbouquet.<prefix>_*.tv` and nothing else; your satellite bouquets and favourites are merged back into `bouquets.tv` untouched, and a profile that renders *no* services refuses to push instead of clearing the box.
+
+Then SPM calls **`GET /api/servicelistreload?mode=2`** — bouquets only; modes 0/1 would also re-read `lamedb` and throw away the tuner's service cache for a change that never touched it. *Web interface auth* is per profile: `none` (a stock OpenPLi answers its API without credentials) or `basic` with the user/password you set on the box. A failed reload is a warning, not a failed push — the files are already there, and the box menu can reload them.
+
+**Getting the files onto the box the other way (pull).** Each profile has an opaque token and a one-liner to run on the receiver:
 
 ```sh
 wget -qO- http://nas:8880/enigma2/<token>/install.sh | sh
 ```
 
-It downloads the tarball, backs `bouquets.tv` up, **merges** our entries into it (`grep -v userbouquet.<prefix>_` — your satellite bouquets and favourites are kept), copies the files into `/etc/enigma2` and reloads the service list via OpenWebif (`/api/servicelistreload?mode=2`). Re-run it (or put it in cron) after changing the playlist. *Download .tar.gz* gives you the same files by hand, and *rotate token* invalidates the old URLs. Pushing from SPM over FTP/SSH is the next phase.
+It downloads the tarball, backs `bouquets.tv` up, **merges** our entries into it (`grep -v userbouquet.<prefix>_` — your satellite bouquets and favourites are kept), copies the files into `/etc/enigma2` and reloads the service list via OpenWebif (`/api/servicelistreload?mode=2`). Re-run it (or put it in cron) after changing the playlist. *Download .tar.gz* gives you the same files by hand, and *rotate token* invalidates the old URLs. Pull needs nothing configured on the SPM side, which makes it the fallback when the box's FTP is disabled.
 
 Service references use the SPM playlist id as the SID (`4097:0:1:2A:…`), so regenerating a bouquet does not renumber anything — the box's own favourites, picon names and the (later) EPG channel map keep pointing at the same services.
 

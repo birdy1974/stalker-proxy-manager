@@ -349,3 +349,27 @@ Answer, now implemented in `_Resolver` (`app/services/enigma2_bouquets.py`):
 * `mkv`/`direct` items are raised from `1` to `4097` with a note recommending `5002`;
 * the bundle reports `deliveries = {ts, mkv, direct}`, shown in the preview and used for the "no text subtitles under this player" warning (it now follows what was actually written);
 * `container_mode = fixed` on the profile restores the E2 profile-wide behaviour.
+
+## E3 — push to the receiver (shipped)
+
+`app/services/enigma2_push.py`, `POST /api/enigma2/profiles/{id}/{test,push,restore}`.
+
+Decisions (answers from the review):
+
+| Question | Answer | Consequence in the code |
+|---|---|---|
+| Transport | **root over FTP** | `ftplib`, login defaults to `root`; `/etc/enigma2` is root-owned and OpenWebif has no upload API |
+| OpenWebif auth | **both, user selectable** | `Enigma2Profile.owif_auth` = `none` \| `basic` (+ user/password), `OWIF_AUTH` in the push service |
+| Reload | **mode 2** | `GET /api/servicelistreload?mode=2` — bouquets only; 0/1 would also re-read `lamedb` |
+| Safety | **always back up + one restore point** | `bouquets.tv` → `bouquets.tv.spm-backup` before every push (overwritten, not accumulated), plus a `restore` endpoint |
+
+Implementation notes worth keeping:
+
+* atomic writes are done **inside `/etc/enigma2`** (`.spm-upload-<name>` → `RNFR/RNTO`), *not* via `/tmp`: tmpfs → flash is a cross-filesystem rename and `rename(2)` answers `EXDEV`, so the FTP server would fail the move with 550;
+* servers that refuse `RNTO` onto an existing name get a delete-then-rename fallback, and never leave a temp file behind;
+* an empty bundle refuses to push (a profile whose filters match nothing must not become "delete every SPM bouquet");
+* a failed OpenWebif reload leaves `ok = True` — the files are on the box, only the refresh has to be done from the menu;
+* `restore` strips our own include lines from the restore point before writing it back: after a *second* push the backup already lists the first push's bouquets, and those files are deleted by the same restore - putting the file back verbatim would leave enigma2 with ghost bouquets (found by pushing twice against a real vsftpd, not by the unit tests);
+* every step is reported (`Report.steps`) and the last outcome is stored on the profile (`last_push_at`, `last_push_result`).
+
+Tests: `tests/test_enigma2_push.py` (22) run against a fake vsftpd implementing the same command surface (`NLST`, `RETR`, `STOR`, `RNFR/RNTO`, `DELE`) including a wrong password, a non-Enigma2 directory and a server that rejects `RNTO`.

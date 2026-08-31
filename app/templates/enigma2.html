@@ -76,20 +76,40 @@
         </div>
 
         <hr class="my-3">
-        <div class="small text-muted mb-2"><b>The receiver.</b> Used by the installer one-liner today; pushing the files from here
-          (FTP/SSH + OpenWebif reload) arrives with the next phase.</div>
+        <div class="small text-muted mb-2"><b>The receiver.</b> With transport <code>ftp</code> SPM uploads the bouquets itself
+          (atomic rename, <code>bouquets.tv</code> backed up as a restore point) and reloads the service list over OpenWebif;
+          <code>download</code> means you use the installer one-liner below instead.</div>
         <div class="row g-2">
           <div class="col-md-3"><label class="muted-label">Host / IP</label>
             <input class="form-control form-control-sm mono e2-field" id="f-host" placeholder="192.168.1.50"></div>
-          <div class="col-md-2"><label class="muted-label">OpenWebif port</label>
-            <input class="form-control form-control-sm e2-field" type="number" id="f-web_port" value="80"></div>
           <div class="col-md-2"><label class="muted-label">Transport</label>
             <select class="form-select form-select-sm e2-field" id="f-transport"></select></div>
-          <div class="col-md-2"><label class="muted-label">Login</label>
+          <div class="col-md-2"><label class="muted-label" title="vsftpd on a stock OpenPLi image">FTP port</label>
+            <input class="form-control form-control-sm e2-field" type="number" id="f-ftp_port" value="21"></div>
+          <div class="col-md-2"><label class="muted-label" title="the bouquet directory is root-owned, so a normal user cannot write it">FTP login</label>
             <input class="form-control form-control-sm mono e2-field" id="f-login" value="root"></div>
-          <div class="col-md-3"><label class="muted-label">Password <span class="text-muted" id="f-pass-hint"></span></label>
+          <div class="col-md-3"><label class="muted-label">FTP password <span class="text-muted" id="f-pass-hint"></span></label>
             <input class="form-control form-control-sm e2-field" type="password" id="f-password" placeholder="unchanged"></div>
         </div>
+        <div class="row g-2 mt-1">
+          <div class="col-md-2"><label class="muted-label">OpenWebif port</label>
+            <input class="form-control form-control-sm e2-field" type="number" id="f-web_port" value="80"></div>
+          <div class="col-md-3"><label class="muted-label" title="a stock OpenPLi answers its API without credentials; set basic if you locked the web interface down">Web interface auth</label>
+            <select class="form-select form-select-sm e2-field" id="f-owif_auth"></select></div>
+          <div class="col-md-2"><label class="muted-label">OpenWebif user</label>
+            <input class="form-control form-control-sm mono e2-field" id="f-owif_user" placeholder="root"></div>
+          <div class="col-md-3"><label class="muted-label">OpenWebif password <span class="text-muted" id="f-owif-pass-hint"></span></label>
+            <input class="form-control form-control-sm e2-field" type="password" id="f-owif_pass" placeholder="unchanged"></div>
+          <div class="col-md-2 d-flex align-items-end">
+            <label class="small"><input type="checkbox" class="e2-field" id="f-use_https"> HTTPS</label></div>
+        </div>
+        <div class="d-flex gap-2 mt-2 flex-wrap">
+          <button class="btn btn-sm btn-outline-secondary" id="e2-test"><i class="bi bi-plug"></i> Test connection</button>
+          <button class="btn btn-sm btn-outline-secondary" id="e2-dry"><i class="bi bi-clipboard-check"></i> Dry run</button>
+          <button class="btn btn-sm btn-accent" id="e2-push"><i class="bi bi-upload"></i> Push now</button>
+          <button class="btn btn-sm btn-outline-danger ms-auto" id="e2-restore"><i class="bi bi-arrow-counterclockwise"></i> Restore backup</button>
+        </div>
+        <div class="small text-muted mt-1" id="e2-push-status"></div>
 
         <hr class="my-3">
         <div class="muted-label">Install on the box (paste into telnet/SSH — re-run it any time to refresh)</div>
@@ -119,7 +139,8 @@
 
 {% block scripts %}
 <script>
-const FIELDS = ["name","enabled","user_id","host","web_port","transport","login","password",
+const FIELDS = ["name","enabled","user_id","host","web_port","use_https","transport","ftp_port",
+  "login","password","owif_auth","owif_user","owif_pass",
   "bouquet_prefix","player_live","player_vod","player_series","container_live","container_vod",
   "container_series","container_mode","delivery_mode","layout","max_entries",
   "include_live","include_vod","include_series","include_local"];
@@ -141,6 +162,7 @@ function readFields() {
   out.user_id = out.user_id || null;
   out.max_entries = +out.max_entries || 1500;
   out.web_port = +out.web_port || 80;
+  out.ftp_port = +out.ftp_port || 21;
   return out;
 }
 
@@ -153,7 +175,12 @@ function writeFields(p) {
     else n.value = v === null || v === undefined ? "" : v;
   }
   $("#f-password").value = "";
+  $("#f-owif_pass").value = "";
   $("#f-pass-hint").textContent = p.has_password ? "(stored — leave empty to keep)" : "";
+  $("#f-owif-pass-hint").textContent = p.has_owif_pass ? "(stored — leave empty to keep)" : "";
+  $("#e2-push-status").innerHTML = p.last_push_at
+    ? `last push ${esc(String(p.last_push_at).replace("T", " ").slice(0, 19))}:
+       <span class="mono">${esc((p.last_push_result || "").split("\n").pop())}</span>` : "";
 }
 
 async function loadList() {
@@ -214,6 +241,46 @@ async function preview() {
   footer.append(mBtn("Close", "btn-outline-secondary", m.close));
 }
 
+// ---- push / test / restore (E3) -------------------------------------------
+function showReport(title, r) {
+  const body = el("div");
+  const rows = (r.steps || []).map(s =>
+    `<tr><td class="pe-2">${s.ok ? '<span class="text-success">ok</span>' : '<span class="text-danger">fail</span>'}</td>
+     <td class="pe-2">${esc(s.name)}</td><td class="small text-muted mono">${esc(s.detail || "")}</td></tr>`).join("");
+  body.innerHTML = `${r.error ? `<div class="alert alert-danger py-1 px-2 small">${esc(r.error)}</div>` : ""}
+    ${r.dry_run ? '<div class="alert alert-info py-1 px-2 small">Dry run — nothing was written on the receiver.</div>' : ""}
+    <table class="table table-sm mb-0"><tbody>${rows || '<tr><td class="small text-muted">no steps</td></tr>'}</tbody></table>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title, body, footer, size: "lg" });
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close));
+}
+
+async function pushAction(path, title, opts = {}) {
+  if (!current) return;
+  await save();
+  try {
+    const r = await api(`/api/enigma2/profiles/${current.id}${path}`, { method: "POST" });
+    showReport(`${title} — ${current.name}`, r);
+    toast(r.ok ? `${title}: ok` : `${title} failed`, r.ok ? "ok" : "err");
+    if (r.item) { await loadList(); current = r.item; select(current.id); }
+  } catch (e) {
+    toast(String(e.message || e), "err");
+  }
+}
+
+$("#e2-test").addEventListener("click", () => pushAction("/test", "Test connection"));
+$("#e2-dry").addEventListener("click", () => pushAction("/push?dry_run=1", "Dry run"));
+$("#e2-push").addEventListener("click", () => pushAction("/push", "Push"));
+$("#e2-restore").addEventListener("click", () => {
+  if (!current) return;
+  confirmDialog({
+    title: "Restore backup",
+    body: "Put the receiver's backed-up bouquets.tv back and delete the bouquets SPM installed? This is the state the box was in before the last push.",
+    okText: "Restore", okClass: "btn-danger",
+    onOk: () => pushAction("/restore", "Restore"),
+  });
+});
+
 $("#e2-add").addEventListener("click", async () => {
   const r = await api("/api/enigma2/profiles", { method: "POST", body: { name: "New receiver" } });
   await loadList(); select(r.item.id);
@@ -252,6 +319,7 @@ $("#e2-delete").addEventListener("click", () => {
   fill("container_mode", META.container_modes);
   fill("delivery_mode", META.delivery_modes);
   fill("transport", META.transports);
+  fill("owif_auth", META.owif_auth);
   const sel = $("#f-user_id");
   sel.innerHTML = '<option value="">— none (URLs without credentials) —</option>';
   for (const u of META.users) sel.append(el("option", { value: u.id }, u.name + (u.enabled ? "" : " (disabled)")));

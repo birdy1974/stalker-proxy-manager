@@ -374,6 +374,7 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     },
     "enigma2_profiles": {
         "container_mode": ("VARCHAR(6)", "'auto'"),
+        "owif_auth": ("VARCHAR(6)", "'none'"),
     },
     "serie_sources": {
         "raw_series": ("TEXT", "NULL"),

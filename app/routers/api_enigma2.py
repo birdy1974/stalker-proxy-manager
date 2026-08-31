@@ -20,6 +20,7 @@ from ..database import get_db
 from ..models import Enigma2Profile, User
 from ..security import require_admin
 from ..services import enigma2_bouquets as e2
+from ..services import enigma2_push as e2push
 from ..services.db_logging import db_log
 
 router = APIRouter(prefix="/api/enigma2", tags=["enigma2"],
@@ -28,7 +29,8 @@ public = APIRouter(tags=["enigma2"])
 
 # Columns a client may write. `token` is generated, the status columns are ours.
 EDITABLE = [
-    "name", "enabled", "user_id", "host", "web_port", "use_https", "owif_user",
+    "name", "enabled", "user_id", "host", "web_port", "use_https",
+    "owif_auth", "owif_user",
     "owif_pass", "transport", "ftp_port", "ssh_port", "login", "password",
     "bouquet_prefix", "player_live", "player_vod", "player_series",
     "container_mode", "container_live", "container_vod", "container_series",
@@ -79,6 +81,8 @@ def _apply(p: Enigma2Profile, payload: dict) -> None:
             raise HTTPException(400, f"layout must be one of {e2.LAYOUTS}")
         if f == "delivery_mode" and val not in e2.DELIVERY_MODES:
             raise HTTPException(400, f"delivery must be one of {e2.DELIVERY_MODES}")
+        if f == "owif_auth" and val not in e2push.OWIF_AUTH:
+            raise HTTPException(400, f"OpenWebif auth must be one of {e2push.OWIF_AUTH}")
         if f == "transport" and val not in e2.TRANSPORTS:
             raise HTTPException(400, f"transport must be one of {e2.TRANSPORTS}")
         setattr(p, f, val)
@@ -106,6 +110,8 @@ async def meta(db=Depends(get_db)):
         "layouts": list(e2.LAYOUTS),
         "delivery_modes": list(e2.DELIVERY_MODES),
         "transports": list(e2.TRANSPORTS),
+        "owif_auth": list(e2push.OWIF_AUTH),
+        "reload_mode": e2push.RELOAD_MODE,
         "users": [{"id": u.id, "name": u.name, "enabled": u.enabled} for u in users],
     }
 
@@ -202,6 +208,54 @@ async def download(pid: int, request: Request, db=Depends(get_db)):
     data = e2.tarball_bytes(bundle, p.bouquet_prefix)
     return Response(data, media_type="application/gzip", headers={
         "Content-Disposition": f'attachment; filename="{e2.slugify(p.name)}-bouquets.tar.gz"'})
+
+
+# ------------------------------------------------------------------ push (E3)
+async def _finish_push(p: Enigma2Profile, rep, db, what: str) -> dict:
+    """Store the outcome on the profile so the GUI shows it after a reload."""
+    if not rep.dry_run:
+        p.last_push_at = datetime.now(timezone.utc)
+        p.last_push_result = rep.text() or ("ok" if rep.ok else rep.error)
+        await db.commit()
+    await db_log("INFO" if rep.ok else "ERROR", "enigma2",
+                 f"profile '{p.name}': {what} "
+                 f"{'ok' if rep.ok else 'failed - ' + (rep.error or 'see log')}")
+    return rep.as_dict() | {"item": _row(p)}
+
+
+@router.post("/profiles/{pid}/test")
+async def test_receiver(pid: int, db=Depends(get_db)):
+    """Log in over FTP and ping OpenWebif; writes nothing on the box."""
+    p = await db.get(Enigma2Profile, pid)
+    if not p:
+        raise HTTPException(404, "profile not found")
+    rep = await e2push.test_connection(p)
+    return rep.as_dict()
+
+
+@router.post("/profiles/{pid}/push")
+async def push(pid: int, request: Request, dry_run: bool = False, db=Depends(get_db)):
+    """Render, then upload to the receiver and reload its service list.
+
+    `dry_run=1` connects and reports exactly what would happen without writing
+    a single byte - the recommended first click for a new receiver.
+    """
+    p, bundle, base = await _bundle(pid, request, db)
+    if base.split("//")[-1].split(":")[0] in ("localhost", "127.0.0.1"):
+        raise HTTPException(409, f"the URLs would point at {base}, which the receiver "
+                                 "cannot reach - set the public base URL in Settings first")
+    rep = await e2push.push_bundle(p, bundle, dry_run=dry_run)
+    return await _finish_push(p, rep, db, "dry-run push" if dry_run else "push")
+
+
+@router.post("/profiles/{pid}/restore")
+async def restore(pid: int, db=Depends(get_db)):
+    """Put the receiver's backed-up bouquets.tv back and drop our bouquets."""
+    p = await db.get(Enigma2Profile, pid)
+    if not p:
+        raise HTTPException(404, "profile not found")
+    rep = await e2push.restore(p)
+    return await _finish_push(p, rep, db, "restore")
 
 
 # ------------------------------------------------------------------ public
