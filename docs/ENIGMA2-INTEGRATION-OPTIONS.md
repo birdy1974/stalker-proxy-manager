@@ -301,13 +301,15 @@ we build E2–E5.
 
 ## 8. Concrete build plan for E1 – E3
 
-**E1 — pipeline (no Enigma2 code)**
+**E1 — pipeline (no Enigma2 code)** — ✅ **implemented** (see the commit that added `tests/test_mkv_output.py`)
 * `app/services/ffmpeg_templates.py`: `output_format` gains `matroska`; `SUB_MODES` gains `keep` (map `0:s?`, `-c:s copy`, only legal with `matroska`); MKV output writes `-f matroska pipe:1` and drops the mpegts-only flags.
 * `app/services/ffmpeg_validate.py`: accept `keep`+matroska, reject `keep`+mpegts/hls with a clear message, keep the existing "text subs in TS" guard.
 * `app/services/stream_manager.py`: the spawn-time probe gate must not degrade `keep` to `-sn` for text tracks (that gate exists for the `dvb` mode only).
 * `app/routers/output.py`: `/play/{kind}/{id}.mkv` (and `?container=mkv`) serving `video/x-matroska`; Xtream-style `/movie/{u}/{p}/{id}.mkv`, `/series/{u}/{p}/{id}.mkv`.
 * New built-in templates: *Enigma2 VOD — remux + subtitles (MKV)* (S2), *Enigma2 VOD — VAAPI 1080p H.264 + AC3 + subtitles (MKV)* (S3), *Vu+ Duo2 (H.264 High@4.0 1080p / AC3)*.
-* Tests: extend `tests/test_subtitle_modes.py`, `test_ffmpeg_templates.py`, `test_ffmpeg_validate.py`; new `test_mkv_output.py`.
+* Tests: extend `tests/test_subtitle_modes.py`; new `tests/test_mkv_output.py` (renderer, 2-way-sync fixed point, presets, spawn gate, HTTP routes).
+* Delivered as: `output_format="matroska"` (+ `-live 1` for the pipe), `subs="keep"` (`-map 0:s? -c:s copy`), `option_warnings()` surfaced by `POST /api/ffmpeg/build` and shown in the editor, `.mkv` aliases for `/play/{live,vod,episode}` and the Xtream-style `/movie|/series` URLs, and the three built-in presets (`E2_VOD_REMUX_PRESET_NAME`, `E2_VOD_TRANSCODE_PRESET_NAME`, `E2_DUO2_LIVE_PRESET_NAME`).
+* Not verified in CI: no ffmpeg binary in the build sandbox, so the rendered commands are asserted as text. Run *Demo (test video)* in the FFmpeg tab on the NAS once to see real Matroska bytes.
 
 **E2 — bouquets**
 * `app/models.py`: `Enigma2Profile` (fields in §4.1) + a light `Enigma2PushLog`, created by the existing bootstrap/migration path in `database.py`.

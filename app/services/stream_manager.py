@@ -66,6 +66,13 @@ _NET_SCHEMES = ("http://", "https://")
 # hardware-only transcoding there is deliberately nothing text subs can do
 # here: they are dropped (safely, by the gate - never by an ffmpeg abort).
 _BITMAP_SUB_CODECS = {"dvb_subtitle", "dvd_subtitle", "hdmv_pgs_subtitle", "xsub"}
+# The other half of the story: a MATROSKA output (subs="keep", the Enigma2 VOD
+# path) carries text subtitles too, so nothing has to be dropped there - the
+# tracks are copied byte for byte beside a video pipeline that stays fully
+# hardware. Only these few codecs have no place in a Matroska file and would
+# abort the muxer, so the gate maps around them.
+_MKV_UNSUPPORTED_SUB_CODECS = {"dvb_teletext", "eia_608", "eia_708", "cea_608",
+                               "arib_caption", "hdmv_text_subtitle"}
 
 
 class _WithTemplate:
@@ -551,6 +558,33 @@ class StreamManager:
         if not mapped:
             return args
 
+        # ---- keep: MATROSKA output, every subtitle track copied ------------
+        # Nothing to degrade here - mkv holds SRT/ASS/PGS/DVB alike - except
+        # the handful of codecs the muxer refuses (teletext & closed captions).
+        # `-map 0:s?` is optional, so a source without subtitles is fine and a
+        # failed probe changes nothing: it is only used to route AROUND a
+        # codec that would abort the muxer.
+        if StreamManager._outputs_matroska(args):
+            if not pace:                   # live: trusted, no probe (zap speed)
+                return args
+            subs = await subtitle_streams(url, is_url=is_net)
+            if not subs:                   # None (probe failed) or [] (no subs)
+                return args
+            bad = [s["codec"] for s in subs if s["codec"] in _MKV_UNSUPPORTED_SUB_CODECS]
+            if not bad:
+                return args
+            idxs = [n for n, s in enumerate(subs)
+                    if s["codec"] not in _MKV_UNSUPPORTED_SUB_CODECS][:16]
+            if not idxs:
+                await db_log("INFO", "stream", tag +
+                             "no Matroska-compatible subtitle track ("
+                             + ", ".join(bad) + ") -> subtitles dropped")
+                return StreamManager._ensure_sn(StreamManager._strip_subs(args))
+            await db_log("INFO", "stream", tag +
+                         "subtitles copied to Matroska, skipping "
+                         + ", ".join(bad))
+            return StreamManager._remap_subs(args, idxs, "copy")
+
         # ---- dvb / copy: keep BITMAP subtitles as a track in the output TS --
         if not pace:                       # live: opt-in trusted, no probe
             return args
@@ -577,6 +611,21 @@ class StreamManager:
                          "dvbsub")
         all_dvb = all(s["codec"] == "dvb_subtitle" for s in subs)
         tok = codec_tok if (codec_tok == "copy" and all_dvb) else "dvbsub"
+        return StreamManager._remap_subs(args, idxs, tok)
+
+    @staticmethod
+    def _outputs_matroska(args: list[str]) -> bool:
+        """True when the OUTPUT muxer is Matroska (`-f matroska` / `-f mkv`)."""
+        for i, t in enumerate(args):
+            if t == "-f" and i + 1 < len(args) and args[i + 1] in ("matroska", "mkv"):
+                return True
+        return False
+
+    @staticmethod
+    def _remap_subs(args: list[str], idxs: list[int], codec: str) -> list[str]:
+        """Replace whatever subtitle mapping argv carries with explicit maps for
+        `idxs` (ordinals AMONG the subtitle streams, which is what `0:s:N`
+        addresses) plus one `-c:s codec`."""
         out = StreamManager._strip_subs(args)
         try:
             last_map = max(i for i, t in enumerate(out) if t == "-map")
@@ -586,7 +635,7 @@ class StreamManager:
         ins: list[str] = []
         for idx in idxs:
             ins += ["-map", f"0:s:{idx}"]
-        ins += ["-c:s", tok]
+        ins += ["-c:s", codec]
         out[at:at] = ins
         return out
 

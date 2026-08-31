@@ -12,7 +12,8 @@ from ..database import get_db
 from ..models import FFmpegTemplate
 from ..security import require_admin
 from ..services.ffmpeg_templates import (FFmpegOptions, REDIRECT_COMMAND,
-                                     build_command, coerce_options, parse_command)
+                                     build_command, coerce_options,
+                                     option_warnings, parse_command)
 from ..services.ffmpeg_validate import TEST_VIDEO_URL, run_demo, syntax_check
 
 router = APIRouter(prefix="/api/ffmpeg", tags=["ffmpeg"], dependencies=[Depends(require_admin)])
@@ -80,7 +81,8 @@ async def delete_template(tid: int, db=Depends(get_db)):
 @router.post("/build")
 async def build(payload: dict):
     """fields -> command (2-way sync, left side of the editor)."""
-    return {"command": build_command(FFmpegOptions(**coerce_options(payload)))}
+    opts = FFmpegOptions(**coerce_options(payload))
+    return {"command": build_command(opts), "warnings": option_warnings(opts)}
 
 
 @router.post("/parse")

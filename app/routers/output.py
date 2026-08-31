@@ -5,6 +5,9 @@ Public output endpoints (NO admin auth - they carry user credentials instead):
   /player_api.php                 Xtream Codes API subset
   /xmltv.php, /epg.xml            EPG output (merged sources land in Phase 3)
   /play/{kind}/{id}.ts?u=&p=      the actual proxied/transcoded streams
+  /play/{kind}/{id}.mkv?u=&p=     same stream, announced as Matroska (the
+                                  subtitle-capable container: Enigma2 +
+                                  exteplayer3, VLC, Kodi)
   /live/{u}/{p}/{id}.ts           Xtream-style URLs
   /movie/{u}/{p}/{id}.ts          Xtream-style VOD
   /series/{u}/{p}/{episode}.ts    Xtream-style series episodes
@@ -177,8 +180,16 @@ async def _wants_redirect(kind: str, ref_id: int, mode: str) -> bool:
     return await MANAGER.uses_redirect(kind, ref_id)
 
 
+# Container announced to the client. The real container is whatever the item's
+# ffmpeg template muxes (`output_format`); the URL extension only decides the
+# Content-Type - and set-top boxes DO sniff the extension, which is why the
+# Enigma2 VOD/series bouquets point at `.mkv` while live keeps `.ts`.
+MEDIA_TYPES = {"ts": "video/mp2t", "mkv": "video/x-matroska"}
+
+
 async def _stream_response(kind: str, ref_id: int, user: User | None, label: str,
-                            request: Request, mode: str = ""):
+                            request: Request, mode: str = "",
+                            media_type: str = "video/mp2t"):
     """
     Serve a stream: either proxied through ffmpeg (default) or redirected
     straight to the resolved portal URL.
@@ -213,7 +224,7 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     # a strong reference, so the task cannot be garbage-collected mid-flight.
     MANAGER.watch(request, handle)
     body = await _guarded(gen, label, handle.item_name)
-    return StreamingResponse(body, media_type="video/mp2t",
+    return StreamingResponse(body, media_type=media_type,
                              headers=STREAM_HEADERS | {"X-SPM-Stream": handle.id})
 
 
@@ -233,6 +244,32 @@ async def play_vod(request: Request, pid: int, u: str = "", p: str = "", mode: s
 async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
     user = await _authed(u, p, "m3u")
     return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode)
+
+
+# ---- Matroska aliases ------------------------------------------------------
+# Same items, same templates, same fallback chain - only the announced
+# container differs. Point these at an item whose template muxes `matroska`
+# (the two built-in "Enigma2 VOD" presets) and the copied SRT/ASS/PGS tracks
+# arrive intact: MPEG-TS has no slot for text subtitles, Matroska has.
+@router.api_route("/play/live/{pid}.mkv", methods=["GET", "HEAD"])
+async def play_live_mkv(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
+    user = await _authed(u, p, "m3u")
+    return await _stream_response("live", pid, user, f"live #{pid}", request, mode,
+                                  MEDIA_TYPES["mkv"])
+
+
+@router.get("/play/vod/{pid}.mkv")
+async def play_vod_mkv(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
+    user = await _authed(u, p, "m3u")
+    return await _stream_response("vod", pid, user, f"vod #{pid}", request, mode,
+                                  MEDIA_TYPES["mkv"])
+
+
+@router.get("/play/episode/{eid}.mkv")
+async def play_episode_mkv(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
+    user = await _authed(u, p, "m3u")
+    return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode,
+                                  MEDIA_TYPES["mkv"])
 
 
 @router.api_route("/play/local/{pid}.{ext}", methods=["GET", "HEAD"])
@@ -285,6 +322,16 @@ async def xmovie(request: Request, sid: int, u: str, p: str, mode: str = ""):
 @router.get("/series/{u}/{p}/{sid}.ts")
 async def xseries(request: Request, sid: int, u: str, p: str, mode: str = ""):
     return await play_episode(request, sid, u, p, mode)
+
+
+@router.get("/movie/{u}/{p}/{sid}.mkv")
+async def xmovie_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_vod_mkv(request, sid, u, p, mode)
+
+
+@router.get("/series/{u}/{p}/{sid}.mkv")
+async def xseries_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""):
+    return await play_episode_mkv(request, sid, u, p, mode)
 
 
 # -------------------------------------------------- admin quick-play (GUI)

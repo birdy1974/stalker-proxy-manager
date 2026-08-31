@@ -114,21 +114,27 @@ def test_coerce_normalises_subs():
     assert coerce_options({"subs": None}) == {}
 
 
-def test_every_builtin_preset_ships_dvb():
-    """The shipped hardware templates keep the ORIGINAL bitmap subtitle track;
-    only the redirect marker is exempt."""
+def test_every_builtin_preset_keeps_subtitles():
+    """Every shipped template keeps the source's subtitles - as DVB bitmap in
+    an MPEG-TS pipe, as an untouched copy of ALL tracks in a Matroska one.
+    Only the redirect marker is exempt."""
     for p in default_presets():
         if p["name"] == REDIRECT_PRESET_NAME:
             assert p["command"] == "@redirect"
             continue
-        assert p["subs"] == "dvb", p["name"]
         cmd = p["command"]
+        assert p["subs"] in ("dvb", "keep"), p["name"]
         assert "-map 0:s?" in cmd, p["name"]
-        expected = "-c:s copy" if p["name"] == COPY_PRESET_NAME else "-c:s dvbsub"
-        assert expected in cmd, p["name"]
         assert "-sn" not in cmd, p["name"]
+        if p["subs"] == "keep":
+            assert p["output_format"] == "matroska", p["name"]
+            assert "-c:s copy" in cmd and "-f matroska" in cmd, p["name"]
+        else:
+            assert p["output_format"] == "mpegts", p["name"]
+            expected = "-c:s copy" if p["name"] == COPY_PRESET_NAME else "-c:s dvbsub"
+            assert expected in cmd, p["name"]
         parsed = parse_command(cmd)["options"]
-        assert parsed["subs"] == "dvb", p["name"]
+        assert parsed["subs"] == p["subs"], p["name"]
         assert build_command(FFmpegOptions(**parsed)) == cmd, p["name"]
 
 
