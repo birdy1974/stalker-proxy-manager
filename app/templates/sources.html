@@ -233,7 +233,12 @@ async function seriesDetail(row) {
   }).catch(() => {
     body.querySelector(".probe-box").innerHTML = '<span class="text-danger small">probe failed</span>';
   }); }
-  footer.append(mBtn("Close", "btn-outline-secondary", m.close));
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close),
+    mBtn("Refetch seasons", "btn-outline-primary", async () => {
+      await api("/api/sources/series/refetch", { method: "POST", body: { ids: [item.id] } });
+      toast("seasons/episodes reset — fetching again in the background", "ok");
+      m.close();
+    }, "bi-arrow-repeat"));
 }
 
 /* ----------------------------- local tab ----------------------------- */

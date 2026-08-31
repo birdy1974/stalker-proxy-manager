@@ -45,9 +45,17 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None) -> 
         if mac:
             flags = getattr(src, "link_flags", None) if src is not None else None
             force = bool(getattr(mac, "force_ch_link_check", False))
+            # Classic-Stalker episode: cmd addresses the SEASON; only create_link
+            # with `series=<n>` yields this episode's URL, so direct play is out.
+            series = None
+            if src is not None and bool(getattr(src, "series_param", False)):
+                ep_num = getattr(src, "episode_number", None)
+                if ep_num is not None:
+                    series = int(ep_num)
             stored = cmd_to_url(cmd) or ""
             policy = link_policy(url=stored, link_flags=flags, force_ch_link_check=force,
-                                 allow_direct=bool(getattr(portal, "direct_links", True)))
+                                 allow_direct=bool(getattr(portal, "direct_links", True))
+                                 and series is None)
             if policy.direct:
                 return apply_mac_placeholder(stored, mac.mac)
             # Pooled: do NOT handshake here. create_link() authenticates lazily
@@ -57,7 +65,7 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None) -> 
                                                              portal_url=portal.resolved_url))
             try:
                 return await client.create_link(cmd, kind, link_flags=flags,
-                                                force_ch_link_check=force)
+                                                force_ch_link_check=force, series=series)
             except Exception:  # noqa: BLE001 - fall through to raw cmd
                 pass
             finally:

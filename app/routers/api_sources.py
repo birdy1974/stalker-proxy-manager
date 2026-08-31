@@ -263,6 +263,49 @@ async def toggle_seasons(payload: dict, db=Depends(get_db)):
     return {"ok": True, "count": len(rows)}
 
 
+@router.post("/series/refetch")
+async def refetch_series(payload: dict, db=Depends(get_db)):
+    """Throw away a series' fetched seasons/episodes state and fetch again.
+
+    The season fetch only visits rows with `seasons_fetched=False` and skips
+    seasons with `episodes_fetched=True`, so data stored by an older (buggy)
+    parser - e.g. the season containers that were once stored as a single
+    phantom "E02" per season - would never be repaired without this reset.
+    Season rows themselves are KEPT (their enabled flags and the playlist
+    links pointing at them survive); only the episode rows are dropped and
+    rebuilt by the queued fetch job.
+    """
+    from collections import defaultdict
+    from sqlalchemy import delete
+    from ..services.fetch_jobs import submit as submit_fetch
+
+    ids = [int(i) for i in payload.get("ids", [])]
+    rows = (await db.execute(select(SerieSource).where(SerieSource.id.in_(ids)))).scalars().all()
+    if not rows:
+        raise HTTPException(404, "no matching series")
+    season_ids = [sid for (sid,) in (await db.execute(
+        select(SerieSeason.id).where(SerieSeason.serie_source_id.in_([r.id for r in rows])))).all()]
+    if season_ids:
+        await db.execute(delete(SerieEpisode).where(
+            SerieEpisode.serie_season_id.in_(season_ids)))
+        for sn in (await db.execute(select(SerieSeason).where(
+                SerieSeason.id.in_(season_ids)))).scalars().all():
+            sn.episodes_fetched = False
+    by_portal: dict[int, list[int]] = defaultdict(list)
+    for r in rows:
+        r.seasons_fetched = False
+        by_portal[r.portal_id].append(r.id)
+    await db.commit()
+    jobs = []
+    for pid, sids in by_portal.items():
+        job = await submit_fetch("fetch_seasons", pid, series_ids=sids)
+        jobs.append(job.public())
+    await db_log("INFO", "sources",
+                 f"series: refetch queued for {len(rows)} title(s) "
+                 f"({len(season_ids)} season(s) reset)")
+    return {"ok": True, "count": len(rows), "season_jobs": jobs}
+
+
 # ------------------------------------------------------------------ local
 @router.get("/local/dirs")
 async def local_dirs(db=Depends(get_db), q: str = "", page: int = 1, per_page: int = 25,

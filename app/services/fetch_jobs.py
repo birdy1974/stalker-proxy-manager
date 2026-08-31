@@ -33,7 +33,7 @@ from ..portal.account import mac_is_usable, mac_status
 from ..portal.capabilities import gate_feature, loads_modules
 from ..portal.links import parse_link_flags
 from ..portal.pool import POOL, PortalSession
-from ..portal.client import PortalError, StalkerClient
+from ..portal.client import PortalError, StalkerClient, truthy
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
 from .titles import portal_item_title
@@ -512,7 +512,10 @@ def _episode_number(item: dict) -> int | None:
     """Episode number from `series` pair [season, episode], `episode_number`, or name 'S01E05'.
     
     Validation order:
-    1. `series` list [season, episode] - most reliable (explicit structure)
+    1. `series` pair [season, episode] - ONLY when it is exactly two values
+       (on classic panels `series` is the season's whole episode-number list
+       [1, 2, ..., N]; reading element [1] of that list is how every season
+       collapsed into a single phantom "E02")
     2. `episode_number` - specifically named for episodes
     3. `series_number` - ambiguous (could be season), validate against season number
     4. `episode_id`, `episode` - portal IDs, may not be sequential
@@ -522,7 +525,7 @@ def _episode_number(item: dict) -> int | None:
     portals `series_number` actually contains the season number, not the episode number.
     """
     meta = item.get("series") or []
-    if isinstance(meta, (list, tuple)) and len(meta) > 1:
+    if isinstance(meta, (list, tuple)) and len(meta) == 2:
         try:
             return int(meta[1])
         except (TypeError, ValueError):
@@ -568,7 +571,7 @@ def _episode_number(item: dict) -> int | None:
 def _episode_season(item: dict) -> int | None:
     """Season number carried by an episode row."""
     meta = item.get("series") or []
-    if isinstance(meta, (list, tuple)) and len(meta) > 1:
+    if isinstance(meta, (list, tuple)) and len(meta) == 2:
         try:
             return int(meta[0])
         except (TypeError, ValueError):
@@ -586,6 +589,69 @@ def _episode_season(item: dict) -> int | None:
         except ValueError:
             pass
     return None
+
+
+def _season_container_episodes(item: dict) -> list[int]:
+    """Episode numbers of a classic-Stalker SEASON CONTAINER, else [].
+
+    On classic Stalker/Ministra panels `get_ordered_list&movie_id=<series>`
+    returns season objects whose `series` field is the list of the season's
+    episode NUMBERS ([1, 2, ..., N]) and whose single `cmd` addresses the whole
+    season - there are no per-episode objects at all (IPTVnator models this as
+    `StalkerSeason.series: string[]` and expands it in mapRegularSeriesEpisodes).
+
+    Returns [] for anything that explicitly IS an episode (`is_episode`,
+    `series_number`, `episode_number`), for the two-value [season, episode]
+    pair shape (unless it reads like the start of an enumeration), and for
+    lists that are not an ascending enumeration of positive numbers.
+    """
+    if not isinstance(item, dict):
+        return []
+    if truthy(item.get("is_episode")) or item.get("series_number") is not None \
+            or item.get("episode_number") is not None:
+        return []                       # explicitly an episode object
+    raw = item.get("series")
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return []
+    out: list[int] = []
+    for v in raw:
+        s = str(v).strip()
+        if not s.isdigit():
+            return []
+        n = int(s)
+        if n <= 0:
+            return []
+        out.append(n)
+    if out != sorted(set(out)):         # an enumeration is strictly ascending
+        return []
+    if len(out) == 2 and out[0] != 1:   # ambiguous [season, episode] pair like [3, 7]
+        return []
+    return out
+
+
+def _write_container_episodes(s2, row, existing_eps: dict, sitem: dict,
+                              nums: list[int]) -> None:
+    """Expand ONE classic season container into SerieEpisode rows.
+
+    Every episode shares the season's cmd; what tells them apart at playback is
+    the `series=<episode_number>` create_link parameter, recorded here via
+    SerieEpisode.series_param (see LinkPlan/plan_for and client.create_link).
+    """
+    spid = str(sitem.get("id", ""))[:60]
+    scmd = sitem.get("cmd")
+    sflags = parse_link_flags(sitem)
+    for en in nums:
+        erow = existing_eps.setdefault(row.id, {}).get(en)
+        if erow is None:
+            erow = SerieEpisode(serie_season_id=row.id, episode_number=en)
+            s2.add(erow)
+            existing_eps[row.id][en] = erow
+        erow.portal_item_id = spid
+        erow.name = f"Episode {en}"
+        erow.cmd = scmd
+        erow.duration = None
+        erow.link_flags = sflags
+        erow.series_param = True
 
 
 def extract_seasons_from_meta(raw: Any) -> list[tuple[int, str, str]]:
@@ -894,6 +960,7 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
                 job.detail = f"series {done_series}/{total_series}: {sname}"
                 try:
                     wanted: list[tuple[int, str, str]] = []
+                    season_items: dict[int, dict] = {}   # raw portal season objects
                     # 1. Try querying the portal seasons API (Option 3 with strict validation)
                     try:
                         seasons = await client.series_seasons(pid)
@@ -901,6 +968,7 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
                             snum = _season_number(sitem)
                             wanted.append((snum, str(sitem.get("season_id") or sitem.get("id") or snum),
                                            (sitem.get("name") or f"Season {snum}")[:300]))
+                            season_items[snum] = sitem
                     except PortalError:
                         pass
 
@@ -913,17 +981,37 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
                     if not wanted:
                         wanted = [(1, "1", "Season 1")]
 
+                    # --- classic Stalker flavor (IPTVnator's "regular series"):
+                    # the season object ITSELF carries `series=[1..N]`, the list
+                    # of its episode numbers, and one cmd for the whole season.
+                    # There are no per-episode objects to fetch - the panel
+                    # selects the episode at create_link time via `series=<n>`.
+                    # Expand the list instead of asking the portal for episodes
+                    # it cannot enumerate (mapRegularSeriesEpisodes in IPTVnator).
+                    classic: dict[int, tuple[dict, list[int]]] = {}
+                    for snum, sitem in season_items.items():
+                        nums = _season_container_episodes(sitem)
+                        if nums and sitem.get("cmd"):
+                            classic[snum] = (sitem, nums)
+
                     # --- complete episode list in ONE request when supported
                     bulk: dict[int, list[dict]] = {}
-                    if whole_episode_list and len(wanted) > 1:
+                    to_ask = [w for w in wanted if w[0] not in classic]
+                    if whole_episode_list and len(to_ask) > 1:
                         try:
                             for e in await client.series_episodes(pid, None):
+                                nums = _season_container_episodes(e)
+                                if nums and e.get("cmd"):
+                                    # a classic panel answers the "all episodes"
+                                    # question with its season containers
+                                    classic.setdefault(_season_number(e), (e, nums))
+                                    continue
                                 sn = _episode_season(e)
                                 if sn is not None:
                                     bulk.setdefault(sn, []).append(e)
                         except PortalError:
                             pass
-                        if len(bulk) < 2:
+                        if not classic and len(bulk) < 2:
                             # not a real "all episodes" answer (single season,
                             # or the panel returned seasons again) -> per season
                             bulk = {}
@@ -952,11 +1040,36 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
                     for snum, (row, pseason) in rows.items():
                         if row.episodes_fetched:
                             continue
+                        if snum in classic:
+                            _write_container_episodes(s2, row, existing_eps, *classic[snum])
+                            row.episodes_fetched = True
+                            continue
                         eps = bulk.get(snum)
                         if eps is None:
                             eps = await client.series_episodes(pid, pseason)
+                        # A classic panel ignores the season_id parameter and
+                        # answers with its season list AGAIN. Storing those rows
+                        # as episodes is the old "every season is one E02" bug:
+                        # each container's series=[1,2,...] read as [season,
+                        # episode] made episode_number always 2. Find OUR
+                        # season's container and expand it instead.
+                        conts = [(e, _season_container_episodes(e)) for e in eps]
+                        if eps and all(nums for _e2, nums in conts):
+                            match = next(
+                                ((e2, nums) for e2, nums in conts
+                                 if str(e2.get("season_id") or "") == str(pseason)
+                                 or str(e2.get("id") or "") == str(pseason)
+                                 or _season_number(e2) == snum),
+                                None)
+                            if match is not None and match[0].get("cmd"):
+                                _write_container_episodes(s2, row, existing_eps, *match)
+                                row.episodes_fetched = True
+                                continue
+                            eps = []     # a season dump without our season: store nothing
                         cursor = max(existing_eps.get(row.id, {}), default=0)
                         for e in eps:
+                            if _season_container_episodes(e):
+                                continue                     # stray container in a mixed answer
                             en = _episode_number(e)
                             if en is None:                   # fall back to running order
                                 cursor += 1
@@ -971,6 +1084,7 @@ async def _fetch_seasons_episodes(job: Job, client: StalkerClient, portal_id: in
                             erow.cmd = e.get("cmd")
                             erow.duration = str(e.get("time", "") or "")[:20] or None
                             erow.link_flags = parse_link_flags(e)
+                            erow.series_param = False
                         row.episodes_fetched = True
 
                     srow = await s2.get(SerieSource, sid)
