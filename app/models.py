@@ -283,6 +283,12 @@ class SerieEpisode(Base):
     cmd: Mapped[str | None] = mapped_column(Text)                          # set on real portals, empty on pure series-rows
     duration: Mapped[str | None] = mapped_column(String(20))
     link_flags: Mapped[str | None] = mapped_column(String(60))    # see LiveSource.link_flags
+    # Classic-Stalker episode (IPTVnator's "regular series"): `cmd` addresses the
+    # whole SEASON container and the panel selects the episode server-side via
+    # the `series=<episode_number>` create_link parameter. Without sending that
+    # parameter the panel answers with the container (or nothing) - the episode
+    # "does not play".
+    series_param: Mapped[bool] = mapped_column(Boolean, default=False)
 
     season: Mapped[SerieSeason] = relationship(back_populates="episodes")
 

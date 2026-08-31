@@ -337,7 +337,13 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
                      "xtream_url": ("VARCHAR(600)", "NULL")},
     "vod_sources": {"link_flags": ("VARCHAR(60)", "NULL"),
                     "xtream_url": ("VARCHAR(600)", "NULL")},
-    "serie_episodes": {"link_flags": ("VARCHAR(60)", "NULL")},
+    "serie_episodes": {
+        "link_flags": ("VARCHAR(60)", "NULL"),
+        # R-series fix: classic panels select the episode via create_link's
+        # `series=` parameter; this flag marks rows whose cmd is the season
+        # container rather than a per-episode stream.
+        "series_param": ("BOOLEAN", "0"),
+    },
     "mac_addresses": {
         "last_error": ("VARCHAR(200)", "NULL"),
         "force_ch_link_check": ("BOOLEAN", "0"),
@@ -357,12 +363,14 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         "global_quality": ("VARCHAR(6)", "'26'"),
         "async_depth": ("VARCHAR(4)", "'4'"),
         "is_builtin": ("BOOLEAN", "0"),
+        # NOTE: keep every ffmpeg_templates column in THIS one dict entry - a
+        # second "ffmpeg_templates" key in a dict literal silently replaces the
+        # first, which is exactly how the subs column once knocked out the five
+        # migrations above on databases that predate them.
+        "subs": ("VARCHAR(6)", "'drop'"),
     },
     "local_files": {
         "duration_s": ("FLOAT", "NULL"),
-    },
-    "ffmpeg_templates": {
-        "subs": ("VARCHAR(6)", "'drop'"),
     },
     "serie_sources": {
         "raw_series": ("TEXT", "NULL"),

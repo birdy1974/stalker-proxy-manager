@@ -313,8 +313,19 @@ def _is_valid_season_item(item: dict, series_id: str) -> bool:
 
 
 def _is_valid_episode_item(item: dict, series_id: str) -> bool:
-    """True if item is an episode (not a generic movie dump from an ignored query)."""
+    """True if item is an episode (not a generic movie dump from an ignored query).
+
+    A classic-Stalker SEASON CONTAINER (a season object whose `series` field is
+    the list of its episode numbers) is deliberately still accepted here: the
+    fetch job recognizes and EXPANDS it into episodes (IPTVnator's
+    mapRegularSeriesEpisodes). What is rejected is an explicit season object of
+    the modern flavor (`is_season` set without `is_episode`) - those panels have
+    real per-episode objects, and storing their season rows as episodes is how
+    every season ended up as a single phantom "E02".
+    """
     if not isinstance(item, dict):
+        return False
+    if truthy(item.get("is_season")) and not truthy(item.get("is_episode")):
         return False
     if truthy(item.get("is_episode")):
         return True
@@ -1033,7 +1044,8 @@ class StalkerClient:
 
     # ---------------------------------------------------------------- links
     async def create_link(self, cmd: str, kind: str = "itv", *, link_flags: str | None = None,
-                          force_ch_link_check: bool = False) -> str:
+                          force_ch_link_check: bool = False,
+                          series: int | str | None = None) -> str:
         """
         Resolve a portal `cmd` to a playable stream URL.
 
@@ -1056,6 +1068,11 @@ class StalkerClient:
         some panels happily answer with a link we must then not use.
         """
         type_ = {"live": "itv", "itv": "itv", "vod": "vod", "series": "vod", "episode": "vod"}.get(kind, "itv")
+        if series is not None:
+            # Classic-Stalker episode: the panel selects the episode server-side
+            # by the `series` parameter of a type=vod create_link (the stored cmd
+            # addresses the whole season). Same request IPTVnator sends.
+            type_ = "vod"
         raw_cmd = str(cmd or "").strip()
         requested = extract_url(raw_cmd)
         out_cmd = sanitize_cmd(raw_cmd)
@@ -1064,7 +1081,8 @@ class StalkerClient:
         data = await self._get({
             "type": type_, "action": "create_link", "cmd": out_cmd, "JsHttpRequest": "1-xml",
             **link_request_params(link_flags=link_flags,
-                                  force_ch_link_check=force_ch_link_check),
+                                  force_ch_link_check=force_ch_link_check,
+                                  series=series),
         })
         js = data.get("js")
         raw = ""

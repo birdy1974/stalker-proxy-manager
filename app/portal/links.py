@@ -260,6 +260,10 @@ class LinkPlan:
     #: than being the portal's answer, so the stream path must not occupy a MAC
     #: slot and must not open a portal session at all
     adopted: bool = False
+    #: classic-Stalker episode selector: the row's cmd addresses the SEASON, and
+    #: the panel picks the episode server-side via `series=<n>` at create_link
+    #: time. None for everything that is not such an episode.
+    series: int | None = None
 
     @property
     def direct_url(self) -> str:
@@ -267,8 +271,11 @@ class LinkPlan:
         return apply_mac_placeholder(self.url, self.mac)
 
     def request_kwargs(self) -> dict:
-        return {"link_flags": self.link_flags,
-                "force_ch_link_check": self.force_ch_link_check}
+        out = {"link_flags": self.link_flags,
+               "force_ch_link_check": self.force_ch_link_check}
+        if self.series is not None:
+            out["series"] = self.series
+        return out
 
 
 def plan_for(src, mac_row, *, ffmpeg: bool = False,
@@ -278,10 +285,20 @@ def plan_for(src, mac_row, *, ffmpeg: bool = False,
     url = extract_url(cmd)
     link_flags = getattr(src, "link_flags", None)
     force = bool(getattr(mac_row, "force_ch_link_check", False))
+    # A classic-Stalker episode has no static answer AT ALL: its stored cmd
+    # addresses the season container, and only create_link with `series=<n>`
+    # yields the episode's own URL. Direct play of the stored cmd would play
+    # the container (usually episode 1) for every episode of the season.
+    series = None
+    if bool(getattr(src, "series_param", False)):
+        ep_num = getattr(src, "episode_number", None)
+        if ep_num is not None:
+            series = int(ep_num)
     policy = link_policy(url=url, link_flags=link_flags, force_ch_link_check=force,
-                         ffmpeg=ffmpeg, allow_direct=allow_direct)
+                         ffmpeg=ffmpeg, allow_direct=allow_direct and series is None)
     return LinkPlan(policy=policy, cmd=cmd, url=url, link_flags=link_flags,
-                    force_ch_link_check=force, mac=str(getattr(mac_row, "mac", "") or ""))
+                    force_ch_link_check=force, mac=str(getattr(mac_row, "mac", "") or ""),
+                    series=series)
 
 
 # ---------------------------------------------------------------------------
@@ -312,16 +329,27 @@ def plan_adopted(url: str, *, src=None, mac_row=None) -> LinkPlan:
 
 
 def link_request_params(*, link_flags: str | None, force_ch_link_check: bool,
-                        series: bool = False) -> dict:
+                        series: bool | int | str | None = False) -> dict:
     """The `create_link` query parameters the channel's own flags imply.
 
     Sending `disable_ad=false` for a channel whose panel wants an ad inserted is
     how a proxy ends up serving an unskippable advertisement inside a "clean"
     stream, and `force_ch_link_check=false` on a panel that set the flag
     contradicts the answer we already stored from `get_profile`.
+
+    `series` carries the classic-Stalker episode selector: on panels where a
+    season is ONE cmd with an episode-number list, `series=<n>` is how the panel
+    knows which episode to link (IPTVnator sends exactly this). A bare True/False
+    keeps the faithful-box default of "1"/"0".
     """
+    if series is None or series is False:
+        series_val = "0"
+    elif series is True:
+        series_val = "1"
+    else:
+        series_val = str(series)
     return {
-        "series": "1" if series else "0",
+        "series": series_val,
         "forced_storage": "false",
         "disable_ad": "true" if has_flag(link_flags, FLAG_DISABLE_AD) else "false",
         "download": "false",
