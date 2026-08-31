@@ -120,13 +120,14 @@ async def access_log(request: Request, call_next):
                           request.method, path, qs[:120], status, ms)
 
 # --------------------------------------------------------------- sub-routers
-from .routers import (api_ffmpeg, api_epg, api_misc, api_playlist, api_portals,  # noqa: E402
-                      api_sources, api_users, output, web)
+from .routers import (api_enigma2, api_ffmpeg, api_epg, api_misc, api_playlist,  # noqa: E402
+                      api_portals, api_sources, api_users, output, web)
 
 app.include_router(web.router)
 app.include_router(output.router)
 for r in (api_portals.router, api_sources.router, api_playlist.router,
-          api_ffmpeg.router, api_users.router, api_misc.router, api_epg.router):
+          api_ffmpeg.router, api_users.router, api_misc.router, api_epg.router,
+          api_enigma2.router, api_enigma2.public):
     app.include_router(r)
 
 if MOCK_PORTAL_ENABLED:

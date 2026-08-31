@@ -582,6 +582,86 @@ class ActiveStream(Base):
     bytes_sent: Mapped[int] = mapped_column(BigInteger, default=0)
 
 
+# ===========================================================================
+# ENIGMA2 OUTPUT
+# ===========================================================================
+class Enigma2Profile(Base):
+    """One Enigma2 receiver (a Vu+ / Dreambox running OpenPLi & friends).
+
+    The box plays URLs this proxy already serves; a profile only decides HOW
+    they are written into its bouquet files:
+
+      * which SPM user's credentials and group filters they carry,
+      * which PLAYER the box should use per content kind - the leading number
+        of an Enigma2 service reference: 1 (DVB pipeline), 4097 (servicemp3),
+        5001 (ServiceApp/gstplayer), 5002 (ServiceApp/exteplayer3),
+      * which CONTAINER the URL asks for (`ts` or `mkv`) - which is how VOD and
+        series get subtitles at all: MPEG-TS cannot carry text subtitles, so
+        those bouquets point at the `.mkv` aliases and are played by
+        exteplayer3 (5002). See docs/ENIGMA2-INTEGRATION-OPTIONS.md.
+
+    The files reach the box either by pull (the installer one-liner, which
+    carries `token`) or by push (E3: FTP as `login`/`password`, then an
+    OpenWebif reload using `owif_auth`/`owif_user`/`owif_pass`).
+    """
+
+    __tablename__ = "enigma2_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    # whose credentials/group filters the generated URLs carry
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"))
+    # opaque id for the public pull endpoints (/enigma2/{token}/...): the box
+    # fetches its own bouquets without an admin session
+    token: Mapped[str] = mapped_column(String(48), unique=True, index=True)
+
+    # ---- the receiver (OpenWebif + push transport; used from E3 on) --------
+    host: Mapped[str | None] = mapped_column(String(200))
+    web_port: Mapped[int] = mapped_column(Integer, default=80)
+    use_https: Mapped[bool] = mapped_column(Boolean, default=False)
+    # an out-of-the-box OpenPLi answers its API without credentials; a box
+    # whose web interface was locked down needs the browser's user/password
+    owif_auth: Mapped[str] = mapped_column(String(6), default="none")   # none|basic
+    owif_user: Mapped[str | None] = mapped_column(String(80))
+    owif_pass: Mapped[str | None] = mapped_column(String(120))
+    transport: Mapped[str] = mapped_column(String(10), default="download")  # download|ftp|ssh
+    ftp_port: Mapped[int] = mapped_column(Integer, default=21)
+    ssh_port: Mapped[int] = mapped_column(Integer, default=22)
+    login: Mapped[str | None] = mapped_column(String(80), default="root")
+    password: Mapped[str | None] = mapped_column(String(120))
+
+    # ---- what to write ------------------------------------------------------
+    bouquet_prefix: Mapped[str] = mapped_column(String(20), default="spm")
+    player_live: Mapped[str] = mapped_column(String(6), default="4097")
+    player_vod: Mapped[str] = mapped_column(String(6), default="5002")
+    player_series: Mapped[str] = mapped_column(String(6), default="5002")
+    # auto  = per item, from the ffmpeg template it is assigned (a redirect
+    #         item keeps the panel's own container, an MKV template gets .mkv);
+    # fixed = always the per-kind container/player below.
+    container_mode: Mapped[str] = mapped_column(String(6), default="auto")
+    container_live: Mapped[str] = mapped_column(String(4), default="ts")
+    container_vod: Mapped[str] = mapped_column(String(4), default="mkv")
+    container_series: Mapped[str] = mapped_column(String(4), default="mkv")
+    # template = whatever the item is assigned in the Playlist Builder;
+    # proxy/redirect append ?mode= and override it per URL.
+    delivery_mode: Mapped[str] = mapped_column(String(10), default="template")
+    include_live: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_vod: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_series: Mapped[bool] = mapped_column(Boolean, default=True)
+    include_local: Mapped[bool] = mapped_column(Boolean, default=False)
+    groups_json: Mapped[str | None] = mapped_column(Text)   # extra per-profile filter
+    layout: Mapped[str] = mapped_column(String(20), default="group_markers")
+    max_entries: Mapped[int] = mapped_column(Integer, default=1500)
+
+    # ---- status -------------------------------------------------------------
+    last_build_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    bouquet_count: Mapped[int] = mapped_column(Integer, default=0)
+    service_count: Mapped[int] = mapped_column(Integer, default=0)
+    last_push_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_push_result: Mapped[str | None] = mapped_column(Text)
+
+
 class Setting(Base):
     """Simple key/value store for everything persistent that isn't tabular (D17)."""
 

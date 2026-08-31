@@ -171,6 +171,9 @@ Shipped presets (stored as rows in the database and **re-seeded on every boot** 
 | Software 720p (libx264) | no-GPU fallback |
 | Copy / passthrough | remux only (`-c copy`); also the automatic fallback when no GPU device is mapped |
 | **Dreambox DM800se (Enigma2 / MPEG2-SD)** | downmix to an MPEG-2 transport stream the ancient Enigma2/openpli box can play (see below) |
+| **Enigma2 VOD - remux + subtitles (MKV)** | container swap only (`-c copy`) into **Matroska**, copying *every* subtitle track (SRT/ASS/PGS/DVB) — the way VOD & series get subtitles without any transcoding (see *Subtitles for VOD & series* below) |
+| **Enigma2 VOD - VAAPI 1080p H.264 + AC3 + subtitles (MKV)** | the 4K/HEVC rescue path: video re-encoded **on the GPU** to H.264 High@4.0 1080p with AC3 audio, subtitles copied through untouched |
+| **Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)** | live TV for a Vu+ Duo2: H.264 High@4.0 1080p + AC3 in MPEG-TS with DVB bitmap subtitles (service reference `1`/`4097`) |
 | **Redirect (bypass ffmpeg)** | not an ffmpeg command at all — the player is 302-redirected straight to the portal's CDN. **The default template**: any item without an explicit template assignment redirects (see below) |
 
 **Redirect (bypass ffmpeg) is the default.** The old global *proxy vs redirect* switch in Settings is gone: redirect is now a built-in template **and the default**. An item without an explicit template assignment is 302-redirected straight to the portal's CDN — instant start and zero CPU, but no transcode, no transport-stream rewriting and no mid-stream fallback. Assign any other template (inline *FFmpeg tpl* dropdown, the edit dialog, or bulk *Assign template…* in the Playlist Builder) to switch that channel back to ffmpeg proxying/transcoding. The `?mode=redirect` / `?mode=proxy` query parameter still works as a per-URL override.
@@ -201,14 +204,99 @@ ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed
 
 **Subtitles: bitmap tracks are kept as DVB (`subs=dvb`, hardware-safe) — text tracks are dropped.** The proxy's output is an MPEG-TS/HLS pipe, and that pipe can only carry **bitmap DVB subtitles**; the text formats found in VOD/local containers (SRT/ASS/SSA) die at the `dvbsub` re-encode (`Subtitle encoding currently only possible from text to text or bitmap to bitmap`) or at the mpegts muxer, and bitmap PGS/vobsub have no text converter. Any such track aborts ffmpeg **before the first output byte** — which is why, with the old unguarded `-map 0:s? -c:s dvbsub` mapping, *every movie file with a text subtitle track* looked like "ffmpeg templates don't work for VOD/local files" while live MPEG-TS (DVB subs or none) kept playing. The 23.976 fps vs 50 fps difference people notice in the same breath is only the fingerprint of that split: film content in files vs broadcast TV over UDP/TS — the frame rate itself transcodes fine either way.
 
-**Transcoding is hardware-only here, and the subtitle support is chosen to match.** The template editor's **Subtitles** field has exactly two values:
+**Transcoding is hardware-only here, and the subtitle support is chosen to match.** The template editor's **Subtitles** field has three values:
 
 | Mode | What it does | Guarantees |
 |---|---|---|
 | **Drop** (`-sn`) | no subtitle track in the output | the safe default; never interacts with the source |
+| **Copy all** (`subs=keep`, **Matroska output only**) | maps *every* subtitle track and copies it **byte for byte** into a Matroska (`.mkv`) output — text (SRT/ASS/SSA) *and* bitmap (PGS/DVD/DVB). This is the only way to deliver VOD/series subtitles from this proxy, because the container, not the pipeline, is what MPEG-TS lacks | **hardware-safe by construction**: `-c:s copy` is a byte copy, there is no subtitle *encoder* in the pipe at all, and the video path stays pure VAAPI/QSV. Asked for on an MPEG-TS/HLS output it degrades to *Keep as DVB* (and the editor says so) |
 | **Keep as DVB** (`subs=dvb`) | maps the source's subtitle track and re-encodes **bitmap** subs (PGS / DVD / DVB) into a **DVB subtitle track** in the output TS — players that decode DVB subs (VLC, Kodi, Enigma2, most MAG boxes) show them in their subtitle menu. A remux template (`-c copy`) carries already-DVB tracks through with `-c:s copy` | **hardware-safe by construction**: the subtitle track is demuxed and re-encoded *independently of the video*, so the VAAPI/QSV pipeline (`-hwaccel …` → `scale_vaapi/qsv` → hardware encode) never touches it — the only CPU work is a few kbit/s of palletised bitmap, which no GPU encoder does anyway |
 
-There is deliberately **no burn-in mode**: rendering text into the picture (libass `subtitles=` filter) requires CPU video frames, which would defeat hardware-only transcoding. A stored command that still contains a `subtitles=` filter has it stripped at spawn time, and the parser flags it (`subtitles= burn filter dropped: software-only`). Text subtitles therefore have exactly two supported routes: keep them in the *original file* (local items served with the Copy/Redirect templates play the untouched MKV/MP4, and the player loads them as usual), or pre-burn them into the file outside this proxy. Sources whose only tracks are text get their mapping **automatically degraded to `-sn` at spawn** — the spawn gate probes the file/link once (8 s cap; the 10-min cache is keyed without the per-play token, so a second play of the same movie skips the probe) and logs `no convertible (bitmap) subtitle track -> subtitles dropped` instead of letting ffmpeg die. Live plays are never probed (zapping stays instant; live TS carries DVB subs natively). Every shipped transcoding preset (VAAPI 720p/1080p, QSV, Copy, Dreambox) ships with `subs=dvb`; set the field back to *Drop* on any template if you prefer no subtitle track at all.
+There is deliberately **no burn-in mode**: rendering text into the picture (libass `subtitles=` filter) requires CPU video frames, which would defeat hardware-only transcoding. A stored command that still contains a `subtitles=` filter has it stripped at spawn time, and the parser flags it (`subtitles= burn filter dropped: software-only`). Text subtitles therefore have exactly two supported routes: keep them in the *original file* (local items served with the Copy/Redirect templates play the untouched MKV/MP4, and the player loads them as usual), or pre-burn them into the file outside this proxy. Sources whose only tracks are text get their mapping **automatically degraded to `-sn` at spawn** — the spawn gate probes the file/link once (8 s cap; the 10-min cache is keyed without the per-play token, so a second play of the same movie skips the probe) and logs `no convertible (bitmap) subtitle track -> subtitles dropped` instead of letting ffmpeg die. Live plays are never probed (zapping stays instant; live TS carries DVB subs natively). Every shipped MPEG-TS preset (VAAPI 720p/1080p, QSV, Copy, Dreambox, Vu+ Duo2 live) ships with `subs=dvb`, and the two Matroska presets ship with `subs=keep`; set the field back to *Drop* on any template if you prefer no subtitle track at all.
+
+### Subtitles for VOD & series: change the container, not the pipeline
+
+MPEG-TS has **no slot for text subtitles**, and ffmpeg cannot convert text to a bitmap track without *rendering* it into the picture — which needs CPU video frames and would throw away hardware-only transcoding. So the fix is not a smarter subtitle mode, it is a different **container**: set the template's **Output** to **Matroska / MKV** and its **Subtitles** field to **Copy all**, and every track the source carries is copied straight through:
+
+```text
+ffmpeg … -i <url> -map 0:v:0 -map 0:a:0? -map 0:s? -dn
+         -c:v copy -c:a copy -c:s copy -f matroska -live 1 pipe:1
+```
+
+* `-live 1` is what a pipe needs: the Matroska muxer must not try to seek back and patch cues/duration at the end (it cannot, on a pipe).
+* The same mode works **with** hardware transcoding: `-c:v h264_vaapi … -c:s copy` re-encodes the video on the GPU (4K/HEVC → H.264 1080p for a box that cannot decode it) while the subtitle tracks ride along untouched. That is the *Enigma2 VOD - VAAPI 1080p* preset.
+* At spawn time the gate probes the source only to route **around** the handful of codecs Matroska cannot hold (teletext, EIA-608/708); everything else is kept, and a source with no subtitles at all costs nothing (`-map 0:s?` is optional).
+
+Play those items through the **`.mkv` URL aliases**, which exist next to the `.ts` ones for every kind:
+
+```text
+/play/vod/{id}.mkv?u=…&p=…        /movie/{user}/{pass}/{id}.mkv
+/play/episode/{id}.mkv?u=…&p=…    /series/{user}/{pass}/{id}.mkv
+/play/live/{id}.mkv?u=…&p=…
+```
+
+The URL extension does not change the pipeline (the template's `output_format` does) — it sets the `Content-Type` (`video/x-matroska`), and set-top boxes do sniff it.
+
+**On an Enigma2 box (Vu+ / OpenPLi)** this is the difference between "no subtitles ever" and a working subtitle menu for VOD and series. Install ServiceApp + exteplayer3 on the box (`opkg install enigma2-plugin-systemplugins-serviceapp exteplayer3 ffmpeg`) and give those bouquet entries the service reference **`5002`** (exteplayer3) instead of `4097`; live TV keeps `4097` (or `1`) with the MPEG-TS/DVB-subtitle presets. Example bouquet line:
+
+```text
+#SERVICE 5002:0:1:0:0:0:0:0:0:0:http%3a//nas%3a8880/play/vod/42.mkv?u=box&p=secret:Some Movie
+#DESCRIPTION Some Movie
+```
+
+Note that a proxied stream is a live pipe: there is no HTTP Range, so **no seeking** inside a `.mkv` proxied play. When the source codec already fits the box, the *Redirect (bypass ffmpeg)* template is the better choice — the player gets the original file from the CDN with subtitles *and* seeking, at zero CPU. See `docs/ENIGMA2-INTEGRATION-OPTIONS.md` for the full picture (bouquet generation and pushing to the box are the next phases).
+
+### Enigma2 receivers: generated bouquets (the *Enigma2* tab)
+
+An Enigma2 box reads plain-text bouquet files, so SPM writes them. A **receiver profile** (Enigma2 tab) turns the playlist into `userbouquet.<prefix>_*.tv` files and decides, per content kind:
+
+| Setting | Meaning |
+|---|---|
+| **Player** | the leading number of the service reference: `1` (DVB pipeline — live TS, native DVB subtitles, lowest latency), `4097` (servicemp3/gstreamer, the generic default), `5001` (ServiceApp → gstplayer), **`5002`** (ServiceApp → exteplayer3 — text subtitles and multi-audio) |
+| **Container choice** | `auto` (default) resolves the URL alias **per item, from the ffmpeg template that item is assigned**; `fixed` uses the two *Container* dropdowns for everything |
+| **Container** | which URL alias the line points at in `fixed` mode: `ts` or `mkv`. It has to match the item's ffmpeg template — the preview warns when `mkv` is combined with a player that cannot show text subtitles |
+| **Delivery** | `template` (whatever each item is assigned in the Playlist Builder), or `proxy`/`redirect` appended as `?mode=` for this box only |
+| **Layout** | `group_markers` (one bouquet per group, marker lines per series and season — the default), `per_series` (one bouquet per show), `flat` (one per content kind). Bouquets are auto-split into numbered parts above *Max per bouquet* (default 1500) because Enigma2 redraws the whole list on every zap |
+| **Output user** | whose credentials and group whitelist the URLs carry; the profile can narrow the group filter further, never widen it |
+
+Defaults are the Vu+ Duo2 recipe: live = `4097` + `.ts`, VOD and series = **`5002` + `.mkv`** so the copied SRT/ASS tracks actually reach the box.
+
+**A real library mixes deliveries, so the bouquet does too.** Every playlist row carries its own ffmpeg template (falling back to the default one), and the template decides what actually comes out of the pipe — one movie is remuxed to Matroska, the next is a plain MPEG-TS transcode, and untouched rows usually sit on the *Redirect* preset, where SPM answers `302` and the box fetches the panel's file itself. Announcing all three as `.mkv` would be a lie the player notices. In `auto` mode each line is therefore resolved on its own:
+
+| The item's template | Line gets | Why |
+|---|---|---|
+| `@redirect` (bypass ffmpeg) | the profile's alias, player ≥ `4097` | the container is the panel's, not ours — the alias is cosmetic because the box follows the redirect and sniffs the body. Best case for VOD: original subtitles **and** seeking survive |
+| `output_format = matroska` | `.mkv` | the remux carries text subtitles |
+| anything else | `.ts` | MPEG-TS out of ffmpeg |
+
+Service type `1` hands the bytes straight to the DVB demuxer, which only understands raw TS: items that are MKV or direct are automatically raised to `4097` and the preview says so (use `5002` if you want their subtitles). The summary line counts the split — *114 services · 0 ts · 0 mkv · 114 direct* — so you can see at a glance which delivery your library is really on. Set *Container choice* to `fixed` for the old profile-wide behaviour.
+
+**Preview before anything leaves the server.** *Preview* renders the exact file contents (`#SERVICE` / `#DESCRIPTION` / marker lines) plus a summary — *13 bouquets · 114 services* — and flags the classic mistakes: URLs pointing at `localhost` (a receiver cannot reach that — set the public base URL in Settings), a `.mkv` container under player `4097`, or a deleted output user.
+
+**Pushing from SPM (transport `ftp`).** Set the receiver's host, keep the login on `root` (the bouquet directory is root-owned; a stock OpenPLi enables the root FTP account) and the tab gets four buttons:
+
+* **Test connection** — logs in, looks at `/etc/enigma2`, counts the bouquets a previous push left there and pings OpenWebif. Writes nothing.
+* **Dry run** — connects and reports exactly what *would* happen: how many files, which stale bouquets would go, whether `bouquets.tv` changes. Still writes nothing.
+* **Push now** — backs up, uploads, removes stale SPM bouquets, merges `bouquets.tv`, reloads the box.
+* **Restore backup** — puts `bouquets.tv.spm-backup` back and deletes the bouquets SPM installed, i.e. the box as it was before the last push.
+
+Three safety rules are built into the push, because a half-written `bouquets.tv` is a receiver that boots into an empty channel list:
+
+1. **Nothing is written in place.** Every file goes to a temporary name *in the same directory* and is then `RNFR`/`RNTO`'d over the target — a rename inside one directory is atomic, so enigma2 always reads either the old file or the new one. (Uploading to `/tmp` and renaming across would fail: `/tmp` is tmpfs, `/etc/enigma2` is flash, and `rename(2)` cannot cross filesystems.)
+2. **One restore point, always.** The box's `bouquets.tv` is copied to `bouquets.tv.spm-backup` before anything changes, every push, overwriting the previous one — the last known-good state, without a pile of dated files on a 512 MB flash.
+3. **Only our own files are deleted.** `userbouquet.<prefix>_*.tv` and nothing else; your satellite bouquets and favourites are merged back into `bouquets.tv` untouched, and a profile that renders *no* services refuses to push instead of clearing the box.
+
+Then SPM calls **`GET /api/servicelistreload?mode=2`** — bouquets only; modes 0/1 would also re-read `lamedb` and throw away the tuner's service cache for a change that never touched it. *Web interface auth* is per profile: `none` (a stock OpenPLi answers its API without credentials) or `basic` with the user/password you set on the box. A failed reload is a warning, not a failed push — the files are already there, and the box menu can reload them.
+
+**Getting the files onto the box the other way (pull).** Each profile has an opaque token and a one-liner to run on the receiver:
+
+```sh
+wget -qO- http://nas:8880/enigma2/<token>/install.sh | sh
+```
+
+It downloads the tarball, backs `bouquets.tv` up, **merges** our entries into it (`grep -v userbouquet.<prefix>_` — your satellite bouquets and favourites are kept), copies the files into `/etc/enigma2` and reloads the service list via OpenWebif (`/api/servicelistreload?mode=2`). Re-run it (or put it in cron) after changing the playlist. *Download .tar.gz* gives you the same files by hand, and *rotate token* invalidates the old URLs. Pull needs nothing configured on the SPM side, which makes it the fallback when the box's FTP is disabled.
+
+Service references use the SPM playlist id as the SID (`4097:0:1:2A:…`), so regenerating a bouquet does not renumber anything — the box's own favourites, picon names and the (later) EPG channel map keep pointing at the same services.
 
 **VOD/episode/local inputs are paced (`-re`), live never is.** A file input would otherwise be drained at *encode* speed — ffmpeg pushes a whole movie through the pipe as fast as the encoder allows, the player's buffer fills, ffmpeg hits EOF long before the viewer reaches the end, and the stream stops mid-playback. For `vod`/`episode`/`local` plays the manager therefore inserts `-re` in front of `-i` (unless the template sets its own `-re`/`-readrate`), so the file streams at its own frame rate and lasts exactly as long as the content. Live inputs are already paced by their encoder and are never throttled.
 

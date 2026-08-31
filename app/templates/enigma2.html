@@ -1,0 +1,330 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+  <div class="col-lg-3">
+    <div class="card h-100">
+      <div class="card-header d-flex align-items-center">
+        <span><i class="bi bi-tv"></i> Receivers</span>
+        <button class="btn btn-sm btn-accent ms-auto" id="e2-add"><i class="bi bi-plus-lg"></i> Add</button>
+      </div>
+      <div class="card-body p-2" id="e2-list"></div>
+      <div class="card-footer small text-muted">
+        A profile turns the playlist into Enigma2 <code>userbouquet.*.tv</code> files.
+        VOD &amp; series get <b>subtitles</b> only when their player is
+        <b>5002</b> (ServiceApp/exteplayer3) and the container is <b>mkv</b>.
+      </div>
+    </div>
+  </div>
+
+  <div class="col-lg-9">
+    <div class="card" id="e2-editor" style="display:none">
+      <div class="card-header d-flex align-items-center gap-2">
+        <span><i class="bi bi-sliders"></i> <span id="e2-title">Receiver</span></span>
+        <span class="badge text-bg-light ms-2 mono" id="e2-stats"></span>
+        <div class="btn-group ms-auto">
+          <button class="btn btn-sm btn-outline-secondary" id="e2-preview"><i class="bi bi-eye"></i> Preview</button>
+          <button class="btn btn-sm btn-outline-secondary" id="e2-download"><i class="bi bi-download"></i> Download .tar.gz</button>
+          <button class="btn btn-sm btn-accent" id="e2-save"><i class="bi bi-check2"></i> Save</button>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="row g-2">
+          <div class="col-md-4"><label class="muted-label">Name</label>
+            <input class="form-control form-control-sm e2-field" id="f-name"></div>
+          <div class="col-md-3"><label class="muted-label" title="Whose credentials and group whitelist the generated URLs carry">Output user</label>
+            <select class="form-select form-select-sm e2-field" id="f-user_id"></select></div>
+          <div class="col-md-2"><label class="muted-label" title="File names: userbouquet.<prefix>_live_news.tv">Bouquet prefix</label>
+            <input class="form-control form-control-sm mono e2-field" id="f-bouquet_prefix" value="spm"></div>
+          <div class="col-md-2"><label class="muted-label" title="Split a bouquet into numbered parts above this many services - Enigma2 redraws the whole list on every zap">Max per bouquet</label>
+            <input class="form-control form-control-sm e2-field" type="number" min="50" id="f-max_entries" value="1500"></div>
+          <div class="col-md-1 d-flex align-items-end"><label class="small"><input type="checkbox" class="e2-field" id="f-enabled" checked> On</label></div>
+        </div>
+
+        <hr class="my-3">
+        <div class="small text-muted mb-2"><b>Players &amp; containers.</b> The leading number of the service reference decides
+          which player the box uses; the container decides which URL alias it gets. MPEG-TS cannot carry text subtitles, so VOD and
+          series need <code>mkv</code> + <code>5002</code>; live TV is best served as <code>ts</code> (native DVB subtitles).</div>
+        <div class="row g-2">
+          <div class="col-md-3"><label class="muted-label">Live player</label>
+            <select class="form-select form-select-sm e2-field" id="f-player_live"></select></div>
+          <div class="col-md-1"><label class="muted-label">Live</label>
+            <select class="form-select form-select-sm e2-field" id="f-container_live"></select></div>
+          <div class="col-md-3"><label class="muted-label">VOD player</label>
+            <select class="form-select form-select-sm e2-field" id="f-player_vod"></select></div>
+          <div class="col-md-1"><label class="muted-label">VOD</label>
+            <select class="form-select form-select-sm e2-field" id="f-container_vod"></select></div>
+          <div class="col-md-3"><label class="muted-label">Series player</label>
+            <select class="form-select form-select-sm e2-field" id="f-player_series"></select></div>
+          <div class="col-md-1"><label class="muted-label">Series</label>
+            <select class="form-select form-select-sm e2-field" id="f-container_series"></select></div>
+        </div>
+
+        <div class="row g-2 mt-1">
+          <div class="col-md-3"><label class="muted-label" title="auto = each item gets the URL alias its own ffmpeg template produces (redirect items keep the panel's container, Matroska templates get .mkv, everything else .ts) and the player is raised to 4097 where service type 1 could not demux it. fixed = always use the containers configured above.">Container choice</label>
+            <select class="form-select form-select-sm e2-field" id="f-container_mode"></select></div>
+          <div class="col-md-3"><label class="muted-label" title="template = whatever each item is assigned in the Playlist Builder. proxy/redirect append ?mode= and override it for this box only.">Delivery</label>
+            <select class="form-select form-select-sm e2-field" id="f-delivery_mode"></select></div>
+          <div class="col-md-3"><label class="muted-label" title="group_markers = one bouquet per group with markers per series/season (recommended). per_series = one bouquet per series. flat = everything in one.">Layout</label>
+            <select class="form-select form-select-sm e2-field" id="f-layout"></select></div>
+          <div class="col-md-6"><label class="muted-label">Content</label>
+            <div class="d-flex gap-3 pt-1">
+              <label class="small"><input type="checkbox" class="e2-field" id="f-include_live" checked> Live</label>
+              <label class="small"><input type="checkbox" class="e2-field" id="f-include_vod" checked> VOD</label>
+              <label class="small"><input type="checkbox" class="e2-field" id="f-include_series" checked> Series</label>
+              <label class="small"><input type="checkbox" class="e2-field" id="f-include_local"> Local files</label>
+            </div></div>
+        </div>
+
+        <hr class="my-3">
+        <div class="small text-muted mb-2"><b>The receiver.</b> With transport <code>ftp</code> SPM uploads the bouquets itself
+          (atomic rename, <code>bouquets.tv</code> backed up as a restore point) and reloads the service list over OpenWebif;
+          <code>download</code> means you use the installer one-liner below instead.</div>
+        <div class="row g-2">
+          <div class="col-md-3"><label class="muted-label">Host / IP</label>
+            <input class="form-control form-control-sm mono e2-field" id="f-host" placeholder="192.168.1.50"></div>
+          <div class="col-md-2"><label class="muted-label">Transport</label>
+            <select class="form-select form-select-sm e2-field" id="f-transport"></select></div>
+          <div class="col-md-2"><label class="muted-label" title="vsftpd on a stock OpenPLi image">FTP port</label>
+            <input class="form-control form-control-sm e2-field" type="number" id="f-ftp_port" value="21"></div>
+          <div class="col-md-2"><label class="muted-label" title="the bouquet directory is root-owned, so a normal user cannot write it">FTP login</label>
+            <input class="form-control form-control-sm mono e2-field" id="f-login" value="root"></div>
+          <div class="col-md-3"><label class="muted-label">FTP password <span class="text-muted" id="f-pass-hint"></span></label>
+            <input class="form-control form-control-sm e2-field" type="password" id="f-password" placeholder="unchanged"></div>
+        </div>
+        <div class="row g-2 mt-1">
+          <div class="col-md-2"><label class="muted-label">OpenWebif port</label>
+            <input class="form-control form-control-sm e2-field" type="number" id="f-web_port" value="80"></div>
+          <div class="col-md-3"><label class="muted-label" title="a stock OpenPLi answers its API without credentials; set basic if you locked the web interface down">Web interface auth</label>
+            <select class="form-select form-select-sm e2-field" id="f-owif_auth"></select></div>
+          <div class="col-md-2"><label class="muted-label">OpenWebif user</label>
+            <input class="form-control form-control-sm mono e2-field" id="f-owif_user" placeholder="root"></div>
+          <div class="col-md-3"><label class="muted-label">OpenWebif password <span class="text-muted" id="f-owif-pass-hint"></span></label>
+            <input class="form-control form-control-sm e2-field" type="password" id="f-owif_pass" placeholder="unchanged"></div>
+          <div class="col-md-2 d-flex align-items-end">
+            <label class="small"><input type="checkbox" class="e2-field" id="f-use_https"> HTTPS</label></div>
+        </div>
+        <div class="d-flex gap-2 mt-2 flex-wrap">
+          <button class="btn btn-sm btn-outline-secondary" id="e2-test"><i class="bi bi-plug"></i> Test connection</button>
+          <button class="btn btn-sm btn-outline-secondary" id="e2-dry"><i class="bi bi-clipboard-check"></i> Dry run</button>
+          <button class="btn btn-sm btn-accent" id="e2-push"><i class="bi bi-upload"></i> Push now</button>
+          <button class="btn btn-sm btn-outline-danger ms-auto" id="e2-restore"><i class="bi bi-arrow-counterclockwise"></i> Restore backup</button>
+        </div>
+        <div class="small text-muted mt-1" id="e2-push-status"></div>
+
+        <hr class="my-3">
+        <div class="muted-label">Install on the box (paste into telnet/SSH — re-run it any time to refresh)</div>
+        <div class="input-group input-group-sm">
+          <input class="form-control mono" id="e2-install" readonly>
+          <button class="btn btn-outline-secondary" id="e2-copy">copy</button>
+        </div>
+        <div class="small text-muted mt-1">The one-liner downloads the bouquets, backs up <code>bouquets.tv</code>, merges our
+          entries into it (yours are kept) and reloads the service list via OpenWebif. It carries a per-profile token, not your admin password.
+          <button class="btn btn-sm btn-link p-0 align-baseline" id="e2-rotate">rotate token</button></div>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <button class="btn btn-sm btn-outline-danger" id="e2-delete"><i class="bi bi-trash"></i> Delete profile</button>
+      </div>
+    </div>
+    <div class="card" id="e2-empty">
+      <div class="card-body text-muted">
+        <p class="mb-1">No receiver selected.</p>
+        <p class="small mb-0">Enigma2 boxes read plain text bouquet files. Create a profile, pick the players and containers for this
+          box, preview what would be written, then either download the tarball or run the installer one-liner on the receiver.
+          See <code>docs/ENIGMA2-INTEGRATION-OPTIONS.md</code> for the reasoning behind the defaults.</p>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const FIELDS = ["name","enabled","user_id","host","web_port","use_https","transport","ftp_port",
+  "login","password","owif_auth","owif_user","owif_pass",
+  "bouquet_prefix","player_live","player_vod","player_series","container_live","container_vod",
+  "container_series","container_mode","delivery_mode","layout","max_entries",
+  "include_live","include_vod","include_series","include_local"];
+let META = null, profiles = [], current = null;
+
+function fill(id, options, labels) {
+  const sel = $("#f-" + id);
+  sel.innerHTML = "";
+  for (const v of options) sel.append(el("option", { value: v }, labels ? labels[v] : v));
+}
+
+function readFields() {
+  const out = {};
+  for (const f of FIELDS) {
+    const n = $("#f-" + f);
+    if (!n) continue;
+    out[f] = n.type === "checkbox" ? n.checked : n.value;
+  }
+  out.user_id = out.user_id || null;
+  out.max_entries = +out.max_entries || 1500;
+  out.web_port = +out.web_port || 80;
+  out.ftp_port = +out.ftp_port || 21;
+  return out;
+}
+
+function writeFields(p) {
+  for (const f of FIELDS) {
+    const n = $("#f-" + f);
+    if (!n) continue;
+    const v = p[f];
+    if (n.type === "checkbox") n.checked = !!v;
+    else n.value = v === null || v === undefined ? "" : v;
+  }
+  $("#f-password").value = "";
+  $("#f-owif_pass").value = "";
+  $("#f-pass-hint").textContent = p.has_password ? "(stored — leave empty to keep)" : "";
+  $("#f-owif-pass-hint").textContent = p.has_owif_pass ? "(stored — leave empty to keep)" : "";
+  $("#e2-push-status").innerHTML = p.last_push_at
+    ? `last push ${esc(String(p.last_push_at).replace("T", " ").slice(0, 19))}:
+       <span class="mono">${esc((p.last_push_result || "").split("\n").pop())}</span>` : "";
+}
+
+async function loadList() {
+  profiles = (await api("/api/enigma2/profiles")).items;
+  const host = $("#e2-list"); host.innerHTML = "";
+  if (!profiles.length) host.innerHTML = '<div class="small text-muted p-2">No receivers yet.</div>';
+  for (const p of profiles) {
+    const b = el("button", { class: "btn btn-sm w-100 text-start mb-1 " + (current?.id === p.id ? "btn-accent" : "btn-light") });
+    b.innerHTML = `<div class="d-flex justify-content-between"><span>${esc(p.name)}</span>
+      <span class="badge ${p.enabled ? "st-online" : "st-unknown"}">${p.enabled ? "on" : "off"}</span></div>
+      <div class="small text-muted">${esc(p.host || "no host")} · live ${esc(p.player_live)} · vod ${esc(p.player_vod)}/${esc(p.container_vod)}
+      ${p.service_count ? "· " + p.service_count + " services" : ""}</div>`;
+    b.addEventListener("click", () => select(p.id));
+    host.append(b);
+  }
+}
+
+function select(id) {
+  current = profiles.find(p => p.id === id) || null;
+  $("#e2-editor").style.display = current ? "" : "none";
+  $("#e2-empty").style.display = current ? "none" : "";
+  if (!current) return;
+  writeFields(current);
+  $("#e2-title").textContent = current.name;
+  $("#e2-stats").textContent = current.service_count
+    ? `${current.bouquet_count} bouquets · ${current.service_count} services` : "not built yet";
+  $("#e2-install").value = `wget -qO- ${location.origin}/enigma2/${current.token}/install.sh | sh`;
+  loadList();
+}
+
+async function save() {
+  if (!current) return;
+  const r = await api(`/api/enigma2/profiles/${current.id}`, { method: "PUT", body: readFields() });
+  toast("profile saved", "ok");
+  await loadList();
+  current = r.item; select(current.id);
+}
+
+async function preview() {
+  if (!current) return;
+  await save();
+  const r = await api(`/api/enigma2/profiles/${current.id}/preview`, { method: "POST" });
+  const body = el("div");
+  const warn = (r.summary.warnings || []).map(w => `<div class="alert alert-warning py-1 px-2 small mb-1">${esc(w)}</div>`).join("");
+  const tabs = r.files.map((f, i) => `<option value="${i}">${esc(f.title)} — ${f.services} services (${esc(f.name)})</option>`).join("");
+  body.innerHTML = `${warn}
+    <div class="small text-muted mb-2">${r.summary.bouquets} bouquets · ${r.summary.services} services
+      · <span title="what each item's ffmpeg template actually delivers">${r.summary.deliveries.ts} ts ·
+      ${r.summary.deliveries.mkv} mkv · ${r.summary.deliveries.direct} direct</span>
+      · URLs point at <span class="mono">${esc(r.base_url)}</span></div>
+    <select class="form-select form-select-sm mb-2" id="pv-pick">${tabs}</select>
+    <pre class="small bg-dark text-light p-2 mono" id="pv-text" style="max-height:420px;overflow:auto;white-space:pre"></pre>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: `Preview — ${current.name}`, body, footer, size: "xl" });
+  const show = () => { const i = +$("#pv-pick", body).value; $("#pv-text", body).textContent = r.files[i] ? r.files[i].text : "(nothing to write)"; };
+  if (r.files.length) { $("#pv-pick", body).addEventListener("change", show); show(); }
+  else $("#pv-text", body).textContent = "(nothing to write)";
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close));
+}
+
+// ---- push / test / restore (E3) -------------------------------------------
+function showReport(title, r) {
+  const body = el("div");
+  const rows = (r.steps || []).map(s =>
+    `<tr><td class="pe-2">${s.ok ? '<span class="text-success">ok</span>' : '<span class="text-danger">fail</span>'}</td>
+     <td class="pe-2">${esc(s.name)}</td><td class="small text-muted mono">${esc(s.detail || "")}</td></tr>`).join("");
+  body.innerHTML = `${r.error ? `<div class="alert alert-danger py-1 px-2 small">${esc(r.error)}</div>` : ""}
+    ${r.dry_run ? '<div class="alert alert-info py-1 px-2 small">Dry run — nothing was written on the receiver.</div>' : ""}
+    <table class="table table-sm mb-0"><tbody>${rows || '<tr><td class="small text-muted">no steps</td></tr>'}</tbody></table>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title, body, footer, size: "lg" });
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close));
+}
+
+async function pushAction(path, title, opts = {}) {
+  if (!current) return;
+  await save();
+  try {
+    const r = await api(`/api/enigma2/profiles/${current.id}${path}`, { method: "POST" });
+    showReport(`${title} — ${current.name}`, r);
+    toast(r.ok ? `${title}: ok` : `${title} failed`, r.ok ? "ok" : "err");
+    if (r.item) { await loadList(); current = r.item; select(current.id); }
+  } catch (e) {
+    toast(String(e.message || e), "err");
+  }
+}
+
+$("#e2-test").addEventListener("click", () => pushAction("/test", "Test connection"));
+$("#e2-dry").addEventListener("click", () => pushAction("/push?dry_run=1", "Dry run"));
+$("#e2-push").addEventListener("click", () => pushAction("/push", "Push"));
+$("#e2-restore").addEventListener("click", () => {
+  if (!current) return;
+  confirmDialog({
+    title: "Restore backup",
+    body: "Put the receiver's backed-up bouquets.tv back and delete the bouquets SPM installed? This is the state the box was in before the last push.",
+    okText: "Restore", okClass: "btn-danger",
+    onOk: () => pushAction("/restore", "Restore"),
+  });
+});
+
+$("#e2-add").addEventListener("click", async () => {
+  const r = await api("/api/enigma2/profiles", { method: "POST", body: { name: "New receiver" } });
+  await loadList(); select(r.item.id);
+});
+$("#e2-save").addEventListener("click", save);
+$("#e2-preview").addEventListener("click", preview);
+$("#e2-download").addEventListener("click", async () => {
+  if (!current) return;
+  await save();
+  window.location = `/api/enigma2/profiles/${current.id}/bouquets.tar.gz`;
+});
+$("#e2-copy").addEventListener("click", () => {
+  navigator.clipboard.writeText($("#e2-install").value); toast("installer command copied", "ok");
+});
+$("#e2-rotate").addEventListener("click", async () => {
+  if (!current) return;
+  const r = await api(`/api/enigma2/profiles/${current.id}/token`, { method: "POST" });
+  await loadList(); select(r.item.id); toast("token rotated — re-run the installer on the box", "ok");
+});
+$("#e2-delete").addEventListener("click", () => {
+  if (!current) return;
+  confirmDialog({
+    title: "Delete profile", body: "Delete this receiver profile? Bouquets already installed on the box keep working until you remove them there.",
+    okText: "Delete", okClass: "btn-danger",
+    onOk: async () => { await api(`/api/enigma2/profiles/${current.id}`, { method: "DELETE" }); current = null; select(null); loadList(); },
+  });
+});
+
+(async () => {
+  META = await api("/api/enigma2/meta");
+  const playerLabels = {};
+  for (const [k, v] of Object.entries(META.players)) playerLabels[k] = `${k} — ${v}`;
+  for (const f of ["player_live", "player_vod", "player_series"]) fill(f, Object.keys(META.players), playerLabels);
+  for (const f of ["container_live", "container_vod", "container_series"]) fill(f, META.containers);
+  fill("layout", META.layouts);
+  fill("container_mode", META.container_modes);
+  fill("delivery_mode", META.delivery_modes);
+  fill("transport", META.transports);
+  fill("owif_auth", META.owif_auth);
+  const sel = $("#f-user_id");
+  sel.innerHTML = '<option value="">— none (URLs without credentials) —</option>';
+  for (const u of META.users) sel.append(el("option", { value: u.id }, u.name + (u.enabled ? "" : " (disabled)")));
+  await loadList();
+  if (profiles.length) select(profiles[0].id);
+})();
+</script>
+{% endblock %}

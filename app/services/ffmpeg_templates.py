@@ -65,7 +65,18 @@ HW_CHOICES = ["none", "vaapi", "qsv"]
 #           deliberately NO burn-in mode: rendering text into the picture
 #           needs CPU video frames (libass overlay), which would defeat
 #           hardware-only transcoding.
-SUB_MODES = ("drop", "dvb")
+#   keep  - copy EVERY subtitle track as-is into a MATROSKA output (text
+#           SRT/ASS *and* bitmap). MPEG-TS cannot carry text subtitles at all
+#           and ffmpeg cannot render text->bitmap without burning it into the
+#           picture (= CPU), so the only hardware-only way to deliver VOD /
+#           series subtitles is to change the CONTAINER, not the pipeline.
+#           Requires output_format="matroska"; on mpegts/hls the renderer
+#           degrades it to dvb (the only thing that container can carry).
+#           Consumers: exteplayer3 on Enigma2 (service ref 5002), VLC, Kodi.
+SUB_MODES = ("drop", "dvb", "keep")
+# Container of the rendered output. mpegts/hls go through the byte pipe as
+# before; matroska is the subtitle-capable container for VOD and series.
+OUTPUT_FORMATS = ("mpegts", "hls", "matroska")
 # VAAPI rate-control modes (h264_vaapi/hevc_vaapi). ffmpeg's encoder aliases
 # are uppercase (see `ffmpeg -h encoder=h264_vaapi`). "AUTO" = let the driver
 # choose; everything else is passed through as-is so the command stays honest.
@@ -83,6 +94,15 @@ REFERENCE_PRESET_NAME = "VAAPI 720p ~1M (DS918+ reference)"
 REDIRECT_PRESET_NAME = "Redirect (bypass ffmpeg)"
 REDIRECT_COMMAND = "@redirect"
 COPY_PRESET_NAME = "Copy / passthrough (no transcode)"
+# Enigma2 (Vu+ / OpenPLi) presets. The set-top box cannot show text subtitles
+# from an MPEG-TS pipe - no player can, the container has no slot for them - so
+# the two VOD presets deliver MATROSKA and copy every subtitle track into it.
+# Play them with ServiceApp/exteplayer3 (bouquet service reference 5002); the
+# live preset stays MPEG-TS (service reference 1 or 4097) where the box shows
+# DVB bitmap subtitles natively.
+E2_VOD_REMUX_PRESET_NAME = "Enigma2 VOD - remux + subtitles (MKV)"
+E2_VOD_TRANSCODE_PRESET_NAME = "Enigma2 VOD - VAAPI 1080p H.264 + AC3 + subtitles (MKV)"
+E2_DUO2_LIVE_PRESET_NAME = "Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)"
 URL_PLACEHOLDER = "<url>"
 
 # Input options an HLS *playlist* needs and a plain stream does not. ffmpeg
@@ -116,7 +136,12 @@ RESILIENT_INPUT_OPTS = (
 # Same for the container options the renderer picks from `output_format` alone.
 _HLS_OUTPUT_OPTS = (("-hls_time", "6"), ("-hls_list_size", "6"),
                     ("-hls_flags", "delete_segments+append_list"))
-_OWNED_OUT = {"-mpegts_flags": "+resend_headers", **dict(_HLS_OUTPUT_OPTS)}
+# Matroska over a pipe is a NON-SEEKABLE output: `-live 1` tells the muxer not
+# to go back and patch cues/duration at the end (it cannot), which is exactly
+# the streaming mode exteplayer3 & friends read.
+_MKV_OUTPUT_OPTS = (("-live", "1"),)
+_OWNED_OUT = {"-mpegts_flags": "+resend_headers", **dict(_HLS_OUTPUT_OPTS),
+              **dict(_MKV_OUTPUT_OPTS)}
 # Output targets the renderer writes itself; a leftover one is not an extra arg.
 _OWNED_TARGETS = ("pipe:1", "<out_dir>/index.m3u8")
 
@@ -240,6 +265,11 @@ def coerce_options(base: dict | None) -> dict:
         elif k == "subs":
             # a stale "burn" (removed: software-only) degrades to drop
             out[k] = str(v).strip().lower() if str(v).strip().lower() in SUB_MODES else "drop"
+        elif k == "output_format":
+            fmt = str(v).strip().lower()
+            # "mkv" is what people type; the muxer is called matroska
+            fmt = "matroska" if fmt == "mkv" else fmt
+            out[k] = fmt if fmt in OUTPUT_FORMATS else "mpegts"
         else:
             out[k] = v if isinstance(v, str) else str(v)
     return out
@@ -274,6 +304,14 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
 
     # one normalised lookup: a stale or hand-edited row may carry anything
     mode = opts.subs if opts.subs in SUB_MODES else "drop"
+    container = opts.output_format if opts.output_format in OUTPUT_FORMATS else "mpegts"
+    mkv = container == "matroska"
+    # keep = "copy every subtitle track", which only a container that can hold
+    # text subtitles can honour. Asked for on mpegts/hls it degrades to dvb -
+    # the bitmap-only mode that container CAN carry - instead of rendering a
+    # command that aborts at the muxer ("subrip is not supported by mpegts").
+    if mode == "keep" and not mkv:
+        mode = "dvb"
 
     # ---- video filter chain ------------------------------------------------
     if transcode:
@@ -319,11 +357,11 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     # instead of killing the stream.
     c += ["-map", "0:v:0"]
     c += ["-map", "0:a:0?"] if opts.audio_codec != "none" else ["-an"]
-    if mode == "dvb":
+    if mode in ("dvb", "keep"):
         # optional map: a source without any subtitle track keeps playing
         c += ["-map", "0:s?"]
     c += ["-dn"]
-    if mode != "dvb":
+    if mode == "drop":
         c += ["-sn"]
 
     # ---- video encoder ------------------------------------------------------
@@ -388,13 +426,23 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     # VIDEO pipeline stays 100% hardware.
     if mode == "dvb":
         c += ["-c:s", "copy" if opts.video_codec == "copy" else "dvbsub"]
+    elif mode == "keep":
+        # Matroska carries SRT/ASS/PGS/DVB as they are: a byte copy, no encoder,
+        # no CPU video frames - the VAAPI/QSV video pipeline above is untouched.
+        c += ["-c:s", "copy"]
 
     if opts.extra_output.strip():
         c += shlex.split(opts.extra_output)
 
     # ---- output -------------------------------------------------------------
     own_out = _tokens(opts.extra_output)
-    if opts.output_format == "hls":
+    if container == "matroska":
+        c += ["-f", "matroska"]
+        for flag, val in _MKV_OUTPUT_OPTS:
+            if flag not in own_out:
+                c += [flag, val]
+        c += ["pipe:1"]
+    elif container == "hls":
         c += ["-f", "hls"]
         for flag, val in _HLS_OUTPUT_OPTS:
             if flag not in own_out:
@@ -406,6 +454,25 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
             c += ["-mpegts_flags", _OWNED_OUT["-mpegts_flags"]]
         c += ["pipe:1"]
     return " ".join(c)
+
+
+def option_warnings(opts: FFmpegOptions) -> list[str]:
+    """Field combinations that are legal but do not mean what they say.
+
+    build_command() silently resolves them (it has to render *something*), so
+    this is what the GUI shows beside the command instead of letting the user
+    believe a template keeps subtitles it cannot keep.
+    """
+    out: list[str] = []
+    if opts.subs == "keep" and opts.output_format != "matroska":
+        out.append("subtitles \"copy all\" needs Output = Matroska; MPEG-TS/HLS "
+                   "cannot carry text subtitles, so the command renders the "
+                   "bitmap-only DVB mode instead")
+    if opts.subs == "keep" and opts.output_format == "matroska" \
+            and opts.audio_codec == "mp2":
+        out.append("MP2 audio in Matroska plays on few set-top boxes; "
+                   "AC3 or AAC is the safer choice")
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -596,7 +663,8 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
             i += 2
             continue
         if t == "-f" and i + 1 < len(toks):
-            opts.output_format = toks[i + 1] if toks[i + 1] in ("mpegts", "hls") else "mpegts"
+            fmt = "matroska" if toks[i + 1] == "mkv" else toks[i + 1]
+            opts.output_format = fmt if fmt in OUTPUT_FORMATS else "mpegts"
             i += 2
             continue
         if t == "-preset" and i + 1 < len(toks):
@@ -612,7 +680,10 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
     # codec without -sn means "keep as DVB", an explicit -sn alone means drop.
     # Nothing mentioned -> the base keeps its value (partial-parse rule).
     if (sub_map or sub_codec is not None) and not sn_seen:
-        opts.subs = "dvb"
+        # Same maps, different meaning per container: copying subtitles into a
+        # Matroska output is the "keep everything" mode, into an MPEG-TS output
+        # it can only ever be the bitmap (DVB) one.
+        opts.subs = "keep" if opts.output_format == "matroska" else "dvb"
     elif sn_seen:
         opts.subs = "drop"
     return {"options": asdict(opts), "warnings": warnings}
@@ -650,6 +721,32 @@ def default_presets() -> list[dict]:
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k", subs="dvb"),
         mk(COPY_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source", subs="dvb"),
+        # --- Enigma2 / Vu+ Duo2 --------------------------------------------
+        # VOD + series with subtitles, no CPU anywhere:
+        #  * remux  - container swap only (the source codec already fits the
+        #             box), every subtitle track copied through;
+        #  * VAAPI  - the 4K/HEVC rescue path: the video is re-encoded on the
+        #             GPU to H.264 High@4.0 1080p (the ceiling of the BCM7424
+        #             in a Duo2) with AC3 audio, while `-c:s copy` carries the
+        #             SRT/ASS/PGS tracks untouched beside it.
+        mk(E2_VOD_REMUX_PRESET_NAME, hw_accel="none", video_codec="copy",
+           audio_codec="copy", resolution="source",
+           output_format="matroska", subs="keep"),
+        mk(E2_VOD_TRANSCODE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
+           aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
+           maxrate="4400k", bufsize="8000k", fps="25", gop="50",
+           profile="high", level="4.0", low_power=True, async_depth="4",
+           audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
+           output_format="matroska", subs="keep"),
+        # Live TV for the same box: MPEG-TS straight into the DVB pipeline
+        # (service reference 1 or 4097) with the DVB bitmap subtitles the box
+        # renders natively.
+        mk(E2_DUO2_LIVE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
+           aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
+           maxrate="4400k", bufsize="8000k", fps="25", gop="50",
+           profile="high", level="4.0", low_power=True, async_depth="4",
+           audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
+           subs="dvb"),
         mk("Dreambox DM800se (Enigma2 / MPEG2-SD)", hw_accel="vaapi",
            resolution="576p", aspect="16:9", video_codec="h264_vaapi",
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k",
