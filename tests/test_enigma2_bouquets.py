@@ -165,8 +165,9 @@ async def test_group_markers_layout_is_one_bouquet_per_group():
 
 
 async def test_live_and_vod_get_their_configured_player_and_container():
+    """container_mode=fixed: the profile decides for every item."""
     user = await _catalogue()
-    bundle = await e2.build_bundle(_profile(user), NAS)
+    bundle = await e2.build_bundle(_profile(user, container_mode="fixed"), NAS)
     live = next(f for f in bundle.files if "live_news" in f.name).text
     vod = next(f for f in bundle.files if "vod_action" in f.name).text
     assert "#SERVICE 4097:" in live and "/play/live/" in live and ".ts?u=box&p=pw" in live
@@ -260,10 +261,11 @@ async def test_content_types_can_be_switched_off():
 
 async def test_warnings_flag_the_combination_that_silently_loses_subtitles():
     user = await _catalogue()
-    bundle = await e2.build_bundle(_profile(user, player_vod="4097"), NAS)
+    bundle = await e2.build_bundle(
+        _profile(user, container_mode="fixed", player_vod="4097"), NAS)
     assert any("exteplayer3" in w for w in bundle.warnings)
-    assert not any("exteplayer3" in w for w in
-                   (await e2.build_bundle(_profile(user), NAS)).warnings)
+    assert not any("exteplayer3" in w for w in (await e2.build_bundle(
+        _profile(user, container_mode="fixed"), NAS)).warnings)
 
 
 async def test_delivery_mode_overrides_the_per_item_template():
@@ -369,3 +371,116 @@ async def test_the_gui_page_renders():
     async with AsyncClient(transport=transport, base_url=BASE) as c:
         r = await c.get("/enigma2")
         assert r.status_code == 200 and "Receivers" in r.text
+
+
+# --------------------------------------------------------------------------- #
+# mixed libraries: the bouquet line follows the ITEM's template
+# --------------------------------------------------------------------------- #
+def _services(text: str) -> dict:
+    """{name: service line}, markers (service type 1:64) skipped."""
+    return {ln.split(":")[-1]: ln for ln in text.splitlines()
+            if ln.startswith("#SERVICE") and not ln.startswith("#SERVICE 1:64:")}
+
+
+async def _templates() -> dict:
+    """The three deliveries a library really mixes: a 302 redirect, a Matroska
+    remux and a plain MPEG-TS transcode."""
+    from app.models import FFmpegTemplate
+    from app.services.ffmpeg_templates import REDIRECT_COMMAND
+
+    async with SessionLocal() as s:
+        redirect = FFmpegTemplate(name="Redirect (bypass ffmpeg)", command=REDIRECT_COMMAND,
+                                  command_source="fields", enabled=True, is_default=True,
+                                  output_format="mpegts", video_codec="copy")
+        mkv = FFmpegTemplate(name="Enigma2 VOD - remux + subtitles (MKV)", enabled=True,
+                             output_format="matroska", subs="keep", video_codec="copy",
+                             command="ffmpeg -i <url> -c copy -c:s copy -f matroska pipe:1",
+                             command_source="fields")
+        ts = FFmpegTemplate(name="VAAPI 1080p", enabled=True, output_format="mpegts",
+                            subs="dvb", video_codec="h264_vaapi",
+                            command="ffmpeg -i <url> -c:v h264_vaapi -f mpegts pipe:1",
+                            command_source="fields")
+        s.add_all([redirect, mkv, ts])
+        await s.commit()
+        return {"redirect": redirect.id, "mkv": mkv.id, "ts": ts.id}
+
+
+async def _mixed_vod(tpl: dict) -> User:
+    """Three movies: one direct (redirect), one MKV remux, one TS transcode."""
+    from app.models import Portal, VodSource
+
+    async with SessionLocal() as s:
+        user = User(name="mix", password="pw", enabled=True, m3u_enabled=True)
+        s.add(user)
+        portal = Portal(name="p", base_url="http://127.0.0.1:1/c/")
+        s.add(portal)
+        await s.flush()
+        for title, key in (("Direct Movie", "redirect"), ("Mkv Movie", "mkv"),
+                           ("Ts Movie", "ts")):
+            src = VodSource(portal_id=portal.id, portal_item_id=title,
+                            original_name=title)
+            s.add(src)
+            await s.flush()
+            s.add(VodPlaylist(vod_source_id=src.id, custom_name=title,
+                              group_name="Mixed", enabled=True, order=1,
+                              ffmpeg_template_id=tpl[key]))
+        await s.commit()
+        return user
+
+
+async def test_each_item_gets_the_url_alias_its_own_template_produces():
+    """A library mixes deliveries per item, so the profile cannot decide the
+    container for all of them: an MPEG-TS transcode announced as `.mkv` (or the
+    reverse) is exactly the mismatch that makes one movie play and the next one
+    not."""
+    tpl = await _templates()
+    user = await _mixed_vod(tpl)
+    bundle = await e2.build_bundle(_profile(user), NAS)
+    text = next(f for f in bundle.files if "vod_mixed" in f.name).text
+    lines = _services(text)
+    assert ".mkv" in lines["Mkv Movie"]          # Matroska template -> .mkv
+    assert ".ts" in lines["Ts Movie"]            # mpegts template   -> .ts
+    # direct: SPM answers 302 and the panel's own container arrives, so the
+    # alias stays the profile's choice and only the player has to be able to
+    # demux whatever comes back
+    assert ".mkv" in lines["Direct Movie"]
+    assert all(ln.startswith("#SERVICE 5002:") for ln in lines.values())
+    assert bundle.deliveries == {"ts": 1, "mkv": 1, "direct": 1}
+
+
+async def test_direct_and_mkv_items_are_never_left_on_the_dvb_service_type():
+    """Service type 1 hands the bytes straight to the DVB pipeline: fine for a
+    raw TS, a black screen for an MP4/MKV. Auto mode raises those items to 4097
+    (and says so) instead of writing a line that cannot work."""
+    tpl = await _templates()
+    user = await _mixed_vod(tpl)
+    bundle = await e2.build_bundle(_profile(user, player_vod="1"), NAS)
+    text = next(f for f in bundle.files if "vod_mixed" in f.name).text
+    lines = _services(text)
+    assert lines["Ts Movie"].startswith("#SERVICE 1:")          # raw TS is fine
+    assert lines["Mkv Movie"].startswith("#SERVICE 4097:")
+    assert lines["Direct Movie"].startswith("#SERVICE 4097:")
+    assert any("cannot demux" in w or "cannot play" in w for w in bundle.warnings)
+    assert any("redirect template" in w for w in bundle.warnings)
+
+
+async def test_fixed_mode_keeps_the_profiles_own_choice_for_every_item():
+    tpl = await _templates()
+    user = await _mixed_vod(tpl)
+    bundle = await e2.build_bundle(_profile(user, container_mode="fixed"), NAS)
+    text = next(f for f in bundle.files if "vod_mixed" in f.name).text
+    assert text.count(".mkv?") == 3 and ".ts?" not in text
+    # the breakdown is still reported, so the preview can warn about the mix
+    assert bundle.deliveries == {"ts": 1, "mkv": 1, "direct": 1}
+
+
+async def test_items_without_a_template_follow_the_default_one():
+    """The built-in default is the redirect preset, so an untouched playlist is
+    all-direct - and must not be written as service type 1."""
+    tpl = await _templates()
+    user = await _catalogue()          # no ffmpeg_template_id anywhere
+    bundle = await e2.build_bundle(_profile(user, player_live="1"), NAS)
+    assert bundle.deliveries["direct"] == bundle.services
+    live = next(f for f in bundle.files if "live_news" in f.name).text
+    assert "#SERVICE 4097:" in live and "#SERVICE 1:0" not in live
+    assert tpl["redirect"]

@@ -253,12 +253,23 @@ An Enigma2 box reads plain-text bouquet files, so SPM writes them. A **receiver 
 | Setting | Meaning |
 |---|---|
 | **Player** | the leading number of the service reference: `1` (DVB pipeline — live TS, native DVB subtitles, lowest latency), `4097` (servicemp3/gstreamer, the generic default), `5001` (ServiceApp → gstplayer), **`5002`** (ServiceApp → exteplayer3 — text subtitles and multi-audio) |
-| **Container** | which URL alias the line points at: `ts` or `mkv`. It has to match the item's ffmpeg template — the preview warns when `mkv` is combined with a player that cannot show text subtitles |
+| **Container choice** | `auto` (default) resolves the URL alias **per item, from the ffmpeg template that item is assigned**; `fixed` uses the two *Container* dropdowns for everything |
+| **Container** | which URL alias the line points at in `fixed` mode: `ts` or `mkv`. It has to match the item's ffmpeg template — the preview warns when `mkv` is combined with a player that cannot show text subtitles |
 | **Delivery** | `template` (whatever each item is assigned in the Playlist Builder), or `proxy`/`redirect` appended as `?mode=` for this box only |
 | **Layout** | `group_markers` (one bouquet per group, marker lines per series and season — the default), `per_series` (one bouquet per show), `flat` (one per content kind). Bouquets are auto-split into numbered parts above *Max per bouquet* (default 1500) because Enigma2 redraws the whole list on every zap |
 | **Output user** | whose credentials and group whitelist the URLs carry; the profile can narrow the group filter further, never widen it |
 
 Defaults are the Vu+ Duo2 recipe: live = `4097` + `.ts`, VOD and series = **`5002` + `.mkv`** so the copied SRT/ASS tracks actually reach the box.
+
+**A real library mixes deliveries, so the bouquet does too.** Every playlist row carries its own ffmpeg template (falling back to the default one), and the template decides what actually comes out of the pipe — one movie is remuxed to Matroska, the next is a plain MPEG-TS transcode, and untouched rows usually sit on the *Redirect* preset, where SPM answers `302` and the box fetches the panel's file itself. Announcing all three as `.mkv` would be a lie the player notices. In `auto` mode each line is therefore resolved on its own:
+
+| The item's template | Line gets | Why |
+|---|---|---|
+| `@redirect` (bypass ffmpeg) | the profile's alias, player ≥ `4097` | the container is the panel's, not ours — the alias is cosmetic because the box follows the redirect and sniffs the body. Best case for VOD: original subtitles **and** seeking survive |
+| `output_format = matroska` | `.mkv` | the remux carries text subtitles |
+| anything else | `.ts` | MPEG-TS out of ffmpeg |
+
+Service type `1` hands the bytes straight to the DVB demuxer, which only understands raw TS: items that are MKV or direct are automatically raised to `4097` and the preview says so (use `5002` if you want their subtitles). The summary line counts the split — *114 services · 0 ts · 0 mkv · 114 direct* — so you can see at a glance which delivery your library is really on. Set *Container choice* to `fixed` for the old profile-wide behaviour.
 
 **Preview before anything leaves the server.** *Preview* renders the exact file contents (`#SERVICE` / `#DESCRIPTION` / marker lines) plus a summary — *13 bouquets · 114 services* — and flags the classic mistakes: URLs pointing at `localhost` (a receiver cannot reach that — set the public base URL in Settings), a `.mkv` container under player `4097`, or a deleted output user.
 

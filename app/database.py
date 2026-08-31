@@ -372,6 +372,9 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "local_files": {
         "duration_s": ("FLOAT", "NULL"),
     },
+    "enigma2_profiles": {
+        "container_mode": ("VARCHAR(6)", "'auto'"),
+    },
     "serie_sources": {
         "raw_series": ("TEXT", "NULL"),
     },

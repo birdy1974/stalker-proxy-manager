@@ -31,7 +31,8 @@ EDITABLE = [
     "name", "enabled", "user_id", "host", "web_port", "use_https", "owif_user",
     "owif_pass", "transport", "ftp_port", "ssh_port", "login", "password",
     "bouquet_prefix", "player_live", "player_vod", "player_series",
-    "container_live", "container_vod", "container_series", "delivery_mode",
+    "container_mode", "container_live", "container_vod", "container_series",
+    "delivery_mode",
     "include_live", "include_vod", "include_series", "include_local",
     "groups_json", "layout", "max_entries",
 ]
@@ -72,6 +73,8 @@ def _apply(p: Enigma2Profile, payload: dict) -> None:
         if f in ("container_live", "container_vod", "container_series") \
                 and val not in e2.CONTAINERS:
             raise HTTPException(400, f"container must be one of {e2.CONTAINERS}")
+        if f == "container_mode" and val not in e2.CONTAINER_MODES:
+            raise HTTPException(400, f"container mode must be one of {e2.CONTAINER_MODES}")
         if f == "layout" and val not in e2.LAYOUTS:
             raise HTTPException(400, f"layout must be one of {e2.LAYOUTS}")
         if f == "delivery_mode" and val not in e2.DELIVERY_MODES:
@@ -99,6 +102,7 @@ async def meta(db=Depends(get_db)):
     return {
         "players": e2.PLAYERS,
         "containers": list(e2.CONTAINERS),
+        "container_modes": list(e2.CONTAINER_MODES),
         "layouts": list(e2.LAYOUTS),
         "delivery_modes": list(e2.DELIVERY_MODES),
         "transports": list(e2.TRANSPORTS),

@@ -632,6 +632,10 @@ class Enigma2Profile(Base):
     player_live: Mapped[str] = mapped_column(String(6), default="4097")
     player_vod: Mapped[str] = mapped_column(String(6), default="5002")
     player_series: Mapped[str] = mapped_column(String(6), default="5002")
+    # auto  = per item, from the ffmpeg template it is assigned (a redirect
+    #         item keeps the panel's own container, an MKV template gets .mkv);
+    # fixed = always the per-kind container/player below.
+    container_mode: Mapped[str] = mapped_column(String(6), default="auto")
     container_live: Mapped[str] = mapped_column(String(4), default="ts")
     container_vod: Mapped[str] = mapped_column(String(4), default="mkv")
     container_series: Mapped[str] = mapped_column(String(4), default="mkv")

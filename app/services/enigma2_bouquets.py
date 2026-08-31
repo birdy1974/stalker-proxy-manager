@@ -47,9 +47,11 @@ from sqlalchemy import select
 
 from ..database import SessionLocal
 from ..models import (
-    Enigma2Profile, LivePlaylist, LocalFile, LocalPlaylist, SerieEpisode,
-    SeriePlaylist, SeriePlaylistSeason, SerieSeason, User, VodPlaylist, VodSource,
+    Enigma2Profile, FFmpegTemplate, LivePlaylist, LocalFile, LocalPlaylist,
+    SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SerieSeason, User,
+    VodPlaylist, VodSource,
 )
+from .ffmpeg_templates import REDIRECT_COMMAND
 from .local_files import play_extension
 from .playlist_gen import _allowed, _chunked, _groups
 from .titles import best_title
@@ -62,6 +64,14 @@ PLAYERS = {
     "5002": "ServiceApp - exteplayer3 (text subtitles, multi-audio)",
 }
 CONTAINERS = ("ts", "mkv")
+# How the URL alias (and the player) is chosen for each item:
+#   auto  - from the item's own ffmpeg template, per item (default)
+#   fixed - always the profile's per-kind container/player
+CONTAINER_MODES = ("auto", "fixed")
+# Players that can read an arbitrary container over HTTP (they demux with
+# gstreamer/ffmpeg). Service type 1 hands the bytes to the DVB pipeline
+# unchanged, so it can only ever play raw MPEG-TS.
+FFMPEG_PLAYERS = ("4097", "5001", "5002")
 LAYOUTS = ("group_markers", "per_series", "flat")
 DELIVERY_MODES = ("template", "proxy", "redirect")
 TRANSPORTS = ("download", "ftp", "ssh")
@@ -122,6 +132,94 @@ def marker_line(label: str) -> list[str]:
 
 
 @dataclass
+class Delivery:
+    """What one playlist item will actually send, and how the box must read it.
+
+    A library is mixed on purpose: one movie is assigned the redirect template
+    (302 to the panel's CDN - original container, its own subtitle tracks, and
+    seeking), the next one an MKV remux, a 4K/HEVC one the VAAPI Matroska
+    transcode, and live TV stays MPEG-TS. The bouquet line has to match the
+    item, not the profile, or the box is handed a `.ts` URL that answers with
+    Matroska (or worse, a service type that cannot demux it at all).
+    """
+    kind: str                # ts | mkv | direct
+    container: str           # the URL alias to use (.ts / .mkv)
+    player: str              # leading number of the service reference
+    template: str = ""       # template name, for the preview
+    note: str = ""           # why the player was changed, if it was
+
+
+class _Resolver:
+    """Maps `ffmpeg_template_id -> Delivery` for one profile.
+
+    `direct` is the redirect template (`@redirect`): SPM answers 302 and the
+    receiver fetches the panel's own file. Its container is whatever the panel
+    serves - unknowable from here - so the URL alias stays cosmetic and only
+    the PLAYER matters: service type 1 would hand an MP4/MKV/HLS body to the
+    DVB pipeline and show a black screen, so it is upgraded to 4097.
+    """
+
+    def __init__(self, templates: dict, default_tpl, profile: Enigma2Profile,
+                 any_tpl=None) -> None:
+        self.tpl = templates
+        self.default = default_tpl
+        self.any = any_tpl
+        self.p = profile
+        self.mode = profile.container_mode if profile.container_mode in CONTAINER_MODES else "auto"
+        self.counts = {"ts": 0, "mkv": 0, "direct": 0}
+        self.notes: set[str] = set()
+        # (content kind, player) actually written with a .mkv url - the
+        # "no text subtitles there" warning has to follow what was WRITTEN,
+        # not what the templates would have produced
+        self.mkv_players: set[tuple[str, str]] = set()
+
+    def _row(self, template_id):
+        row = self.tpl.get(template_id) if template_id else None
+        if row is None or not row.get("enabled"):
+            row = self.default or self.any   # same chain the streamer walks
+        return row
+
+    def for_item(self, template_id, kind: str) -> Delivery:
+        """kind is the CONTENT kind (live/vod/series/local), not the container."""
+        container = {"live": self.p.container_live, "vod": self.p.container_vod,
+                     "series": self.p.container_series}.get(kind, self.p.container_vod)
+        player = {"live": self.p.player_live, "vod": self.p.player_vod,
+                  "series": self.p.player_series}.get(kind, self.p.player_vod)
+        row = self._row(template_id)
+        name = (row or {}).get("name", "")
+        if (row or {}).get("command", "").strip() == REDIRECT_COMMAND:
+            what = "direct"
+        elif (row or {}).get("output_format") == "matroska":
+            what = "mkv"
+        else:
+            what = "ts"
+        self.counts[what] += 1
+
+        if self.mode == "fixed":
+            if container == "mkv":
+                self.mkv_players.add((kind, player))
+            return Delivery(what, container, player, name)
+
+        note = ""
+        if what == "ts":
+            container = "ts"
+        elif what == "mkv":
+            container = "mkv"
+            if player not in FFMPEG_PLAYERS:
+                player, note = "4097", ("service type 1 cannot demux Matroska - "
+                                        "player raised to 4097 (use 5002 for subtitles)")
+        else:                                   # direct: the panel decides
+            if player not in FFMPEG_PLAYERS:
+                player, note = "4097", ("direct items deliver the panel's own container - "
+                                        "service type 1 cannot play it, player raised to 4097")
+        if note:
+            self.notes.add(note)
+        if container == "mkv":
+            self.mkv_players.add((kind, player))
+        return Delivery(what, container, player, name, note)
+
+
+@dataclass
 class BouquetFile:
     name: str                       # userbouquet.spm_live.tv
     title: str                      # #NAME value, as shown in the box
@@ -137,6 +235,10 @@ class BouquetFile:
 class Bundle:
     files: list[BouquetFile] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # how the items split across delivery kinds (ts / mkv / direct) - shown in
+    # the preview, because "why does THIS movie have no subtitles" is answered
+    # by the item's template, not by the profile
+    deliveries: dict = field(default_factory=lambda: {"ts": 0, "mkv": 0, "direct": 0})
 
     @property
     def services(self) -> int:
@@ -144,6 +246,7 @@ class Bundle:
 
     def summary(self) -> dict:
         return {"bouquets": len(self.files), "services": self.services,
+                "deliveries": self.deliveries,
                 "files": [{"name": f.name, "title": f.title, "services": f.services}
                           for f in self.files],
                 "warnings": self.warnings}
@@ -247,63 +350,77 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
     mode = profile.delivery_mode if profile.delivery_mode in DELIVERY_MODES else "template"
 
     async with SessionLocal() as s:
+        rows = (await s.execute(select(FFmpegTemplate))).scalars().all()
+        templates = {r.id: {"name": r.name, "command": r.command or "",
+                            "output_format": r.output_format, "enabled": r.enabled}
+                     for r in rows}
+        default_tpl = next((templates[r.id] for r in rows if r.is_default), None)
+        res = _Resolver(templates, default_tpl, profile,
+                        templates[rows[0].id] if rows else None)
+
         if profile.include_live:
             bundle.files += await _live_files(s, profile, base_url, user, ugroups,
-                                              pgroups, prefix, layout, mode)
+                                              pgroups, prefix, layout, mode, res)
         if profile.include_vod:
             bundle.files += await _vod_files(s, profile, base_url, user, ugroups,
-                                             pgroups, prefix, layout, mode)
+                                             pgroups, prefix, layout, mode, res)
         if profile.include_series:
             bundle.files += await _series_files(s, profile, base_url, user, ugroups,
-                                                pgroups, prefix, layout, mode)
+                                                pgroups, prefix, layout, mode, res)
         if profile.include_local:
             bundle.files += await _local_files(s, profile, base_url, user, ugroups,
-                                               pgroups, prefix, mode)
+                                               pgroups, prefix, mode, res)
+    bundle.deliveries = dict(res.counts)
+    bundle.warnings += sorted(res.notes)
+    if res.counts["direct"]:
+        bundle.warnings.append(
+            f"{res.counts['direct']} item(s) use the redirect template: the box "
+            "fetches the panel's own file, so it keeps the original container, "
+            "its subtitle tracks AND seeking - the .ts/.mkv in our URL is only "
+            "cosmetic there, but the player must be 4097/5001/5002")
 
     if not bundle.files:
         bundle.warnings.append("nothing to write: no enabled playlist items match "
                                "this profile's content types and group filters")
-    if profile.container_vod == "mkv" and profile.player_vod not in ("5001", "5002"):
-        bundle.warnings.append(
-            f"VOD uses the .mkv container but player {profile.player_vod}: text "
-            "subtitles need ServiceApp/exteplayer3 (5002) on the box")
-    if profile.container_series == "mkv" and profile.player_series not in ("5001", "5002"):
-        bundle.warnings.append(
-            f"series use the .mkv container but player {profile.player_series}: "
-            "text subtitles need ServiceApp/exteplayer3 (5002) on the box")
+    for kind, player in sorted(res.mkv_players):
+        if player not in FFMPEG_PLAYERS[1:]:      # 5001 / 5002 read text subs
+            label = {"vod": "VOD", "series": "series"}.get(kind, kind)
+            bundle.warnings.append(
+                f"{label} uses the .mkv container but player {player}: text "
+                "subtitles need ServiceApp/exteplayer3 (5002) on the box")
     return bundle
 
 
 async def _live_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                      layout, mode) -> list[BouquetFile]:
+                      layout, mode, res: _Resolver) -> list[BouquetFile]:
     items = (await s.execute(select(LivePlaylist).where(LivePlaylist.enabled.is_(True))
                              .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
     items = [it for it in items if _visible(it.group_name, ugroups["live"], pgroups["live"])]
     if not items:
         return []
     out: list[BouquetFile] = []
+    def add(w, it) -> None:
+        d = res.for_item(it.ffmpeg_template_id, "live")
+        w.service(d.player, it.id,
+                  stream_url(base_url, "live", it.id, d.container, user, mode),
+                  best_title(it.custom_name))
+
     if layout == "flat":
         w = _Writer(prefix, "live", "SPM - Live", profile.max_entries)
         for it in items:
-            w.service(profile.player_live, it.id,
-                      stream_url(base_url, "live", it.id, profile.container_live,
-                                 user, mode),
-                      best_title(it.custom_name))
+            add(w, it)
         return w.done()
     # one bouquet per group (the channel list stays the shape of the panel)
     for group, rows in _by_group(items, "Live").items():
         w = _Writer(prefix, f"live_{group}", f"SPM - Live - {group}", profile.max_entries)
         for it in rows:
-            w.service(profile.player_live, it.id,
-                      stream_url(base_url, "live", it.id, profile.container_live,
-                                 user, mode),
-                      best_title(it.custom_name))
+            add(w, it)
         out += w.done()
     return out
 
 
 async def _vod_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                     layout, mode) -> list[BouquetFile]:
+                     layout, mode, res: _Resolver) -> list[BouquetFile]:
     items = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                              .order_by(VodPlaylist.order, VodPlaylist.id))).scalars().all()
     items = [it for it in items if _visible(it.group_name, ugroups["vod"], pgroups["vod"])]
@@ -332,16 +449,16 @@ async def _vod_files(s, profile, base_url, user, ugroups, pgroups, prefix,
             if layout == "group_markers" and first != letter:
                 letter = first
                 w.marker(letter)
-            w.service(profile.player_vod, it.id,
-                      stream_url(base_url, "vod", it.id, profile.container_vod,
-                                 user, mode),
+            d = res.for_item(it.ffmpeg_template_id, "vod")
+            w.service(d.player, it.id,
+                      stream_url(base_url, "vod", it.id, d.container, user, mode),
                       title(it))
         out += w.done()
     return out
 
 
 async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                        layout, mode) -> list[BouquetFile]:
+                        layout, mode, res: _Resolver) -> list[BouquetFile]:
     """Series are the reason `layout` exists.
 
     per_series      one bouquet per series - clean, but 400 series means 400
@@ -389,9 +506,9 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
             if season_number != season:
                 season = season_number
                 w.marker(f"{show} - Season {season_number}")
-            w.service(profile.player_series, ep_id,
-                      stream_url(base_url, "episode", ep_id, profile.container_series,
-                                 user, mode),
+            d = res.for_item(sp.ffmpeg_template_id, "series")
+            w.service(d.player, ep_id,
+                      stream_url(base_url, "episode", ep_id, d.container, user, mode),
                       f"{show} S{season_number:02d}E{ep_num:02d}")
 
     out: list[BouquetFile] = []
@@ -417,7 +534,7 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
 
 
 async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                       mode) -> list[BouquetFile]:
+                       mode, res: _Resolver) -> list[BouquetFile]:
     items = (await s.execute(select(LocalPlaylist).where(LocalPlaylist.enabled.is_(True))
                              .order_by(LocalPlaylist.order, LocalPlaylist.id))).scalars().all()
     items = [it for it in items
@@ -436,8 +553,9 @@ async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
             continue
         # local items keep their real extension: the file is served as-is
         # (original container, its own subtitle tracks included)
-        w.service(profile.player_vod, it.id,
-                  stream_url(base_url, "local", it.id, profile.container_vod, user,
+        d = res.for_item(it.ffmpeg_template_id, "local")
+        w.service(d.player, it.id,
+                  stream_url(base_url, "local", it.id, d.container, user,
                              mode, ext=play_extension(lf.filename)),
                   best_title(it.custom_name, lf.filename))
     return w.done()

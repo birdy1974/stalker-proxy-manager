@@ -60,6 +60,8 @@
         </div>
 
         <div class="row g-2 mt-1">
+          <div class="col-md-3"><label class="muted-label" title="auto = each item gets the URL alias its own ffmpeg template produces (redirect items keep the panel's container, Matroska templates get .mkv, everything else .ts) and the player is raised to 4097 where service type 1 could not demux it. fixed = always use the containers configured above.">Container choice</label>
+            <select class="form-select form-select-sm e2-field" id="f-container_mode"></select></div>
           <div class="col-md-3"><label class="muted-label" title="template = whatever each item is assigned in the Playlist Builder. proxy/redirect append ?mode= and override it for this box only.">Delivery</label>
             <select class="form-select form-select-sm e2-field" id="f-delivery_mode"></select></div>
           <div class="col-md-3"><label class="muted-label" title="group_markers = one bouquet per group with markers per series/season (recommended). per_series = one bouquet per series. flat = everything in one.">Layout</label>
@@ -119,7 +121,7 @@
 <script>
 const FIELDS = ["name","enabled","user_id","host","web_port","transport","login","password",
   "bouquet_prefix","player_live","player_vod","player_series","container_live","container_vod",
-  "container_series","delivery_mode","layout","max_entries",
+  "container_series","container_mode","delivery_mode","layout","max_entries",
   "include_live","include_vod","include_series","include_local"];
 let META = null, profiles = [], current = null;
 
@@ -198,8 +200,10 @@ async function preview() {
   const warn = (r.summary.warnings || []).map(w => `<div class="alert alert-warning py-1 px-2 small mb-1">${esc(w)}</div>`).join("");
   const tabs = r.files.map((f, i) => `<option value="${i}">${esc(f.title)} — ${f.services} services (${esc(f.name)})</option>`).join("");
   body.innerHTML = `${warn}
-    <div class="small text-muted mb-2">${r.summary.bouquets} bouquets · ${r.summary.services} services · URLs point at
-      <span class="mono">${esc(r.base_url)}</span></div>
+    <div class="small text-muted mb-2">${r.summary.bouquets} bouquets · ${r.summary.services} services
+      · <span title="what each item's ffmpeg template actually delivers">${r.summary.deliveries.ts} ts ·
+      ${r.summary.deliveries.mkv} mkv · ${r.summary.deliveries.direct} direct</span>
+      · URLs point at <span class="mono">${esc(r.base_url)}</span></div>
     <select class="form-select form-select-sm mb-2" id="pv-pick">${tabs}</select>
     <pre class="small bg-dark text-light p-2 mono" id="pv-text" style="max-height:420px;overflow:auto;white-space:pre"></pre>`;
   const footer = el("div", { class: "d-flex gap-2" });
@@ -245,6 +249,7 @@ $("#e2-delete").addEventListener("click", () => {
   for (const f of ["player_live", "player_vod", "player_series"]) fill(f, Object.keys(META.players), playerLabels);
   for (const f of ["container_live", "container_vod", "container_series"]) fill(f, META.containers);
   fill("layout", META.layouts);
+  fill("container_mode", META.container_modes);
   fill("delivery_mode", META.delivery_modes);
   fill("transport", META.transports);
   const sel = $("#f-user_id");

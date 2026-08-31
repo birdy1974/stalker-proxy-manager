@@ -336,3 +336,16 @@ we build E2–E5.
 3. Duo2 FTP login — default `root` with the box's password, or a different account?
 4. Where should the transcode ceiling sit: 1080p H.264 High@4.0 with AC3 passthrough
    for 5.1 sources, or force stereo AC3 for simplicity?
+
+### E2 follow-up: per-item container resolution (shipped)
+
+Question from review: *"with per-item ffmpeg templates, one VOD can be direct (302) and another MKV — which extension/player does the direct one get?"*
+
+Answer, now implemented in `_Resolver` (`app/services/enigma2_bouquets.py`):
+
+* each item is classified from **its own** template (item → default template → first template → plain mpegts):
+  `@redirect` ⇒ `direct`, `output_format=matroska` ⇒ `mkv`, else `ts`;
+* `direct` keeps the profile's alias (the box follows the 302 and sniffs the body, so the extension is cosmetic) but never stays on service type `1`;
+* `mkv`/`direct` items are raised from `1` to `4097` with a note recommending `5002`;
+* the bundle reports `deliveries = {ts, mkv, direct}`, shown in the preview and used for the "no text subtitles under this player" warning (it now follows what was actually written);
+* `container_mode = fixed` on the profile restores the E2 profile-wide behaviour.
