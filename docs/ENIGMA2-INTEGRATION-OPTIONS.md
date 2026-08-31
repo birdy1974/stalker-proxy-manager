@@ -311,12 +311,14 @@ we build E2–E5.
 * Delivered as: `output_format="matroska"` (+ `-live 1` for the pipe), `subs="keep"` (`-map 0:s? -c:s copy`), `option_warnings()` surfaced by `POST /api/ffmpeg/build` and shown in the editor, `.mkv` aliases for `/play/{live,vod,episode}` and the Xtream-style `/movie|/series` URLs, and the three built-in presets (`E2_VOD_REMUX_PRESET_NAME`, `E2_VOD_TRANSCODE_PRESET_NAME`, `E2_DUO2_LIVE_PRESET_NAME`).
 * Not verified in CI: no ffmpeg binary in the build sandbox, so the rendered commands are asserted as text. Run *Demo (test video)* in the FFmpeg tab on the NAS once to see real Matroska bytes.
 
-**E2 — bouquets**
+**E2 — bouquets** — ✅ **implemented**
 * `app/models.py`: `Enigma2Profile` (fields in §4.1) + a light `Enigma2PushLog`, created by the existing bootstrap/migration path in `database.py`.
 * `app/services/enigma2_bouquets.py`: pure renderer `profile → [BouquetFile(name, text, count)]`, reusing `_groups()/_allowed()` from `playlist_gen.py`, `best_title()` from `titles.py`, plus the reference builder (escaping, stable SID from item id, marker lines) and the `bouquets.tv` merge helper.
 * `app/routers/api_enigma2.py` (admin) + public `GET /enigma2/{token}/bouquets.tar.gz` and `install.sh` in `output.py`.
 * `app/templates/enigma2.html` + nav entry in `base.html`, JS in `app/static/js/`; profile CRUD, preview modal, summary ("7 bouquets / 4 812 services").
-* Tests: `test_enigma2_bouquets.py` (escaping, markers, splitting, group filters, stable SIDs, bouquets.tv merge idempotency).
+* Tests: `tests/test_enigma2_bouquets.py` — 22 cases: reference escaping, marker syntax, stable SIDs, per-layout file sets, letter/series/season markers, auto-split, the two group filters, warnings, tarball contents, installer semantics, full CRUD + preview + public pull + token rotation.
+* Delivered as: `Enigma2Profile` (created by `create_all`, no migration needed), `app/services/enigma2_bouquets.py` (pure renderer + `merge_bouquets_tv` + `install_script` + `tarball_bytes`), `app/routers/api_enigma2.py` (admin CRUD/preview/download **and** the token-authenticated public pull), `app/templates/enigma2.html` + nav entry.
+* Deviation from the sketch: `bouquets.tv` is **not** shipped in the tarball - only the box knows which other bouquets it has, so the installer merges `bouquets.spm.add` into the receiver's own copy instead.
 
 **E3 — push**
 * `app/services/enigma2_push.py`: FTP upload (thread-pooled `ftplib`), upload to `/tmp` → `RNFR/RNTO` into `/etc/enigma2`, timestamped remote backup of `bouquets.tv`, then `GET /api/servicelistreload?mode=2` on OpenWebif with optional basic auth; every step through `db_log`.

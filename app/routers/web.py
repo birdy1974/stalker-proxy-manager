@@ -50,6 +50,7 @@ PAGES = {
     "/playlist": ("playlist.html", "Playlist Builder", "playlist"),
     "/ffmpeg": ("ffmpeg.html", "FFmpeg Templates", "ffmpeg"),
     "/users": ("users.html", "User Management", "users"),
+    "/enigma2": ("enigma2.html", "Enigma2 Receivers", "enigma2"),
     "/settings": ("settings.html", "Settings", "settings"),
 }
 
@@ -112,6 +113,12 @@ async def ffmpeg(request: Request, admin=Depends(require_admin)):
 @router.get("/users", response_class=HTMLResponse)
 async def users(request: Request, admin=Depends(require_admin)):
     return templates.TemplateResponse(request, "users.html", _ctx(request, "users", "User Management"))
+
+
+@router.get("/enigma2", response_class=HTMLResponse)
+async def enigma2(request: Request, admin=Depends(require_admin)):
+    return templates.TemplateResponse(request, "enigma2.html",
+                                      _ctx(request, "enigma2", "Enigma2 Receivers"))
 
 
 @router.get("/settings", response_class=HTMLResponse)

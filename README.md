@@ -246,6 +246,32 @@ The URL extension does not change the pipeline (the template's `output_format` d
 
 Note that a proxied stream is a live pipe: there is no HTTP Range, so **no seeking** inside a `.mkv` proxied play. When the source codec already fits the box, the *Redirect (bypass ffmpeg)* template is the better choice — the player gets the original file from the CDN with subtitles *and* seeking, at zero CPU. See `docs/ENIGMA2-INTEGRATION-OPTIONS.md` for the full picture (bouquet generation and pushing to the box are the next phases).
 
+### Enigma2 receivers: generated bouquets (the *Enigma2* tab)
+
+An Enigma2 box reads plain-text bouquet files, so SPM writes them. A **receiver profile** (Enigma2 tab) turns the playlist into `userbouquet.<prefix>_*.tv` files and decides, per content kind:
+
+| Setting | Meaning |
+|---|---|
+| **Player** | the leading number of the service reference: `1` (DVB pipeline — live TS, native DVB subtitles, lowest latency), `4097` (servicemp3/gstreamer, the generic default), `5001` (ServiceApp → gstplayer), **`5002`** (ServiceApp → exteplayer3 — text subtitles and multi-audio) |
+| **Container** | which URL alias the line points at: `ts` or `mkv`. It has to match the item's ffmpeg template — the preview warns when `mkv` is combined with a player that cannot show text subtitles |
+| **Delivery** | `template` (whatever each item is assigned in the Playlist Builder), or `proxy`/`redirect` appended as `?mode=` for this box only |
+| **Layout** | `group_markers` (one bouquet per group, marker lines per series and season — the default), `per_series` (one bouquet per show), `flat` (one per content kind). Bouquets are auto-split into numbered parts above *Max per bouquet* (default 1500) because Enigma2 redraws the whole list on every zap |
+| **Output user** | whose credentials and group whitelist the URLs carry; the profile can narrow the group filter further, never widen it |
+
+Defaults are the Vu+ Duo2 recipe: live = `4097` + `.ts`, VOD and series = **`5002` + `.mkv`** so the copied SRT/ASS tracks actually reach the box.
+
+**Preview before anything leaves the server.** *Preview* renders the exact file contents (`#SERVICE` / `#DESCRIPTION` / marker lines) plus a summary — *13 bouquets · 114 services* — and flags the classic mistakes: URLs pointing at `localhost` (a receiver cannot reach that — set the public base URL in Settings), a `.mkv` container under player `4097`, or a deleted output user.
+
+**Getting the files onto the box (this release: pull).** Each profile has an opaque token and a one-liner to run on the receiver:
+
+```sh
+wget -qO- http://nas:8880/enigma2/<token>/install.sh | sh
+```
+
+It downloads the tarball, backs `bouquets.tv` up, **merges** our entries into it (`grep -v userbouquet.<prefix>_` — your satellite bouquets and favourites are kept), copies the files into `/etc/enigma2` and reloads the service list via OpenWebif (`/api/servicelistreload?mode=2`). Re-run it (or put it in cron) after changing the playlist. *Download .tar.gz* gives you the same files by hand, and *rotate token* invalidates the old URLs. Pushing from SPM over FTP/SSH is the next phase.
+
+Service references use the SPM playlist id as the SID (`4097:0:1:2A:…`), so regenerating a bouquet does not renumber anything — the box's own favourites, picon names and the (later) EPG channel map keep pointing at the same services.
+
 **VOD/episode/local inputs are paced (`-re`), live never is.** A file input would otherwise be drained at *encode* speed — ffmpeg pushes a whole movie through the pipe as fast as the encoder allows, the player's buffer fills, ffmpeg hits EOF long before the viewer reaches the end, and the stream stops mid-playback. For `vod`/`episode`/`local` plays the manager therefore inserts `-re` in front of `-i` (unless the template sets its own `-re`/`-readrate`), so the file streams at its own frame rate and lasts exactly as long as the content. Live inputs are already paced by their encoder and are never throttled.
 
 
