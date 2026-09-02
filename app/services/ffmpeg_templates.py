@@ -135,13 +135,17 @@ RESILIENT_INPUT_OPTS = (
 )
 # Same for the container options the renderer picks from `output_format` alone.
 _HLS_OUTPUT_OPTS = (("-hls_time", "6"), ("-hls_list_size", "6"),
-                    ("-hls_flags", "delete_segments+append_list"))
+                    ("-hls_flags", "delete_segments+append_list"),
+                    ("-flush_packets", "1"))
+# Packet flushing is important for Enigma2 receivers: do not leave the
+# receiver waiting behind FFmpeg's output buffer, regardless of container.
+_MPEGTS_OUTPUT_OPTS = (("-flush_packets", "1"),)
 # Matroska over a pipe is a NON-SEEKABLE output: `-live 1` tells the muxer not
 # to go back and patch cues/duration at the end (it cannot), which is exactly
 # the streaming mode exteplayer3 & friends read.
-_MKV_OUTPUT_OPTS = (("-live", "1"),)
+_MKV_OUTPUT_OPTS = (("-live", "1"), ("-flush_packets", "1"))
 _OWNED_OUT = {"-mpegts_flags": "+resend_headers", **dict(_HLS_OUTPUT_OPTS),
-              **dict(_MKV_OUTPUT_OPTS)}
+              **dict(_MKV_OUTPUT_OPTS), **dict(_MPEGTS_OUTPUT_OPTS)}
 # Output targets the renderer writes itself; a leftover one is not an extra arg.
 _OWNED_TARGETS = ("pipe:1", "<out_dir>/index.m3u8")
 
@@ -452,6 +456,9 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
         c += ["-f", "mpegts"]
         if "-mpegts_flags" not in own_out:
             c += ["-mpegts_flags", _OWNED_OUT["-mpegts_flags"]]
+        for flag, val in _MPEGTS_OUTPUT_OPTS:
+            if flag not in own_out:
+                c += [flag, val]
         c += ["pipe:1"]
     return " ".join(c)
 

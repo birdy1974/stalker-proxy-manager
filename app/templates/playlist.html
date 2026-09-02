@@ -575,13 +575,20 @@ window.editLocal = (id) => {
 (async () => {
   await loadTemplates();
   liveBuilder(); vodBuilder(); seriesBuilder(); localBuilder();
-  $$("#pl-tabs .nav-link").forEach(a => a.addEventListener("click", (e) => {
-    e.preventDefault();
+  function selectTab(tab) {
+    const a = $$("#pl-tabs .nav-link").find(x => x.dataset.tab === tab) || $("#pl-tabs .nav-link");
     $$("#pl-tabs .nav-link").forEach(x => x.classList.remove("active"));
     a.classList.add("active");
     for (const k of ["live", "vod", "series", "local"])
-      $("#pl-" + k).classList.toggle("d-none", k !== a.dataset.tab);
+      $("#pl-" + k).classList.toggle("d-none", k !== tab);
+  }
+  $$("#pl-tabs .nav-link").forEach(a => a.addEventListener("click", (e) => {
+    e.preventDefault();
+    selectTab(a.dataset.tab);
+    history.replaceState(null, "", "/playlist?tab=" + a.dataset.tab);
   }));
+  const requestedTab = new URLSearchParams(location.search).get("tab");
+  if (["live", "vod", "series", "local"].includes(requestedTab)) selectTab(requestedTab);
 })();
 document.addEventListener("DOMContentLoaded", () => {
   const b = document.getElementById("sync-seasons");

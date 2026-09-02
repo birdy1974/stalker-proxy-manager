@@ -551,12 +551,16 @@ async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
         lf = files.get(it.local_file_id)
         if not lf:
             continue
-        # local items keep their real extension: the file is served as-is
-        # (original container, its own subtitle tracks included)
         d = res.for_item(it.ffmpeg_template_id, "local")
+        # A transcoded/remuxed local file must advertise the container that
+        # ffmpeg actually writes.  Using the source suffix (for example
+        # `.mp4`) while returning a Matroska stream makes Enigma2 select the
+        # wrong demuxer and results in a black screen.  Only direct delivery
+        # serves the original file and should retain its real extension.
+        ext = play_extension(lf.filename) if d.kind == "direct" else "." + d.container
         w.service(d.player, it.id,
                   stream_url(base_url, "local", it.id, d.container, user,
-                             mode, ext=play_extension(lf.filename)),
+                             mode, ext=ext),
                   best_title(it.custom_name, lf.filename))
     return w.done()
 

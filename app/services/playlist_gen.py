@@ -15,7 +15,8 @@ import json
 from datetime import datetime, timezone
 from urllib.parse import quote
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+import time
 
 from ..database import SessionLocal
 from ..models import (
@@ -83,7 +84,32 @@ def _chunked(seq: list, size: int = 800):
         yield seq[i:i + size]
 
 
+_M3U_CACHE: dict[tuple, tuple[float, str]] = {}
+_M3U_CACHE_TTL = 120
+
+async def _playlist_revision(s) -> tuple:
+    """Cheap per-database revision signature; changes invalidate cached M3Us."""
+    tables = (LivePlaylist, VodPlaylist, SeriePlaylist, LocalPlaylist,
+              SeriePlaylistSeason, LocalFile, SerieEpisode)
+    return tuple((await s.scalar(select(func.count()).select_from(t)),
+                   await s.scalar(select(func.max(t.id)).select_from(t))) for t in tables)
+
 async def build_m3u(base_url: str, user: User) -> str:
+    async with SessionLocal() as s:
+        revision = await _playlist_revision(s)
+    key = (user.id, user.groups_json or "", base_url, revision)
+    cached = _M3U_CACHE.get(key)
+    if cached and time.monotonic() - cached[0] < _M3U_CACHE_TTL:
+        return cached[1]
+    text = await _build_m3u(base_url, user)
+    _M3U_CACHE[key] = (time.monotonic(), text)
+    # Bound memory when users/URLs change.
+    if len(_M3U_CACHE) > 100:
+        oldest = min(_M3U_CACHE, key=lambda k: _M3U_CACHE[k][0])
+        _M3U_CACHE.pop(oldest, None)
+    return text
+
+async def _build_m3u(base_url: str, user: User) -> str:
     """
     Render the final per-user playlist (groups filtered per user).
 
@@ -164,8 +190,11 @@ async def build_m3u(base_url: str, user: User) -> str:
                     .order_by(SerieEpisode.episode_number))).all():
                 eps_by_season.setdefault(season_id, []).append((ep_id, ep_num))
 
+        seasons_by_playlist: dict[int, list] = {}
+        for row in season_rows:
+            seasons_by_playlist.setdefault(row[0], []).append(row)
         for sp in visible:
-            for sp_id, season_id, season_number in [r for r in season_rows if r[0] == sp.id]:
+            for sp_id, season_id, season_number in seasons_by_playlist.get(sp.id, []):
                 for ep_id, ep_num in eps_by_season.get(season_id, []):
                     name = f"{best_title(sp.custom_name)} S{season_number:02d}E{ep_num:02d}"
                     attr = (f'tvg-name="{m3u_attr(name)}" '
