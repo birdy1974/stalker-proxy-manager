@@ -35,6 +35,8 @@ if DATABASE_URL.startswith("sqlite"):
     def _sqlite_pragma(dbapi_conn, _):  # noqa: ANN001
         cur = dbapi_conn.cursor()
         cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.execute("PRAGMA busy_timeout=10000")
         cur.execute("PRAGMA foreign_keys=ON")
         cur.close()
 
@@ -387,6 +389,16 @@ def _add_missing_columns(sync_conn) -> None:
     from sqlalchemy import inspect, text
 
     is_sqlite = sync_conn.dialect.name == "sqlite"
+    # Idempotent indexes for playlist ordering and series expansion.  These
+    # are deliberately created here so existing installations benefit too.
+    from sqlalchemy import text
+    for name, table, column in (
+        ("ix_vod_playlist_order", "vod_playlist", "order"),
+        ("ix_serie_playlist_order", "serie_playlist", "order"),
+        ("ix_spls_season", "serie_playlist_seasons", "serie_season_id"),
+        ("ix_serie_episodes_season", "serie_episodes", "serie_season_id"),
+    ):
+        sync_conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{name}" ON "{table}" ("{column}")'))
     insp = inspect(sync_conn)
     for table, columns in _NEW_COLUMNS.items():
         if not insp.has_table(table):

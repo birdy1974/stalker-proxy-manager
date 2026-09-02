@@ -98,7 +98,8 @@
                 </select></div>
               <div class="col-4"><label class="muted-label" title="MPEG-TS: live TV, DVB bitmap subtitles only. Matroska: VOD/series with text subtitles (SRT/ASS) - play it with exteplayer3 (Enigma2 service reference 5002), VLC or Kodi. HLS writes segment files.">Output</label>
                 <select class="form-select form-select-sm ff-field" id="f-output_format"><option value="mpegts">MPEG-TS (pipe)</option><option value="matroska">Matroska / MKV (pipe, subtitle-capable)</option><option value="hls">HLS (files)</option></select></div>
-              <div class="col-6"><label class="muted-label">Extra input flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_input"></div>
+              <div class="col-3"><label class="muted-label" title="FFmpeg network read timeout in microseconds">Read timeout (µs)</label><input class="form-control form-control-sm ff-field" id="f-timeout" value="10000000" inputmode="numeric" min="0"></div>
+              <div class="col-5"><label class="muted-label">Extra input flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_input"></div>
               <div class="col-6"><label class="muted-label">Extra output flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_output"></div>
           <div class="col-12 mt-2">
             <label class="muted-label">Full ffmpeg command (edit freely — fields update on the fly)</label>
@@ -154,6 +155,10 @@ function readFields() {
     const n = $("#f-" + k);
     o[k] = n.type === "checkbox" ? n.checked : n.value;
   }
+  // Keep the timeout as a normal extra input option so it works with the
+  // existing template schema and remains compatible with imported templates.
+  const extra = o.extra_input.replace(/(^|\s)-rw_timeout\s+\S+/g, "").trim();
+  o.extra_input = `-rw_timeout ${Math.max(0, Number($("#f-timeout").value) || 0)}${extra ? " " + extra : ""}`;
   return o;
 }
 function writeFields(t) {
@@ -166,6 +171,8 @@ function writeFields(t) {
       n.append(el("option", { value: val, selected: "" }, val));   // keep unknown custom values
     }
   }
+  const match = String(t.extra_input || "").match(/(?:^|\s)-rw_timeout\s+(\d+)/);
+  if (match) $("#f-timeout").value = match[1];
 }
 
 /* fields -> command */

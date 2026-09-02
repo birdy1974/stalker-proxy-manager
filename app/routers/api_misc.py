@@ -14,7 +14,7 @@ from sqlalchemy import func, select
 from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL
 from ..database import get_db
 from ..models import (
-    EpgSource, FFmpegTemplate, LiveGenre, LivePlaylist, LiveSource, LocalFile,
+    EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre, LivePlaylist, LiveSource, LocalFile,
     LocalPlaylist, LocalSource, Log, Portal, SerieGenre, SeriePlaylist,
     SerieSource, Setting, User, VodGenre, VodPlaylist, VodSource,
 )
@@ -46,6 +46,7 @@ async def dashboard(db=Depends(get_db)):
                            + await cnt(SeriePlaylist) + await cnt(LocalPlaylist)),
         "ffmpeg_templates": await cnt(FFmpegTemplate, FFmpegTemplate.enabled.is_(True)),
         "users": await cnt(User),
+        "enigma2_profiles": await cnt(Enigma2Profile),
         "local_files": await cnt(LocalFile),
     }
     streams = MANAGER.list()

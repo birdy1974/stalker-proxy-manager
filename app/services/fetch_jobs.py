@@ -356,21 +356,27 @@ async def _run_items_fetch(job: Job, client: StalkerClient | None = None,
 async def _sync_genres(s, model, portal_id: int, incoming: list[dict], syn_ok_none=True) -> dict[str, int]:
     """Upsert genres (preserve enabled), return {genre_portal_id: row.id}."""
     known: dict[str, int] = {}
+    # Load the complete existing set once.  The old implementation performed
+    # one SELECT (and a flush) per genre, which is very slow on SQLite.
+    existing = (await s.execute(select(model).where(model.portal_id == portal_id))).scalars().all()
+    by_gid = {r.genre_portal_id: r for r in existing}
     for g in incoming:
         gid = str(g.get("id", "")).strip()
         if not gid or gid == "*":
             continue
         title = (g.get("title") or g.get("name") or gid)[:300]
-        row = (await s.execute(select(model).where(
-            model.portal_id == portal_id, model.genre_portal_id == gid))).scalar_one_or_none()
+        row = by_gid.get(gid)
         if row is None:
             row = model(portal_id=portal_id, genre_portal_id=gid, name=title, enabled=False)
             s.add(row)
-            await s.flush()
-        else:
+            # IDs are assigned at the single transaction flush below.
+            by_gid[gid] = row
+        elif row.name != title:
             row.name = title
         known[gid] = row.id
-    return known
+    await s.flush()
+    # Newly inserted rows receive IDs during flush; rebuild the result map.
+    return {gid: by_gid[gid].id for gid in known}
 
 
 async def _paged_upsert(job, fetch_page, upsert_many, genre_name,

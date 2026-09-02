@@ -76,22 +76,23 @@ const STAT_CARDS = [
   ["series", "Series (en/av)"], ["playlist_items", "Playlist items"],
   ["ffmpeg_templates", "FFmpeg tpl"], ["users", "Users"], ["__streams", "Active streams"],
 ];
-function card(label, value, sub="") {
-  return `<div class="col-6 col-md-3 col-xxl"><div class="card stat"><div class="card-body py-2 px-3">
-    <div class="num">${value}</div><div class="lbl">${label}</div>
-    <div class="small text-muted">${sub}</div></div></div></div>`;
+function card(label, value, sub="", href="#") {
+  return `<div class="col-6 col-md-3 col-xxl"><a class="text-decoration-none" href="${href}" aria-label="Open ${label}"><div class="card stat h-100">
+    <div class="card-body py-2 px-3"><div class="num">${value}</div><div class="lbl">${label}</div>
+    <div class="small text-muted">${sub}</div></div></div></a></div>`;
 }
 async function refreshStats() {
   const d = await api("/api/dashboard");
   const s = d.stats;
   $("#stats").innerHTML =
-    card("Portals", s.portals, s.portals_enabled + " enabled") +
-    card("Live channels", `${s.live_enabled}/${s.live_available}`, "enabled / available") +
-    card("VOD", `${s.vod_enabled}/${s.vod_available}`, "enabled / available") +
-    card("Series", `${s.series_enabled}/${s.series_available}`, "enabled / available") +
-    card("Playlist items", s.playlist_items) +
-    card("FFmpeg templates", s.ffmpeg_templates, "enabled") +
-    card("Users", s.users) +
+    card("Portals", s.portals, s.portals_enabled + " enabled", "/portals") +
+    card("Live channels", `${s.live_enabled}/${s.live_available}`, "enabled / available", "/playlist?tab=live") +
+    card("VOD", `${s.vod_enabled}/${s.vod_available}`, "enabled / available", "/playlist?tab=vod") +
+    card("Series", `${s.series_enabled}/${s.series_available}`, "enabled / available", "/playlist?tab=series") +
+    card("Playlist items", s.playlist_items, "", "/playlist") +
+    card("FFmpeg templates", s.ffmpeg_templates, "enabled", "/ffmpeg") +
+    card("Users", s.users, "", "/users") +
+    card("Enigma2", s.enigma2_profiles, "receivers", "/enigma2") +
     card("Active streams", d.streams.length);
   $("#mock-hint").innerHTML = {% if mock_enabled %}`<b>Demo tip:</b> add portal <span class="mono">{{ mock_portal_url }}</span> with MAC <span class="mono">{{ mock_macs }}</span> to try the full flow without a real portal. The Mock Control there simulates offline/busy portals so you can watch fallback work.`{% else %}""{% endif %};
   renderApi(d.api);
