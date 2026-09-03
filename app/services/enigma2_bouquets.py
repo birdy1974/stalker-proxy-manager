@@ -74,7 +74,7 @@ CONTAINER_MODES = ("auto", "fixed")
 FFMPEG_PLAYERS = ("4097", "5001", "5002")
 LAYOUTS = ("group_markers", "per_series", "flat")
 DELIVERY_MODES = ("template", "proxy", "redirect")
-TRANSPORTS = ("download", "ftp", "ssh")
+TRANSPORTS = ("ftp", "download", "ssh")
 # Where the files belong on the receiver.
 E2_DIR = "/etc/enigma2"
 BOUQUETS_TV = "bouquets.tv"

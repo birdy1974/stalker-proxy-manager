@@ -312,6 +312,7 @@ async def test_profile_crud_preview_and_public_pull():
         item = r.json()["item"]
         pid, token = item["id"], item["token"]
         assert item["player_vod"] == "5002" and item["container_vod"] == "mkv"
+        assert item["transport"] == "ftp"
 
         # secrets never travel back to the browser
         await c.put(f"/api/enigma2/profiles/{pid}", json={"password": "boxpw"})
