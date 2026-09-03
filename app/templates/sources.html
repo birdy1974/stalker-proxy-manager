@@ -115,11 +115,15 @@ function playlistNameCell(r) {
     badge = ` <span class="badge text-bg-success" title="primary source of this custom channel">primary</span>`;
   }
   // stopPropagation so typing / clicking the input does not select the row
+  // mouseup preventDefault keeps the select-all from collapsing when the
+  // click that focused the field also places the caret.
   return `<div class="d-flex align-items-center gap-1" onclick="event.stopPropagation()">
     <input class="form-control form-control-sm" style="min-width:140px"
       value="${esc(name)}"
       placeholder="playlist name…"
-      title="Unique name → new custom channel. Existing name → this source becomes a fallback."
+      title="Click to edit. Unique name → new custom channel. Existing name → this source becomes a fallback."
+      onfocus="this.select()"
+      onmouseup="event.preventDefault()"
       onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
       onblur="saveLivePlaylistName(${r.id}, this)">
     ${badge}
@@ -317,14 +321,35 @@ function localTab(hostSel) {
     perPageDefault: 15, defaultSort: "path",
     server: async (q) => await api("/api/sources/local/files?" + q),
     columns: [
-      { key: "enabled", label: "On", width: "36px", render: r => `<span class="badge ${r.enabled ? "st-online" : "st-unknown"}">${r.enabled ? "on" : "off"}</span>` },
+      { key: "enabled", label: "On", width: "48px",
+        render: r => `<span class="badge ${r.enabled ? "st-online" : "st-unknown"}"
+          role="button" tabindex="0"
+          title="${r.enabled ? "click to disable this file" : "click to enable this file"}"
+          style="cursor:pointer"
+          onclick="event.stopPropagation();toggleLocalFile(${r.id}, ${r.enabled ? "true" : "false"}, this)">${r.enabled ? "on" : "off"}</span>` },
       { key: "filename", label: "Filename", sort: "filename", filter: { type: "text", param: "q", placeholder: "file…" }, render: r => esc(r.filename) },
       { key: "relative_path", label: "Path", sort: "path", render: r => `<span class="mono small text-muted">${esc(r.relative_path)}</span>` },
       { key: "size_bytes", label: "Size", render: r => r.size_bytes ? (r.size_bytes / 1048576).toFixed(0) + " MB" : "" },
     ],
     emptyText: "Scan a directory to list its videos here.",
   });
+  TABS.localFiles = ft;
 }
+window.toggleLocalFile = async (id, enabled, el) => {
+  const next = !enabled;
+  try {
+    await api("/api/sources/local/files/toggle", { method: "POST",
+      body: { ids: [id], enabled: next } });
+    if (el) {
+      el.className = `badge ${next ? "st-online" : "st-unknown"}`;
+      el.textContent = next ? "on" : "off";
+      el.title = next ? "click to disable this file" : "click to enable this file";
+      el.setAttribute("onclick",
+        `event.stopPropagation();toggleLocalFile(${id}, ${next ? "true" : "false"}, this)`);
+    }
+    toast(next ? "file enabled" : "file disabled", "ok");
+  } catch (e) { /* api() already toasted */ }
+};
 
 /* directory browser popup (stays inside the mounted media root) */
 function browseDir(start, onPick) {
