@@ -11,12 +11,19 @@ import os
 
 from sqlalchemy import select
 
-from ..models import MacAddress, Portal
+from ..models import (
+    LivePlaylist, LivePlaylistSource, LiveSource, LocalFile, LocalPlaylist,
+    LocalSource, MacAddress, Portal, SerieEpisode, SeriePlaylist,
+    SeriePlaylistSeason, SerieSeason, SerieSource, VodPlaylist,
+    VodPlaylistSource, VodSource,
+)
 from ..portal.client import apply_mac_placeholder, extract_url
 from ..portal.links import link_policy
 from ..portal.pool import POOL, PortalSession
 from .probe import probe_media
 from .tmdb import tmdb_lookup
+
+PLAYLIST_KINDS = ("live", "vod", "series", "local")
 
 
 def cmd_to_url(cmd: str) -> str | None:
@@ -99,3 +106,81 @@ def local_file_path(directory: str, rel: str | None) -> str:
     if os.path.isabs(directory):
         return os.path.join(directory, rel or "")
     return str(MEDIA_ROOT / directory / (rel or ""))
+
+
+async def playlist_primary_input(db, kind: str, pid: int):
+    """Return (cmd_or_path, portal_id, is_url, source_row) for a playlist item's primary source.
+
+    Same resolution the Playlist detail popup and the ffmpeg demo use, so a
+    template test against a channel sees the URL the stream path would play.
+    """
+    if kind == "live":
+        link = (await db.execute(select(LivePlaylistSource).where(
+            LivePlaylistSource.live_playlist_id == pid)
+            .order_by(LivePlaylistSource.priority))).scalars().first()
+        src = await db.get(LiveSource, link.live_source_id) if link else None
+        return (src.cmd if src else None), (src.portal_id if src else None), True, src
+    if kind == "vod":
+        link = (await db.execute(select(VodPlaylistSource).where(
+            VodPlaylistSource.vod_playlist_id == pid)
+            .order_by(VodPlaylistSource.priority))).scalars().first()
+        src = await db.get(VodSource, link.vod_source_id) if link else None
+        if not src:
+            pl = await db.get(VodPlaylist, pid)
+            src = await db.get(VodSource, pl.vod_source_id) if pl else None
+        return (src.cmd if src else None), (src.portal_id if src else None), True, src
+    if kind == "series":
+        pl = await db.get(SeriePlaylist, pid)
+        eps = []
+        if pl:
+            season_links = (await db.execute(
+                select(SeriePlaylistSeason).where(
+                    SeriePlaylistSeason.serie_playlist_id == pid,
+                    SeriePlaylistSeason.enabled.is_(True)))).scalars().all()
+            for sl in season_links:
+                eps = (await db.execute(select(SerieEpisode).where(
+                    SerieEpisode.serie_season_id == sl.serie_season_id)
+                    .order_by(SerieEpisode.episode_number).limit(1))).scalars().all()
+                if eps:
+                    break
+        if not eps or not eps[0].cmd:
+            return None, None, True, None
+        season = await db.get(SerieSeason, eps[0].serie_season_id)
+        ssrc = await db.get(SerieSource, season.serie_source_id) if season else None
+        return eps[0].cmd, (ssrc.portal_id if ssrc else None), True, eps[0]
+    if kind == "local":
+        r = await db.get(LocalPlaylist, pid)
+        lf = await db.get(LocalFile, r.local_file_id) if r else None
+        ls = await db.get(LocalSource, lf.local_source_id) if lf else None
+        path = local_file_path(ls.directory, lf.relative_path) if ls and lf else None
+        return path, None, False, None
+    return None, None, True, None
+
+
+async def resolve_playlist_input(db, kind: str, pid: int) -> dict:
+    """Playable URL/path + labels for one enabled playlist item.
+
+    Raises ValueError with a GUI-safe message when the item cannot be tested.
+    """
+    if kind not in PLAYLIST_KINDS:
+        raise ValueError("kind must be live|vod|series|local")
+    models = {"live": LivePlaylist, "vod": VodPlaylist, "series": SeriePlaylist,
+              "local": LocalPlaylist}
+    row = await db.get(models[kind], pid)
+    if not row:
+        raise ValueError("playlist item not found")
+    if not row.enabled:
+        raise ValueError("playlist item is disabled")
+    cmd, portal_id, is_url, src = await playlist_primary_input(db, kind, pid)
+    name = getattr(row, "custom_name", None) or f"{kind} #{pid}"
+    src_name = getattr(src, "original_name", None) or getattr(src, "name", None)
+    if not cmd:
+        raise ValueError(f"no usable source stream on '{name}'")
+    if is_url:
+        url = await playable_url(db, cmd, portal_id, kind, src=src)
+        if not url:
+            raise ValueError(f"could not resolve a playable URL for '{name}'")
+        return {"kind": kind, "id": pid, "name": name, "url": url, "is_url": True,
+                "source": src_name, "cmd": cmd}
+    return {"kind": kind, "id": pid, "name": name, "url": cmd, "is_url": False,
+            "source": src_name, "cmd": cmd}

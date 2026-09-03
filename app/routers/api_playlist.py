@@ -653,46 +653,7 @@ async def _source_cmd_and_portal(db, kind: str, pid: int):
     portal has to be asked for a link at all (R2) - a popup that ignores that
     answers with a URL the stream path will never use.
     """
-    if kind == "live":
-        link = (await db.execute(select(LivePlaylistSource).where(
-            LivePlaylistSource.live_playlist_id == pid)
-            .order_by(LivePlaylistSource.priority))).scalars().first()
-        src = await db.get(LiveSource, link.live_source_id) if link else None
-        return (src.cmd if src else None), (src.portal_id if src else None), True, src
-    if kind == "vod":
-        link = (await db.execute(select(VodPlaylistSource).where(
-            VodPlaylistSource.vod_playlist_id == pid)
-            .order_by(VodPlaylistSource.priority))).scalars().first()
-        src = await db.get(VodSource, link.vod_source_id) if link else None
-        return (src.cmd if src else None), (src.portal_id if src else None), True, src
-    if kind == "series":
-        # first enabled season's first episode of the playlist's source
-        pl = await db.get(SeriePlaylist, pid)
-        eps = []
-        if pl:
-            season_links = (await db.execute(
-                select(SeriePlaylistSeason).where(
-                    SeriePlaylistSeason.serie_playlist_id == pid,
-                    SeriePlaylistSeason.enabled.is_(True)))).scalars().all()
-            for sl in season_links:
-                eps = (await db.execute(select(SerieEpisode).where(
-                    SerieEpisode.serie_season_id == sl.serie_season_id)
-                    .order_by(SerieEpisode.episode_number).limit(1))).scalars().all()
-                if eps:
-                    break
-        if not eps or not eps[0].cmd:
-            return None, None, True, None
-        season = await db.get(SerieSeason, eps[0].serie_season_id)
-        ssrc = await db.get(SerieSource, season.serie_source_id) if season else None
-        # the *episode* row carries the flags (a series link is per episode)
-        return eps[0].cmd, (ssrc.portal_id if ssrc else None), True, eps[0]
-    if kind == "local":
-        r = await db.get(LocalPlaylist, pid)
-        lf = await db.get(LocalFile, r.local_file_id) if r else None
-        ls = await db.get(LocalSource, lf.local_source_id) if lf else None
-        path = item_info.local_file_path(ls.directory, lf.relative_path) if ls and lf else None
-        return path, None, False, None
-    return None, None, True, None
+    return await item_info.playlist_primary_input(db, kind, pid)
 
 
 @router.get("/info")

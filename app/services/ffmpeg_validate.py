@@ -20,6 +20,9 @@ LAVFI_VIDEO = "testsrc2=size=640x360:rate=25:duration=4,format=yuv420p"
 _NETONLY = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout)\b\s*(?:\S+)?"
 )
+MAX_STDERR = 256 * 1024
+DEMO_TIMEOUT_S = 20
+PLAYLIST_DEMO_TIMEOUT_S = 30
 
 
 def syntax_check(command: str) -> dict:
@@ -45,6 +48,29 @@ def syntax_check(command: str) -> dict:
             "detail": f"{len(toks)} tokens, placeholder at input"}
 
 
+def _bound_demo(toks: list[str]) -> list[str]:
+    """Cap a demo run at 2s and never write HLS files during a probe."""
+    if "-t" not in toks:
+        try:
+            i = toks.index("-i")
+            insert_at = i + 2 if i + 1 < len(toks) else len(toks)
+            toks[insert_at:insert_at] = ["-t", "2"]
+        except ValueError:
+            toks += ["-t", "2"]
+    if "-f" in toks:
+        fi = len(toks) - 1 - toks[::-1].index("-f")
+        if fi + 1 < len(toks) and toks[fi + 1] == "hls":
+            toks[fi + 1] = "mpegts"
+            toks = [t for t in toks if t != "<out_dir>/index.m3u8"]
+            if toks[-1:] != ["pipe:1"]:
+                toks += ["pipe:1"]
+    # Demos are about seeing *why* a template works or fails. A template that
+    # happens to carry -loglevel error would hide the very output we want.
+    if "-loglevel" not in toks and "-v" not in toks:
+        toks[1:1] = ["-loglevel", "info"]
+    return toks
+
+
 def _argv(command: str, url: str, *, lavfi: bool) -> list[str]:
     cmd = command.strip()
     if lavfi:
@@ -55,28 +81,33 @@ def _argv(command: str, url: str, *, lavfi: bool) -> list[str]:
         cmd = cmd.replace(URL_PLACEHOLDER, url)
     if cmd.startswith("ffmpeg"):
         cmd = FFMPEG_BIN + cmd[len("ffmpeg"):]
-    toks = shlex.split(cmd)
-    # Bound the run so a working encoder cannot sit forever.
-    if "-t" not in toks:
-        try:
-            i = toks.index("-i")
-            insert_at = i + 2 if i + 1 < len(toks) else len(toks)
-            toks[insert_at:insert_at] = ["-t", "2"]
-        except ValueError:
-            toks += ["-t", "2"]
-    # Never write HLS files during a probe.
-    if "-f" in toks:
-        fi = len(toks) - 1 - toks[::-1].index("-f")
-        if fi + 1 < len(toks) and toks[fi + 1] == "hls":
-            toks[fi + 1] = "mpegts"
-            toks = [t for t in toks if t != "<out_dir>/index.m3u8"]
-            if toks[-1:] != ["pipe:1"]:
-                toks += ["pipe:1"]
-    return toks
+    return _bound_demo(shlex.split(cmd))
 
 
-async def run_demo(command: str, mode: str = "lavfi", url: str | None = None) -> dict:
-    """Spawn ffmpeg with the template; return bytes/stderr/rc."""
+def _playlist_argv(command: str, url: str) -> list[str]:
+    """Build argv the same way the stream path does (UA / referer / HLS opts)."""
+    from .stream_manager import StreamManager
+    args = StreamManager._ffmpeg_argv(command, url)
+    if not args:
+        return _argv(command, url, lavfi=False)
+    return _bound_demo(list(args))
+
+
+def _result(*, ok: bool, mode: str, detail: str, args: list[str] | None = None,
+            out_n: int = 0, rc=None, err: str = "", ms: int = 0,
+            source: str = "") -> dict:
+    argv = list(args or [])
+    return {
+        "ok": ok, "mode": mode, "detail": detail, "bytes": out_n, "rc": rc,
+        "stderr": err, "ms": ms, "source": source,
+        "argv": argv,
+        "argv_text": " ".join(shlex.quote(a) for a in argv),
+    }
+
+
+async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
+                   source_label: str | None = None) -> dict:
+    """Spawn ffmpeg with the template; return bytes/stderr/rc plus the argv."""
     syn = syntax_check(command)
     if mode == "syntax" or not syn["ok"]:
         return syn
@@ -86,20 +117,27 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None) ->
     lavfi = mode == "lavfi"
     src = (url or "").strip() or TEST_VIDEO_URL
     try:
-        args = _argv(command, src, lavfi=lavfi)
+        if lavfi:
+            args = _argv(command, src, lavfi=True)
+        elif mode == "playlist":
+            args = _playlist_argv(command, src)
+        else:
+            args = _argv(command, src, lavfi=False)
     except ValueError as exc:
-        return {"ok": False, "mode": mode, "detail": str(exc)}
+        return _result(ok=False, mode=mode, detail=str(exc), source=source_label or src)
 
+    source = source_label or ("lavfi testsrc2" if lavfi else src)
     started = time.perf_counter()
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     except FileNotFoundError:
-        return {"ok": False, "mode": mode, "detail": f"ffmpeg not found: {args[0]}"}
+        return _result(ok=False, mode=mode, detail=f"ffmpeg not found: {args[0]}",
+                       args=args, source=source)
 
     out_n = 0
-    err_chunks: list[bytes] = []
+    err_buf = bytearray()
 
     async def _stdout() -> None:
         nonlocal out_n
@@ -113,28 +151,31 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None) ->
     async def _stderr() -> None:
         assert proc.stderr
         while True:
-            line = await proc.stderr.readline()
-            if not line:
+            chunk = await proc.stderr.read(4096)
+            if not chunk:
                 return
-            err_chunks.append(line)
-            del err_chunks[:-40]
+            err_buf.extend(chunk)
+            if len(err_buf) > MAX_STDERR:
+                del err_buf[:len(err_buf) - MAX_STDERR]
 
+    timeout = PLAYLIST_DEMO_TIMEOUT_S if mode == "playlist" else DEMO_TIMEOUT_S
     try:
-        await asyncio.wait_for(asyncio.gather(_stdout(), _stderr(), proc.wait()), 20)
+        await asyncio.wait_for(asyncio.gather(_stdout(), _stderr(), proc.wait()), timeout)
     except asyncio.TimeoutError:
         try:
             proc.kill()
         except ProcessLookupError:
             pass
         await proc.wait()
-        return {"ok": False, "mode": mode, "detail": "timed out after 20s",
-                "bytes": out_n, "rc": proc.returncode,
-                "stderr": b"".join(err_chunks[-12:]).decode(errors="replace")[-1500:],
-                "ms": int((time.perf_counter() - started) * 1000),
-                "source": "lavfi testsrc2" if lavfi else src}
+        return _result(
+            ok=False, mode=mode, detail=f"timed out after {timeout}s",
+            args=args, out_n=out_n, rc=proc.returncode,
+            err=err_buf.decode(errors="replace"),
+            ms=int((time.perf_counter() - started) * 1000),
+            source=source)
 
     rc = proc.returncode
-    err = b"".join(err_chunks[-16:]).decode(errors="replace")[-1800:]
+    err = err_buf.decode(errors="replace")
     ms = int((time.perf_counter() - started) * 1000)
     ok = rc == 0 and out_n > 0
     if rc == 0 and out_n == 0:
@@ -148,6 +189,5 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None) ->
         detail = f"ffmpeg rc={rc}, {out_n} bytes in {ms} ms"
     else:
         detail = f"{out_n} bytes in {ms} ms"
-    return {"ok": ok, "mode": mode, "detail": detail, "bytes": out_n, "rc": rc,
-            "stderr": err, "ms": ms,
-            "source": "lavfi testsrc2" if lavfi else src}
+    return _result(ok=ok, mode=mode, detail=detail, args=args, out_n=out_n,
+                   rc=rc, err=err, ms=ms, source=source)
