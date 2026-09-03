@@ -94,12 +94,13 @@ REFERENCE_PRESET_NAME = "VAAPI 720p ~1M (DS918+ reference)"
 REDIRECT_PRESET_NAME = "Redirect (bypass ffmpeg)"
 REDIRECT_COMMAND = "@redirect"
 COPY_PRESET_NAME = "Copy / passthrough (no transcode)"
-# Enigma2 (Vu+ / OpenPLi) presets. The set-top box cannot show text subtitles
-# from an MPEG-TS pipe - no player can, the container has no slot for them - so
-# the two VOD presets deliver MATROSKA and copy every subtitle track into it.
-# Play them with ServiceApp/exteplayer3 (bouquet service reference 5002); the
-# live preset stays MPEG-TS (service reference 1 or 4097) where the box shows
-# DVB bitmap subtitles natively.
+# Enigma2 (Vu+ / OpenPLi) presets. A live Matroska pipe (`-f matroska -live 1`)
+# is audio-only on exteplayer3 (no cue index on a non-seekable output), and a
+# progressive MP4 is the same. MPEG-TS with Annex-B H.264 is what the box
+# already plays for live TV, so the VOD presets mux that - not MKV. Text
+# subtitles cannot ride along (the container has no slot); DVB bitmap tracks
+# still can. Keep the historical names: the seeder matches built-ins by name
+# and rewriting them would orphan the templates already assigned on playlists.
 E2_VOD_REMUX_PRESET_NAME = "Enigma2 VOD - remux + subtitles (MKV)"
 E2_VOD_TRANSCODE_PRESET_NAME = "Enigma2 VOD - VAAPI 1080p H.264 + AC3 + subtitles (MKV)"
 E2_DUO2_LIVE_PRESET_NAME = "Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)"
@@ -144,7 +145,11 @@ _MPEGTS_OUTPUT_OPTS = (("-flush_packets", "1"),)
 # to go back and patch cues/duration at the end (it cannot), which is exactly
 # the streaming mode exteplayer3 & friends read.
 _MKV_OUTPUT_OPTS = (("-live", "1"), ("-flush_packets", "1"))
-_OWNED_OUT = {"-mpegts_flags": "+resend_headers", **dict(_HLS_OUTPUT_OPTS),
+# Annex-B conversion is implied by mpegts+copy (AVCC in MP4/MKV is otherwise
+# a black screen on Enigma2). Owned so parse->build does not duplicate it.
+_OWNED_OUT = {"-mpegts_flags": "+resend_headers",
+              "-bsf:v": "h264_mp4toannexb",
+              **dict(_HLS_OUTPUT_OPTS),
               **dict(_MKV_OUTPUT_OPTS), **dict(_MPEGTS_OUTPUT_OPTS)}
 # Output targets the renderer writes itself; a leftover one is not an extra arg.
 _OWNED_TARGETS = ("pipe:1", "<out_dir>/index.m3u8")
@@ -453,6 +458,11 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
                 c += [flag, val]
         c += ["<out_dir>/index.m3u8"]
     else:
+        # H.264 in MP4/MKV is length-prefixed (AVCC). The MPEG-TS demuxer on
+        # Enigma2 wants start-code prefixed NAL units (Annex-B); without the
+        # bitstream filter a copy remux plays audio and a black picture.
+        if not transcode and "-bsf:v" not in own_out:
+            c += ["-bsf:v", "h264_mp4toannexb"]
         c += ["-f", "mpegts"]
         if "-mpegts_flags" not in own_out:
             c += ["-mpegts_flags", _OWNED_OUT["-mpegts_flags"]]
@@ -461,6 +471,19 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
                 c += [flag, val]
         c += ["pipe:1"]
     return " ".join(c)
+
+
+def mpegts_copy_command(ffmpeg_bin: str = "ffmpeg") -> str:
+    """Remux any file to MPEG-TS (copy + Annex-B) for Enigma2 / live players.
+
+    Used when a local item is requested as `.ts` but its template is the
+    redirect marker (which is not an ffmpeg command). Subtitles are dropped:
+    a text track in an MP4 would abort the mpegts muxer.
+    """
+    return build_command(FFmpegOptions(
+        hw_accel="none", video_codec="copy", audio_codec="copy",
+        resolution="source", output_format="mpegts", subs="drop",
+    ), ffmpeg_bin)
 
 
 def option_warnings(opts: FFmpegOptions) -> list[str]:
@@ -729,22 +752,20 @@ def default_presets() -> list[dict]:
         mk(COPY_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source", subs="dvb"),
         # --- Enigma2 / Vu+ Duo2 --------------------------------------------
-        # VOD + series with subtitles, no CPU anywhere:
-        #  * remux  - container swap only (the source codec already fits the
-        #             box), every subtitle track copied through;
-        #  * VAAPI  - the 4K/HEVC rescue path: the video is re-encoded on the
-        #             GPU to H.264 High@4.0 1080p (the ceiling of the BCM7424
-        #             in a Duo2) with AC3 audio, while `-c:s copy` carries the
-        #             SRT/ASS/PGS tracks untouched beside it.
+        # VOD + series as MPEG-TS (the container the box already plays for
+        # live). A live Matroska pipe is audio-only on exteplayer3.
+        #  * remux  - copy + h264_mp4toannexb, DVB bitmap subs if present;
+        #  * VAAPI  - 4K/HEVC rescue: GPU H.264 High@4.0 1080p (BCM7424
+        #             ceiling) + AC3, DVB bitmap subs.
         mk(E2_VOD_REMUX_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source",
-           output_format="matroska", subs="keep"),
+           output_format="mpegts", subs="dvb"),
         mk(E2_VOD_TRANSCODE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            maxrate="4400k", bufsize="8000k", fps="25", gop="50",
            profile="high", level="4.0", low_power=True, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
-           output_format="matroska", subs="keep"),
+           output_format="mpegts", subs="dvb"),
         # Live TV for the same box: MPEG-TS straight into the DVB pipeline
         # (service reference 1 or 4097) with the DVB bitmap subtitles the box
         # renders natively.

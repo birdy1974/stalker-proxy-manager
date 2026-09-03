@@ -47,7 +47,8 @@ from ..portal.links import plan_adopted, plan_for
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
                                HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
-                               URL_PLACEHOLDER, serves_original_file)
+                               URL_PLACEHOLDER, mpegts_copy_command,
+                               serves_original_file)
 from .probe import subtitle_streams
 from .item_info import local_file_path
 
@@ -593,6 +594,7 @@ class StreamManager:
                 args.insert(args.index("-i"), "-re")   # input option: before -i
             except ValueError:
                 pass
+        args = StreamManager._ensure_annexb(args)
         # Inject metadata title before the output format specifier so players
         # display the correct stream name instead of source stream metadata
         if title:
@@ -687,6 +689,48 @@ class StreamManager:
         all_dvb = all(s["codec"] == "dvb_subtitle" for s in subs)
         tok = codec_tok if (codec_tok == "copy" and all_dvb) else "dvbsub"
         return StreamManager._remap_subs(args, idxs, tok)
+
+    @staticmethod
+    def _ensure_annexb(args: list[str]) -> list[str]:
+        """H.264 in MP4/MKV is AVCC; Enigma2's MPEG-TS demuxer needs Annex-B.
+
+        Hand-written copy commands (and older stored templates) omit
+        `-bsf:v h264_mp4toannexb`. Without it the box plays audio and a black
+        picture. Idempotent: a command that already sets a video bitstream
+        filter is left alone. Only applies to `-c:v copy` / `-c copy` into
+        mpegts - a transcode already emits Annex-B.
+        """
+        if not args or "-bsf:v" in args or "-bsf:v:0" in args:
+            return args
+        try:
+            last_i = max(idx for idx, a in enumerate(args) if a == "-i")
+        except ValueError:
+            return args
+        fmt = None
+        f_idx = None
+        copy_v = False
+        i = last_i + 1
+        while i < len(args):
+            t = args[i]
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            if t == "-f" and nxt is not None:
+                fmt, f_idx = nxt, i
+                i += 2
+                continue
+            if t in ("-c:v", "-vcodec") and nxt == "copy":
+                copy_v = True
+                i += 2
+                continue
+            if t in ("-c", "-codec") and nxt == "copy":
+                copy_v = True
+                i += 2
+                continue
+            i += 1
+        if not copy_v or fmt != "mpegts" or f_idx is None:
+            return args
+        out = list(args)
+        out[f_idx:f_idx] = ["-bsf:v", "h264_mp4toannexb"]
+        return out
 
     @staticmethod
     def _outputs_matroska(args: list[str]) -> bool:
@@ -1178,6 +1222,13 @@ class StreamManager:
             raise ValueError(f"unknown kind {kind}")
 
         tpl_name, command = await self._template_for(item)
+        # Local files never 302 (the client cannot see our disk). The default
+        # template is the redirect marker, which is not an ffmpeg command: when
+        # we reach the pipe (Enigma2 asked for `.ts`, not the original MP4)
+        # remux to MPEG-TS with Annex-B instead of dying in _spawn.
+        if kind == "local" and (command or "").strip() == REDIRECT_COMMAND:
+            tpl_name = "(local mpegts remux)"
+            command = mpegts_copy_command()
         handle = StreamHandle(id=uuid.uuid4().hex, kind=kind, item_name=item_name,
                               user_name=user_name, template_name=tpl_name, command=command)
         # Pre-check: empty chain or EVERY mac currently occupied -> fail fast

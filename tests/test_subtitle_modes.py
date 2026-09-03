@@ -131,7 +131,7 @@ def test_every_builtin_preset_keeps_subtitles():
             assert "-c:s copy" in cmd and "-f matroska" in cmd, p["name"]
         else:
             assert p["output_format"] == "mpegts", p["name"]
-            expected = "-c:s copy" if p["name"] == COPY_PRESET_NAME else "-c:s dvbsub"
+            expected = "-c:s copy" if p["video_codec"] == "copy" else "-c:s dvbsub"
             assert expected in cmd, p["name"]
         parsed = parse_command(cmd)["options"]
         assert parsed["subs"] == p["subs"], p["name"]
