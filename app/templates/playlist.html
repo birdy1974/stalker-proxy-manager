@@ -517,10 +517,17 @@ window.editSeries = async (id) => {
       <div class="col-md-4"><label class="muted-label">Group</label>${groupDialogHtml("s-group", row.group_name || "", "dl-s")}</div>
       <div class="col-md-4"><label class="muted-label">FFmpeg template</label><select class="form-select form-select-sm" id="s-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
     </div>
-    <div class="muted-label mt-2">Enabled seasons</div>
+    <div class="d-flex align-items-center gap-2 mt-2">
+      <div class="muted-label mb-0">Enabled seasons</div>
+      ${row.seasons.length ? `<button type="button" class="btn btn-xs btn-outline-secondary" id="s-seasons-on">Enable all</button>
+      <button type="button" class="btn btn-xs btn-outline-secondary" id="s-seasons-off">Disable all</button>` : ""}
+    </div>
     <div>${row.seasons.map(s => `<label class="me-2 small"><input type="checkbox" class="s-season" data-link="${s.link_id}" ${s.enabled ? "checked" : ""}> ${esc(s.name || "S" + s.season_number)}</label>`).join("")}</div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: "Edit series", body, footer, size: "lg" });
+  const setSeasons = (on) => $$(".s-season", body).forEach(i => { i.checked = on; });
+  $("#s-seasons-on", body)?.addEventListener("click", () => setSeasons(true));
+  $("#s-seasons-off", body)?.addEventListener("click", () => setSeasons(false));
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
     mBtn("Save", "btn-accent", async () => {
       const seasons = $$(".s-season", body).map(i => ({ link_id: +i.dataset.link, enabled: i.checked }));

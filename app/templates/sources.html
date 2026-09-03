@@ -219,10 +219,14 @@ async function seriesDetail(row) {
         <h6>${esc(item.name)} ${item.year ? `<span class="text-muted">(${esc(item.year)})</span>` : ""} ${item.rating ? `<span class="badge text-bg-warning">★ ${esc(item.rating)}</span>` : ""}</h6>
         <div class="small text-muted mb-2">${esc(item.portal)} · ${esc(item.genre)}</div>
         <p class="small">${esc(item.description || "No description from portal.")}</p>
-        <div class="muted-label">Seasons (fetched)</div>
+        <div class="d-flex align-items-center gap-2">
+          <div class="muted-label mb-0">Seasons (fetched)</div>
+          ${item.seasons.length ? `<button type="button" class="btn btn-xs btn-outline-secondary" id="src-seasons-on">Enable all</button>
+          <button type="button" class="btn btn-xs btn-outline-secondary" id="src-seasons-off">Disable all</button>` : ""}
+        </div>
         ${item.seasons.length ? item.seasons.map(s => `
           <label class="d-flex gap-2 align-items-center small mb-1">
-            <input type="checkbox" ${s.enabled ? "checked" : ""} onchange="api('/api/sources/series/seasons/toggle',{method:'POST',body:{ids:[${s.id}],enabled:this.checked}}).then(()=>toast('season updated','ok'))">
+            <input type="checkbox" class="src-season" data-id="${s.id}" ${s.enabled ? "checked" : ""} onchange="api('/api/sources/series/seasons/toggle',{method:'POST',body:{ids:[${s.id}],enabled:this.checked}}).then(()=>toast('season updated','ok'))">
             <span>${esc(s.name || "Season " + s.season_number)}</span>
             <span class="text-muted">${s.episode_count} episodes ${s.episodes_fetched ? "" : "· pending fetch"}</span>
           </label>`).join("") : `<div class="small text-muted">${item.enabled ? "seasons are being fetched — close and reopen this popup in a moment" : "enable the series (switch in the list) to fetch seasons"}</div>`}
@@ -234,6 +238,16 @@ async function seriesDetail(row) {
     </div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: "Series details", body, footer, size: "lg" });
+  const setSrcSeasons = async (enabled) => {
+    const boxes = $$(".src-season", body);
+    const ids = boxes.map(i => +i.dataset.id);
+    if (!ids.length) return;
+    await api("/api/sources/series/seasons/toggle", { method: "POST", body: { ids, enabled } });
+    boxes.forEach(i => { i.checked = enabled; });
+    toast(enabled ? "all seasons enabled" : "all seasons disabled", "ok");
+  };
+  $("#src-seasons-on", body)?.addEventListener("click", () => setSrcSeasons(true));
+  $("#src-seasons-off", body)?.addEventListener("click", () => setSrcSeasons(false));
   { const mediaKind = "series"; /* after open: load probe + TMDB lazily (endpoints are slow by nature) */
   api(`/api/sources/media-info?kind=${mediaKind}&id=${item.id}`).then(d => {
     body.querySelector(".probe-box").innerHTML = probeHtml(d.probe);
