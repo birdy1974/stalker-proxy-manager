@@ -49,7 +49,7 @@ from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
                                HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
                                URL_PLACEHOLDER, mpegts_copy_command,
                                serves_original_file)
-from .probe import subtitle_streams
+from .probe import media_codecs, subtitle_streams
 from .item_info import local_file_path
 
 log = logging.getLogger("spm.stream")
@@ -74,6 +74,26 @@ _BITMAP_SUB_CODECS = {"dvb_subtitle", "dvd_subtitle", "hdmv_pgs_subtitle", "xsub
 # abort the muxer, so the gate maps around them.
 _MKV_UNSUPPORTED_SUB_CODECS = {"dvb_teletext", "eia_608", "eia_708", "cea_608",
                                "arib_caption", "hdmv_text_subtitle"}
+# Audio codecs MPEG-TS can carry as a bare copy (and Enigma2 can decode).
+# Anything else in a copy remux (Vorbis/FLAC/PCM/ALAC/Opus - common in MKV)
+# aborts ffmpeg at output init with zero bytes, so the remux gate re-encodes
+# the audio alone to AC3 instead (the video pipeline stays copy).
+_TS_AUDIO_CODECS = {"mp1", "mp2", "mp3", "aac", "aac_latm", "ac3", "eac3", "dts"}
+# Length-prefixed video layouts the mpegts muxer needs start codes for, and
+# the bitstream filter that performs the conversion. Anything NOT in this
+# table (MPEG-1/2, MPEG-4 part 2, VC-1) carries start codes natively: a
+# h264_mp4toannexb filter applied to one of those aborts ffmpeg with rc=234
+# before the first output byte ("produced no data for local file").
+_TS_VIDEO_BSF = {"h264": "h264_mp4toannexb", "hevc": "hevc_mp4toannexb",
+                 "vvc": "vvc_mp4toannexb"}
+# How long the ffmpeg CLI may buffer packets waiting for a lagging stream
+# before it flushes anyway (mux-level, microseconds). ffmpeg's own default is
+# 10 s: a file whose audio starts 30-60 s into the video (typical re-authored
+# captures) then sits silent for the full 10 s, which is exactly the
+# "no data within N s -> 502" failure for anything that starts slow (network
+# VOD on top of a slow portal, a hard disk that has to spin up). Two seconds
+# is plenty for normal A/V skew and keeps stream start responsive.
+MAX_INTERLEAVE_DELTA_US = os.environ.get("SPM_MAX_INTERLEAVE_DELTA_US", "2000000")
 
 
 class _WithTemplate:
@@ -595,6 +615,7 @@ class StreamManager:
             except ValueError:
                 pass
         args = StreamManager._ensure_annexb(args)
+        args = StreamManager._ensure_interleave_flush(args)
         # Inject metadata title before the output format specifier so players
         # display the correct stream name instead of source stream metadata
         if title:
@@ -690,6 +711,101 @@ class StreamManager:
         tok = codec_tok if (codec_tok == "copy" and all_dvb) else "dvbsub"
         return StreamManager._remap_subs(args, idxs, tok)
 
+    async def _remux_gate(self, args: list[str], url: str, pace: bool,
+                          name: str = "") -> list[str]:
+        """
+        Per-source reality check for the copy -> MPEG-TS remux (the "direct"
+        path: local files requested as .ts, and copy templates on VOD links).
+
+        The command template can only be syntactic - it cannot know what is
+        inside the file. Two file properties decide whether the remux lives:
+          * the VIDEO codec needs the right Annex-B bitstream filter: H.264
+            wants h264_mp4toannexb, HEVC wants hevc_mp4toannexb, MPEG-2/VC-1
+            carry start codes natively. The wrong filter (which is what every
+            HEVC or MPEG-2-in-MP4 local file got, since _ensure_annexb has to
+            assume H.264) kills ffmpeg with rc=234 before the first byte -
+            the exact "ffmpeg produced no data for local file" failure.
+          * the AUDIO codec must have a berth in MPEG-TS: Vorbis/FLAC/PCM/
+            ALAC/Opus (all common in MKV) abort the muxer with "codec not
+            currently supported in container". Those get an audio-only
+            re-encode to AC3 (a few % CPU; the video stays a copy).
+
+        Like _subs_gate this probes once per source and degrades to the safe
+        default, never to an ffmpeg abort. Live inputs (pace=False) are again
+        trusted instead of probed (zap speed), and a failed probe leaves the
+        command untouched - i.e. exactly the behaviour we had before this
+        gate existed.
+        """
+        if not pace:                       # live: trusted, no probe
+            return args
+        fmt, f_idx = StreamManager._output_format(args)
+        if fmt != "mpegts":                # matroska/hls accept everything
+            return args
+        copy_v, copy_a = StreamManager._copy_flags(args)
+        if not (copy_v or copy_a):         # a real transcode: nothing to fix
+            return args
+        tag = f"[{name}] " if name else ""
+        is_net = url.lower().startswith(_NET_SCHEMES)
+        codecs = await media_codecs(url, is_url=is_net)
+        if codecs is None:
+            await db_log("INFO", "stream", tag +
+                         "codec probe failed -> remux command left unchanged")
+            return args
+        vcodec, acodec = codecs.get("video"), codecs.get("audio")
+        out = list(args)
+
+        # ---- video: match the bitstream filter to the real codec ----------
+        if copy_v and vcodec:
+            want = _TS_VIDEO_BSF.get(vcodec)
+            bsf_i = next((i for i, t in enumerate(out)
+                          if t in ("-bsf:v", "-bsf:v:0") and i + 1 < len(out)),
+                         None)
+            have = out[bsf_i + 1] if bsf_i is not None else None
+            if want:
+                if have is None and f_idx is not None:
+                    out[f_idx:f_idx] = ["-bsf:v", want]
+                    await db_log("INFO", "stream", tag +
+                                 f"video is {vcodec} -> inserted -bsf:v {want}")
+                elif have is not None and have != want:
+                    out[bsf_i + 1] = want
+                    await db_log("INFO", "stream", tag +
+                                 f"video is {vcodec} -> -bsf:v {want} "
+                                 f"(was {have}; the wrong filter aborts at init)")
+            elif have in _TS_VIDEO_BSF.values():
+                await db_log("INFO", "stream", tag +
+                             f"video is {vcodec} (start codes native) -> "
+                             f"-bsf:v {have} removed")
+                del out[bsf_i:bsf_i + 2]
+
+        # ---- audio: MPEG-TS berth or a light AC3 re-encode ----------------
+        if copy_a and acodec and acodec not in _TS_AUDIO_CODECS:
+            changed = False
+            j = 0
+            while j < len(out):
+                t = out[j]
+                if t in ("-c:a", "-acodec") and j + 1 < len(out) and out[j + 1] == "copy":
+                    out[j + 1] = "ac3"
+                    changed = True
+                    j += 2
+                    continue
+                if t in ("-c", "-codec") and j + 1 < len(out) and out[j + 1] == "copy":
+                    # `-c copy` covers every stream; expand so video stays a
+                    # copy while audio alone is re-encoded
+                    out[j:j + 2] = ["-c:v", "copy", "-c:a", "ac3"]
+                    changed = True
+                    j += 4
+                    continue
+                j += 1
+            if changed:
+                if "-b:a" not in out:
+                    k = out.index("ac3")
+                    out[k + 1:k + 1] = ["-b:a", "384k"]
+                await db_log("INFO", "stream", tag +
+                             f"audio codec {acodec} cannot ride MPEG-TS -> "
+                             "audio transcoded to AC3 (video stays copy)")
+
+        return out
+
     @staticmethod
     def _ensure_annexb(args: list[str]) -> list[str]:
         """H.264 in MP4/MKV is AVCC; Enigma2's MPEG-TS demuxer needs Annex-B.
@@ -699,6 +815,12 @@ class StreamManager:
         picture. Idempotent: a command that already sets a video bitstream
         filter is left alone. Only applies to `-c:v copy` / `-c copy` into
         mpegts - a transcode already emits Annex-B.
+
+        This pass can only be syntactic (argv knows no codecs), so the filter
+        it inserts assumes H.264; the spawn-time `_remux_gate` then corrects
+        it against the file's actual video codec (HEVC needs
+        `hevc_mp4toannexb`, MPEG-2/VC-1 need none - the wrong filter is a
+        fatal rc=234 before the first byte).
         """
         if not args or "-bsf:v" in args or "-bsf:v:0" in args:
             return args
@@ -733,12 +855,78 @@ class StreamManager:
         return out
 
     @staticmethod
+    def _output_format(args: list[str]) -> tuple[str | None, int | None]:
+        """(output muxer, index of its `-f`) for the OUTPUT section, i.e. after
+        the last `-i` - an input-side `-f` (grab devices) is not our business."""
+        try:
+            last_i = max(idx for idx, a in enumerate(args) if a == "-i")
+        except ValueError:
+            last_i = -1
+        fmt = f_idx = None
+        i = last_i + 1
+        while i < len(args):
+            if args[i] == "-f" and i + 1 < len(args):
+                fmt, f_idx = args[i + 1], i
+                i += 2
+                continue
+            i += 1
+        return fmt, f_idx
+
+    @staticmethod
     def _outputs_matroska(args: list[str]) -> bool:
         """True when the OUTPUT muxer is Matroska (`-f matroska` / `-f mkv`)."""
-        for i, t in enumerate(args):
-            if t == "-f" and i + 1 < len(args) and args[i + 1] in ("matroska", "mkv"):
-                return True
-        return False
+        return StreamManager._output_format(args)[0] in ("matroska", "mkv")
+
+    @staticmethod
+    def _ensure_interleave_flush(args: list[str]) -> list[str]:
+        """Cap the CLI interleave buffer so a lagging track cannot stall the
+        stream start.
+
+        ffmpeg muxes with av_interleaved_write_frame: packets of the EARLY
+        stream are buffered until the LATE one catches up, and only
+        `-max_interleave_delta` (default 10 s) forces a flush. An MP4 whose
+        audio starts 30-60 s into the video therefore produces its first
+        output byte after ~10 s of silence - past (or dangerously near) the
+        start timeout, moot before the box ever sees a byte. Capping the delta
+        at 2 s makes the same file start at ~2 s. Only for streamed pipes
+        (mpegts/matroska); a user's own value always wins.
+        """
+        if not args or "-max_interleave_delta" in args:
+            return args
+        fmt, f_idx = StreamManager._output_format(args)
+        if fmt not in ("mpegts", "matroska", "mkv") or f_idx is None:
+            return args
+        out = list(args)
+        out[f_idx:f_idx] = ["-max_interleave_delta", MAX_INTERLEAVE_DELTA_US]
+        return out
+
+    @staticmethod
+    def _copy_flags(args: list[str]) -> tuple[bool, bool]:
+        """(video copied, audio copied) for the output section. `-c copy`
+        covers both; `-an` means there is no audio to fix at all."""
+        copy_v = copy_a = False
+        i = 0
+        while i < len(args):
+            t = args[i]
+            nxt = args[i + 1] if i + 1 < len(args) else None
+            if t in ("-c:v", "-vcodec") and nxt == "copy":
+                copy_v = True
+                i += 2
+                continue
+            if t in ("-c:a", "-acodec") and nxt == "copy":
+                copy_a = True
+                i += 2
+                continue
+            if t in ("-c", "-codec") and nxt == "copy":
+                copy_v = copy_a = True
+                i += 2
+                continue
+            if t == "-an":
+                copy_a = False
+                i += 1
+                continue
+            i += 1
+        return copy_v, copy_a
 
     @staticmethod
     def _remap_subs(args: list[str], idxs: list[int], codec: str) -> list[str]:
@@ -772,6 +960,7 @@ class StreamManager:
         if not args:
             await db_log("ERROR", "stream", "unparseable ffmpeg template")
             return None
+        args = await self._remux_gate(args, url, pace, title or "")
         args = await self._subs_gate(args, url, pace, title or "")
         # Log the full command for debugging
         await db_log("DEBUG", "ffmpeg", f"spawn command: {' '.join(args)}")
@@ -1273,8 +1462,24 @@ class StreamManager:
                 registered = True
                 first = await self._first_bytes(proc)
                 if not first:
-                    await db_log("WARNING", "stream",
-                                 f"[{h.item_name}] ffmpeg produced no data for local file")
+                    if proc.returncode is None:
+                        # ffmpeg is still running, just silent: slow storage
+                        # (disk spin-up, network mount) or a file its demuxer
+                        # chews on. The guard upstream reports the 502.
+                        await db_log("WARNING", "stream",
+                                     f"[{h.item_name}] no data within "
+                                     f"{STREAM_START_TIMEOUT:.0f}s from local file "
+                                     f"(template '{h.template_name}'); ffmpeg still "
+                                     "running - slow storage or unparseable file")
+                    else:
+                        # ffmpeg is gone: it died AT OUTPUT INIT. Its own error
+                        # (unsupported codec in MPEG-TS, bad bitstream filter,
+                        # ...) is in the [ffmpeg] stderr tail right above.
+                        await db_log("WARNING", "stream",
+                                     f"[{h.item_name}] ffmpeg exited "
+                                     f"rc={proc.returncode} before sending data for "
+                                     f"local file (template '{h.template_name}') - "
+                                     "see the [ffmpeg] log entry for its error")
                     await self._kill_quiet(proc)
                     return
                 yield first

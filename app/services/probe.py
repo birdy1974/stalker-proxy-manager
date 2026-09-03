@@ -26,6 +26,8 @@ _RE_STREAM_AUDIO = re.compile(
 _RE_DAR = re.compile(r"DAR\s+([0-9]+:[0-9]+)")
 _RE_STREAM_SUBTITLE = re.compile(
     r"Stream\s+#\d+:(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*Subtitle:\s*([A-Za-z0-9_]+)", re.I)
+_RE_STREAM_AV = re.compile(
+    r"Stream\s+#\d+:\d+.*?:\s*(Video|Audio):\s*([A-Za-z0-9_]+)", re.I)
 
 # Wall-clock cap on a single probe. Network streams can be slow to connect and
 # to deliver enough data for analysis, so 10s was far too tight; 30s is the
@@ -226,3 +228,75 @@ async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
         return None
     _SUBS_CACHE[key] = (time.time(), subs)
     return subs
+
+
+# --------------------------------------------------------------------------
+# A/V codec detection for the spawn-time remux gate (stream_manager).
+#
+# The remux (copy->mpegts) path must know what it is copying BEFORE ffmpeg is
+# spawned: `-bsf:v h264_mp4toannexb` kills the pipe on HEVC/MPEG-2 files (the
+# filter aborts with rc=234 and zero output bytes), and audio codecs like
+# Vorbis/FLAC/PCM have no berth in MPEG-TS at all. Same cost discipline as
+# subtitle_streams: one ffmpeg run in analyze mode, 8 s wall-clock cap, 10 min
+# cache keyed without the per-play token. Returns
+#   {'video': codec|None, 'audio': codec|None}
+# (first non-attached-pic video, first audio) or None when the probe itself
+# failed - the caller then leaves the command untouched (status quo).
+# --------------------------------------------------------------------------
+_CODECS_CACHE: dict[str, tuple[float, dict | None]] = {}
+
+
+def _parse_codecs(text: str) -> dict | None:
+    """Extract first video/audio codec names from ffmpeg's stderr banner.
+
+    Input section only (the Output section describes our decode sink). An MP4
+    cover image is a video stream too - it is skipped, because `-map 0:v:0`
+    addresses the movie, not the attached picture. Returns None when no stream
+    line was found at all.
+    """
+    i = text.find("\nOutput #")
+    if i != -1:
+        text = text[:i]
+    video = audio = None
+    for m in _RE_STREAM_AV.finditer(text):
+        end = text.find("\n", m.start())
+        line = text[m.start():end if end != -1 else len(text)]
+        kind, codec = m.group(1).lower(), m.group(2).lower()
+        if kind == "video" and video is None and "(attached pic)" not in line:
+            video = codec
+        elif kind == "audio" and audio is None:
+            audio = codec
+    if video is None and audio is None:
+        return None
+    return {"video": video, "audio": audio}
+
+
+async def media_codecs(target: str, *, is_url: bool) -> dict | None:
+    """{'video':..., 'audio':...} for the remux gate, or None on probe failure.
+    Cached like subtitle_streams (same key discipline, its own table)."""
+    base = target.split("?", 1)[0] if is_url else target
+    key = f"codecs|{base}|{is_url}"
+    hit = _CODECS_CACHE.get(key)
+    if hit and time.time() - hit[0] < _SUBS_CACHE_TTL:
+        return hit[1]
+    args = _probe_args(target, is_url=is_url)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(),
+                                            timeout=SUBS_PROBE_TIMEOUT)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:  # noqa: PERF203
+                pass
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+    out = _parse_codecs(err.decode("utf-8", errors="replace"))
+    if out is None and proc.returncode not in (0, None):
+        _CODECS_CACHE[key] = (time.time(), None)
+        return None
+    _CODECS_CACHE[key] = (time.time(), out)
+    return out
