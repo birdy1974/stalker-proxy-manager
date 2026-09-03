@@ -248,3 +248,86 @@ async def test_e2e_remux_of_a_plain_h264_aac_mp4_still_flows(tmp_path):
         "-t", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac")
     data = await _first_bytes_via_spawn(media)
     assert data and data[:1] == b"\x47"
+
+
+# --------------------------------------------------------------------------- #
+#  failure visibility: what ffmpeg said when a local file never starts
+# --------------------------------------------------------------------------- #
+def test_stderr_tail_helper_squashes_and_limits():
+    class Fake:
+        spm_stderr_tail = [b"Input #0, mov,mp4, from 'x.mp4':\n",
+                           b"[mov] moov atom not found\rprogress junk",
+                           b"Error opening input file: Invalid data\n"]
+    tail = StreamManager._stderr_tail(Fake())
+    assert "moov atom not found" in tail and "\r" not in tail
+    assert StreamManager._stderr_tail(object()) == ""
+
+
+async def test_drain_attaches_tail_and_logs_only_real_errors(monkeypatch):
+    logged = []
+
+    async def fake_log(level, component, message):
+        logged.append((level, component, message))
+
+    monkeypatch.setattr(sm, "db_log", fake_log)
+
+    class Fake:
+        def __init__(self, lines, rc):
+            self._q = asyncio.Queue()
+            for ln in lines:
+                self._q.put_nowait(ln)
+            self._q.put_nowait(b"")
+            self.stderr = self
+            self._rc = rc
+            self.returncode = None
+
+        async def readline(self):
+            return await self._q.get()
+
+        async def wait(self):
+            self.returncode = self._rc
+            return self._rc
+
+    manager = StreamManager()
+    killed = Fake([b"some complaint\n"], -9)               # we killed it
+    await manager._drain_stderr(killed)
+    assert killed.spm_stderr_tail == [b"some complaint\n"]
+    assert not logged                                      # kills stay quiet
+
+    dead = Fake([b"Invalid data found when processing input\n"], 234)
+    await manager._drain_stderr(dead)
+    assert any("rc=234" in m and "Invalid data" in m for _, _, m in logged)
+
+
+async def test_local_pump_logs_ffmpeg_tail_after_a_silent_stall(monkeypatch):
+    """A process that never outputs a byte (the user's VAAPI episode) must
+    leave its own last words in the stream log when it is stopped."""
+    logged = []
+
+    async def fake_log(level, component, message):
+        logged.append((level, component, message))
+
+    async def _spawn_stub(self, cmd_template, url, title=None, pace=False):
+        proc = await asyncio.create_subprocess_exec(
+            "sh", "-c", "echo boom-error >&2; sleep 30",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+        asyncio.get_running_loop().create_task(self._drain_stderr(proc))
+        return proc
+
+    monkeypatch.setattr(sm, "db_log", fake_log)
+    monkeypatch.setattr(sm, "STREAM_START_TIMEOUT", 0.6)
+    monkeypatch.setattr(StreamManager, "_spawn", _spawn_stub)
+
+    h = sm.StreamHandle(id="x" * 32, kind="local", item_name="Test.mp4",
+                        user_name="u", template_name="VAAPI", command="(cmd)")
+    manager = StreamManager()
+    async for _ in manager._pump(h, [("local", "/nonexistent")], "local"):
+        pass
+    await asyncio.sleep(0.1)                     # let the drain flush its tail
+    joined = "\n".join(m for _, _, m in logged)
+    assert "no data within 1s from local file" in joined
+    assert "still running" in joined
+    assert "boom-error" in joined
+    assert "stopped after" in joined

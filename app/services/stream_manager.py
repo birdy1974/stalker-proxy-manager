@@ -976,8 +976,16 @@ class StreamManager:
             return None
 
     async def _drain_stderr(self, proc) -> None:
-        """Keep stderr from blocking; last lines are logged on failure."""
+        """Keep stderr from blocking; last lines are logged on failure.
+
+        The raw tail is also parked on the process object: a stream that has
+        to be KILLED after a silent stall (rc ends up -9, which is
+        deliberately not logged here - it is mostly user kills) then still
+        gets to explain itself; the local pump logs that tail after stopping
+        the process (see _pump's 'no data' branch).
+        """
         lines: list[bytes] = []
+        proc.spm_stderr_tail = lines
         try:
             while True:
                 line = await proc.stderr.readline()
@@ -992,6 +1000,22 @@ class StreamManager:
             tail = b"".join(lines[-12:]).decode(errors="replace").strip()
             if tail:
                 await db_log("WARNING", "ffmpeg", f"ffmpeg exited rc={rc}: {tail[:900]}")
+
+    @staticmethod
+    def _stderr_tail(proc, max_lines: int = 8, limit: int = 600) -> str:
+        """The last stderr lines (the tail _drain_stderr collected), as text.
+
+        ffmpeg writes progress stats separated by \r without newlines, so
+        squeezing them onto single lines keeps the log readable.
+        """
+        lines = getattr(proc, "spm_stderr_tail", None) or []
+        if not lines:
+            return ""
+        text = b"".join(lines[-max_lines:]).decode(errors="replace")
+        squashed = "\n".join(ln for ln in
+                             (l.strip() for l in text.replace("\r", "\n").splitlines())
+                             if ln)
+        return squashed[-limit:]
 
     @staticmethod
     async def _kill_quiet(proc) -> None:
@@ -1462,7 +1486,8 @@ class StreamManager:
                 registered = True
                 first = await self._first_bytes(proc)
                 if not first:
-                    if proc.returncode is None:
+                    stalled = proc.returncode is None
+                    if stalled:
                         # ffmpeg is still running, just silent: slow storage
                         # (disk spin-up, network mount) or a file its demuxer
                         # chews on. The guard upstream reports the 502.
@@ -1481,6 +1506,18 @@ class StreamManager:
                                      f"local file (template '{h.template_name}') - "
                                      "see the [ffmpeg] log entry for its error")
                     await self._kill_quiet(proc)
+                    if stalled or proc.returncode == 0:
+                        # Killed (-9) and clean-exit (0) processes are the two
+                        # cases _drain_stderr deliberately does NOT report
+                        # (it would yell on every user stop / normal EOF). But
+                        # here the process never sent a single byte, so whatever
+                        # it had to say IS the diagnosis - VAAPI init hanging,
+                        # "moov atom not found", demuxer errors on a broken
+                        # file. Log it.
+                        tail = self._stderr_tail(proc)
+                        if tail:
+                            await db_log("WARNING", "stream",
+                                         f"[{h.item_name}] ffmpeg's last words: {tail}")
                     return
                 yield first
                 async for chunk in self._read_proc(h, proc):
