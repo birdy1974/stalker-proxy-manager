@@ -114,14 +114,17 @@ def test_enigma2_presets_are_shipped_and_fit_the_duo2():
 
     remux = presets[E2_VOD_REMUX_PRESET_NAME]
     assert remux["video_codec"] == "copy" and remux["audio_codec"] == "copy"
-    assert "-f matroska" in remux["command"] and "-c:s copy" in remux["command"]
+    # live Matroska is audio-only on the box; MPEG-TS + Annex-B is what plays
+    assert remux["output_format"] == "mpegts"
+    assert "-f mpegts" in remux["command"] and "-bsf:v h264_mp4toannexb" in remux["command"]
+    assert "-f matroska" not in remux["command"]
 
     hw = presets[E2_VOD_TRANSCODE_PRESET_NAME]
-    # the 4K/HEVC rescue path: GPU video, copied subtitles, box-friendly audio
+    # the 4K/HEVC rescue path: GPU video, box-friendly audio, MPEG-TS
     assert hw["video_codec"] == "h264_vaapi" and hw["resolution"] == "1080p"
     assert hw["profile"] == "high" and hw["level"] == "4.0"
-    assert hw["audio_codec"] == "ac3"
-    assert "-c:s copy" in hw["command"] and "-f matroska" in hw["command"]
+    assert hw["audio_codec"] == "ac3" and hw["output_format"] == "mpegts"
+    assert "-f mpegts" in hw["command"] and "-f matroska" not in hw["command"]
     assert "libx264" not in hw["command"] and "subtitles=" not in hw["command"]
 
     live = presets[E2_DUO2_LIVE_PRESET_NAME]
@@ -206,7 +209,7 @@ async def test_mkv_urls_exist_next_to_the_ts_ones():
     async with SessionLocal() as s:
         tpl = (await s.execute(select(FFmpegTemplate).where(
             FFmpegTemplate.name == E2_VOD_REMUX_PRESET_NAME))).scalar_one()
-        assert tpl.is_builtin is True and tpl.output_format == "matroska"
+        assert tpl.is_builtin is True and tpl.output_format == "mpegts"
         portal = Portal(name="p", base_url="http://127.0.0.1:1/c/")
         s.add(portal)
         await s.flush()

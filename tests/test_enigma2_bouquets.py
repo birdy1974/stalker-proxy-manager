@@ -27,8 +27,9 @@ from sqlalchemy import select
 from app.database import SessionLocal
 from app.main import app
 from app.models import (
-    Enigma2Profile, LivePlaylist, Portal, SerieEpisode, SeriePlaylist,
-    SeriePlaylistSeason, SerieSeason, SerieSource, User, VodPlaylist, VodSource,
+    Enigma2Profile, LivePlaylist, LocalFile, LocalPlaylist, LocalSource, Portal,
+    SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource,
+    User, VodPlaylist, VodSource,
 )
 from app.services import enigma2_bouquets as e2
 
@@ -252,6 +253,31 @@ async def test_group_filters_of_user_and_profile_both_apply():
     assert not [f for f in bundle2.files if "_live_" in f.name]
 
 
+async def test_local_files_are_advertised_as_mpegts():
+    """Enigma2 plays audio-only on a progressive MP4 and on a live MKV pipe.
+    Local bouquet lines therefore always ask for `.ts` so the play path remuxes."""
+    async with SessionLocal() as s:
+        user = User(name="locbox", password="pw", enabled=True)
+        s.add(user)
+        ls = LocalSource(directory="/tmp", enabled=True)
+        s.add(ls)
+        await s.flush()
+        lf = LocalFile(local_source_id=ls.id, relative_path="movie.mp4",
+                       filename="movie.mp4", size_bytes=1)
+        s.add(lf)
+        await s.flush()
+        s.add(LocalPlaylist(local_file_id=lf.id, custom_name="Home Movie",
+                            group_name="Files", enabled=True))
+        await s.commit()
+    bundle = await e2.build_bundle(
+        _profile(user, include_live=False, include_vod=False,
+                 include_series=False, include_local=True), NAS)
+    text = next(f for f in bundle.files if "local" in f.name).text
+    assert "/play/local/" in text and ".ts?u=locbox&p=pw" in text
+    assert ".mp4" not in text
+    assert "#SERVICE 4097:" in text or "#SERVICE 5002:" in text
+
+
 async def test_content_types_can_be_switched_off():
     user = await _catalogue()
     bundle = await e2.build_bundle(
@@ -312,6 +338,7 @@ async def test_profile_crud_preview_and_public_pull():
         item = r.json()["item"]
         pid, token = item["id"], item["token"]
         assert item["player_vod"] == "5002" and item["container_vod"] == "mkv"
+        assert item["transport"] == "ftp"
 
         # secrets never travel back to the browser
         await c.put(f"/api/enigma2/profiles/{pid}", json={"password": "boxpw"})

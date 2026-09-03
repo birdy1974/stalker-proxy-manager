@@ -5,16 +5,21 @@ GUI's two-way sync between option fields and the full command text.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_, select
 
 from ..database import get_db
-from ..models import FFmpegTemplate
+from ..models import (
+    FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource, LocalFile,
+    LocalPlaylist, LocalSource, Portal, SeriePlaylist, SerieSource,
+    VodPlaylist, VodSource,
+)
 from ..security import require_admin
+from ..services import item_info
 from ..services.ffmpeg_templates import (FFmpegOptions, REDIRECT_COMMAND,
                                      build_command, coerce_options,
                                      option_warnings, parse_command)
-from ..services.ffmpeg_validate import TEST_VIDEO_URL, run_demo, syntax_check
+from ..services.ffmpeg_validate import run_demo, syntax_check
 
 router = APIRouter(prefix="/api/ffmpeg", tags=["ffmpeg"], dependencies=[Depends(require_admin)])
 
@@ -102,13 +107,103 @@ async def validate(payload: dict):
     return syntax_check(payload.get("command", ""))
 
 
+@router.get("/demo-sources")
+async def demo_sources(kind: str = "live", q: str = "", db=Depends(get_db)):
+    """Enabled playlist items the FFmpeg tab can demo a template against."""
+    q = (q or "").strip()
+    if kind not in item_info.PLAYLIST_KINDS:
+        raise HTTPException(400, "kind must be live|vod|series|local")
+    like = f"%{q}%" if q else None
+    items: list[dict] = []
+    if kind == "live":
+        stmt = (select(LivePlaylist, LiveSource.original_name, Portal.name)
+                .outerjoin(LivePlaylistSource, (LivePlaylistSource.live_playlist_id == LivePlaylist.id)
+                           & (LivePlaylistSource.priority == 1))
+                .outerjoin(LiveSource, LiveSource.id == LivePlaylistSource.live_source_id)
+                .outerjoin(Portal, Portal.id == LiveSource.portal_id)
+                .where(LivePlaylist.enabled.is_(True)))
+        if like:
+            stmt = stmt.where(or_(LivePlaylist.custom_name.ilike(like),
+                                  LiveSource.original_name.ilike(like)))
+        stmt = stmt.order_by(LivePlaylist.custom_name).limit(80)
+        for pl, src_name, portal_name in (await db.execute(stmt)).all():
+            items.append({"id": pl.id, "kind": "live", "name": pl.custom_name,
+                          "group": pl.group_name, "source": src_name, "portal": portal_name})
+    elif kind == "vod":
+        stmt = (select(VodPlaylist, VodSource.original_name, Portal.name)
+                .outerjoin(VodSource, VodSource.id == VodPlaylist.vod_source_id)
+                .outerjoin(Portal, Portal.id == VodSource.portal_id)
+                .where(VodPlaylist.enabled.is_(True)))
+        if like:
+            stmt = stmt.where(or_(VodPlaylist.custom_name.ilike(like),
+                                  VodSource.original_name.ilike(like)))
+        stmt = stmt.order_by(VodPlaylist.custom_name).limit(80)
+        for pl, src_name, portal_name in (await db.execute(stmt)).all():
+            items.append({"id": pl.id, "kind": "vod", "name": pl.custom_name,
+                          "group": pl.group_name, "source": src_name, "portal": portal_name})
+    elif kind == "series":
+        stmt = (select(SeriePlaylist, SerieSource.original_name, Portal.name)
+                .outerjoin(SerieSource, SerieSource.id == SeriePlaylist.serie_source_id)
+                .outerjoin(Portal, Portal.id == SerieSource.portal_id)
+                .where(SeriePlaylist.enabled.is_(True)))
+        if like:
+            stmt = stmt.where(or_(SeriePlaylist.custom_name.ilike(like),
+                                  SerieSource.original_name.ilike(like)))
+        stmt = stmt.order_by(SeriePlaylist.custom_name).limit(80)
+        for pl, src_name, portal_name in (await db.execute(stmt)).all():
+            items.append({"id": pl.id, "kind": "series", "name": pl.custom_name,
+                          "group": pl.group_name, "source": src_name, "portal": portal_name})
+    else:
+        stmt = (select(LocalPlaylist, LocalFile.filename, LocalSource.directory)
+                .outerjoin(LocalFile, LocalFile.id == LocalPlaylist.local_file_id)
+                .outerjoin(LocalSource, LocalSource.id == LocalFile.local_source_id)
+                .where(LocalPlaylist.enabled.is_(True)))
+        if like:
+            stmt = stmt.where(or_(LocalPlaylist.custom_name.ilike(like),
+                                  LocalFile.filename.ilike(like)))
+        stmt = stmt.order_by(LocalPlaylist.custom_name).limit(80)
+        for pl, filename, directory in (await db.execute(stmt)).all():
+            items.append({"id": pl.id, "kind": "local", "name": pl.custom_name,
+                          "group": pl.group_name, "source": filename, "portal": directory})
+    return {"items": items, "kind": kind, "query": q}
+
+
 @router.post("/demo")
-async def demo(payload: dict):
+async def demo(payload: dict, db=Depends(get_db)):
     """Run the template command against a short test input (~2 s).
-    mode: 'lavfi' (synthetic testsrc2, no network) or 'url' (real HTTP clip)."""
+
+    mode: 'lavfi' (synthetic testsrc2), 'url' (HTTP clip), or 'playlist'
+    (an enabled playlist item identified by kind + id).
+    """
+    command = payload.get("command", "")
+    mode = payload.get("mode") or "lavfi"
+    if mode == "playlist" or (payload.get("kind") and payload.get("id") is not None
+                              and payload.get("id") != ""):
+        kind = payload.get("kind") or "live"
+        try:
+            pid = int(payload.get("id"))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, "id must be an integer") from exc
+        try:
+            resolved = await item_info.resolve_playlist_input(db, kind, pid)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        label = resolved["name"]
+        if resolved.get("source"):
+            label = f"{label} · {resolved['source']}"
+        result = await run_demo(
+            command=command, mode="playlist", url=resolved["url"],
+            source_label=f"{kind} #{resolved['id']} {label}",
+        )
+        result["playlist"] = {"kind": kind, "id": resolved["id"],
+                              "name": resolved["name"],
+                              "source": resolved.get("source"),
+                              "url": resolved["url"]}
+        return result
     return await run_demo(
-        command=payload.get("command", ""),
-        mode=payload.get("mode", "lavfi"),
+        command=command,
+        mode=mode,
+        url=payload.get("url"),
     )
 
 

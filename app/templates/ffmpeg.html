@@ -108,15 +108,14 @@
               <span class="small" id="sync-state"></span>
               <div class="btn-group ms-auto">
                 <button class="btn btn-sm btn-outline-secondary" id="btn-test-syntax">Validate syntax</button>
-                <button class="btn btn-sm btn-outline-secondary" id="btn-test-lavfi" title="ffmpeg lavfi testsrc2, ~2s">Demo (testsrc)</button>
+                <button class="btn btn-sm btn-outline-secondary" id="btn-test-playlist" title="Run this template against an enabled playlist source for ~2s">Demo (playlist source)</button>
                 <button class="btn btn-sm btn-outline-secondary" id="btn-test-url" title="Big Buck Bunny 10s clip from test-videos.co.uk">Demo (test video)</button>
               </div>
             </div>
-            <pre class="small bg-dark text-light p-2 mt-2 d-none" id="validate-out" style="max-height:220px;overflow:auto;white-space:pre-wrap"></pre>
+            <pre class="small bg-dark text-light p-2 mt-2 d-none mono" id="validate-out" style="max-height:480px;overflow:auto;white-space:pre-wrap"></pre>
             <div class="small text-muted mt-2">The literal <code>&lt;url&gt;</code> is replaced with the real stream at runtime.
-              Demos run the <b>actual</b> command for ~2s: testsrc is synthetic (no network);
-              test video is <a href="https://test-videos.co.uk/" target="_blank" rel="noopener">test-videos.co.uk</a> Big Buck Bunny H.264 360p.
-              VAAPI/QSV failures on testsrc are expected if the encoder needs hardware frames — use the test video for that.</div>
+              <b>Demo (playlist source)</b> lets you pick an enabled Playlist item and runs the actual command against its primary source for ~2s, with the full ffmpeg argv and stderr.
+              Test video is <a href="https://test-videos.co.uk/" target="_blank" rel="noopener">test-videos.co.uk</a> Big Buck Bunny H.264 360p.</div>
           </div>
         </div>
       </div>
@@ -238,7 +237,7 @@ async function selectTemplate(id) {
   $$(".ff-field").forEach(n => { if (n.id !== "f-enabled") n.disabled = redir; });
   $("#f-command").disabled = redir;
   $("#btn-test-syntax").disabled = redir;
-  $("#btn-test-lavfi").disabled = redir;
+  $("#btn-test-playlist").disabled = redir;
   $("#btn-test-url").disabled = redir;
 }
 $("#tpl-new").addEventListener("click", () => {
@@ -247,7 +246,7 @@ $("#tpl-new").addEventListener("click", () => {
   $$(".ff-field").forEach(n => n.disabled = false);
   $("#f-command").disabled = false;
   $("#btn-test-syntax").disabled = false;
-  $("#btn-test-lavfi").disabled = false;
+  $("#btn-test-playlist").disabled = false;
   $("#btn-test-url").disabled = false;
   writeFields({ name: "New template", enabled: true, hw_accel: "vaapi",
                 low_power: true, rc_mode: "CQP", global_quality: "26", async_depth: "4" });
@@ -268,40 +267,104 @@ $("#tpl-delete").addEventListener("click", () => {
   confirmDialog({ title: "Delete template", body: `Delete <b>${esc(current.name)}</b>? Channels using it fall back to the default template.`,
     okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/ffmpeg/${current.id}`, { method: "DELETE" }); current = null; loadList(); } });
 });
-async function showValidate(result, label) {
+function showValidate(result, label) {
   const box = $("#validate-out");
   box.classList.remove("d-none");
-  const ok = result.ok;
-  const header = ok
-    ? `<span class="text-success">✔ ${esc(label)} — ${esc(result.detail || "ok")}</span>`
-    : `<span class="text-danger">✘ ${esc(label)} — ${esc(result.detail || "failed")}</span>`;
-  const meta = result.ms != null
-    ? `\nsource: ${esc(result.source || "")}   ${result.bytes ?? 0} bytes   rc=${result.rc ?? "?"}   ${result.ms} ms`
-    : "";
-  const err = result.stderr ? `\n\n--- ffmpeg stderr (tail) ---\n${esc(result.stderr)}` : "";
-  box.textContent = header + meta + err;
+  const mark = result.ok ? "✔" : "✘";
+  const lines = [`${mark} ${label} — ${result.detail || (result.ok ? "ok" : "failed")}`];
+  if (result.playlist) {
+    const p = result.playlist;
+    lines.push(`playlist: ${p.kind} #${p.id}  ${p.name || ""}${p.source ? "  source=" + p.source : ""}`);
+    if (p.url) lines.push(`input: ${p.url}`);
+  } else if (result.source) {
+    lines.push(`source: ${result.source}`);
+  }
+  if (result.ms != null) {
+    lines.push(`bytes=${result.bytes ?? 0}   rc=${result.rc ?? "?"}   ${result.ms} ms`);
+  }
+  const argv = result.argv_text || (result.argv ? result.argv.join(" ") : "");
+  if (argv) lines.push("", "--- ffmpeg command ---", argv);
+  if (result.stderr) lines.push("", "--- ffmpeg stderr ---", result.stderr);
+  box.textContent = lines.join("\n");
+  box.scrollTop = 0;
 }
 async function runValidate() {
   const cmd = $("#f-command").value.trim();
   try {
     const r = await api("/api/ffmpeg/validate", { method: "POST", body: { command: cmd } });
-    await showValidate(r, "syntax check");
+    showValidate(r, "syntax check");
   } catch { /* toast already shown */ }
 }
-async function runDemo(mode) {
+async function runDemo(mode, extra = {}) {
   const cmd = $("#f-command").value.trim();
   if (!cmd) return toast("no command to test", "warn");
   $("#validate-out").classList.remove("d-none");
-  $("#validate-out").textContent = mode === "lavfi"
-    ? "running ffmpeg with synthetic testsrc2 input (~2 s) …"
+  $("#validate-out").textContent = extra.id
+    ? `resolving ${extra.kind} #${extra.id} and running ffmpeg (~2 s) …`
     : "running ffmpeg against test-videos.co.uk clip (~2 s) …";
   try {
-    const r = await api("/api/ffmpeg/demo", { method: "POST", body: { command: cmd, mode } });
-    await showValidate(r, mode === "lavfi" ? "demo testsrc" : "demo test video");
-  } catch { /* toast already shown */ }
+    const r = await api("/api/ffmpeg/demo", { method: "POST", body: { command: cmd, mode, ...extra } });
+    const label = extra.id
+      ? `demo playlist source (${extra.kind} #${extra.id})`
+      : "demo test video";
+    showValidate(r, label);
+  } catch (e) {
+    $("#validate-out").textContent = `✘ demo failed — ${e && e.message ? e.message : e}`;
+  }
+}
+function pickPlaylistAndDemo() {
+  const cmd = $("#f-command").value.trim();
+  if (!cmd) return toast("no command to test", "warn");
+  const kindSel = el("select", { class: "form-select form-select-sm" },
+    [["live", "Live"], ["vod", "VOD"], ["series", "Series"], ["local", "Local"]].map(
+      ([v, l]) => el("option", { value: v }, l)));
+  const q = el("input", { class: "form-control form-control-sm", placeholder: "filter enabled playlist items…" });
+  const list = el("div", { class: "list-group mt-2", style: "max-height:360px;overflow:auto" });
+  const hint = el("p", { class: "small text-muted mb-2" },
+    "Pick an enabled Playlist item. ffmpeg runs this template against its primary source for ~2 seconds and prints the full command plus stderr.");
+  const body = el("div", {}, hint,
+    el("div", { class: "row g-2" },
+      el("div", { class: "col-4" }, kindSel),
+      el("div", { class: "col-8" }, q)),
+    list);
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: "Demo against playlist source", body, footer, size: "lg" });
+  footer.append(mBtn("Cancel", "btn-outline-secondary", m.close));
+  async function reload() {
+    list.innerHTML = `<div class="text-muted small p-2">loading…</div>`;
+    try {
+      const r = await api(`/api/ffmpeg/demo-sources?kind=${encodeURIComponent(kindSel.value)}&q=${encodeURIComponent(q.value)}`);
+      const items = r.items || [];
+      list.innerHTML = "";
+      if (!items.length) {
+        list.append(el("div", { class: "text-muted small p-2" },
+          "No enabled playlist items. Enable something in the Playlist tab first."));
+        return;
+      }
+      for (const it of items) {
+        const b = el("button", { class: "list-group-item list-group-item-action py-2", type: "button" });
+        const sub = [it.group, it.source, it.portal].filter(Boolean).map(esc).join(" · ");
+        b.innerHTML = `<div class="d-flex justify-content-between gap-2">
+            <span>${esc(it.name)}</span>
+            <span class="badge text-bg-light">${esc(it.kind)} #${it.id}</span>
+          </div>
+          ${sub ? `<div class="small text-muted">${sub}</div>` : ""}`;
+        b.addEventListener("click", () => {
+          m.close();
+          runDemo("playlist", { kind: it.kind, id: it.id });
+        });
+        list.append(b);
+      }
+    } catch {
+      list.innerHTML = `<div class="text-danger small p-2">failed to load playlist items</div>`;
+    }
+  }
+  kindSel.addEventListener("change", reload);
+  let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(reload, 200); });
+  reload();
 }
 $("#btn-test-syntax").addEventListener("click", runValidate);
-$("#btn-test-lavfi").addEventListener("click", () => runDemo("lavfi"));
+$("#btn-test-playlist").addEventListener("click", pickPlaylistAndDemo);
 $("#btn-test-url").addEventListener("click", () => runDemo("url"));
 $("#tpl-import").addEventListener("click", () => $("#tpl-import-file").click());
 $("#tpl-import-file").addEventListener("change", async (e) => {

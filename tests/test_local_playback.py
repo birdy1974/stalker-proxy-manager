@@ -162,9 +162,6 @@ async def test_direct_and_copy_serve_the_original_file(tmp_path):
             assert "video/mp4" in r.headers.get("content-type", "")
             assert r.headers.get("accept-ranges") == "bytes"
             assert "attachment" not in r.headers.get("content-disposition", "")
-        # legacy .ts URL still works
-        r = await c.get(f"/play/local/{pid_redir}.ts?u=loc&p=pw")
-        assert r.status_code == 200 and r.content == payload
         head = await c.head(f"/play/local/{pid_redir}.mp4?u=loc&p=pw")
         assert head.status_code == 200
         assert head.headers.get("accept-ranges") == "bytes"
@@ -219,6 +216,63 @@ async def test_transcode_template_goes_through_ffmpeg_with_quoted_path(
     assert seen and seen[0] == str(media)
     assert "file:" not in seen[0]
     await MANAGER.kill_all()
+
+
+async def test_ts_url_remuxes_local_mp4_instead_of_serving_the_file(
+        tmp_path, monkeypatch):
+    """Enigma2 bouquets ask for `.ts`. Serving the original MP4 under that
+    alias (wrong demuxer) or as a live Matroska pipe is audio-only on the box.
+    The play path must go through ffmpeg even when the template is redirect."""
+    await _seed_defaults()
+    seen: list[tuple[str, str]] = []
+
+    async def _spawn_stub(self, cmd_template: str, url: str, title: str | None = None,
+                          pace: bool = False):
+        seen.append((cmd_template, url))
+        return await asyncio.create_subprocess_exec(
+            "sh", "-c", "printf MPEGTS",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE)
+
+    monkeypatch.setattr(StreamManager, "_spawn", _spawn_stub)
+
+    async with SessionLocal() as s:
+        redir_id = (await s.execute(select(FFmpegTemplate.id).where(
+            FFmpegTemplate.name == REDIRECT_PRESET_NAME))).scalar_one()
+    pid, media = await _seed_file(tmp_path, name="movie.mp4", template_id=redir_id)
+    await _user()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url=BASE) as c:
+        r = await c.get(f"/play/local/{pid}.ts?u=loc&p=pw")
+    assert r.status_code == 200, r.text
+    assert r.content == b"MPEGTS"
+    assert "video/mp2t" in r.headers.get("content-type", "")
+    assert seen and seen[0][1] == str(media)
+    assert "-f mpegts" in seen[0][0]
+    assert "-bsf:v h264_mp4toannexb" in seen[0][0]
+    await MANAGER.kill_all()
+
+
+def test_ffmpeg_argv_injects_annexb_when_copying_to_mpegts():
+    args = StreamManager._ffmpeg_argv(
+        f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1",
+        "/media/movie.mp4")
+    assert args is not None
+    assert args[args.index("-bsf:v") + 1] == "h264_mp4toannexb"
+    # already present: do not duplicate
+    twice = StreamManager._ffmpeg_argv(
+        f"ffmpeg -i {URL_PLACEHOLDER} -c copy -bsf:v h264_mp4toannexb -f mpegts pipe:1",
+        "/media/movie.mp4")
+    assert twice.count("-bsf:v") == 1
+    # transcode / matroska: leave alone
+    va = StreamManager._ffmpeg_argv(
+        build_command(FFmpegOptions()), "http://cdn/live.ts")
+    assert "-bsf:v" not in va
+    mkv = StreamManager._ffmpeg_argv(
+        f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f matroska -live 1 pipe:1",
+        "/media/movie.mp4")
+    assert "-bsf:v" not in mkv
 
 
 def test_extinf_duration_helper():

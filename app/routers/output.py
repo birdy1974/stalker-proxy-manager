@@ -296,15 +296,29 @@ async def play_episode_mkv(request: Request, eid: int, u: str = "", p: str = "",
 async def play_local(request: Request, pid: int, ext: str, u: str = "", p: str = "",
                      mode: str = ""):  # noqa: ARG001
     user = await _authed(u, p, "m3u")
-    return await _local_response(pid, user, request)
+    return await _local_response(pid, user, request, ext)
 
 
-async def _local_response(pid: int, user, request: Request):
+def _requested_matches_file(path: str, ext: str | None) -> bool:
+    """True when the URL alias is the file's own suffix (or none was given).
+
+    A `.ts` / `.mkv` URL on an `.mp4` file is how Enigma2 bouquets ask for a
+    stream container. Serving the original bytes under the wrong extension is
+    the audio-only / black-picture failure on the box.
+    """
+    if not ext:
+        return True
+    want = ext.lower().lstrip(".")
+    have = os.path.splitext(path)[1].lower().lstrip(".")
+    return want == have
+
+
+async def _local_response(pid: int, user, request: Request, ext: str | None = None):
     """Serve a local playlist item: original file for direct/copy, else ffmpeg."""
     path, item_name = await MANAGER.local_disk_path(pid)
     if not path:
         raise HTTPException(404, f"local #{pid}: file not found on disk")
-    if await MANAGER.local_serves_original(pid):
+    if await MANAGER.local_serves_original(pid) and _requested_matches_file(path, ext):
         if not MANAGER.can_open_for(user.name if user else None,
                                     user.max_connections if user else None):
             await db_log("WARNING", "output",

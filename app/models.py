@@ -625,7 +625,7 @@ class Enigma2Profile(Base):
     owif_auth: Mapped[str] = mapped_column(String(6), default="none")   # none|basic
     owif_user: Mapped[str | None] = mapped_column(String(80))
     owif_pass: Mapped[str | None] = mapped_column(String(120))
-    transport: Mapped[str] = mapped_column(String(10), default="download")  # download|ftp|ssh
+    transport: Mapped[str] = mapped_column(String(10), default="ftp")  # ftp|download|ssh
     ftp_port: Mapped[int] = mapped_column(Integer, default=21)
     ssh_port: Mapped[int] = mapped_column(Integer, default=22)
     login: Mapped[str | None] = mapped_column(String(80), default="root")

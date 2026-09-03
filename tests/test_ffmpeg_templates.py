@@ -58,6 +58,20 @@ def test_low_power_is_emitted_only_for_h264_vaapi():
     assert "-low_power 1" in build_command(FFmpegOptions(video_codec="h264_vaapi"))
 
 
+def test_copy_to_mpegts_adds_annexb_bitstream_filter():
+    """AVCC H.264 remuxed to MPEG-TS is audio-only on Enigma2 without this."""
+    cp = build_command(FFmpegOptions(hw_accel="none", video_codec="copy",
+                                     audio_codec="copy", resolution="source"))
+    assert "-bsf:v h264_mp4toannexb" in cp and "-f mpegts" in cp
+    assert "-bsf:v" not in build_command(FFmpegOptions())
+    mkv = build_command(FFmpegOptions(hw_accel="none", video_codec="copy",
+                                      audio_codec="copy", resolution="source",
+                                      output_format="matroska", subs="keep"))
+    assert "-bsf:v" not in mkv
+    # two-way sync must not duplicate the filter
+    assert build_command(FFmpegOptions(**parse_command(cp)["options"])) == cp
+
+
 def test_software_and_copy_templates_get_no_vaapi_flags():
     sw = build_command(FFmpegOptions(hw_accel="none", video_codec="libx264"))
     assert "-low_power" not in sw and "-rc_mode" not in sw and "-async_depth" not in sw

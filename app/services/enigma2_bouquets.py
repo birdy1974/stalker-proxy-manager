@@ -52,7 +52,6 @@ from ..models import (
     VodPlaylist, VodSource,
 )
 from .ffmpeg_templates import REDIRECT_COMMAND
-from .local_files import play_extension
 from .playlist_gen import _allowed, _chunked, _groups
 from .titles import best_title
 
@@ -74,7 +73,7 @@ CONTAINER_MODES = ("auto", "fixed")
 FFMPEG_PLAYERS = ("4097", "5001", "5002")
 LAYOUTS = ("group_markers", "per_series", "flat")
 DELIVERY_MODES = ("template", "proxy", "redirect")
-TRANSPORTS = ("download", "ftp", "ssh")
+TRANSPORTS = ("ftp", "download", "ssh")
 # Where the files belong on the receiver.
 E2_DIR = "/etc/enigma2"
 BOUQUETS_TV = "bouquets.tv"
@@ -552,15 +551,15 @@ async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
         if not lf:
             continue
         d = res.for_item(it.ffmpeg_template_id, "local")
-        # A transcoded/remuxed local file must advertise the container that
-        # ffmpeg actually writes.  Using the source suffix (for example
-        # `.mp4`) while returning a Matroska stream makes Enigma2 select the
-        # wrong demuxer and results in a black screen.  Only direct delivery
-        # serves the original file and should retain its real extension.
-        ext = play_extension(lf.filename) if d.kind == "direct" else "." + d.container
-        w.service(d.player, it.id,
-                  stream_url(base_url, "local", it.id, d.container, user,
-                             mode, ext=ext),
+        # Progressive MP4 over HTTP is audio-only on Enigma2 (no picture), and
+        # a live Matroska pipe is the same. Local items are always advertised
+        # as MPEG-TS; /play/local/{id}.ts remuxes with h264_mp4toannexb even
+        # when the template would otherwise FileResponse the original file.
+        # Service type 1 cannot demux a remuxed AAC/H.264 TS from an MP4.
+        player = d.player if d.player in FFMPEG_PLAYERS else "4097"
+        w.service(player, it.id,
+                  stream_url(base_url, "local", it.id, "ts", user,
+                             mode, ext=".ts"),
                   best_title(it.custom_name, lf.filename))
     return w.done()
 
