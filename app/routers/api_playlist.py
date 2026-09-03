@@ -140,7 +140,10 @@ async def live_list(db=Depends(get_db), q: str = "", group: str = "", portal_id:
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
     col = {"order": LivePlaylist.order, "name": LivePlaylist.custom_name,
            "group": LivePlaylist.group_name, "id": LivePlaylist.id}.get(sort, LivePlaylist.order)
-    stmt = stmt.order_by(col.desc() if direction == "desc" else col.asc())
+    primary = col.desc() if direction == "desc" else col.asc()
+    # id as a tie-breaker: SQLite otherwise reshuffles equal-order rows after
+    # any UPDATE (changing a template used to jump the item around the list).
+    stmt = stmt.order_by(primary, LivePlaylist.id.asc())
     rows = (await db.execute(stmt.offset((page - 1) * per_page).limit(per_page))).scalars().all()
     groups = [g[0] for g in (await db.execute(
         select(LivePlaylist.group_name).distinct().order_by(LivePlaylist.group_name))).all() if g[0]]
@@ -216,15 +219,34 @@ async def live_delete(pid: int, db=Depends(get_db)):
     return {"ok": True}
 
 
-@router.post("/live/order")
-async def live_order(payload: dict, db=Depends(get_db)):
-    """Drag&drop result: [{id, order}, ...] (only valid when sorted by order - G6)."""
+async def _set_order(db, model, payload: dict) -> dict:
+    """Drag&drop result: [{id, order}, ...] (only valid when sorted by order)."""
     for row in payload.get("items", []):
-        r = await db.get(LivePlaylist, int(row["id"]))
+        r = await db.get(model, int(row["id"]))
         if r:
             r.order = int(row["order"])
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/live/order")
+async def live_order(payload: dict, db=Depends(get_db)):
+    return await _set_order(db, LivePlaylist, payload)
+
+
+@router.post("/vod/order")
+async def vod_order(payload: dict, db=Depends(get_db)):
+    return await _set_order(db, VodPlaylist, payload)
+
+
+@router.post("/series/order")
+async def series_order(payload: dict, db=Depends(get_db)):
+    return await _set_order(db, SeriePlaylist, payload)
+
+
+@router.post("/local/order")
+async def local_order(payload: dict, db=Depends(get_db)):
+    return await _set_order(db, LocalPlaylist, payload)
 
 
 @router.post("/live/bulk")
@@ -464,7 +486,8 @@ async def _pl_list(db, model, src_model, src_fk_name, q, group, filters, page, p
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
     col = {"order": model.order, "name": model.custom_name,
            "group": model.group_name}.get(sort, model.order)
-    stmt = stmt.order_by(col.desc() if direction == "desc" else col.asc())
+    primary = col.desc() if direction == "desc" else col.asc()
+    stmt = stmt.order_by(primary, model.id.asc())
     rows = (await db.execute(stmt.offset((page - 1) * per_page).limit(per_page))).scalars().all()
     tpls = {t.id: t.name for t in (await db.execute(select(FFmpegTemplate))).scalars().all()}
     groups = [g[0] for g in (await db.execute(
@@ -626,8 +649,10 @@ async def local_pl(db=Depends(get_db), q: str = "", group: str = "", page: int =
     if group:
         stmt = stmt.where(LocalPlaylist.group_name == group)
     total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
-    col = {"order": LocalPlaylist.order, "name": LocalPlaylist.custom_name}.get(sort, LocalPlaylist.order)
-    stmt = stmt.order_by(col.desc() if direction == "desc" else col.asc())
+    col = {"order": LocalPlaylist.order, "name": LocalPlaylist.custom_name,
+           "group": LocalPlaylist.group_name}.get(sort, LocalPlaylist.order)
+    primary = col.desc() if direction == "desc" else col.asc()
+    stmt = stmt.order_by(primary, LocalPlaylist.id.asc())
     rows = (await db.execute(stmt.offset((page - 1) * per_page).limit(per_page))).scalars().all()
     tpls = {t.id: t.name for t in (await db.execute(select(FFmpegTemplate))).scalars().all()}
     items = []

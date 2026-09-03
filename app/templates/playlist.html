@@ -41,7 +41,9 @@ window.inlineTpl = async (kind, id, value, table) => {
   await api(`/api/playlist/${kind}/${id}`, { method: "PUT",
     body: { ffmpeg_template_id: +value || null } });
   toast("template updated", "ok");
-  PL_TABLES[kind].reload();
+  /* Do not reload: a list sorted by order used to reshuffle after the UPDATE
+     (equal-order rows have no stable secondary key). The <select> already
+     shows the new template. */
 };
 const tplInlineCell = (kind, r) => `
   <select class="form-select form-select-sm" style="min-width:150px"
@@ -181,11 +183,24 @@ function bulkBar(kind, getTable, { allowGroup = true } = {}) {
 }
 
 /* toolbar shared by the vod/series/local tabs: bulk add first, then bulk edit */
+const orderCol = { key: "order", label: "Ord", sort: "order", width: "52px" };
+function orderDnd(kind, getTable) {
+  return { onReorder: async (ids) => {
+    const t = getTable();
+    const orders = (t.items || []).map(r => r.order).sort((a, b) => a - b);
+    await api(`/api/playlist/${kind}/order`, { method: "POST",
+      body: { items: ids.map((id, i) => ({ id, order: orders[i] ?? (i + 1) })) } });
+    toast("order saved", "ok");
+  } };
+}
+
 function builderBar(kind, getTable, primary) {
   const bar = el("div", { class: "d-flex flex-wrap gap-2 align-items-center" });
   bar.append(mBtn("Add from sources…", primary ? "btn-accent" : "btn-outline-secondary",
     () => addSourcesDialog(kind, () => getTable().reload()), "bi-plus-circle"),
-    bulkBar(kind, getTable));
+    bulkBar(kind, getTable),
+    el("span", { class: "small text-muted ms-auto" },
+      "Drag rows to reorder (only while sorted by Ord)."));
   return bar;
 }
 
@@ -273,8 +288,7 @@ function liveBuilder() {
   bar.append(
     mBtn("Add custom channel", "btn-accent", () => editCustomChannel(null), "bi-plus-circle"),
     builderBar("live", () => liveTable, false),
-    el("a", { class: "btn btn-sm btn-outline-secondary", href: "/api/export?section=live_playlist" }, "⤓ Export"),
-    el("span", { class: "small text-muted ms-auto" }, "Drag rows to reorder (only while sorted by Order)."));
+    el("a", { class: "btn btn-sm btn-outline-secondary", href: "/api/export?section=live_playlist" }, "⤓ Export"));
   liveTable = new DataTable($("#pl-live"), {
     selectable: true, defaultSort: "order", extraHeader: bar,
     server: async (q) => await api("/api/playlist/live?" + q),
@@ -426,8 +440,10 @@ function vodBuilder() {
     selectable: true, defaultSort: "order", extraHeader: builderBar("vod", () => vodTable, true),
     server: async (q) => await api("/api/playlist/vod?" + q),
     onRowClick: (row) => showDetails("vod", row),
+    dnd: orderDnd("vod", () => vodTable),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/vod/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
+      orderCol,
       { key: "poster", label: "", width: "44px", render: r => r.poster ? `<img class="poster-thumb" src="${esc(r.poster)}" loading="lazy">` : "" },
       { key: "custom_name", class: "col-name", label: "Title", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("vod", r) },
@@ -477,8 +493,10 @@ function seriesBuilder() {
     selectable: true, defaultSort: "order", extraHeader: builderBar("series", () => seriesTable, true),
     server: async (q) => await api("/api/playlist/series?" + q),
     onRowClick: (row) => showDetails("series", row),
+    dnd: orderDnd("series", () => seriesTable),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/series/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
+      orderCol,
       { key: "poster", label: "", width: "44px", render: r => r.poster ? `<img class="poster-thumb" src="${esc(r.poster)}" loading="lazy">` : "" },
       { key: "custom_name", class: "col-name", label: "Series", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("series", r) },
@@ -542,8 +560,10 @@ function localBuilder() {
   localTable = new DataTable($("#pl-local"), {
     selectable: true, defaultSort: "order", extraHeader: builderBar("local", () => localTable, true),
     server: async (q) => await api("/api/playlist/local?" + q),
+    dnd: orderDnd("local", () => localTable),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/local/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
+      orderCol,
       { key: "custom_name", class: "col-name", label: "Name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name || "")}</b><div class="small text-muted mono">${esc(r.file)}</div>` },
       { key: "group_name", label: "Group", filter: groupFilterLoader, render: r => groupCell("local", r) },
       { key: "template", label: "FFmpeg tpl", render: r => tplInlineCell("local", r) },
