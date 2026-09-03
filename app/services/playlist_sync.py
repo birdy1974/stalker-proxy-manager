@@ -209,6 +209,157 @@ async def _add_live(db, ids: list[int], group: str | None) -> dict:
     return {"added": added, "existed": len(existing), "missing": max(0, len(ids) - len(srcs))}
 
 
+def _name_key(s: str | None) -> str:
+    return (s or "").strip().casefold()
+
+
+async def live_playlist_links_for(db, source_ids: list[int]) -> dict[int, dict]:
+    """Map live_source_id -> playlist placement used by Input Sources → Live.
+
+    One query for the page of ids. Each value is
+      {playlist_id, custom_name, priority, is_primary, chain_len}
+    or missing when the source is not (yet) on any live playlist row.
+    """
+    ids = _clean_ids(source_ids)
+    if not ids:
+        return {}
+    rows = (await db.execute(
+        select(LivePlaylistSource.live_source_id, LivePlaylistSource.priority,
+               LivePlaylist.id, LivePlaylist.custom_name)
+        .join(LivePlaylist, LivePlaylist.id == LivePlaylistSource.live_playlist_id)
+        .where(LivePlaylistSource.live_source_id.in_(ids))
+        .order_by(LivePlaylistSource.priority))).all()
+    # Prefer the lowest-priority (primary) link when a source sits on several chains.
+    best: dict[int, tuple] = {}
+    for sid, prio, pid, cname in rows:
+        cur = best.get(sid)
+        if cur is None or prio < cur[0]:
+            best[sid] = (prio, pid, cname)
+    if not best:
+        return {}
+    # chain lengths for the playlists we care about (badge: "fallback #2 of 3")
+    pl_ids = {v[1] for v in best.values()}
+    lengths: dict[int, int] = {}
+    for pid, n in (await db.execute(
+            select(LivePlaylistSource.live_playlist_id, func.count())
+            .where(LivePlaylistSource.live_playlist_id.in_(pl_ids))
+            .group_by(LivePlaylistSource.live_playlist_id))).all():
+        lengths[pid] = n
+    return {
+        sid: {
+            "playlist_id": pid,
+            "custom_name": cname,
+            "priority": prio,
+            "is_primary": prio == 1,
+            "chain_len": lengths.get(pid, 1),
+        }
+        for sid, (prio, pid, cname) in best.items()
+    }
+
+
+async def _detach_live_source(db, source_id: int, *, keep_playlist_id: int | None = None) -> list[int]:
+    """Remove this source from every live-playlist chain (except `keep`).
+
+    Empty custom channels left behind are deleted so a rename-to-fallback does
+    not leave orphan playlist rows with no sources.
+    """
+    links = (await db.execute(select(LivePlaylistSource).where(
+        LivePlaylistSource.live_source_id == source_id))).scalars().all()
+    touched: set[int] = set()
+    for link in links:
+        if keep_playlist_id is not None and link.live_playlist_id == keep_playlist_id:
+            continue
+        touched.add(link.live_playlist_id)
+        await db.delete(link)
+    await db.flush()
+    emptied: list[int] = []
+    for pid in touched:
+        left = await db.scalar(select(func.count()).select_from(LivePlaylistSource).where(
+            LivePlaylistSource.live_playlist_id == pid))
+        if not left:
+            row = await db.get(LivePlaylist, pid)
+            if row:
+                await db.delete(row)
+                emptied.append(pid)
+    return emptied
+
+
+async def assign_live_custom_name(db, source_id: int, custom_name: str) -> dict:
+    """
+    Input Sources → Live: set the Playlist custom name for an enabled source.
+
+    * name unique among live playlist rows  → create a new custom channel
+      (or rename the channel this source already owns as primary)
+    * name already used                     → attach this source as a fallback
+      on that existing custom channel (and detach it from any other chain)
+
+    Matching is case-insensitive and whitespace-trimmed. Does not commit.
+    """
+    name = (custom_name or "").strip()
+    if not name:
+        raise ValueError("custom name required")
+    src = await db.get(LiveSource, source_id)
+    if not src:
+        raise ValueError("source not found")
+    if not src.enabled:
+        raise ValueError("enable the channel first")
+
+    # Existing playlist row with this custom name (case-insensitive).
+    match: LivePlaylist | None = None
+    for row in (await db.execute(select(LivePlaylist))).scalars().all():
+        if _name_key(row.custom_name) == _name_key(name):
+            match = row
+            break
+
+    if match is not None:
+        # Already on this chain? Keep position; just report.
+        on = (await db.execute(select(LivePlaylistSource).where(
+            LivePlaylistSource.live_playlist_id == match.id,
+            LivePlaylistSource.live_source_id == source_id))).scalar_one_or_none()
+        if on is not None:
+            return {"action": "unchanged", "playlist_id": match.id,
+                    "custom_name": match.custom_name, "priority": on.priority,
+                    "is_primary": on.priority == 1}
+        await _detach_live_source(db, source_id, keep_playlist_id=match.id)
+        max_p = await db.scalar(select(func.max(LivePlaylistSource.priority)).where(
+            LivePlaylistSource.live_playlist_id == match.id)) or 0
+        prio = int(max_p) + 1
+        db.add(LivePlaylistSource(live_playlist_id=match.id, live_source_id=source_id,
+                                  priority=prio))
+        await db.flush()
+        return {"action": "fallback", "playlist_id": match.id,
+                "custom_name": match.custom_name, "priority": prio, "is_primary": False}
+
+    # Unique name: rename the primary channel this source already owns, else create.
+    primary = (await db.execute(select(LivePlaylistSource).where(
+        LivePlaylistSource.live_source_id == source_id,
+        LivePlaylistSource.priority == 1))).scalar_one_or_none()
+    if primary is not None:
+        pl = await db.get(LivePlaylist, primary.live_playlist_id)
+        if pl:
+            pl.custom_name = name
+            await db.flush()
+            return {"action": "renamed", "playlist_id": pl.id, "custom_name": pl.custom_name,
+                    "priority": 1, "is_primary": True}
+
+    await _detach_live_source(db, source_id)
+    genre = await db.get(LiveGenre, src.live_genre_id) if src.live_genre_id else None
+    nxt = await _next_order(db, LivePlaylist, 1)
+    pl = LivePlaylist(
+        custom_name=name,
+        group_name=(genre.name if genre else None) or "Live",
+        number=int(src.number) if str(src.number or "").isdigit() else None,
+        epg_id=src.epg_original, logo=src.logo_original,
+        enabled=True, order=nxt,
+    )
+    db.add(pl)
+    await db.flush()
+    db.add(LivePlaylistSource(live_playlist_id=pl.id, live_source_id=source_id, priority=1))
+    await db.flush()
+    return {"action": "created", "playlist_id": pl.id, "custom_name": pl.custom_name,
+            "priority": 1, "is_primary": True}
+
+
 async def _existing_ids(db, kind: str, ids: list[int]) -> set[int]:
     model, col = {
         "vod": (VodPlaylist, VodPlaylist.vod_source_id),

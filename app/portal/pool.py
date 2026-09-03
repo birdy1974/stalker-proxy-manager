@@ -165,6 +165,52 @@ class ClientPool:
         if client is not None:
             await client._aclose()
 
+    async def drop_mac(self, mac: str) -> int:
+        """Close every pooled session that authenticated as ``mac``.
+
+        MAC is part of the session key (index 1, normalised). Used when a MAC
+        row is removed so a deleted device cannot keep a live token against the
+        panel, and so a re-added MAC starts with a clean handshake.
+        """
+        target = normalize_mac(mac or "")
+        if not target:
+            return 0
+        async with self._guard:
+            victims = [(k, self._clients.pop(k))
+                       for k in list(self._clients)
+                       if k[1] == target]
+            for k, _ in victims:
+                self._used.pop(k, None)
+        return await self._close_victims(victims)
+
+    async def drop_portal_url(self, portal_url: str | None) -> int:
+        """Close every pooled session pointed at ``portal_url`` (or base_url).
+
+        Called on portal delete so tokens and TCP sockets of a removed panel do
+        not linger until the idle reaper. Matching is exact on the key's first
+        element (the URL the client was built with).
+        """
+        url = (portal_url or "").strip()
+        if not url:
+            return 0
+        async with self._guard:
+            victims = [(k, self._clients.pop(k))
+                       for k in list(self._clients)
+                       if k[0] == url]
+            for k, _ in victims:
+                self._used.pop(k, None)
+        return await self._close_victims(victims)
+
+    async def _close_victims(self, victims: list) -> int:
+        closed = 0
+        for key, client in victims:
+            try:
+                await client._aclose()
+                closed += 1
+            except Exception:  # noqa: BLE001 - never let cleanup fail the caller
+                log.warning("could not close portal session %s", key[:2] if key else "?")
+        return closed
+
     async def close_all(self) -> None:
         async with self._guard:
             clients = list(self._clients.items())

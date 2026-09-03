@@ -7,6 +7,7 @@
       <button class="btn btn-sm btn-accent" id="btn-add"><i class="bi bi-plus-circle"></i> Add portal</button>
       <button class="btn btn-sm btn-outline-secondary" id="btn-test-sel"><i class="bi bi-plug"></i> Test selected</button>
       <button class="btn btn-sm btn-outline-secondary" id="btn-test-all"><i class="bi bi-plug-fill"></i> Test all</button>
+      <button class="btn btn-sm btn-outline-secondary" id="btn-mac-health" title="Refresh status + expire date of every MAC on multi-MAC portals (same work the background scheduler does)"><i class="bi bi-heart-pulse"></i> Refresh MAC health</button>
       <button class="btn btn-sm btn-outline-danger" id="btn-del-sel"><i class="bi bi-trash"></i> Delete selected</button>
       <span class="vr mx-1"></span>
       <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=portals"><i class="bi bi-download"></i> Export</a>
@@ -144,15 +145,26 @@ function makeTable() {
       /* R7 in one badge per row: "offered" means we found an account and have
          changed nothing, which is the whole point of keeping the two steps apart */
       { key: "xtream", label: "Xtream", width: "150px", render: r => xtreamHtml(r, false) },
-      { key: "macs", label: "MAC addresses", render: r => r.macs.map(m => `
-          <div class="d-flex align-items-center gap-2 mb-1">
-            <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
-            <span class="small text-muted">${esc(m.expire_date || "")}</span>
-            <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="STB identity this portal is told (serial, device id) - pin the values your box really sends"
-              onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
-            <button class="btn btn-xs btn-outline-danger py-0 px-1" title="delete mac"
-              onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
-          </div>`).join("") || '<span class="text-muted small">none</span>' },
+      { key: "macs", label: "MAC addresses", render: r => {
+          const multi = (r.macs || []).length >= 2;
+          const rows = (r.macs || []).map(m => {
+            const checked = m.last_checked ? ` · checked ${esc(m.last_checked.slice(0, 16).replace("T", " "))}` : "";
+            return `<div class="d-flex align-items-center gap-2 mb-1">
+              <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
+              <span class="small text-muted" title="expire date from the panel">${esc(m.expire_date || "")}</span>
+              <span class="small text-muted">${checked}</span>
+              <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="STB identity this portal is told (serial, device id) - pin the values your box really sends"
+                onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
+              <button class="btn btn-xs btn-outline-danger py-0 px-1" title="delete mac"
+                onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
+            </div>`;
+          }).join("") || '<span class="text-muted small">none</span>';
+          const cmp = multi
+            ? `<button class="btn btn-xs btn-outline-secondary mt-1" title="Ask every online MAC for its genre lists and show what differs"
+                 onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button>`
+            : "";
+          return rows + cmp;
+        } },
       { key: "actions", label: "Actions", render: r => `
         <div class="btn-group btn-group-sm">
           <button class="btn btn-outline-secondary" title="Edit / genres / content" onclick="editPortal(${r.id})"><i class="bi bi-pencil"></i></button>
@@ -568,6 +580,72 @@ $("#btn-test-sel").addEventListener("click", async () => {
 $("#btn-test-all").addEventListener("click", async () => {
   toast("testing all portals…"); await api("/api/portals/test-batch", { method: "POST", body: { ids: [] } }); table.reload();
 });
+$("#btn-mac-health").addEventListener("click", async () => {
+  toast("refreshing MAC status + expiry on multi-MAC portals…");
+  const r = await api("/api/portals/mac-health/refresh", { method: "POST", body: { only_multi: true } });
+  toast(`MAC health: ${r.macs_online ?? 0}/${r.macs_total ?? 0} online across ${r.portals ?? 0} portal(s)`, "ok");
+  table.reload();
+});
+
+/* Compare genres across every online MAC of one portal.
+   Offline/expired MACs are listed but not asked. Differences are shown per
+   kind (live/vod/series) as "only on this MAC" lists — that's the package
+   split shared-login resellers often hide behind one portal URL. */
+window.compareGenres = async (pid) => {
+  const p = table.items.find(x => x.id === pid);
+  toast(`comparing genres across MACs of ${p?.name || "portal"}…`);
+  const d = await api(`/api/portals/${pid}/compare-genres`, { method: "POST" });
+  const body = el("div");
+  const skipped = (d.skipped || []).map(s =>
+    `<div class="small text-muted">· <span class="mono">${esc(s.mac)}</span> skipped (${esc(s.status || "")}: ${esc(s.reason || "")})</div>`
+  ).join("");
+  const macRows = (d.macs || []).map(m => {
+    if (!m.ok) return `<tr><td class="mono small">${esc(m.mac)}</td><td colspan="6" class="text-danger small">${esc(m.error || "failed")}</td></tr>`;
+    const flag = (n) => n ? `<span class="badge text-bg-warning">${n} only here</span>` : '<span class="badge text-bg-success">match</span>';
+    return `<tr>
+      <td class="mono small">${esc(m.mac)}</td>
+      <td class="text-end">${m.live}</td><td>${flag(m.only_live)}</td>
+      <td class="text-end">${m.vod}</td><td>${flag(m.only_vod)}</td>
+      <td class="text-end">${m.series}</td><td>${flag(m.only_series)}</td>
+    </tr>`;
+  }).join("");
+  const onlyBlock = (kind, diff) => {
+    if (!diff || diff.identical !== false) return "";
+    const parts = Object.entries(diff.only || {}).map(([mac, list]) =>
+      `<div class="mb-2"><div class="small fw-semibold mono">${esc(mac)} — ${list.length} only on this MAC</div>
+        <div class="small">${list.map(g => `<span class="badge text-bg-light me-1 mb-1">${esc(g.name)}</span>`).join("")}</div></div>`
+    ).join("");
+    return `<div class="mt-3"><div class="muted-label">${kind.toUpperCase()} differences</div>${parts || '<div class="small text-muted">none</div>'}</div>`;
+  };
+  const headCls = d.identical ? "text-success" : "text-warning";
+  body.innerHTML = `
+    <div class="alert ${d.identical ? "alert-success" : "alert-warning"} py-2 small mb-2">
+      <b class="${headCls}">${esc(d.message || "")}</b>
+      <div class="text-muted">${d.compared || 0} MAC(s) compared · fetched ${esc((d.fetched_at || "").replace("T", " ").slice(0, 19))}</div>
+    </div>
+    ${skipped ? `<div class="mb-2">${skipped}</div>` : ""}
+    <div class="table-responsive"><table class="table table-sm align-middle mb-0">
+      <thead><tr>
+        <th>MAC</th>
+        <th class="text-end">Live</th><th></th>
+        <th class="text-end">VOD</th><th></th>
+        <th class="text-end">Series</th><th></th>
+      </tr></thead>
+      <tbody>${macRows || '<tr><td colspan="7" class="text-muted small">no online MAC to ask — press Test first</td></tr>'}</tbody>
+    </table></div>
+    ${onlyBlock("live", d.live)}
+    ${onlyBlock("vod", d.vod)}
+    ${onlyBlock("series", d.series)}
+    <div class="small text-muted mt-3">Genres seen by any compared MAC are upserted into this portal's genre tables (new ones land <em>disabled</em>; your existing enable ticks stay). A MAC with genres the others lack is usually a different package on the same portal URL — keep it as a fallback source rather than treating every MAC as interchangeable.${d.stored ? ` Stored: ${d.stored.live||0} live / ${d.stored.vod||0} vod / ${d.stored.series||0} series.` : ""}</div>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: `Genre compare: ${esc(d.name || p?.name || "")}`, body, footer, size: "lg" });
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close),
+    mBtn("Refresh MAC status first", "btn-outline-secondary", async () => {
+      await api("/api/portals/mac-health/refresh", { method: "POST", body: { portal_id: pid } });
+      m.close(); table.reload();
+      toast("status refreshed — run Compare again", "ok");
+    }, "bi-heart-pulse"));
+};
 $("#btn-del-sel").addEventListener("click", async () => {
   const ids = [...table.selected]; if (!ids.length) return toast("select portals first", "warn");
   confirmDialog({ title: "Delete portals", body: `Delete ${ids.length} portal(s)? Fallback usage is checked per portal.`, okText: "Delete", okClass: "btn-danger",

@@ -49,8 +49,10 @@ async def _schema_and_flush():
     import gc
 
     from app import models
+    from app.services.playlist_gen import clear_m3u_cache
 
     await flush_logs()
+    clear_m3u_cache()                  # drop_all zeros ids; cached M3Us must die
     last: Exception | None = None
     for attempt in range(6):
         try:
@@ -72,6 +74,7 @@ async def _schema_and_flush():
             f"session instead of closing it: {last}")
     yield
     await flush_logs()
+    clear_m3u_cache()
 
 
 @pytest.fixture

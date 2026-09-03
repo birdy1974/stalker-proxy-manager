@@ -176,6 +176,12 @@ async def startup() -> None:
     from .services.epg import epg_scheduler
     import asyncio  # noqa: PLC0415 - the task set is built at startup
     asyncio.create_task(epg_scheduler())
+    # Multi-MAC portals: keep every MAC's status + expiry fresh in the background
+    # so a secondary account that expires overnight is dropped from fallback
+    # chains without anyone pressing Test. Interval is the GUI setting
+    # `mac_health_minutes` (0 = paused).
+    from .services.mac_health import mac_health_scheduler
+    _bg.add(asyncio.create_task(mac_health_scheduler(), name="spm-mac-health"))
     # Reaps streams whose teardown was lost, so a MAC or a user's connection
     # slot can never stay occupied until the next restart.
     _bg.add(asyncio.create_task(MANAGER.reap_dead(), name="spm-stream-reaper"))

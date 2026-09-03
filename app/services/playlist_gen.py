@@ -86,13 +86,38 @@ def _chunked(seq: list, size: int = 800):
 
 _M3U_CACHE: dict[tuple, tuple[float, str]] = {}
 _M3U_CACHE_TTL = 120
+# Tables whose row count / max(id) form the cheap cache-bust signature.
+_REVISION_TABLES = (LivePlaylist, VodPlaylist, SeriePlaylist, LocalPlaylist,
+                    SeriePlaylistSeason, LocalFile, SerieEpisode)
+
+
+def clear_m3u_cache() -> None:
+    """Drop every cached playlist. Tests call this between schema resets so a
+    zeroed DB cannot reuse a previous library's M3U under the same revision."""
+    _M3U_CACHE.clear()
+
 
 async def _playlist_revision(s) -> tuple:
-    """Cheap per-database revision signature; changes invalidate cached M3Us."""
-    tables = (LivePlaylist, VodPlaylist, SeriePlaylist, LocalPlaylist,
-              SeriePlaylistSeason, LocalFile, SerieEpisode)
-    return tuple((await s.scalar(select(func.count()).select_from(t)),
-                   await s.scalar(select(func.max(t.id)).select_from(t))) for t in tables)
+    """Cheap per-database revision signature; changes invalidate cached M3Us.
+
+    One round trip for every table (scalar subqueries), not N×2 sequential
+    awaits. A genexp of `await`s is an *async* generator — `tuple(...)` cannot
+    iterate it, which used to make every /playlist.m3u request answer 500
+    (VLC then reports it cannot load the playlist).
+    """
+    cols = []
+    for t in _REVISION_TABLES:
+        cols.append(select(func.count()).select_from(t).scalar_subquery())
+        cols.append(select(func.max(t.id)).select_from(t).scalar_subquery())
+    row = (await s.execute(select(*cols))).one()
+    # Pack as ((count, max_id), ...) so the cache key stays stable & readable.
+    return tuple((row[i], row[i + 1]) for i in range(0, len(row), 2))
+
+
+def _extinf_title(title: str | None) -> str:
+    """Display name after the EXTINF comma — must be a single physical line."""
+    return (title or "").replace("\r", " ").replace("\n", " ").replace("\0", "")
+
 
 async def build_m3u(base_url: str, user: User) -> str:
     async with SessionLocal() as s:
@@ -134,7 +159,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
         for it in items:
             if not _allowed(it.group_name, groups["live"]):
                 continue
-            title = best_title(it.custom_name)
+            title = _extinf_title(best_title(it.custom_name))
             attrs = {
                 "tvg-chno": it.number if it.number is not None else it.order,
                 "tvg-id": m3u_attr(it.epg_id or ""), "tvg-name": m3u_attr(title),
@@ -157,7 +182,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
                 continue
             # Prefer the longest non-year title: some portals store the year in
             # `name` and the full title in `o_name` (now original_name).
-            title = best_title(it.custom_name, src_names.get(it.vod_source_id))
+            title = _extinf_title(best_title(it.custom_name, src_names.get(it.vod_source_id)))
             attr = (f'tvg-name="{m3u_attr(title)}" '
                     f'tvg-logo="{m3u_attr(it.poster or it.logo or "")}" '
                     f'group-title="{m3u_attr(it.group_name or "VOD")}"')
@@ -196,7 +221,8 @@ async def _build_m3u(base_url: str, user: User) -> str:
         for sp in visible:
             for sp_id, season_id, season_number in seasons_by_playlist.get(sp.id, []):
                 for ep_id, ep_num in eps_by_season.get(season_id, []):
-                    name = f"{best_title(sp.custom_name)} S{season_number:02d}E{ep_num:02d}"
+                    name = _extinf_title(
+                        f"{best_title(sp.custom_name)} S{season_number:02d}E{ep_num:02d}")
                     attr = (f'tvg-name="{m3u_attr(name)}" '
                             f'tvg-logo="{m3u_attr(sp.poster or sp.logo or "")}" '
                             f'group-title="{m3u_attr("Series: " + (sp.group_name or sp.custom_name))}"')
@@ -218,7 +244,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
             lf = files.get(it.local_file_id)
             if not lf:
                 continue
-            name = best_title(it.custom_name, lf.filename)
+            name = _extinf_title(best_title(it.custom_name, lf.filename))
             dur = extinf_duration(lf.duration_s)
             ext = play_extension(lf.filename)
             lines.append(f'#EXTINF:{dur} tvg-name="{m3u_attr(name)}" '

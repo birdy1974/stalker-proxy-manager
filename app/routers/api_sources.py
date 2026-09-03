@@ -21,7 +21,8 @@ from ..config import MEDIA_ROOT
 from ..database import get_db, spawn
 from ..services.permissions import describe_access, permission_hint
 from ..services.playlist_sync import (SYNC_KINDS, add_sources,
-                                        sync_sources)
+                                        assign_live_custom_name,
+                                        live_playlist_links_for, sync_sources)
 from ..models import (
     LiveGenre, LiveSource, LocalFile, LocalPlaylist, LocalSource, Portal,
     SerieEpisode, SerieGenre, SerieSeason, SerieSource, VodGenre, VodSource,
@@ -50,7 +51,11 @@ async def _page(db, stmt, model, page: int, per_page: int, sort: str, direction:
     return total, rows
 
 
-def _live_item(r: LiveSource, genre_names, portal_names) -> dict:
+def _live_item(r: LiveSource, genre_names, portal_names, pl_link: dict | None = None) -> dict:
+    # Playlist placement is only meaningful for enabled sources (the column is
+    # blank otherwise). `playlist_name` is what the GUI shows / edits: the
+    # custom channel name when linked, else the portal original as a default.
+    pl = pl_link if (r.enabled and pl_link) else None
     return {"id": r.id, "name": r.original_name, "number": r.number,
             "portal_id": r.portal_id, "portal": portal_names.get(r.portal_id, "?"),
             "genre_id": r.live_genre_id, "genre": genre_names.get(r.live_genre_id, ""),
@@ -62,7 +67,12 @@ def _live_item(r: LiveSource, genre_names, portal_names) -> dict:
             # R7: the harvested Xtream link for this channel, if the portal has one
             # and it was adopted. `cmd` above stays the truth of the portal path -
             # adoption is a second address for the same channel, not a rewrite.
-            "xtream_url": r.xtream_url or None}
+            "xtream_url": r.xtream_url or None,
+            "playlist_id": pl["playlist_id"] if pl else None,
+            "playlist_name": (pl["custom_name"] if pl else (r.original_name if r.enabled else "")),
+            "playlist_priority": pl["priority"] if pl else None,
+            "playlist_is_primary": pl["is_primary"] if pl else None,
+            "playlist_chain_len": pl["chain_len"] if pl else None}
 
 
 def _vod_item(r: VodSource, genre_names, portal_names) -> dict:
@@ -110,8 +120,29 @@ async def live(db=Depends(get_db), portal_id: int = 0, genre_id: int = 0, q: str
     stmt = _filters(LiveSource, portal_id, LiveSource.live_genre_id, genre_id, q, enabled)
     total, rows = await _page(db, stmt, LiveSource, page, per_page, sort, direction)
     portals, lg, _, _ = await _names(db)
+    # Playlist custom-name column: resolved in one join for the page, never a
+    # per-row portal/EPG round trip (that used to be the "Now" column).
+    links = await live_playlist_links_for(db, [r.id for r in rows])
     return {"total": total, "page": page, "per_page": per_page,
-            "items": [_live_item(r, lg, portals) for r in rows]}
+            "items": [_live_item(r, lg, portals, links.get(r.id)) for r in rows]}
+
+
+@router.post("/live/{sid}/playlist-name")
+async def set_live_playlist_name(sid: int, payload: dict, db=Depends(get_db)):
+    """Set the Playlist custom name for an enabled live source.
+
+    Unique name  → new custom channel (or rename the one this source already owns).
+    Existing name → this source becomes a fallback on that custom channel.
+    """
+    try:
+        res = await assign_live_custom_name(db, sid, payload.get("custom_name") or "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.commit()
+    await db_log("INFO", "sources",
+                 f"live source #{sid} playlist name → {res['action']}: "
+                 f"'{res['custom_name']}' (playlist #{res['playlist_id']})")
+    return {"ok": True, **res}
 
 
 @router.get("/vod")

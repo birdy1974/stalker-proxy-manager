@@ -118,12 +118,87 @@ class StreamHandle:
 REAP_GRACE = 45.0
 
 
+# After a 302 redirect we no longer hold the socket, so we cannot know when the
+# player stops. create_link itself often opens a panel slot though, and a health
+# handshake on that same MAC mid-play can kick the viewer (or burn the slot).
+# A soft lease covers the typical live-zap window; VOD leases outlive a movie
+# only if the operator re-asks within the window, which is rare and harmless.
+REDIRECT_LEASE_S = 180.0
+
+
 class StreamManager:
     def __init__(self) -> None:
         self.streams: dict[str, StreamHandle] = {}
-        self.mac_locks: dict[int, str] = {}                 # mac_id -> stream_id
+        self.mac_locks: dict[int, str] = {}                 # mac_id -> stream_id (ffmpeg pipes)
+        # Soft occupancy for redirect/direct plays: mac_id -> monotonic expiry.
+        # See REDIRECT_LEASE_S. Expired entries are dropped lazily on read.
+        self.redirect_leases: dict[int, float] = {}
         self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
         self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
+
+    # ------------------------------------------------------------- occupancy
+    def is_mac_busy(self, mac_id: int | None) -> bool:
+        """True when a MAC must not be re-handshaked or handed to another play.
+
+        Two independent signals:
+          * ``mac_locks`` — an ffmpeg pipe we own (proxy/transcode). Released
+            the moment the pump ends or the disconnect watchdog fires.
+          * ``redirect_leases`` — we just 302'd a player to the panel CDN with
+            this MAC's create_link token. We no longer see the socket, so the
+            lease is time-bounded rather than exact.
+        """
+        if mac_id is None:
+            return False
+        if mac_id in self.mac_locks:
+            return True
+        exp = self.redirect_leases.get(mac_id)
+        if exp is None:
+            return False
+        if exp <= time.monotonic():
+            self.redirect_leases.pop(mac_id, None)
+            return False
+        return True
+
+    def lease_mac(self, mac_id: int | None, *, seconds: float = REDIRECT_LEASE_S) -> None:
+        """Mark a MAC busy for a short window after a redirect/direct resolve."""
+        if mac_id is None:
+            return
+        self.redirect_leases[mac_id] = time.monotonic() + max(1.0, float(seconds))
+
+    def release_mac(self, mac_id: int | None) -> None:
+        """Drop every occupancy record for one MAC (delete/edit cleanup)."""
+        if mac_id is None:
+            return
+        self.mac_locks.pop(mac_id, None)
+        self.redirect_leases.pop(mac_id, None)
+
+    def release_macs(self, mac_ids) -> None:
+        for mid in mac_ids or ():
+            self.release_mac(mid)
+
+    def busy_mac_ids(self) -> set[int]:
+        """mac_ids currently locked by ffmpeg or holding a live redirect lease."""
+        now = time.monotonic()
+        expired = [mid for mid, exp in self.redirect_leases.items() if exp <= now]
+        for mid in expired:
+            self.redirect_leases.pop(mid, None)
+        return set(self.mac_locks) | set(self.redirect_leases)
+
+    def busy_mac_addresses(self) -> set[str]:
+        """Uppercased MAC strings currently occupied (for health-skip lookups).
+
+        Prefers the live StreamHandle.mac (ffmpeg path, always accurate while
+        bytes flow). Falls back to nothing for leases alone — those are keyed
+        by id; callers that only have a MAC string should pass through
+        ``busy_mac_ids`` + the row id instead. Health refresh has the row, so
+        it uses both.
+        """
+        out: set[str] = set()
+        for h in self.streams.values():
+            mac = (h.mac or "").strip().upper()
+            if mac:
+                out.add(mac)
+        return out
 
     # ------------------------------------------------------------- registry
     def list(self) -> list[dict]:
@@ -1023,8 +1098,11 @@ class StreamManager:
 
         for _src, portal, macs in chain:
             for mac_row in self._macs_for(portal, _src, macs):
-                if mac_row is not None and mac_row.id in self.mac_locks:
-                    continue                      # occupied by one of our own pipes
+                # ffmpeg lock OR a recent redirect lease — both mean "leave this
+                # MAC alone". Redirects never enter mac_locks (we no longer hold
+                # the socket after the 302), so the lease is the only signal.
+                if mac_row is not None and self.is_mac_busy(mac_row.id):
+                    continue
                 # Decided first, before any portal session exists: the point of
                 # R2 is that a channel the panel described as permanent costs the
                 # player one redirect and us *nothing* - no handshake reuse, no
@@ -1035,6 +1113,8 @@ class StreamManager:
                     await db_log("INFO", "stream",
                                  f"[{item_name}] playing the stored link via "
                                  f"{portal.name}/{mac_row.mac}: {plan.policy.reason}")
+                    if mac_row is not None:
+                        self.lease_mac(mac_row.id)
                     return plan.direct_url, item_name
                 client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                 try:
@@ -1066,6 +1146,8 @@ class StreamManager:
                     await db_log("INFO", "stream",
                                  f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
                                  f"(no ffmpeg)")
+                    if mac_row is not None:
+                        self.lease_mac(mac_row.id)
                     return url, item_name
         await db_log("ERROR", "stream",
                      f"[{item_name}] redirect failed: no source produced a link")
@@ -1106,7 +1188,7 @@ class StreamManager:
                              f"[{item_name}] local file missing on disk -> 404")
                 handle.dead = True
         else:
-            free = any(m.id not in self.mac_locks for (_s, _p, macs) in chain for m in macs)
+            free = any(not self.is_mac_busy(m.id) for (_s, _p, macs) in chain for m in macs)
             if not chain or not free:
                 if chain and not free:
                     await db_log("WARNING", "stream",
@@ -1162,7 +1244,7 @@ class StreamManager:
                     # would put the portal back in the loop we removed.
                     plan = self._plan(src, mac_row, portal, ffmpeg=True)
                     adopted = plan.adopted
-                    if not adopted and mac_row.id in self.mac_locks:
+                    if not adopted and self.is_mac_busy(mac_row.id):
                         await db_log("INFO", "stream",
                                      f"[{h.item_name}] mac {mac_row.mac} busy -> skip "
                                      f"(fallback step {idx}/{len(chain)})")
