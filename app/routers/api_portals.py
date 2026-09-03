@@ -174,6 +174,7 @@ async def update_portal(pid: int, payload: dict, db=Depends(get_db)):
     if "base_url" in payload or "tls_insecure" in payload:
         p.resolved_url = p.resolved_path = None   # endpoint/TLS policy changed -> re-resolve
     p.updated = datetime.now(timezone.utc)
+    removed_macs: list[tuple[int, str]] = []
     if "macs" in payload:                        # replace full mac list, keep order/status of existing
         existing = {m.mac: m for m in (await db.execute(
             select(MacAddress).where(MacAddress.portal_id == pid))).scalars().all()}
@@ -181,6 +182,7 @@ async def update_portal(pid: int, payload: dict, db=Depends(get_db)):
         wanted = [e["mac"] for e in entries]
         for mac, row in existing.items():
             if mac not in wanted:
+                removed_macs.append((row.id, row.mac))
                 await db.delete(row)
         have = set(existing) & set(wanted)
         for i, entry in enumerate(entries):
@@ -195,6 +197,10 @@ async def update_portal(pid: int, payload: dict, db=Depends(get_db)):
             else:
                 db.add(MacAddress(portal_id=pid, order=i, **entry))
     await db.commit()
+    # Runtime leftovers: a deleted MAC must not keep a mac_lock, a redirect
+    # lease, or a pooled Stalker session (token + TCP) against the panel.
+    if removed_macs:
+        await _cleanup_removed_macs(removed_macs)
     return {"ok": True}
 
 
@@ -243,10 +249,18 @@ async def delete_portal(pid: int, db=Depends(get_db), replacement_portal_id: int
     genres, playlist-source rows). If replacement_portal_id is given, fallback
     chain rows pointing at this portal's sources are first re-pointed to
     best-effort name-matched sources of the replacement portal (G-flow).
+
+    Runtime state is scrubbed too: mac_locks / redirect leases for every MAC of
+    this portal, and every pooled Stalker session pointed at its URL.
     """
     p = await db.get(Portal, pid)
     if not p:
         raise HTTPException(404, "portal not found")
+    # Snapshot before the cascade wipes the rows — needed for runtime cleanup.
+    mac_rows = list((await db.execute(
+        select(MacAddress).where(MacAddress.portal_id == pid))).scalars().all())
+    removed_macs = [(m.id, m.mac) for m in mac_rows]
+    portal_urls = [u for u in (p.resolved_url, p.base_url) if u]
     usage = await _fallback_usage(db, pid)
     replaced = 0
     if replacement_portal_id:
@@ -256,10 +270,38 @@ async def delete_portal(pid: int, db=Depends(get_db), replacement_portal_id: int
         replaced = await _repoint_fallbacks(db, pid, replacement_portal_id)
     await db.delete(p)          # cascades: macs, genres, sources, playlist-source rows
     await db.commit()
+    await _cleanup_removed_macs(removed_macs, portal_urls=portal_urls)
     msg = f"portal '{p.name}' deleted; fallback rows repointed: {replaced}" if replacement_portal_id \
         else f"portal '{p.name}' deleted ({sum(len(v) for v in usage.values())} fallback rows removed)"
     await db_log("WARNING", "portal", msg)
     return {"ok": True, "repointed": replaced}
+
+
+async def _cleanup_removed_macs(removed: list[tuple[int, str]], *,
+                                portal_urls: list[str] | None = None) -> None:
+    """Drop in-memory leftovers of deleted MAC rows / a deleted portal.
+
+    DB FKs already cascade the durable state. What they cannot touch:
+      * StreamManager.mac_locks / redirect_leases (keyed by mac_id)
+      * ClientPool sessions (keyed by portal_url + normalised MAC)
+    Leaving either behind would keep a ghost occupancy that blocks the next
+    play, or a live token against a panel the operator just removed.
+    """
+    from ..services.stream_manager import MANAGER
+    for mid, mac in removed:
+        try:
+            MANAGER.release_mac(mid)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            await POOL.drop_mac(mac)
+        except Exception:  # noqa: BLE001
+            pass
+    for url in portal_urls or ():
+        try:
+            await POOL.drop_portal_url(url)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _repoint_fallbacks(db, old_pid: int, new_pid: int) -> int:
@@ -513,6 +555,44 @@ async def test_batch(payload: dict, db=Depends(get_db)):
     for p in portals:
         out[p.id] = (await test_portal(p.id, db))["results"]
     return {"results": out}
+
+
+@router.post("/mac-health/refresh")
+async def mac_health_refresh(payload: dict | None = None):
+    """Run the multi-MAC status/expiry sweep once (same work the scheduler does).
+
+    Body (all optional):
+      portal_id   – only this portal
+      only_multi  – default true: portals with fewer than 2 MACs are skipped
+      skip_busy   – default true: MACs holding a live stream are left alone
+    """
+    from ..services import mac_health
+    body = payload or {}
+    pid = body.get("portal_id")
+    skip_busy = bool(body.get("skip_busy", True))
+    if pid:
+        return await mac_health.refresh_portal_macs(int(pid), skip_busy=skip_busy)
+    only_multi = bool(body.get("only_multi", True))
+    return await mac_health.refresh_all_macs(only_multi=only_multi, skip_busy=skip_busy)
+
+
+@router.post("/{pid}/compare-genres")
+async def compare_portal_genres(pid: int):
+    """Ask every online MAC of this portal for its genre lists and report diffs.
+
+    The union of every genre any compared MAC returned is upserted into the
+    portal's live/vod/series genre tables (existing `enabled` flags are kept;
+    brand-new genres land disabled). Offline/expired/banned MACs are listed
+    under `skipped` and not asked. Use this when a secondary MAC might be a
+    different package (shared-login resellers often do that).
+    """
+    from ..services import mac_health
+    out = await mac_health.compare_genres(pid)
+    if not out.get("ok") and out.get("error") == "portal not found":
+        raise HTTPException(404, "portal not found")
+    if not out.get("ok"):
+        raise HTTPException(400, out.get("error") or "compare failed")
+    return out
 
 
 # ------------------------------------------------------------------ genres & fetch

@@ -810,7 +810,7 @@ class StalkerClient:
         Raises what the portal raised, on purpose. A caller walking 40 channels
         needs to tell "this panel has no short EPG" (stop asking) from "this one
         request hit a 503" (retry twice and move on) - which is the fetch
-        discipline in `app/services/epg_now.py`.
+        discipline (callers must batch/cache; do not walk a whole catalogue).
         """
         data = await self._get({"type": "itv", "action": "get_short_epg",
                                 "ch_id": str(ch_id or ""), "size": str(int(size)),

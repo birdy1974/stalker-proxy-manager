@@ -74,27 +74,41 @@ const SETTING_DEFS = [
   ["fallback_strategy", "Fallback order strategy", ["macs_first", "portal_first"], "macs_first"],
   ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
   ["epg_refresh_hours", "EPG refresh interval (hours)", "number", 24],
+  ["mac_health_minutes", "Multi-MAC status refresh (minutes, 0 = off)", "number", 60],
+  ["mac_health_multi_only", "Only portals with ≥2 MACs", ["true", "false"], "true"],
   ["logo_country", "Logo country folder (tv-logos)", "text", "netherlands"],
   ["tmdb_api_key", "TMDB API key (detail-popups enrichment)", "text", ""],
 ];
+const SETTING_HELP = {
+  fallback_strategy: "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately. Takes effect on the next play/fetch (no restart).",
+  mac_health_minutes: "Background handshake of every MAC on multi-MAC portals (status + expire date). MACs holding a live stream are skipped. 0 pauses the scheduler.",
+  mac_health_multi_only: "When true, single-MAC portals are left alone (they are cheap to Test by hand). When false, every enabled portal is swept.",
+};
 async function loadSettings() {
   const { settings } = await api("/api/settings");
   const host = $("#settings-form");
   host.innerHTML = SETTING_DEFS.map(([k, label, type, def]) => {
-    const v = settings[k] ?? def;
+    let v = settings[k] ?? def;
+    if (typeof v === "boolean") v = v ? "true" : "false";
+    const help = SETTING_HELP[k] ? `<div class="small text-muted">${SETTING_HELP[k]}</div>` : "";
     if (Array.isArray(type))
       return `<div class="mb-2"><label class="muted-label">${label}</label>
         <select class="form-select form-select-sm set-field" data-key="${k}" data-kind="str">
-          ${type.map(o => `<option ${o === v ? "selected" : ""}>${o}</option>`).join("")}
-        </select><div class="small text-muted">${k === "fallback_strategy" ? "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately. Takes effect on the next play/fetch (no restart)." : ""}</div></div>`;
+          ${type.map(o => `<option ${String(o) === String(v) ? "selected" : ""}>${o}</option>`).join("")}
+        </select>${help}</div>`;
     return `<div class="mb-2"><label class="muted-label">${label}</label>
       <input class="form-control form-control-sm set-field" data-key="${k}" data-kind="${type === "number" ? "num" : "str"}"
-             type="${type}" value="${esc(v)}"></div>`;
+             type="${type}" value="${esc(v)}"></div>${help}`;
   }).join("");
 }
 $("#set-save").addEventListener("click", async () => {
   const payload = {};
-  $$(".set-field").forEach(n => payload[n.dataset.key] = n.dataset.kind === "num" ? +n.value : n.value);
+  $$(".set-field").forEach(n => {
+    let v = n.dataset.kind === "num" ? +n.value : n.value;
+    // booleans stored as true/false strings in the select → real bools
+    if (n.dataset.key === "mac_health_multi_only") v = String(v) === "true";
+    payload[n.dataset.key] = v;
+  });
   await api("/api/settings", { method: "POST", body: payload });
   toast("settings saved", "ok");
 });

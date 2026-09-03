@@ -46,7 +46,6 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here �
 | `SPM_VAAPI_DEVICE` | `/dev/dri/renderD128` | Intel Quick Sync render node |
 | `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
 | `SPM_MOCK_PORTAL` | `0` | `1` boots a built-in demo portal (test data, busy-MAC emulation) |
-| `SPM_EPG_NOW_TTL` | `120` | how long a "what's on now" answer is reused per channel, in seconds (see *What's on now*) |
 | `SPM_LOG_LEVEL` | `INFO` | Python log level (all records go to container stdout) |
 | `SPM_SKIP_LOGIN` | `0` | **Mockup/preview only**: bypass admin login (`*** LOGIN DISABLED ***` banner in log). Never set on a real deployment |
 | `PUID` / `PGID` | `2000` / `2000` | uid/gid the app runs as — must match the owner of your `./media` bind mount (see below) |
@@ -135,6 +134,8 @@ and, when the ids do not match:
 ## The workflow
 
 1. **Portals** – add each Stalker portal base URL and its MAC addresses (optionally per-MAC password). *Check Portal* resolves the real endpoint (`/c/`, `/client/`, `/portal.php`, …) and verifies each MAC online (busy-ness and subscription expiry included); the per-MAC result now carries **why** a failure happened (`code` + the panel's own wording), not just "failed". Two per-portal network switches live in the same editor: **HTTP proxy** and **Allow broken TLS** (certificate verification is ON for every portal unless that box is ticked — a `TLS unverified` badge then marks the portal in the list, because it is a deliberate exception, not a setting to forget). *Delete* offers a replacement-dialog cleanup for playlists that reference it.
+
+   **Multi-MAC health.** Portals with two or more MACs get a background sweep (Settings → *Multi-MAC status refresh*, default every 60 min; `0` pauses it) that handshakes every MAC and refreshes `status` / `online` / `expire_date` / `last_checked` — the same work *Check Portal* does, kept honest overnight. MACs currently occupied are skipped so a viewer is never kicked: that covers both ffmpeg-proxied plays (hard `mac_locks`) and redirect/direct plays (a soft lease after the 302, because once the player is sent to the panel CDN we no longer hold the socket). The Portals toolbar *Refresh MAC health* button runs the same sweep on demand. On a multi-MAC portal, **Compare genres across MACs** asks each *online* MAC for its live/VOD/series genre lists, reports what is common vs only-on-this-MAC, and **upserts the union into the portal's genre tables** (existing `enabled` flags are kept; brand-new genres land disabled). Useful when a "secondary" MAC is actually a different package from a shared-login reseller. Removing a MAC or deleting a portal also drops its runtime leftovers (mac locks, redirect leases, pooled Stalker sessions) — DB cascades already wipe the durable rows.
 2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season. In the **Edit portal** popup this is a two-step flow: *Fetch genres* loads the live/VOD/series genre lists (all disabled by default — including the synthetic *(All VOD)* / *(All series)* a portal without categories gets), you tick the genres you want (the filter box narrows the list as you type), and **Save** then fetches the items of exactly those enabled genres.
 3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels. Clicking a **VOD** or **Series** row (or its ⓘ button) opens the same detail popup as Input Sources — stored portal metadata, a lazy **stream probe** (codec/resolution/bitrate) and **TMDB** enrichment. The ▶ *test stream* buttons (here and in Input Sources) open the preview player, which closes via its header **×** or the **Stop & Close** button.
 4. **Users** – each user gets `username/password` and can receive **M3U** and/or **Xtream** URLs (copy-buttons in the GUI). Per-user active-connection caps enforced.
@@ -353,7 +354,7 @@ At boot the app performs a **hardware sanity check**: if the default template ne
 - **HLS links get the input options they need.** When the resolved link is a `.m3u8` playlist, ffmpeg receives `-protocol_whitelist file,http,https,tcp,tls,crypto` and `-allowed_extensions ALL` (unless the template already sets them) — without those two, a valid portal playlist dies before the first byte.
 - **`create_link` is asked only when it has to be asked.** A channel whose own flags (`use_http_tmp_link`, `use_load_balancing`) say its link is permanent, and whose stored `cmd` is a complete `http(s)` URL with no session token in it, is handed to the player as-is: a redirect play of such a channel costs the portal **zero** requests (no handshake, no token, no link). Every other case asks, including the ffmpeg path — where the request is worth making twice over, because it hands ffmpeg a fresh `play_token` *and* answers "is this source alive right now", which is what the chain above walks. `Portal.direct_links` (on by default) turns the shortcut off for a panel whose flags lie. The stream log says which rule fired and why.
 - **One trust policy for every outbound call.** Portal, EPG and logo fetches all go through `app/services/http_client.outbound_client()` (OS CA store, verification on). `Portal.tls_insecure` is the only opt-out, it is per portal, and it is part of the pooled-session key so flipping it cannot leave an old session behind.
-- **The panel's own account state is honoured.** Per MAC the panel reports `blocked`, `status` and an expiry, and Check Portal / the nightly portal sync now store that verdict: `banned` and `expired` MACs are dropped from fallback chains and from a fetch job's starting MAC, the Portals tab shows the badge, and the *reason* the portal gave is on the MAC row (`last_error`, shown in the badge tooltip). `offline`/`error` — our transport verdicts — stay retryable, because a portal that timed out is not a portal that said no.
+- **The panel's own account state is honoured.** Per MAC the panel reports `blocked`, `status` and an expiry, and Check Portal / the multi-MAC health scheduler store that verdict: `banned` and `expired` MACs are dropped from fallback chains and from a fetch job's starting MAC, the Portals tab shows the badge (plus `last_checked`), and the *reason* the portal gave is on the MAC row (`last_error`, shown in the badge tooltip). `offline`/`error` — our transport verdicts — stay retryable, because a portal that timed out is not a portal that said no.
 - Client disconnects (and the Dashboard *kill* button) deterministically free the MAC and kill ffmpeg via a disconnect watchdog.
 
 ---
@@ -514,52 +515,23 @@ that endpoint cannot maintain.
 
 ---
 
-## "What's on now" from the portal (no XMLTV required)
+## Input Sources → Live: Playlist custom name
 
-Stalker panels answer `type=itv&action=get_short_epg&ch_id=…&size=10` with the next few programmes
-of one channel. That is enough for a tooltip, and it is the only guide many users have — but it is
-**one request per channel**, which is exactly the pattern that gets an IP banned. So it exists here as
-a fallback with an accounting layer in front of it, and *not* as a way to build an XMLTV guide:
+The old **Now** column on *Sources → Live* asked the panel (`get_short_epg`) once per visible
+channel and made paging the list expensive. It is gone. In its place sits a **Playlist** column:
 
-- `GET /api/epg/now?live=1,2,3` (and/or `playlist=…`, ≤ 60 ids per call) answers
-  `{"items": {"live:1": {found, now, next, source}}, counts, ttl, truncated}` — the keys are prefixed
-  by kind because "row 7" means two different things on two tabs.
-- **XMLTV is tried first, and it wins.** A configured guide source is a local `SELECT` covering every
-  channel at once; the portal is asked only for rows the guide has no `tvg-id` for. On a normal
-  install, where every channel is matched, **this feature costs the portal nothing** — the `source`
-  field tells you which answer you got (`xmltv` / `portal`), and a guide that knows only what comes
-  next is still an answer (`found: false`, `next: …`) rather than a wasted request.
-- Then the **cache** (2 minutes, `SPM_EPG_NOW_TTL`), then the portal — and a second call for the same
-  rows costs zero requests. A channel whose portal refuses is *not* retried: `PortalError.code` (see
-  *What the portal says about itself*) says whether this was a busy box (`503`, retried twice inside
-  the batch) or a rude one (`no such action`, `403`, `bad_json` — never retried).
-- **Three failures and the batch stops for that portal.** A panel that refuses `get_short_epg` does
-  not become friendly on request 14, so the remaining channels of that portal are answered from the
-  cache of the refusal instead: `"not asked: this portal already failed 3 short-epg requests in this
-  batch"`. Per portal, not globally — a broken panel must not blank the tooltip on a working one.
-- Concurrency inside a batch is 6, one session per portal (so at most **one re-handshake per batch**),
-  and one `INFO` log line per batch: `what's-on-now: 3 asked, 41 from the guide source, 0 cached,
-  2 skipped`. If this ever shows up twice a minute, the GUI is asking for more than the visible page.
-- **A panel that said it has no `epg` module is not asked at all** (R6's answer, spent here): those
-  rows come back `{"found": false, "gated": true, "why": "…"}`, which the GUI draws as a dash rather
-  than as a failure — a skipped row for a reason is not a broken channel.
-- Guide times from a portal carry **no offset**, so they are read in `stb_timezone` for that portal —
-  the same value sent as the `timezone=` cookie, which is *why* the panel chose them. Assuming UTC is
-  what makes a guide look two hours wrong for everyone except the person in London.
+- shown only for **enabled** channels (disabled rows stay blank);
+- default value = the portal's original channel name;
+- edit the cell (blur / Enter) to set the custom name used in the final M3U / Xtream output:
+  - **unique name** → a new custom live channel is created (or the channel this source already owns as primary is renamed);
+  - **name already used** (case-insensitive) → this source is attached as a **fallback** on that existing custom channel.
 
-The GUI half is a **Now** column on *Sources → Live*: after each page renders, the visible ids are sent
-in one request and the cell fills with `hh:mm title`, its tooltip carrying the progress, the minutes
-left, and the next programme. Paging and sorting re-ask only what is on screen; the server-side cache
-and the id cap are what make that safe to leave wired to a table.
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `SPM_EPG_NOW_TTL` | `120` | seconds a short-EPG answer stays fresh per channel (min 15). Raise it for a big household that scrolls a lot; set it low if you would rather re-ask |
+The list payload carries the placement (`playlist_id`, `playlist_name`, primary/fallback badge) in
+the same `/api/sources/live` response — no extra round trip per page.
 
 ---
 
 ## Built-in mock portal (testing without a real subscription)
-
 `SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02`, expired `…BB:BB:01` and blocked `…CC:CC:01`, 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {...}` emulates what the portal can do to you, so the client's behaviour is testable without a subscription: `offline`, `slow`, `max_per_mac`, `http_status`, `require_prehash` (demand the second handshake step), `fingerprint_required` (403 a `get_profile` with no serial), `profile_mode` (`full`/`no_id`/`none`), `not_valid` (short-lived token), `token_rejects` (answer 200 + `{"error":"token"}`), `js_error`, `empty_reply`, `corrupt_stream`, `require_tls`, `require_host`, `reject_no_cookie`, `reject_no_referer`. `version_mode` (`full`/`none`/`html` — the last one is a captive portal answering `version.js`), `modules`, `modules_disabled` and `no_modules` (404 the action, which means *we do not know*, not *it has nothing*) emulate what the panel *says about itself*, `xtream_mode=1` makes its `create_link` answers carry `/live/<user>/<pass>/…` (with `xtream_user`/`xtream_pass`, `xtream_status`, `xtream_exp_days` and `xtream_refuse` — the last answers `player_api.php` with `{"user_info": []}`, i.e. "wrong password"), and `epg_mode` (`normal`/`empty`/`absent`/`flaky` — busy twice then fine) is what "no guide", "no such action" and "try again" look like separately. `GET /mock/player_api.php` serves the Xtream account, stream lists (with the two flaws the matcher needs: a channel that is not on the Xtream side, and a duplicated `Sky Sports` name) and media at `/mock/live/…`, `/mock/movie/…`, `/mock/series/…` **with the credentials enforced** — under `/mock/`, never at the root, because `/live/<u>/<p>/<id>.ts` and `/player_api.php` are *our own* Xtream output API and a mock route there would be shadowed by it (a lesson learned from the demo 403ing while every test passed), and `get_short_epg` renders its schedule in the timezone from the `timezone=` cookie so the identity→guide chain is exercised rather than assumed, and the live catalogue ships five deliberate link shapes — permanent, tmp-link, load-balanced, no flags at all, and a "permanent" URL that still carries a `play_token` — so the conditional-`create_link` rules are testable instead of theoretical. `GET /mock/_state` answers with those settings *and* what the portal actually received (`seen_profile`, the handshake `prehash`es, `seen_create_link`, the `handshakes`/`version_calls`/`modules_calls`/`create_links`/`player_api`/`short_epg` counters and the `seen_player_api` query, and per-MAC usage) — which is how the identity and link tests prove a request arrived, or that one deliberately did not, instead of trusting the client.
 
 Tip: the GUI shows the ready-to-copy mock portal URL/MACs in the Portals tab when enabled.

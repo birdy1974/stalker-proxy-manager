@@ -59,10 +59,12 @@ function sourceTable(kind, hostSel) {
         render: r => esc(r.name) + (r.xtream_url
           ? ` <span class="badge text-bg-light" title="${esc(r.xtream_url)}">this channel plays the portal's own Xtream link (no create_link, no MAC slot)</span>`
           : "") },
-      /* "what is on now", asked for THIS PAGE ONLY (see fillNow): one portal
-         request per channel is why there is no such thing as a bulk version of
-         this column. The answer is a tooltip, never a modal. */
-      { key: "now", label: "Now", width: "120px", render: r => `<span class="small" data-now="${r.id}" title="asking…">·</span>` },
+      /* Playlist custom name: filled only for enabled sources. Editing assigns
+         a new custom channel when the name is unique, or attaches this source
+         as a fallback on the existing custom channel when the name already
+         exists. Resolved in the /api/sources/live payload — no extra round trip. */
+      { key: "playlist_name", label: "Playlist", class: "col-name", width: "220px",
+        render: r => playlistNameCell(r) },
       { key: "portal_id", label: "Portal", sort: "portal", filter: { type: "select", options: PORTALS }, render: r => esc(r.portal) },
       { key: "genre_id", label: "Genre", filter: { type: "select", options: GENRES.live, placeholder: "enabled genres" }, render: r => esc(r.genre) },
       { key: "play", label: "", width: "40px", render: r => `<button class="btn btn-sm btn-outline-secondary" title="Test stream (original)" onclick="event.stopPropagation();playInModal('/preview/live/${r.id}.ts',${JSON.stringify(r.name).replace(/"/g, '&quot;')})"><i class="bi bi-play-btn"></i></button>` },
@@ -92,54 +94,60 @@ function sourceTable(kind, hostSel) {
     selectable: true, defaultSort: "name",
     server: async (q) => await api(`/api/sources/${kind}?` + q),
     columns: cols, extraHeader: bulkBar,
-    onRender: kind === "live" ? fillNow : null,
     onRowClick: kind === "vod" ? vodDetail : kind === "series" ? seriesDetail : null,
     emptyText: "Nothing here yet. Fetch a portal (Portals → Fetch) and enable genres first.",
   });
   return t;
 }
 
-/* ---------------------------------------------------------------- what's on now
-   Filled after each render, for the ids on screen. The server dedupes, caches
-   for 2 minutes and answers from the XMLTV source whenever it has one, so this
-   is cheap even when the user pages back and forth - but it is still one portal
-   call per uncovered channel, which is why it is NOT a column we can compute in
-   the table's own payload. */
-async function fillNow(t) {
-  const cells = {};
-  t.tableHost.querySelectorAll("[data-now]").forEach(sp => { cells[sp.dataset.now] = sp; });
-  const ids = t.items.map(r => r.id).filter(id => cells[id]);
-  if (!ids.length) return;
-  const hhmm = (iso) => (iso || "").slice(11, 16) || "?";
-  try {
-    const d = await api(`/api/epg/now?live=${ids.join(",")}`);
-    for (const id of ids) {
-      const sp = cells[id], it = (d.items || {})[`live:${id}`] || {};
-      const src = it.source === "xmltv" ? "from your guide source"
-                : it.source === "portal" ? "from the panel (short epg)" : "";
-      if (it.now) {
-        const left = it.now.minutes_left != null ? `, ${it.now.minutes_left} min left` : "";
-        const pct = it.now.progress != null ? ` · ${it.now.progress}%` : "";
-        sp.innerHTML = `<span class="badge text-bg-light">${hhmm(it.now.start)}</span> ${esc((it.now.title || "").slice(0, 22))}`;
-        sp.title = `${it.now.title || ""}\n${hhmm(it.now.start)}–${hhmm(it.now.stop)}${pct}${left}`
-          + (it.next ? `\nnext: ${it.next.title} at ${hhmm(it.next.start)}` : "")
-          + (src ? `\n${src}` : "");
-      } else if (it.next) {
-        sp.innerHTML = `<span class="text-muted small">nothing on until ${hhmm(it.next.start)}</span>`;
-        sp.title = `nothing scheduled now\nnext: ${it.next.title} at ${hhmm(it.next.start)}${src ? `\n${src}` : ""}`;
-      } else {
-        sp.innerHTML = `<span class="text-muted" title="${esc(it.why || "no answer")}">—</span>`;
-        sp.title = it.gated ? "the panel says it has no guide: " + (it.why || "")
-                 : (it.why || "no answer");
-      }
-    }
-  } catch (e) {
-    // a tooltip that cannot be filled is a dash, never an error toast: the api()
-    // helper already reported the failure, and 40 of these on a page is not a
-    // diagnosis
-    Object.values(cells).forEach(sp => { sp.textContent = "—"; sp.title = "not asked"; });
+/* Playlist custom-name cell (Input Sources → Live).
+   Disabled sources stay blank. Enabled ones show the current custom name
+   (or the portal original as the default) and save on blur / Enter. */
+function playlistNameCell(r) {
+  if (!r.enabled) {
+    return `<span class="text-muted small" title="enable the channel to assign a playlist name">—</span>`;
   }
+  const name = r.playlist_name || r.name || "";
+  let badge = "";
+  if (r.playlist_id && r.playlist_is_primary === false) {
+    badge = ` <span class="badge text-bg-secondary" title="fallback #${r.playlist_priority} of ${r.playlist_chain_len || "?"} on this custom channel">fb #${r.playlist_priority}</span>`;
+  } else if (r.playlist_id && r.playlist_is_primary) {
+    badge = ` <span class="badge text-bg-success" title="primary source of this custom channel">primary</span>`;
+  }
+  // stopPropagation so typing / clicking the input does not select the row
+  return `<div class="d-flex align-items-center gap-1" onclick="event.stopPropagation()">
+    <input class="form-control form-control-sm" style="min-width:140px"
+      value="${esc(name)}"
+      placeholder="playlist name…"
+      title="Unique name → new custom channel. Existing name → this source becomes a fallback."
+      onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
+      onblur="saveLivePlaylistName(${r.id}, this)">
+    ${badge}
+  </div>`;
 }
+window.saveLivePlaylistName = async (sid, input) => {
+  const value = (input.value || "").trim();
+  if (!value) { toast("name required", "warn"); return; }
+  // Skip the round trip when nothing changed.
+  const row = (TABS.live?.items || []).find(x => x.id === sid);
+  if (row && (row.playlist_name || row.name || "") === value) return;
+  try {
+    input.disabled = true;
+    const res = await api(`/api/sources/live/${sid}/playlist-name`, {
+      method: "POST", body: { custom_name: value },
+    });
+    const msg = res.action === "created" ? `custom channel "${res.custom_name}" created`
+              : res.action === "renamed" ? `renamed to "${res.custom_name}"`
+              : res.action === "fallback" ? `added as fallback on "${res.custom_name}"`
+              : "unchanged";
+    toast(msg, "ok");
+    TABS.live && TABS.live.reload();
+  } catch (e) {
+    /* api() already toasted the error */
+  } finally {
+    input.disabled = false;
+  }
+};
 
 window.toggleSerie = async (id, enabled) => {
   const res = await api("/api/sources/toggle", { method: "POST", body: { kind: "series", ids: [id], enabled } });

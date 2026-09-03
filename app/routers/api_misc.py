@@ -111,6 +111,10 @@ DEFAULT_SETTINGS = {
     "tmdb_api_key": "",
     "fetch_page_budget": FETCH_PAGE_BUDGET,
     "output_base_url": OUTPUT_BASE_URL,
+    # Background multi-MAC status/expiry sweep (minutes). 0 = paused.
+    # Only portals with ≥2 MACs are visited when mac_health_multi_only is true.
+    "mac_health_minutes": 60,
+    "mac_health_multi_only": True,
 }
 
 

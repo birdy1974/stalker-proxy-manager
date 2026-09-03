@@ -244,3 +244,55 @@ async def test_every_entry_has_a_matching_playable_url():
     for i in extinf:
         assert lines[i + 1].startswith(BASE + "/play/"), f"orphan EXTINF at line {i}"
     assert all("u=user1&p=pw" in u for u in urls), "every url must carry the user's credentials"
+
+
+async def test_playlist_endpoint_returns_parseable_m3u_for_vlc():
+    """
+    Regression: `_playlist_revision` used a genexp of awaits, so every
+    /playlist.m3u request raised TypeError and answered 500 - VLC then says
+    it cannot load the playlist. Also pin the Content-Type / Disposition that
+    make VLC treat the body as a playlist rather than a download.
+    """
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+
+    await _seed(2)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url=BASE) as c:
+        r = await c.get("/playlist.m3u?u=user1&p=pw")
+        assert r.status_code == 200, r.text
+        body = r.text
+        assert body.startswith("#EXTM3U"), body[:80]
+        assert "/play/live/" in body or "/play/vod/" in body or "/play/episode/" in body
+        ctype = (r.headers.get("content-type") or "").lower()
+        assert "mpegurl" in ctype or "m3u" in ctype, ctype
+        # Must NOT force a file download - VLC opens the URL as a network stream.
+        disp = (r.headers.get("content-disposition") or "").lower()
+        assert "attachment" not in disp, disp
+        # Newlines inside a channel name must not split the EXTINF line.
+        for ln in body.splitlines():
+            if ln.startswith("#EXTINF"):
+                assert "\n" not in ln
+                assert ln.count(",") >= 1
+
+        r2 = await c.get("/get.php?username=user1&password=pw&type=m3u_plus")
+        assert r2.status_code == 200, r2.text
+        assert r2.text.startswith("#EXTM3U")
+
+
+async def test_newlines_in_titles_do_not_break_m3u_lines():
+    """A portal name with an embedded newline used to split the EXTINF line
+    and leave VLC with an orphan URL it cannot pair to a title."""
+    await _seed(0)
+    async with SessionLocal() as s:
+        s.add(LivePlaylist(custom_name="Broken\nChannel", group_name="NL", number=7))
+        await s.commit()
+        user = await s.get(User, 1)
+    text = await build_m3u(BASE, user)
+    lines = text.splitlines()
+    extinf = [ln for ln in lines if ln.startswith("#EXTINF") and "Broken" in ln]
+    assert extinf, text
+    assert "Broken Channel" in extinf[0]
+    assert "\n" not in extinf[0]
+    idx = lines.index(extinf[0])
+    assert lines[idx + 1].startswith(BASE + "/play/live/")

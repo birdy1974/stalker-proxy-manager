@@ -59,13 +59,33 @@ async def _authed(u: str | None, p: str | None, need: str = "m3u") -> User:
 
 
 # ---------------------------------------------------------------- playlists
+def _m3u_response(text: str, *, filename: str | None = None) -> PlainTextResponse:
+    """Serve an M3U body the way players (VLC, Kodi, TiviMate, …) expect it.
+
+    * `audio/x-mpegurl` is the historical type VLC sniffs most reliably;
+      `application/x-mpegURL` alone is sometimes treated as an opaque download.
+    * UTF-8 charset so non-ASCII channel names survive.
+    * `inline` (not `attachment`): VLC opening the URL as a network stream must
+      parse the body, not try to save a file. Browsers still offer Save-As via
+      the filename parameter when the user clicks the link in the GUI.
+    """
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Type": "audio/x-mpegurl; charset=utf-8",
+    }
+    if filename:
+        # Keep ASCII-safe filename; RFC 5987 filename* is overkill here.
+        safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in filename)
+        headers["Content-Disposition"] = f'inline; filename="{safe}"'
+    return PlainTextResponse(text, media_type="audio/x-mpegurl; charset=utf-8",
+                             headers=headers)
+
+
 @router.get("/playlist.m3u")
 async def playlist_m3u(request: Request, u: str = "", p: str = ""):
     user = await _authed(u, p, "m3u")
     text = await build_m3u(await base_url_of(request), user)
-    fname = f"playlist_{user.name}.m3u"
-    return PlainTextResponse(text, media_type="application/x-mpegURL",
-                             headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+    return _m3u_response(text, filename=f"playlist_{user.name}.m3u")
 
 
 @router.get("/get.php")
@@ -73,7 +93,7 @@ async def get_php(request: Request, username: str = "", password: str = "",
                   type: str = Query("m3u_plus"), output: str = "ts"):  # noqa: A002
     user = await _authed(username, password, "xtream")
     text = await build_m3u(await base_url_of(request), user)
-    return PlainTextResponse(text, media_type="application/x-mpegURL")
+    return _m3u_response(text, filename=f"playlist_{user.name}.m3u")
 
 
 # ---------------------------------------------------------------- xtream api
