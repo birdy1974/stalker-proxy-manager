@@ -25,7 +25,12 @@ function make() {
       { key: "access", label: "Access", render: r => `${r.m3u_enabled ? '<span class="badge st-online me-1">m3u</span>' : ""}${r.xtream_enabled ? '<span class="badge st-online">xtream</span>' : ""}` },
       { key: "expire_date", label: "Expires", render: r => esc(r.expire_date || "—") },
       { key: "max_connections", label: "Max conn", width: "80px" },
-      { key: "groups", label: "Group whitelist", render: r => Object.entries(r.groups || {}).filter(([k, v]) => v.length).map(([k, v]) => `<span class="badge text-bg-light me-1">${k}: ${v.length}</span>`).join("") || '<span class="text-muted small">all groups</span>' },
+      { key: "groups", label: "Group whitelist", render: r => Object.entries(r.groups || {}).filter(([k, v]) => v.length).map(([k, v]) => {
+        const st = r.groups_stale?.[k] || [];
+        return st.length
+          ? `<span class="badge text-bg-warning me-1" title="holds ${st.length} group(s) that no longer exist: ${esc(st.join(', '))}${st.length >= v.length ? ' - filters EVERYTHING of this type out right now' : ''}">${k}: ${v.length} stale</span>`
+          : `<span class="badge text-bg-light me-1">${k}: ${v.length}</span>`;
+      }).join("") || '<span class="text-muted small">all groups</span>' },
       { key: "links", label: "Output — M3U URL / Xtream login", render: r => `
         <div class="d-flex gap-1 align-items-center">
           <span class="muted-label mb-0" style="width:40px">M3U</span>
@@ -66,10 +71,18 @@ window.showLinks = (id) => {
 window.editUser = (id) => {
   const u = id ? table.items.find(x => x.id === id) : { name: "", password: "", m3u_enabled: true, xtream_enabled: true, expire_date: "", max_connections: 1, enabled: true, groups: {} };
   const body = el("div");
-  const grpChk = (kind) => (GROUPS[kind] || []).map(g => {
-    const cur = (u.groups?.[kind] || []).map(x => x.toLowerCase());
-    return `<label class="d-block small"><input type="checkbox" class="g-${kind}" value="${esc(g)}" ${cur.includes(g.toLowerCase()) ? "checked" : ""}> ${esc(g)}</label>`;
-  }).join("") || '<div class="small text-muted">no groups exist yet</div>';
+  const grpChk = (kind) => {
+    const have = GROUPS[kind] || [];
+    const cur = u.groups?.[kind] || [];
+    const curLow = cur.map(x => String(x).toLowerCase());
+    const boxes = have.map(g =>
+      `<label class="d-block small"><input type="checkbox" class="g-${kind}" value="${esc(g)}" ${curLow.includes(g.toLowerCase()) ? "checked" : ""}> ${esc(g)}</label>`);
+    // stored whitelist entries whose group no longer exists: render them too,
+    // or they stay invisible while a stale entry filters the whole type out
+    for (const v of cur.filter(v => !have.some(g => String(g).toLowerCase() === String(v).toLowerCase())))
+      boxes.push(`<label class="d-block small" title="no group with this name exists anymore - until removed it may filter this whole type out"><input type="checkbox" class="g-${kind}" value="${esc(String(v))}" checked> ${esc(String(v))} <span class="badge text-bg-warning">stale</span></label>`);
+    return boxes.join("") || '<div class="small text-muted">no groups exist yet</div>';
+  };
   body.innerHTML = `
     <div class="row g-2">
       <div class="col-md-4"><label class="muted-label">Username</label><input class="form-control form-control-sm" id="u-name" value="${esc(u.name)}" ${id ? "disabled" : ""}></div>

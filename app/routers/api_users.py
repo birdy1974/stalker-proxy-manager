@@ -30,9 +30,18 @@ async def _base(request: Request) -> str:
     return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
-def _row(u: User, base: str) -> dict:
+def _row(u: User, base: str, available: dict | None = None) -> dict:
     groups = json.loads(u.groups_json or "{}")
-    return {"id": u.id, "name": u.name, "password": u.password,
+    stale: dict[str, list[str]] | None = None
+    if available is not None:
+        # whitelist entries that no longer match a group in the library: they
+        # are invisible in the editor and, when a type has ONLY dead entries,
+        # they filter that whole type out of the user's output
+        stale = {k: [v for v in (groups.get(k) or [])
+                     if str(v).strip().lower() not in {str(g).strip().lower()
+                                                       for g in available.get(k, [])}]
+                 for k in ("live", "vod", "series", "local")}
+    row = {"id": u.id, "name": u.name, "password": u.password,
             "m3u_enabled": u.m3u_enabled, "xtream_enabled": u.xtream_enabled,
             "expire_date": u.expire_date, "max_connections": u.max_connections,
             "enabled": u.enabled, "groups": groups,
@@ -42,6 +51,9 @@ def _row(u: User, base: str) -> dict:
                        "player_api": f"{base}/player_api.php",
                        "get_php": f"{base}/get.php?username={u.name}&password={u.password}&type=m3u_plus&output=ts"},
             }
+    if stale is not None:
+        row["groups_stale"] = stale
+    return row
 
 
 @router.get("")
@@ -56,7 +68,33 @@ async def list_users(request: Request, db=Depends(get_db)):
         "live": await distinct(LivePlaylist), "vod": await distinct(VodPlaylist),
         "series": await distinct(SeriePlaylist), "local": await distinct(LocalPlaylist),
     }
-    return {"items": [_row(u, base) for u in rows], "groups_available": groups_available}
+    return {"items": [_row(u, base, groups_available) for u in rows],
+            "groups_available": groups_available}
+
+
+def _clean_groups(value) -> dict:
+    """Normalise a group whitelist coming from the GUI/API: strings only,
+    whitespace trimmed (a stray space would silently blackhole that content
+    type in every output), empties dropped, per-type duplicates removed. A
+    bare string is treated as a one-element list instead of exploding into
+    single characters."""
+    if not isinstance(value, dict):
+        value = {}
+    out: dict[str, list[str]] = {}
+    for kind in ("live", "vod", "series", "local"):
+        vals = value.get(kind) or []
+        if isinstance(vals, str):
+            vals = [vals]
+        if not isinstance(vals, list):
+            vals = []
+        seen: set[str] = set()
+        out[kind] = []
+        for v in vals:
+            v = str(v).strip()
+            if v and v.lower() not in seen:
+                seen.add(v.lower())
+                out[kind].append(v)
+    return out
 
 
 @router.post("")
@@ -70,7 +108,7 @@ async def create_user(payload: dict, db=Depends(get_db)):
     for f in FIELDS:
         if f in payload:
             setattr(u, f, payload[f])
-    u.groups_json = json.dumps(payload.get("groups") or {})
+    u.groups_json = json.dumps(_clean_groups(payload.get("groups")))
     db.add(u)
     await db.commit()
     return {"id": u.id}
@@ -85,7 +123,7 @@ async def update_user(uid: int, payload: dict, db=Depends(get_db)):
         if f in payload:
             setattr(u, f, payload[f])
     if "groups" in payload:
-        u.groups_json = json.dumps(payload["groups"])
+        u.groups_json = json.dumps(_clean_groups(payload["groups"]))
     await db.commit()
     return {"ok": True}
 

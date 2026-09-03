@@ -24,6 +24,7 @@ from ..models import (
     SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource, User,
     VodPlaylist, VodSource,
 )
+from .db_logging import db_log
 from .local_files import extinf_duration, play_extension
 from .runtime_settings import get_setting  # noqa: F401  (re-export; EPG scheduler)
 from .titles import best_title, m3u_attr
@@ -71,10 +72,19 @@ def _groups(user: User) -> dict:
     return {"live": [], "vod": [], "series": [], "local": []}
 
 
+def _norm_group(value) -> str:
+    """Whitelist entries and group names compare normalised. Stray whitespace
+    around either side (a pasted comma list, a cosmetic rename on the portal)
+    must not silently blackhole a whole content type from a user's output."""
+    return str(value or "").strip().lower()
+
+
 def _allowed(group_name: str | None, whitelist: list[str]) -> bool:
     if not whitelist:
         return True
-    return (group_name or "").lower() in [w.lower() for w in whitelist]   # case-insensitive
+    # case-insensitive; whitespace-insensitive since the match decides whether
+    # an entire category shows up at all
+    return _norm_group(group_name) in {_norm_group(w) for w in whitelist}
 
 
 def _chunked(seq: list, size: int = 800):
@@ -82,6 +92,45 @@ def _chunked(seq: list, size: int = 800):
     stays under SQLite's bound-parameter limit."""
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
+
+
+# (user.id, kind) -> last-warned signature. A group whitelist that matches
+# NOTHING for a type that HAS items looks like a deliberate choice, so the
+# empty output section it produces used to be completely silent - this is the
+# classic cause of "VOD entries do not appear in my playlist": the portal
+# renamed its categories, the stored whitelist still holds the old names, and
+# the whitelist editor only renders groups that exist, making the dead
+# entries invisible there.
+_BLACKHOLE_WARNED: dict[tuple[int, str], tuple] = {}
+
+
+async def _warn_if_blackholed(user: User, kind: str, items: list,
+                              whitelist: list[str]) -> None:
+    """Log once per state when a non-empty group whitelist filters an entire
+    content type out of a user's output, naming the dead entries and the
+    groups that DO exist so the log pane can explain the empty section."""
+    key = (user.id, kind)
+    if not whitelist or not items:
+        _BLACKHOLE_WARNED.pop(key, None)
+        return
+    have = {_norm_group(it.group_name) for it in items} - {""}
+    if any(_norm_group(w) in have for w in whitelist):
+        _BLACKHOLE_WARNED.pop(key, None)
+        return
+    signature = (len(items), tuple(sorted(_norm_group(w) for w in whitelist)),
+                 frozenset(have))
+    if _BLACKHOLE_WARNED.get(key) == signature:
+        return
+    _BLACKHOLE_WARNED[key] = signature
+    pretty = sorted({(it.group_name or "").strip() for it in items} - {""})
+    await db_log(
+        "WARNING", "playlist",
+        f"user '{user.name}': the {kind} group whitelist "
+        f"{sorted(str(w) for w in whitelist)} matches none of the library's "
+        f"{kind} groups - all {len(items)} {kind} item(s) are missing from "
+        f"this user's M3U/Xtream/bouquet output. The {kind} groups right now "
+        f"are: {pretty[:8]}{' ...' if len(pretty) > 8 else ''}. Fix it under "
+        f"Users > edit user > group whitelist (dead entries show as 'stale').")
 
 
 _M3U_CACHE: dict[tuple, tuple[float, str]] = {}
@@ -95,6 +144,7 @@ def clear_m3u_cache() -> None:
     """Drop every cached playlist. Tests call this between schema resets so a
     zeroed DB cannot reuse a previous library's M3U under the same revision."""
     _M3U_CACHE.clear()
+    _BLACKHOLE_WARNED.clear()
 
 
 async def _playlist_revision(s) -> tuple:
@@ -156,6 +206,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
         # ---- live ------------------------------------------------------
         items = (await s.execute(select(LivePlaylist).where(LivePlaylist.enabled.is_(True))
                                  .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
+        await _warn_if_blackholed(user, "live", items, groups["live"])
         for it in items:
             if not _allowed(it.group_name, groups["live"]):
                 continue
@@ -172,6 +223,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
         # ---- vod -------------------------------------------------------
         vods = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                                 .order_by(VodPlaylist.order, VodPlaylist.id))).scalars().all()
+        await _warn_if_blackholed(user, "vod", vods, groups["vod"])
         src_names: dict[int, str] = {}
         wanted_src = [it.vod_source_id for it in vods if it.vod_source_id]
         for batch in _chunked(wanted_src):
@@ -194,6 +246,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
         # episodes for the visible series in two queries total.
         series = (await s.execute(select(SeriePlaylist).where(SeriePlaylist.enabled.is_(True))
                                   .order_by(SeriePlaylist.order, SeriePlaylist.id))).scalars().all()
+        await _warn_if_blackholed(user, "series", series, groups["series"])
         visible = [sp for sp in series if _allowed(sp.group_name, groups["series"])]
 
         season_rows: list = []
@@ -232,6 +285,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
         # ---- local files ------------------------------------------------
         locals_ = (await s.execute(select(LocalPlaylist).where(LocalPlaylist.enabled.is_(True))
                                    .order_by(LocalPlaylist.order, LocalPlaylist.id))).scalars().all()
+        await _warn_if_blackholed(user, "local", locals_, groups["local"])
         files: dict[int, LocalFile] = {}
         wanted = [it.local_file_id for it in locals_ if it.local_file_id]
         for batch in _chunked(wanted):
