@@ -317,8 +317,10 @@ function localTab(hostSel) {
     if (!ids.length) return toast("select directories, or use Fetch media files for all enabled ones", "warn");
     await runScan(ids);
   });
+  const fileBulk = el("div", { class: "d-flex gap-2 align-items-center flex-wrap" });
   const ft = new DataTable($("#lfiles"), {
-    perPageDefault: 15, defaultSort: "path",
+    selectable: true, perPageDefault: 15, defaultSort: "path",
+    extraHeader: fileBulk,
     server: async (q) => await api("/api/sources/local/files?" + q),
     columns: [
       { key: "enabled", label: "On", width: "48px",
@@ -333,6 +335,20 @@ function localTab(hostSel) {
     ],
     emptyText: "Scan a directory to list its videos here.",
   });
+  const bulkLocalFiles = (enabled) => async () => {
+    const ids = [...ft.selected];
+    if (!ids.length) return toast("select files first", "warn");
+    const res = await api("/api/sources/local/files/toggle", {
+      method: "POST", body: { ids, enabled },
+    });
+    ft.selected.clear();
+    ft.reload();
+    toast(`${res.count} file(s) ${enabled ? "enabled" : "disabled"}`, "ok");
+  };
+  fileBulk.append(
+    el("span", { class: "muted-label" }, "Bulk:"),
+    mBtn("Enable selected", "btn-outline-success", bulkLocalFiles(true), "bi-check2"),
+    mBtn("Disable selected", "btn-outline-secondary", bulkLocalFiles(false), "bi-x"));
   TABS.localFiles = ft;
 }
 window.toggleLocalFile = async (id, enabled, el) => {
