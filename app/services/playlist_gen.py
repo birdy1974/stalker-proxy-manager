@@ -27,7 +27,7 @@ from ..models import (
 from .db_logging import db_log
 from .local_files import extinf_duration, play_extension
 from .runtime_settings import get_setting  # noqa: F401  (re-export; EPG scheduler)
-from .titles import best_title, m3u_attr
+from .titles import best_title, m3u_attr, m3u_display_title
 
 
 class UserAuth:
@@ -165,8 +165,8 @@ async def _playlist_revision(s) -> tuple:
 
 
 def _extinf_title(title: str | None) -> str:
-    """Display name after the EXTINF comma — must be a single physical line."""
-    return (title or "").replace("\r", " ").replace("\n", " ").replace("\0", "")
+    """Display name after the EXTINF comma: one line, VLC-safe dashes."""
+    return m3u_display_title(title)
 
 
 async def build_m3u(base_url: str, user: User) -> str:

@@ -215,8 +215,36 @@ async def test_year_only_custom_name_uses_full_source_title():
         await s.commit()
         user = await s.get(User, 1)
     text = await build_m3u(BASE, user)
-    assert full in text
+    # The words survive; ASCII ' - ' is rewritten so VLC does not split the title.
+    extinf = [ln for ln in text.splitlines()
+              if ln.startswith("#EXTINF") and "**Man of War" in ln]
+    assert extinf, text
+    title = extinf[0].rsplit(",", 1)[-1]
+    assert "Man of War" in title and "2026" in title
+    assert " - " not in title
+    assert "\u2013" in title
     assert not any(ln.endswith(",2026") for ln in text.splitlines() if ln.startswith("#EXTINF"))
+
+
+async def test_minus_in_title_is_kept_whole_for_vlc():
+    """VLC 3.0 parseEXTINF splits 'Artist - Title' so 'Foo - Bar' became just 'Bar'."""
+    from app.services.titles import m3u_display_title
+    raw = "Radio Paloma - 100% Deutscher Schlager!"
+    await _seed(0)
+    async with SessionLocal() as s:
+        s.add(LivePlaylist(custom_name=raw, group_name="NL", number=11))
+        await s.commit()
+        user = await s.get(User, 1)
+    text = await build_m3u(BASE, user)
+    safe = m3u_display_title(raw)
+    extinf = [ln for ln in text.splitlines() if ln.startswith("#EXTINF") and "Radio Paloma" in ln]
+    assert extinf, text
+    line = extinf[0]
+    title = line.rsplit(",", 1)[-1]
+    assert title == safe
+    assert "Radio Paloma" in title and "Schlager" in title
+    assert " - " not in title
+    assert f'tvg-name="{safe}"' in line
 
 
 async def test_m3u_does_not_point_vlc_at_epg():
