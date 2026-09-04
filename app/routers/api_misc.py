@@ -14,9 +14,10 @@ from sqlalchemy import func, select
 from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL
 from ..database import get_db
 from ..models import (
-    EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre, LivePlaylist, LiveSource, LocalFile,
-    LocalPlaylist, LocalSource, Log, Portal, SerieGenre, SeriePlaylist,
-    SerieSource, Setting, User, VodGenre, VodPlaylist, VodSource,
+    Area, EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre,
+    LivePlaylist, LiveSource, LocalFile, LocalPlaylist, LocalSource, Log, Portal,
+    SerieGenre, SeriePlaylist, SerieSource, Setting, User, VodGenre, VodPlaylist,
+    VodSource,
 )
 from ..security import require_admin
 from ..services.db_logging import db_log
@@ -219,8 +220,13 @@ async def export_config(section: str = "all", db=Depends(get_db)):
         data["ffmpeg_templates"] = await dump(
             FFmpegTemplate, [c for c in FFmpegTemplate.__table__.columns.keys() if c != "id"])
     if section in ("all", "users"):
+        data["areas"] = await dump(
+            Area, ["name", "enabled", "notes",
+                   "ffmpeg_template_live_id", "ffmpeg_template_vod_id",
+                   "ffmpeg_template_series_id", "ffmpeg_template_local_id"])
         data["users"] = await dump(User, ["name", "password", "m3u_enabled", "xtream_enabled",
-                                          "expire_date", "max_connections", "enabled", "groups_json"])
+                                          "expire_date", "max_connections", "enabled", "groups_json",
+                                          "area_id"])
     if section in ("all", "settings"):
         data["settings"] = {r.key: json.loads(r.value or "null")
                             for r in (await db.execute(select(Setting))).scalars().all()}
@@ -263,12 +269,33 @@ async def import_config(payload: dict, db=Depends(get_db)):
             db.add(row)
         applied["imported"] += 1
 
+    for a in data.get("areas", []):
+        name = (a.get("name") or "").strip()
+        if not name:
+            continue
+        exists = (await db.execute(select(Area).where(Area.name == name))).scalar_one_or_none()
+        if exists and mode == "merge":
+            applied["skipped"].append(f"area:{name}")
+            continue
+        row = exists or Area(name=name)
+        for k, v in a.items():
+            if hasattr(row, k) and k != "id":
+                setattr(row, k, v)
+        if not exists:
+            db.add(row)
+        applied["imported"] += 1
+
+    area_ids = {r.id for r in (await db.execute(select(Area))).scalars().all()}
+    known_user = {c.name for c in User.__table__.columns} - {"id"}
     for u in data.get("users", []):
         exists = (await db.execute(select(User).where(User.name == u.get("name")))).scalar_one_or_none()
         if exists:
             applied["skipped"].append(f"user:{u.get('name')}")
             continue
-        db.add(User(**{k: v for k, v in u.items() if k != "id"}))
+        payload = {k: v for k, v in u.items() if k in known_user}
+        if payload.get("area_id") not in area_ids:
+            payload["area_id"] = None
+        db.add(User(**payload))
         applied["imported"] += 1
 
     known = {c.name for c in Portal.__table__.columns} - {"id"}

@@ -1,0 +1,269 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="row g-3">
+  <div class="col-lg-4">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-geo-alt"></i> Areas</span>
+        <button class="btn btn-sm btn-accent" id="a-new"><i class="bi bi-plus-circle"></i> New</button>
+      </div>
+      <div class="card-body p-1" id="a-list" style="max-height:calc(100vh - 220px);overflow:auto"></div>
+    </div>
+  </div>
+  <div class="col-lg-8">
+    <div class="card">
+      <div class="card-header d-flex justify-content-between align-items-center">
+        <span id="ed-title">Playback area</span>
+        <span class="small text-muted">one playlist · different FFmpeg per room/device</span>
+      </div>
+      <div class="card-body">
+        <p class="small text-muted">The Playlist is defined once. An area only chooses which FFmpeg template
+          the same channel plays with. Users keep their group whitelist (what they see) and pick an area here
+          (how it is delivered). Empty kind defaults inherit the playlist column.</p>
+        <div class="row g-2">
+          <div class="col-md-6"><label class="muted-label">Name</label>
+            <input class="form-control form-control-sm" id="a-name" placeholder="Living room"></div>
+          <div class="col-md-3 d-flex align-items-end"><div class="form-check form-switch">
+            <input class="form-check-input" type="checkbox" id="a-enabled" checked>
+            <label class="form-check-label small">enabled</label></div></div>
+          <div class="col-12"><label class="muted-label">Notes</label>
+            <input class="form-control form-control-sm" id="a-notes" placeholder="optional"></div>
+        </div>
+        <div class="muted-label mt-3 mb-1">Kind defaults (empty = inherit playlist FFmpeg column)</div>
+        <div class="row g-2" id="a-defaults"></div>
+        <div class="d-flex align-items-center gap-2 mt-3 mb-1">
+          <div class="muted-label mb-0">Exceptions (this channel only)</div>
+          <button class="btn btn-xs btn-outline-secondary ms-auto" id="ex-add" type="button">
+            <i class="bi bi-plus"></i> Add exception…</button>
+        </div>
+        <div id="ex-table"></div>
+      </div>
+      <div class="card-footer d-flex gap-2">
+        <button class="btn btn-sm btn-accent" id="a-save"><i class="bi bi-check2"></i> Save area</button>
+        <button class="btn btn-sm btn-outline-secondary" id="a-dup"><i class="bi bi-copy"></i> Duplicate</button>
+        <button class="btn btn-sm btn-outline-danger" id="a-delete"><i class="bi bi-trash"></i> Delete</button>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const KINDS = [
+  ["live", "Live", "ffmpeg_template_live_id"],
+  ["vod", "VOD", "ffmpeg_template_vod_id"],
+  ["series", "Series", "ffmpeg_template_series_id"],
+  ["local", "Local", "ffmpeg_template_local_id"],
+];
+let areas = [], templates = [], current = null, exTable = null;
+
+const tplOptions = (selected) =>
+  `<option value="">(inherit playlist)</option>` +
+  templates.map(t => `<option value="${t.id}" ${String(t.id) === String(selected) ? "selected" : ""}>${esc(t.name)}</option>`).join("");
+
+function renderDefaults(row) {
+  const host = $("#a-defaults"); host.innerHTML = "";
+  for (const [kind, label, col] of KINDS) {
+    const wrap = el("div", { class: "col-md-6" });
+    wrap.innerHTML = `<label class="muted-label">${label}</label>
+      <select class="form-select form-select-sm a-kind" data-col="${col}">${tplOptions(row?.[col])}</select>`;
+    host.append(wrap);
+  }
+}
+
+function readPayload() {
+  const body = {
+    name: $("#a-name").value.trim(),
+    enabled: $("#a-enabled").checked,
+    notes: $("#a-notes").value.trim(),
+  };
+  for (const sel of $$(".a-kind")) body[sel.dataset.col] = +sel.value || null;
+  return body;
+}
+
+async function loadList() {
+  const d = await api("/api/areas");
+  areas = d.items || []; templates = d.templates || [];
+  const host = $("#a-list"); host.innerHTML = "";
+  if (!areas.length)
+    host.append(el("div", { class: "small text-muted p-2" },
+      "No areas yet. Create one (Living room, Phone, …) then assign it on a user."));
+  for (const a of areas) {
+    const b = el("button", { class: "btn btn-sm w-100 text-start mb-1 " +
+      (current?.id === a.id ? "btn-accent" : "btn-light") });
+    const kinds = KINDS.map(([, label, col]) => a[col.replace("_id", "")] || a[col]
+      ? label : null).filter(Boolean);
+    b.innerHTML = `<div class="d-flex justify-content-between"><span>${esc(a.name)}</span>
+      <span class="badge ${a.enabled ? "st-online" : "st-unknown"}">${a.enabled ? "on" : "off"}</span></div>
+      <div class="small text-muted">${a.user_count} user${a.user_count === 1 ? "" : "s"}`
+      + (kinds.length ? " · " + kinds.join(" · ") : " · inherit playlist") + `</div>`;
+    b.addEventListener("click", () => selectArea(a.id));
+    host.append(b);
+  }
+}
+
+function paintEditor(row) {
+  $("#a-name").value = row?.name || "";
+  $("#a-enabled").checked = row ? !!row.enabled : true;
+  $("#a-notes").value = row?.notes || "";
+  renderDefaults(row);
+}
+
+async function loadExceptions() {
+  const host = $("#ex-table");
+  if (!current) {
+    host.innerHTML = '<div class="small text-muted">Save the area first, then add per-channel exceptions.</div>';
+    exTable = null;
+    return;
+  }
+  host.innerHTML = "";
+  const bar = el("div", { class: "d-flex gap-1 align-items-center mb-1" });
+  bar.append(
+    mBtn("Remove selected", "btn-outline-danger", async () => {
+      const ids = [...(exTable?.selected || [])];
+      if (!ids.length) return toast("select exceptions first", "warn");
+      await api(`/api/areas/${current.id}/items/bulk-delete`, { method: "POST", body: { ids } });
+      toast("removed", "ok"); exTable.reload();
+    }, "bi-trash"));
+  exTable = new DataTable(host, {
+    selectable: true, perPageDefault: 10, extraHeader: bar,
+    server: async () => {
+      const d = await api(`/api/areas/${current.id}/items`);
+      return { total: (d.items || []).length, items: d.items || [] };
+    },
+    columns: [
+      { key: "kind", label: "Kind", width: "70px" },
+      { key: "name", label: "Channel", render: r => `<b>${esc(r.name)}</b>`
+        + (r.missing ? ' <span class="badge text-bg-warning">missing</span>' : "") },
+      { key: "template", label: "FFmpeg tpl", render: r => esc(r.template) },
+      { key: "actions", label: "", width: "36px",
+        render: r => `<button class="btn btn-sm btn-outline-danger" title="Remove"
+          onclick="event.stopPropagation();delEx(${r.id})"><i class="bi bi-x"></i></button>` },
+    ],
+    emptyText: "No exceptions — every item uses the kind defaults (or the playlist column).",
+  });
+}
+window.delEx = async (id) => {
+  await api(`/api/areas/${current.id}/items/${id}`, { method: "DELETE" });
+  exTable && exTable.reload();
+};
+
+async function selectArea(id) {
+  current = areas.find(a => a.id === id) || null;
+  $("#ed-title").textContent = current ? "Edit area: " + current.name : "Playback area";
+  paintEditor(current);
+  await loadList();
+  await loadExceptions();
+}
+
+$("#a-new").addEventListener("click", () => {
+  current = null;
+  $("#ed-title").textContent = "New area (unsaved)";
+  paintEditor({ name: "", enabled: true, notes: "" });
+  loadExceptions();
+  loadList();
+});
+
+$("#a-save").addEventListener("click", async () => {
+  const body = readPayload();
+  if (!body.name) return toast("name required", "warn");
+  if (current) {
+    await api(`/api/areas/${current.id}`, { method: "PUT", body });
+    toast("area saved", "ok");
+    const id = current.id;
+    await loadList();
+    selectArea(id);
+  } else {
+    const r = await api("/api/areas", { method: "POST", body });
+    toast("area created", "ok");
+    await loadList();
+    selectArea(r.id);
+  }
+});
+
+$("#a-dup").addEventListener("click", async () => {
+  if (!current) return toast("save the area first", "warn");
+  const r = await api(`/api/areas/${current.id}/duplicate`, { method: "POST" });
+  toast("duplicated", "ok");
+  await loadList();
+  selectArea(r.id);
+});
+
+$("#a-delete").addEventListener("click", () => {
+  if (!current) return toast("nothing selected", "warn");
+  confirmDialog({ title: "Delete area",
+    body: `Delete <b>${esc(current.name)}</b>? Users on it fall back to the playlist FFmpeg column.`,
+    okText: "Delete", okClass: "btn-danger",
+    onOk: async () => {
+      await api(`/api/areas/${current.id}`, { method: "DELETE" });
+      current = null; paintEditor(null); await loadList(); await loadExceptions();
+    } });
+});
+
+$("#ex-add").addEventListener("click", () => {
+  if (!current) return toast("save the area first", "warn");
+  const kindSel = el("select", { class: "form-select form-select-sm" },
+    KINDS.map(([v, l]) => el("option", { value: v }, l)));
+  const q = el("input", { class: "form-control form-control-sm", placeholder: "filter playlist items…" });
+  const tpl = el("select", { class: "form-select form-select-sm", html: tplOptions() });
+  const list = el("div", { class: "list-group mt-2", style: "max-height:320px;overflow:auto" });
+  const picked = new Set();
+  const body = el("div", {},
+    el("p", { class: "small text-muted mb-2" },
+      "Pick playlist items. They keep their catalog row — only this area’s FFmpeg changes."),
+    el("div", { class: "row g-2" },
+      el("div", { class: "col-4" }, kindSel),
+      el("div", { class: "col-8" }, q),
+      el("div", { class: "col-12" },
+        el("label", { class: "muted-label" }, "FFmpeg template"), tpl)),
+    list);
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: "Add exceptions", body, footer, size: "lg" });
+  const apply = mBtn("Apply to selected", "btn-accent", async () => {
+    const ids = [...picked];
+    if (!ids.length) return toast("select items first", "warn");
+    const tid = +tpl.value;
+    if (!tid) return toast("pick a template (not inherit)", "warn");
+    await api(`/api/areas/${current.id}/items`, { method: "POST", body: {
+      ffmpeg_template_id: tid,
+      items: ids.map(id => ({ kind: kindSel.value, playlist_id: id })),
+    } });
+    toast(`${ids.length} exception(s) saved`, "ok");
+    m.close(); exTable && exTable.reload();
+  });
+  footer.append(apply, mBtn("Cancel", "btn-outline-secondary", m.close));
+  async function reload() {
+    list.innerHTML = `<div class="text-muted small p-2">loading…</div>`;
+    try {
+      const r = await api(`/api/playlist/${kindSel.value}?per_page=100&q=${encodeURIComponent(q.value)}`);
+      list.innerHTML = "";
+      const items = r.items || [];
+      if (!items.length) {
+        list.append(el("div", { class: "text-muted small p-2" }, "No playlist items."));
+        return;
+      }
+      for (const it of items) {
+        const b = el("button", { class: "list-group-item list-group-item-action py-2", type: "button" });
+        const on = picked.has(it.id);
+        b.innerHTML = `<div class="d-flex justify-content-between">
+          <span>${esc(it.custom_name || it.name || "#" + it.id)}</span>
+          <span class="badge ${on ? "st-online" : "text-bg-light"}">${on ? "selected" : it.group_name || ""}</span></div>`;
+        b.addEventListener("click", () => {
+          if (picked.has(it.id)) picked.delete(it.id); else picked.add(it.id);
+          reload();
+        });
+        list.append(b);
+      }
+    } catch {
+      list.innerHTML = `<div class="text-danger small p-2">failed to load playlist</div>`;
+    }
+  }
+  kindSel.addEventListener("change", () => { picked.clear(); reload(); });
+  let t; q.addEventListener("input", () => { clearTimeout(t); t = setTimeout(reload, 200); });
+  reload();
+});
+
+loadList().then(() => { if (areas.length) selectArea(areas[0].id); else paintEditor(null); });
+</script>
+{% endblock %}

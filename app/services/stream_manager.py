@@ -1231,21 +1231,14 @@ class StreamManager:
         gen = self._pump(h, [(src, portal, macs)], "live" if kind == "live" else "vod")
         return h, gen
 
-    async def _template_for(self, item) -> tuple[str, str]:
-        """(template name, command with <url>) - default template as fallback."""
+    async def _template_for(self, item, *, kind: str | None = None,
+                            user_name: str | None = None) -> tuple[str, str]:
+        """(template name, command with <url>) - area overlay then item then default."""
+        from .playback import template_map_for_username
         async with SessionLocal() as s:
-            tpl = None
-            tid = getattr(item, "ffmpeg_template_id", None) if item is not None else None
-            if tid:
-                tpl = await s.get(FFmpegTemplate, tid)
-            if tpl is None or not tpl.enabled:
-                tpl = (await s.execute(select(FFmpegTemplate).where(
-                    FFmpegTemplate.is_default.is_(True)))).scalar_one_or_none()
-            if tpl is None:
-                tpl = (await s.execute(select(FFmpegTemplate).limit(1))).scalar_one_or_none()
-            if tpl is None:
-                return "(pass)", f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1"
-            return tpl.name, (tpl.command or f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1")
+            tmap = await template_map_for_username(s, user_name)
+            resolved = tmap.resolve(kind or "", item)
+            return resolved.name, resolved.command
 
     async def _item_for(self, kind: str, ref_id: int):
         """The playlist item owning a stream ref, for template resolution.
@@ -1273,7 +1266,8 @@ class StreamManager:
                 return await s.get(LocalPlaylist, ref_id)
         return None
 
-    async def uses_redirect(self, kind: str, ref_id: int) -> bool:
+    async def uses_redirect(self, kind: str, ref_id: int,
+                            user_name: str | None = None) -> bool:
         """True when the item's effective template is the redirect/bypass preset.
 
         This backs the per-channel "bypass ffmpeg" mode: a playlist item whose
@@ -1281,12 +1275,13 @@ class StreamManager:
         panel's CDN instead of being proxied through ffmpeg. The redirect
         preset is ALSO the built-in default template, so an item without an
         explicit template assignment resolves to it and redirects too - the old
-        global switch, expressed as a template.
+        global switch, expressed as a template. An area overlay (per user)
+        can still force a real transcode template on the same item.
         """
         item = await self._item_for(kind, ref_id)
         if item is None:
             return False
-        _name, command = await self._template_for(item)
+        _name, command = await self._template_for(item, kind=kind, user_name=user_name)
         return command == REDIRECT_COMMAND
 
     async def local_disk_path(self, ref_id: int) -> tuple[str | None, str]:
@@ -1303,17 +1298,19 @@ class StreamManager:
             return path, name
         return None, name
 
-    async def local_serves_original(self, ref_id: int) -> bool:
+    async def local_serves_original(self, ref_id: int,
+                                    user_name: str | None = None) -> bool:
         """True when this local item should be FileResponse'd, not ffmpeg'd."""
         item = await self._item_for("local", ref_id)
-        _name, command = await self._template_for(item)
+        _name, command = await self._template_for(item, kind="local", user_name=user_name)
         return serves_original_file(command)
 
     async def register_local_file(self, ref_id: int, user_name: str | None,
                                   path: str, item_name: str) -> StreamHandle:
         """Dashboard/max-connections slot for a direct file serve (no ffmpeg)."""
         item = await self._item_for("local", ref_id)
-        tpl_name, _command = await self._template_for(item)
+        tpl_name, _command = await self._template_for(
+            item, kind="local", user_name=user_name)
         h = StreamHandle(id=uuid.uuid4().hex, kind="local", item_name=item_name,
                          user_name=user_name, template_name=tpl_name or "file",
                          command="(file)", url=path)
@@ -1466,7 +1463,8 @@ class StreamManager:
         else:
             raise ValueError(f"unknown kind {kind}")
 
-        tpl_name, command = await self._template_for(item)
+        tpl_name, command = await self._template_for(
+            item, kind=kind, user_name=user_name)
         # Local files never 302 (the client cannot see our disk). The default
         # template is the redirect marker, which is not an ffmpeg command: when
         # we reach the pipe (Enigma2 asked for `.ts`, not the original MP4)

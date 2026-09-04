@@ -187,17 +187,18 @@ async def _guarded(gen, label: str, item_name: str = ""):
     return body()
 
 
-async def _wants_redirect(kind: str, ref_id: int, mode: str) -> bool:
+async def _wants_redirect(kind: str, ref_id: int, mode: str,
+                          user_name: str | None = None) -> bool:
     """Whether this stream should 302 straight to the panel's CDN.
 
     Decided by, in priority order:
       1. an explicit `?mode=redirect|proxy` query param (per-URL override);
-      2. the item's assigned FFmpeg template being the built-in
-         "Redirect (bypass ffmpeg)" preset (per-channel bypass).
+      2. the item's effective FFmpeg template (area overlay, then the
+         playlist assignment, then the built-in redirect default).
     """
     if mode in ("proxy", "redirect"):
         return mode == "redirect"
-    return await MANAGER.uses_redirect(kind, ref_id)
+    return await MANAGER.uses_redirect(kind, ref_id, user_name)
 
 
 # Container announced to the client. The real container is whatever the item's
@@ -222,7 +223,8 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     templates serve the original file; transcode templates still go through
     ffmpeg.
     """
-    if kind != "local" and await _wants_redirect(kind, ref_id, mode):
+    if kind != "local" and await _wants_redirect(
+            kind, ref_id, mode, user.name if user else None):
         from fastapi.responses import RedirectResponse
         url, item_name = await MANAGER.resolve(kind, ref_id)
         if url:

@@ -52,6 +52,7 @@ from ..models import (
     VodPlaylist, VodSource,
 )
 from .ffmpeg_templates import REDIRECT_COMMAND
+from .playback import template_map_for
 from .playlist_gen import _allowed, _chunked, _groups
 from .titles import best_title
 
@@ -356,19 +357,20 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
         default_tpl = next((templates[r.id] for r in rows if r.is_default), None)
         res = _Resolver(templates, default_tpl, profile,
                         templates[rows[0].id] if rows else None)
+        tmap = await template_map_for(s, user)
 
         if profile.include_live:
             bundle.files += await _live_files(s, profile, base_url, user, ugroups,
-                                              pgroups, prefix, layout, mode, res)
+                                              pgroups, prefix, layout, mode, res, tmap)
         if profile.include_vod:
             bundle.files += await _vod_files(s, profile, base_url, user, ugroups,
-                                             pgroups, prefix, layout, mode, res)
+                                             pgroups, prefix, layout, mode, res, tmap)
         if profile.include_series:
             bundle.files += await _series_files(s, profile, base_url, user, ugroups,
-                                                pgroups, prefix, layout, mode, res)
+                                                pgroups, prefix, layout, mode, res, tmap)
         if profile.include_local:
             bundle.files += await _local_files(s, profile, base_url, user, ugroups,
-                                               pgroups, prefix, mode, res)
+                                               pgroups, prefix, mode, res, tmap)
     bundle.deliveries = dict(res.counts)
     bundle.warnings += sorted(res.notes)
     if res.counts["direct"]:
@@ -391,7 +393,7 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
 
 
 async def _live_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                      layout, mode, res: _Resolver) -> list[BouquetFile]:
+                      layout, mode, res: _Resolver, tmap) -> list[BouquetFile]:
     items = (await s.execute(select(LivePlaylist).where(LivePlaylist.enabled.is_(True))
                              .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
     items = [it for it in items if _visible(it.group_name, ugroups["live"], pgroups["live"])]
@@ -399,7 +401,7 @@ async def _live_files(s, profile, base_url, user, ugroups, pgroups, prefix,
         return []
     out: list[BouquetFile] = []
     def add(w, it) -> None:
-        d = res.for_item(it.ffmpeg_template_id, "live")
+        d = res.for_item(tmap.resolve("live", it).id, "live")
         w.service(d.player, it.id,
                   stream_url(base_url, "live", it.id, d.container, user, mode),
                   best_title(it.custom_name))
@@ -419,7 +421,7 @@ async def _live_files(s, profile, base_url, user, ugroups, pgroups, prefix,
 
 
 async def _vod_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                     layout, mode, res: _Resolver) -> list[BouquetFile]:
+                     layout, mode, res: _Resolver, tmap) -> list[BouquetFile]:
     items = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                              .order_by(VodPlaylist.order, VodPlaylist.id))).scalars().all()
     items = [it for it in items if _visible(it.group_name, ugroups["vod"], pgroups["vod"])]
@@ -448,7 +450,7 @@ async def _vod_files(s, profile, base_url, user, ugroups, pgroups, prefix,
             if layout == "group_markers" and first != letter:
                 letter = first
                 w.marker(letter)
-            d = res.for_item(it.ffmpeg_template_id, "vod")
+            d = res.for_item(tmap.resolve("vod", it).id, "vod")
             w.service(d.player, it.id,
                       stream_url(base_url, "vod", it.id, d.container, user, mode),
                       title(it))
@@ -457,7 +459,7 @@ async def _vod_files(s, profile, base_url, user, ugroups, pgroups, prefix,
 
 
 async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                        layout, mode, res: _Resolver) -> list[BouquetFile]:
+                        layout, mode, res: _Resolver, tmap) -> list[BouquetFile]:
     """Series are the reason `layout` exists.
 
     per_series      one bouquet per series - clean, but 400 series means 400
@@ -505,7 +507,7 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
             if season_number != season:
                 season = season_number
                 w.marker(f"{show} - Season {season_number}")
-            d = res.for_item(sp.ffmpeg_template_id, "series")
+            d = res.for_item(tmap.resolve("series", sp).id, "series")
             w.service(d.player, ep_id,
                       stream_url(base_url, "episode", ep_id, d.container, user, mode),
                       f"{show} S{season_number:02d}E{ep_num:02d}")
@@ -533,7 +535,7 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
 
 
 async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
-                       mode, res: _Resolver) -> list[BouquetFile]:
+                       mode, res: _Resolver, tmap) -> list[BouquetFile]:
     items = (await s.execute(select(LocalPlaylist).where(LocalPlaylist.enabled.is_(True))
                              .order_by(LocalPlaylist.order, LocalPlaylist.id))).scalars().all()
     items = [it for it in items

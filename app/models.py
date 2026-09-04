@@ -493,6 +493,48 @@ class LocalPlaylist(Base):
 # ===========================================================================
 # USERS / EPG / SETTINGS / LOGS / RUNTIME
 # ===========================================================================
+class Area(Base):
+    """Named playback profile: how the SAME playlist item is transcoded.
+
+    The playlist is defined once. Users keep a group whitelist (what they see)
+    and an optional area (which FFmpeg template those items play with).
+    Kind defaults cover most rooms/devices; `area_item_templates` holds the
+    per-channel exceptions.
+    """
+
+    __tablename__ = "areas"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), unique=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    notes: Mapped[str | None] = mapped_column(Text)
+    ffmpeg_template_live_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ffmpeg_templates.id", ondelete="SET NULL"))
+    ffmpeg_template_vod_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ffmpeg_templates.id", ondelete="SET NULL"))
+    ffmpeg_template_series_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ffmpeg_templates.id", ondelete="SET NULL"))
+    ffmpeg_template_local_id: Mapped[int | None] = mapped_column(
+        ForeignKey("ffmpeg_templates.id", ondelete="SET NULL"))
+
+
+class AreaItemTemplate(Base):
+    """Sparse per-item FFmpeg override for one area (kind + playlist row id)."""
+
+    __tablename__ = "area_item_templates"
+    __table_args__ = (
+        UniqueConstraint("area_id", "kind", "playlist_id", name="uq_area_item_tpl"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    area_id: Mapped[int] = mapped_column(
+        ForeignKey("areas.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(10))                          # live|vod|series|local
+    playlist_id: Mapped[int] = mapped_column(Integer, index=True)
+    ffmpeg_template_id: Mapped[int] = mapped_column(
+        ForeignKey("ffmpeg_templates.id", ondelete="CASCADE"))
+
+
 class User(Base):
     """Output consumer (M3U and/or Xtream). NOT the GUI admin (env-based login)."""
 
@@ -508,6 +550,9 @@ class User(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     groups_json: Mapped[str | None] = mapped_column(Text)                  # {live:[],vod:[],series:[],local:[]}
     last_active: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # which playback area this consumer uses (NULL = playlist item templates)
+    area_id: Mapped[int | None] = mapped_column(
+        ForeignKey("areas.id", ondelete="SET NULL"), index=True)
 
 
 class EpgSource(Base):
