@@ -156,3 +156,49 @@ async def test_disabled_area_is_ignored():
         item = await s.get(VodPlaylist, vid)
         resolved = (await template_map_for(s, user)).resolve("vod", item)
     assert resolved.name == REDIRECT_PRESET_NAME
+
+
+async def test_export_import_restores_area_by_name_not_id():
+    """Backup uses area/template names so a restore onto a new id space still binds."""
+    names = await _templates()
+    vid = await _vod(names[REDIRECT_PRESET_NAME])
+    async with SessionLocal() as s:
+        area = Area(name="Phone", enabled=True, notes="handset",
+                    ffmpeg_template_vod_id=names[REFERENCE_PRESET_NAME])
+        s.add(area)
+        await s.flush()
+        s.add(AreaItemTemplate(area_id=area.id, kind="vod", playlist_id=vid,
+                               ffmpeg_template_id=names[E2_VOD_REMUX_PRESET_NAME]))
+        s.add(User(name="alice", password="secret", m3u_enabled=True, area_id=area.id))
+        await s.commit()
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        dumped = await c.get("/api/export?section=users")
+        assert dumped.status_code == 200, dumped.text
+        data = dumped.json()
+        assert data["users"][0]["area"] == "Phone"
+        assert "area_id" not in data["users"][0]
+        assert data["areas"][0]["ffmpeg_template_vod"] == REFERENCE_PRESET_NAME
+        assert data["area_item_templates"][0]["ffmpeg_template"] == E2_VOD_REMUX_PRESET_NAME
+
+    async with SessionLocal() as s:
+        for model in (User, AreaItemTemplate, Area):
+            for row in (await s.execute(select(model))).scalars().all():
+                await s.delete(row)
+        await s.commit()
+
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        imported = await c.post("/api/import", json={"mode": "merge", "data": data})
+        assert imported.status_code == 200, imported.text
+
+    async with SessionLocal() as s:
+        alice = (await s.execute(select(User).where(User.name == "alice"))).scalar_one()
+        phone = (await s.execute(select(Area).where(Area.name == "Phone"))).scalar_one()
+        assert alice.area_id == phone.id
+        assert phone.ffmpeg_template_vod_id == names[REFERENCE_PRESET_NAME]
+        ex = (await s.execute(select(AreaItemTemplate))).scalar_one()
+        assert ex.area_id == phone.id and ex.playlist_id == vid
+        item = await s.get(VodPlaylist, vid)
+        resolved = (await template_map_for(s, alice)).resolve("vod", item)
+    assert resolved.name == E2_VOD_REMUX_PRESET_NAME
