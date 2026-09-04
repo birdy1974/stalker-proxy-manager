@@ -94,13 +94,16 @@ REFERENCE_PRESET_NAME = "VAAPI 720p ~1M (DS918+ reference)"
 REDIRECT_PRESET_NAME = "Redirect (bypass ffmpeg)"
 REDIRECT_COMMAND = "@redirect"
 COPY_PRESET_NAME = "Copy / passthrough (no transcode)"
-# Enigma2 (Vu+ / OpenPLi) presets. A live Matroska pipe (`-f matroska -live 1`)
-# is audio-only on exteplayer3 (no cue index on a non-seekable output), and a
-# progressive MP4 is the same. MPEG-TS with Annex-B H.264 is what the box
-# already plays for live TV, so the VOD presets mux that - not MKV. Text
-# subtitles cannot ride along (the container has no slot); DVB bitmap tracks
-# still can. Keep the historical names: the seeder matches built-ins by name
-# and rewriting them would orphan the templates already assigned on playlists.
+# Enigma2 (Vu+ / OpenPLi) presets. Keep the historical names: the seeder
+# matches built-ins by name and rewriting them would orphan templates already
+# assigned on playlists.
+#
+# VOD/series MUST be Matroska with subs=keep. MPEG-TS cannot carry SRT/ASS, and
+# `-c:s dvbsub` on a VAAPI transcode is what produced the "no data within 25s
+# -> 502" failure on the box (PGS/text -> dvbsub never emits a first byte).
+# A live Matroska pipe is audio-only on exteplayer3; StreamManager rewrites
+# that muxer to MPEG-TS when the input is live, so assigning a VOD MKV
+# template to a live channel still gets a picture.
 E2_VOD_REMUX_PRESET_NAME = "Enigma2 VOD - remux + subtitles (MKV)"
 E2_VOD_TRANSCODE_PRESET_NAME = "Enigma2 VOD - VAAPI 1080p H.264 + AC3 + subtitles (MKV)"
 E2_DUO2_LIVE_PRESET_NAME = "Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)"
@@ -752,20 +755,21 @@ def default_presets() -> list[dict]:
         mk(COPY_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source", subs="dvb"),
         # --- Enigma2 / Vu+ Duo2 --------------------------------------------
-        # VOD + series as MPEG-TS (the container the box already plays for
-        # live). A live Matroska pipe is audio-only on exteplayer3.
-        #  * remux  - copy + h264_mp4toannexb, DVB bitmap subs if present;
+        # VOD + series as Matroska so text subtitles survive on exteplayer3
+        # (service 5002). MPEG-TS has no slot for SRT/ASS, and dvbsub on a
+        # VAAPI transcode is the 502/no-data failure.
+        #  * remux  - copy into MKV, every subtitle track copied;
         #  * VAAPI  - 4K/HEVC rescue: GPU H.264 High@4.0 1080p (BCM7424
-        #             ceiling) + AC3, DVB bitmap subs.
+        #             ceiling) + AC3, subtitles copied beside the GPU path.
         mk(E2_VOD_REMUX_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source",
-           output_format="mpegts", subs="dvb"),
+           output_format="matroska", subs="keep"),
         mk(E2_VOD_TRANSCODE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            maxrate="4400k", bufsize="8000k", fps="25", gop="50",
            profile="high", level="4.0", low_power=True, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
-           output_format="mpegts", subs="dvb"),
+           output_format="matroska", subs="keep"),
         # Live TV for the same box: MPEG-TS straight into the DVB pipeline
         # (service reference 1 or 4097) with the DVB bitmap subtitles the box
         # renders natively.

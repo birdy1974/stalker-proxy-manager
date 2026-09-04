@@ -157,14 +157,13 @@ def test_dvb_template_survives_argv_and_legacy_filters_are_stripped():
 # --------------------------------------------------------------------------- #
 # the spawn-time gate (probe monkeypatched)
 # --------------------------------------------------------------------------- #
-async def test_dvb_keeps_bitmap_tracks_mapped():
-    # subtitle_streams() reports SUBTITLE tracks only (probe parse), and the
-    # map ordinal counts among them: the 2nd subtitle track (absolute #3 here)
-    # maps as `0:s:1`, never as the absolute stream index.
+async def test_dvb_keeps_native_dvb_tracks_mapped():
+    # Only already-DVB tracks ride MPEG-TS. PGS/DVD -> dvbsub stalls the first
+    # output byte. Mixed sources keep the DVB ordinal among subtitle tracks.
     cmd = build_command(FFmpegOptions(**SW, subs="dvb"))
     args = await _gate(cmd, "/media/movie.mkv",
                        [{"index": 2, "codec": "subrip"},
-                        {"index": 3, "codec": "hdmv_pgs_subtitle"}])
+                        {"index": 3, "codec": "dvb_subtitle"}])
     assert _specs(args) == ["0:v:0", "0:a:0?", "0:s:1"]
     assert args[args.index("-c:s") + 1] == "dvbsub"
     assert "-sn" not in args
@@ -180,14 +179,15 @@ async def test_dvb_copies_when_source_is_already_dvb():
     assert args[args.index("-c:s") + 1] == "copy"
 
 
-async def test_dvb_upgrades_copy_to_dvbsub_for_pgs_sources():
+async def test_dvb_drops_pgs_instead_of_converting_to_dvbsub():
+    """PGS -> dvbsub never produced a first byte in time for the box."""
     cmd = build_command(FFmpegOptions(hw_accel="none", video_codec="copy",
                                       audio_codec="copy", resolution="source",
                                       subs="dvb"))
     args = await _gate(cmd, "/media/movie.mkv",
                        [{"index": 3, "codec": "hdmv_pgs_subtitle"}])
-    assert args[args.index("-c:s") + 1] == "dvbsub", "raw PGS cannot enter mpegts by copy"
-    assert "0:s:0" in _specs(args)
+    assert "-c:s" not in args and "-sn" in args
+    assert "0:s" not in " ".join(_specs(args))
 
 
 async def test_dvb_drops_text_only_sources():

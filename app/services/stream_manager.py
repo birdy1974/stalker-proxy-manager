@@ -61,12 +61,11 @@ _NETONLY_OPTS = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout|user_agent|headers|http_proxy"
     r"|seekable|multiple_requests|referer)\b\s*(?:\S+)?")
 _NET_SCHEMES = ("http://", "https://")
-# Subtitle codecs a transcoded MPEG-TS pipe can keep: bitmap ones survive a
-# re-encode into the DVB track of the output TS. Text subs (SRT/ASS/...) can
-# only be burned into the picture - which needs CPU video frames, so with
-# hardware-only transcoding there is deliberately nothing text subs can do
-# here: they are dropped (safely, by the gate - never by an ffmpeg abort).
-_BITMAP_SUB_CODECS = {"dvb_subtitle", "dvd_subtitle", "hdmv_pgs_subtitle", "xsub"}
+# Subtitle codecs a transcoded MPEG-TS pipe can keep WITHOUT a re-encode.
+# Only native DVB rides MPEG-TS as a copy. PGS/DVD -> dvbsub is a CPU-heavy
+# convert that regularly emits no output before the 25s start timeout (the
+# Enigma2 VOD "502, 0.0 MB" failure). Text subs cannot enter MPEG-TS at all.
+_TS_NATIVE_SUB_CODECS = {"dvb_subtitle"}
 # The other half of the story: a MATROSKA output (subs="keep", the Enigma2 VOD
 # path) carries text subtitles too, so nothing has to be dropped there - the
 # tracks are copied byte for byte beside a video pipeline that stays fully
@@ -616,20 +615,25 @@ class StreamManager:
                 pass
         args = StreamManager._ensure_annexb(args)
         args = StreamManager._ensure_interleave_flush(args)
+        # Live Matroska is audio-only on Enigma2 (no cues on a pipe). A VOD
+        # MKV template assigned to a live channel is rewritten to MPEG-TS.
+        if not pace:
+            args = StreamManager._matroska_to_mpegts_for_live(args)
+            args = StreamManager._ensure_annexb(args)
+            args = StreamManager._ensure_interleave_flush(args)
         # Inject metadata title before the output format specifier so players
-        # display the correct stream name instead of source stream metadata
+        # display the correct stream name instead of source stream metadata.
+        # One argv element (create_subprocess_exec); a title with spaces or
+        # a minus must not split into extra flags.
         if title:
+            safe = (title or "").replace("\r", " ").replace("\n", " ").replace("\0", "")
             try:
-                # Find the last -i (input marker) to locate the output section
                 last_i = max(idx for idx, a in enumerate(args) if a == "-i")
-                # Find -f in the output section (after the last -i)
                 f_idx = args.index("-f", last_i)
-                # Insert metadata before -f
-                args[f_idx:f_idx] = ["-metadata", f"title={title}"]
+                args[f_idx:f_idx] = ["-metadata", f"title={safe}"]
             except (ValueError, IndexError):
-                # No -f found, insert before the last argument (the output)
                 if len(args) > 1:
-                    args[-1:-1] = ["-metadata", f"title={title}"]
+                    args[-1:-1] = ["-metadata", f"title={safe}"]
         return args
 
     async def _subs_gate(self, args: list[str], url: str, pace: bool,
@@ -694,12 +698,13 @@ class StreamManager:
         # ffmpeg's `0:s:N` addresses the Nth SUBTITLE stream, not the Nth
         # stream of the input: the map needs the ordinal among the subtitle
         # tracks, not the absolute stream index the probe reports.
-        idxs = [n for n, s in enumerate(subs) if s["codec"] in _BITMAP_SUB_CODECS][:8]
+        idxs = [n for n, s in enumerate(subs) if s["codec"] in _TS_NATIVE_SUB_CODECS][:8]
         if not idxs:
+            extra = ", ".join(s["codec"] for s in subs) if subs else "none"
             await db_log("INFO", "stream", tag +
-                         "no convertible (bitmap) subtitle track ("
-                         + ", ".join(s["codec"] for s in subs) + ")"
-                         " -> subtitles dropped")
+                         "no native DVB subtitle track ("
+                         + extra + ") -> subtitles dropped "
+                         "(PGS/DVD->dvbsub would stall the first byte)")
             return StreamManager._ensure_sn(StreamManager._strip_subs(args))
         # rebuild: explicit maps for the bitmap tracks only, then the codec.
         # 'copy' is honoured only when every source track is already DVB
@@ -876,6 +881,33 @@ class StreamManager:
     def _outputs_matroska(args: list[str]) -> bool:
         """True when the OUTPUT muxer is Matroska (`-f matroska` / `-f mkv`)."""
         return StreamManager._output_format(args)[0] in ("matroska", "mkv")
+
+    @staticmethod
+    def _matroska_to_mpegts_for_live(args: list[str]) -> list[str]:
+        """Rewrite a live Matroska pipe to MPEG-TS.
+
+        exteplayer3 is audio-only on a non-seekable MKV (no cue index). The
+        Enigma2 VOD templates are Matroska on purpose; when one is assigned
+        to a live channel we still owe the box a picture, so drop text
+        subs (MPEG-TS cannot carry them) and mux MPEG-TS instead.
+        """
+        fmt, f_idx = StreamManager._output_format(args)
+        if fmt not in ("matroska", "mkv") or f_idx is None:
+            return args
+        out = list(args)
+        out[f_idx + 1] = "mpegts"
+        i = 0
+        while i < len(out):
+            if out[i] == "-live" and i + 1 < len(out):
+                del out[i:i + 2]
+                continue
+            i += 1
+        out = StreamManager._drop_subtitles(out)
+        if "-mpegts_flags" not in out:
+            _fmt, f2 = StreamManager._output_format(out)
+            if f2 is not None:
+                out[f2:f2] = ["-mpegts_flags", "+resend_headers"]
+        return out
 
     @staticmethod
     def _ensure_interleave_flush(args: list[str]) -> list[str]:

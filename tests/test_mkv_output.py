@@ -114,17 +114,20 @@ def test_enigma2_presets_are_shipped_and_fit_the_duo2():
 
     remux = presets[E2_VOD_REMUX_PRESET_NAME]
     assert remux["video_codec"] == "copy" and remux["audio_codec"] == "copy"
-    # live Matroska is audio-only on the box; MPEG-TS + Annex-B is what plays
-    assert remux["output_format"] == "mpegts"
-    assert "-f mpegts" in remux["command"] and "-bsf:v h264_mp4toannexb" in remux["command"]
-    assert "-f matroska" not in remux["command"]
+    # VOD is Matroska so SRT/ASS survive on exteplayer3; MPEG-TS+dvbsub is
+    # the 502/no-data failure on the box.
+    assert remux["output_format"] == "matroska" and remux["subs"] == "keep"
+    assert "-f matroska" in remux["command"] and "-c:s copy" in remux["command"]
+    assert "-c:s dvbsub" not in remux["command"] and "-f mpegts" not in remux["command"]
 
     hw = presets[E2_VOD_TRANSCODE_PRESET_NAME]
-    # the 4K/HEVC rescue path: GPU video, box-friendly audio, MPEG-TS
+    # the 4K/HEVC rescue path: GPU video, box-friendly audio, Matroska + copy subs
     assert hw["video_codec"] == "h264_vaapi" and hw["resolution"] == "1080p"
     assert hw["profile"] == "high" and hw["level"] == "4.0"
-    assert hw["audio_codec"] == "ac3" and hw["output_format"] == "mpegts"
-    assert "-f mpegts" in hw["command"] and "-f matroska" not in hw["command"]
+    assert hw["audio_codec"] == "ac3" and hw["output_format"] == "matroska"
+    assert hw["subs"] == "keep"
+    assert "-f matroska" in hw["command"] and "-c:s copy" in hw["command"]
+    assert "-c:s dvbsub" not in hw["command"]
     assert "libx264" not in hw["command"] and "subtitles=" not in hw["command"]
 
     live = presets[E2_DUO2_LIVE_PRESET_NAME]
@@ -189,6 +192,24 @@ async def test_gate_does_not_probe_live_matroska():
     assert out == args
 
 
+def test_live_play_of_vod_mkv_template_becomes_mpegts():
+    """exteplayer3 is audio-only on a live MKV pipe. Assigned to a live
+    channel, the VOD MKV template must still produce a picture."""
+    cmd = build_command(FFmpegOptions(**VA, resolution="1080p", audio_codec="ac3", **MKV))
+    live = StreamManager._ffmpeg_argv(cmd, "http://cdn/live.ts", title="F1 - Olav",
+                                      pace=False)
+    vod = StreamManager._ffmpeg_argv(cmd, "http://cdn/movie.mkv", title="F1 - Olav",
+                                     pace=True)
+    assert live[live.index("-f") + 1] == "mpegts"
+    assert "-live" not in live
+    assert "-c:s" not in live and "-sn" in live
+    assert vod[vod.index("-f") + 1] == "matroska"
+    assert "-c:s" in vod
+    # title with a minus stays one argv value, not extra flags
+    assert live[live.index("-metadata") + 1] == "title=F1 - Olav"
+    assert vod[vod.index("-metadata") + 1] == "title=F1 - Olav"
+
+
 # --------------------------------------------------------------------------- #
 # HTTP surface: the .mkv aliases
 # --------------------------------------------------------------------------- #
@@ -209,7 +230,7 @@ async def test_mkv_urls_exist_next_to_the_ts_ones():
     async with SessionLocal() as s:
         tpl = (await s.execute(select(FFmpegTemplate).where(
             FFmpegTemplate.name == E2_VOD_REMUX_PRESET_NAME))).scalar_one()
-        assert tpl.is_builtin is True and tpl.output_format == "mpegts"
+        assert tpl.is_builtin is True and tpl.output_format == "matroska"
         portal = Portal(name="p", base_url="http://127.0.0.1:1/c/")
         s.add(portal)
         await s.flush()
