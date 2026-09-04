@@ -300,7 +300,7 @@ function liveBuilder() {
       { key: "chain", label: "Source chain (1=primary, then fallbacks)", render: r => chainHtml(r.chain) },
       { key: "epg_id", label: "EPG id", render: r => `<span class="mono small">${esc(r.epg_id || "")}</span>` },
       { key: "logo", label: "Logo", render: r => r.logo ? `<img class="logo-thumb" loading="lazy" src="${esc(r.logo)}" onerror="this.style.opacity=.2">` : "" },
-      { key: "template", label: "FFmpeg tpl", render: r => tplInlineCell("live", r) },
+      { key: "template", label: "FFmpeg tpl (default)", render: r => tplInlineCell("live", r) },
       { key: "test", label: "", width: "36px", render: r => `<button class="btn btn-sm btn-outline-secondary" title="Play proxied stream" onclick="event.stopPropagation();playTest(${r.id},'live')"><i class="bi bi-play-btn"></i></button>` },
       { key: "actions", label: "", width: "70px", render: r => `
         <button class="btn btn-sm btn-outline-secondary" onclick="editCustomChannel(${r.id})"><i class="bi bi-pencil"></i></button>
@@ -334,7 +334,7 @@ async function editCustomChannel(id) {
         ${groupDialogHtml("cc-group", row?.group_name || "", "dl-cc")}</div>
       <div class="col-md-3"><label class="muted-label">EPG id (tvg-id)</label>
         <input class="form-control form-control-sm mono" id="cc-epg" value="${esc(row?.epg_id || "")}"></div>
-      <div class="col-md-3"><label class="muted-label">FFmpeg template</label>
+      <div class="col-md-3"><label class="muted-label">FFmpeg template (default)</label>
         <select class="form-select form-select-sm" id="cc-tpl">${tplOptions(row?.ffmpeg_template_id)}</select></div>
       <div class="col-md-3"><label class="muted-label">Channel number (opt)</label>
         <input class="form-control form-control-sm" id="cc-number" value="${row?.number ?? ""}"></div>
@@ -448,7 +448,7 @@ function vodBuilder() {
       { key: "custom_name", class: "col-name", label: "Title", sort: "name", filter: { type: "text", param: "q", placeholder: "title…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("vod", r) },
       { key: "year", label: "Year", width: "56px" },
-      { key: "template", label: "FFmpeg tpl", render: r => tplInlineCell("vod", r) },
+      { key: "template", label: "FFmpeg tpl (default)", render: r => tplInlineCell("vod", r) },
       { key: "chain", label: "Sources", render: chainHtml },
       { key: "actions", label: "", width: "140px", render: r => `
         <button class="btn btn-sm btn-outline-secondary" title="Details (poster / info)" onclick="showDetails('vod', PL_TABLES.vod.items.find(x=>x.id===${r.id}))"><i class="bi bi-info-circle"></i></button>
@@ -475,7 +475,7 @@ window.editVod = async (id) => {
     <div class="row g-2">
       <div class="col-md-6"><label class="muted-label">Custom title</label><input class="form-control form-control-sm" id="v-name" value="${esc(row.custom_name)}"></div>
       <div class="col-md-4"><label class="muted-label">Group</label>${groupDialogHtml("v-group", row.group_name || "", "dl-v")}</div>
-      <div class="col-md-4"><label class="muted-label">FFmpeg template</label><select class="form-select form-select-sm" id="v-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
+      <div class="col-md-4"><label class="muted-label">FFmpeg template (default)</label><select class="form-select form-select-sm" id="v-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
     </div><div class="small text-muted mt-2">Logo/poster: automatic (portal/TMDB) per Phase-1 decision Q1=C.</div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: "Edit VOD item", body, footer, size: "lg" });
@@ -504,7 +504,7 @@ function seriesBuilder() {
           <span class="badge ${s.enabled ? "st-online" : "st-unknown"} me-1" style="cursor:pointer" title="toggle season"
             onclick="togglePlSeason(${r.id}, ${s.link_id}, ${s.enabled ? "false" : "true"})">S${String(s.season_number).padStart(2, "0")}</span>`).join("") +
         `<div class="small text-muted">${r.enabled_episode_count} episodes total</div>` },
-      { key: "template", label: "FFmpeg tpl", render: r => tplInlineCell("series", r) },
+      { key: "template", label: "FFmpeg tpl (default)", render: r => tplInlineCell("series", r) },
       { key: "actions", label: "", width: "140px", render: r => `
         <button class="btn btn-sm btn-outline-secondary" title="Details (poster / info)" onclick="showDetails('series', PL_TABLES.series.items.find(x=>x.id===${r.id}))"><i class="bi bi-info-circle"></i></button>
         <button class="btn btn-sm btn-outline-secondary" title="Edit" onclick="editSeries(${r.id})"><i class="bi bi-pencil"></i></button>
@@ -533,7 +533,7 @@ window.editSeries = async (id) => {
     <div class="row g-2">
       <div class="col-md-6"><label class="muted-label">Custom title</label><input class="form-control form-control-sm" id="s-name" value="${esc(row.custom_name)}"></div>
       <div class="col-md-4"><label class="muted-label">Group</label>${groupDialogHtml("s-group", row.group_name || "", "dl-s")}</div>
-      <div class="col-md-4"><label class="muted-label">FFmpeg template</label><select class="form-select form-select-sm" id="s-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
+      <div class="col-md-4"><label class="muted-label">FFmpeg template (default)</label><select class="form-select form-select-sm" id="s-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
     </div>
     <div class="d-flex align-items-center gap-2 mt-2">
       <div class="muted-label mb-0">Enabled seasons</div>
@@ -566,7 +566,7 @@ function localBuilder() {
       orderCol,
       { key: "custom_name", class: "col-name", label: "Name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name || "")}</b><div class="small text-muted mono">${esc(r.file)}</div>` },
       { key: "group_name", label: "Group", filter: groupFilterLoader, render: r => groupCell("local", r) },
-      { key: "template", label: "FFmpeg tpl", render: r => tplInlineCell("local", r) },
+      { key: "template", label: "FFmpeg tpl (default)", render: r => tplInlineCell("local", r) },
       { key: "actions", label: "", width: "110px", render: r => `
         <button class="btn btn-sm btn-outline-secondary" title="Details" onclick="showDetails('local', PL_TABLES.local.items.find(x=>x.id===${r.id}))"><i class="bi bi-info-circle"></i></button>
         <button class="btn btn-sm btn-outline-secondary" title="Edit" onclick="editLocal(${r.id})"><i class="bi bi-pencil"></i></button>
@@ -587,7 +587,7 @@ window.editLocal = (id) => {
     <div class="row g-2">
       <div class="col-md-6"><label class="muted-label">Name</label><input class="form-control form-control-sm" id="l-name" value="${esc(row.custom_name || "")}"></div>
       <div class="col-md-3"><label class="muted-label">Group</label>${groupDialogHtml("l-group", row.group_name || "", "dl-l")}</div>
-      <div class="col-md-3"><label class="muted-label">FFmpeg template</label><select class="form-select form-select-sm" id="l-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
+      <div class="col-md-3"><label class="muted-label">FFmpeg template (default)</label><select class="form-select form-select-sm" id="l-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
     </div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: "Edit local item", body, footer, size: "lg" });

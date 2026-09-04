@@ -45,3 +45,23 @@ def portal_item_title(item: dict, limit: int = 400) -> str:
 def m3u_attr(value: str | None) -> str:
     """Safe double-quoted M3U attribute (quotes/newlines would truncate titles)."""
     return (value or "").replace("\\", "\\\\").replace('"', "'").replace("\n", " ").replace("\r", "")
+
+
+# VLC 3.0 `parseEXTINF` (modules/demux/playlist/m3u.c) treats the display
+# name after the EXTINF comma as `Artist - Title` whenever it sees this
+# exact three-character ASCII sequence. A VOD named "Man of War - 2026"
+# then shows up in the playlist as just "2026". An en dash is not that
+# splitter, and looks the same in the playlist UI.
+_VLC_ARTIST_SEP = " - "
+_VLC_SAFE_DASH = " \u2013 "  # EN DASH (U+2013)
+
+
+def m3u_display_title(title: str | None) -> str:
+    """Title for `#EXTINF:…,title` and `tvg-name`, safe for VLC.
+
+    Single physical line (a newline would orphan the URL). ASCII
+    space-hyphen-space is rewritten so VLC 3.0 does not split the name
+    into artist / title.
+    """
+    s = (title or "").replace("\r", " ").replace("\n", " ").replace("\0", "")
+    return s.replace(_VLC_ARTIST_SEP, _VLC_SAFE_DASH)

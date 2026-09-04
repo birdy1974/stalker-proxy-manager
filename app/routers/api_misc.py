@@ -14,10 +14,12 @@ from sqlalchemy import func, select
 from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL
 from ..database import get_db
 from ..models import (
-    EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre, LivePlaylist, LiveSource, LocalFile,
-    LocalPlaylist, LocalSource, Log, Portal, SerieGenre, SeriePlaylist,
-    SerieSource, Setting, User, VodGenre, VodPlaylist, VodSource,
+    Area, AreaItemTemplate, EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre,
+    LivePlaylist, LiveSource, LocalFile, LocalPlaylist, LocalSource, Log, Portal,
+    SerieGenre, SeriePlaylist, SerieSource, Setting, User, VodGenre, VodPlaylist,
+    VodSource,
 )
+from ..services.playback import KIND_DEFAULT_COL
 from ..security import require_admin
 from ..services.db_logging import db_log
 from ..services import api_stats
@@ -45,6 +47,7 @@ async def dashboard(db=Depends(get_db)):
         "playlist_items": (await cnt(LivePlaylist) + await cnt(VodPlaylist)
                            + await cnt(SeriePlaylist) + await cnt(LocalPlaylist)),
         "ffmpeg_templates": await cnt(FFmpegTemplate, FFmpegTemplate.enabled.is_(True)),
+        "areas": await cnt(Area),
         "users": await cnt(User),
         "enigma2_profiles": await cnt(Enigma2Profile),
         "local_files": await cnt(LocalFile),
@@ -219,8 +222,35 @@ async def export_config(section: str = "all", db=Depends(get_db)):
         data["ffmpeg_templates"] = await dump(
             FFmpegTemplate, [c for c in FFmpegTemplate.__table__.columns.keys() if c != "id"])
     if section in ("all", "users"):
-        data["users"] = await dump(User, ["name", "password", "m3u_enabled", "xtream_enabled",
-                                          "expire_date", "max_connections", "enabled", "groups_json"])
+        tpls = {t.id: t.name for t in
+                (await db.execute(select(FFmpegTemplate))).scalars().all()}
+        areas = (await db.execute(select(Area))).scalars().all()
+        area_names = {a.id: a.name for a in areas}
+
+        def _tpl(tid):
+            return tpls.get(tid) if tid else None
+
+        data["areas"] = [{
+            "name": a.name, "enabled": a.enabled, "notes": a.notes,
+            "ffmpeg_template_live": _tpl(a.ffmpeg_template_live_id),
+            "ffmpeg_template_vod": _tpl(a.ffmpeg_template_vod_id),
+            "ffmpeg_template_series": _tpl(a.ffmpeg_template_series_id),
+            "ffmpeg_template_local": _tpl(a.ffmpeg_template_local_id),
+        } for a in areas]
+        exceptions = (await db.execute(select(AreaItemTemplate))).scalars().all()
+        data["area_item_templates"] = [{
+            "area": area_names.get(r.area_id), "kind": r.kind,
+            "playlist_id": r.playlist_id,
+            "ffmpeg_template": _tpl(r.ffmpeg_template_id),
+        } for r in exceptions if area_names.get(r.area_id)]
+        users = (await db.execute(select(User))).scalars().all()
+        data["users"] = [{
+            "name": u.name, "password": u.password,
+            "m3u_enabled": u.m3u_enabled, "xtream_enabled": u.xtream_enabled,
+            "expire_date": u.expire_date, "max_connections": u.max_connections,
+            "enabled": u.enabled, "groups_json": u.groups_json,
+            "area": area_names.get(u.area_id) if u.area_id else None,
+        } for u in users]
     if section in ("all", "settings"):
         data["settings"] = {r.key: json.loads(r.value or "null")
                             for r in (await db.execute(select(Setting))).scalars().all()}
@@ -263,12 +293,70 @@ async def import_config(payload: dict, db=Depends(get_db)):
             db.add(row)
         applied["imported"] += 1
 
+    tpl_by_name = {t.name: t.id for t in
+                   (await db.execute(select(FFmpegTemplate))).scalars().all()}
+
+    def _tpl_id(name):
+        return tpl_by_name.get(name) if name else None
+
+    for a in data.get("areas", []):
+        name = (a.get("name") or "").strip()
+        if not name:
+            continue
+        exists = (await db.execute(select(Area).where(Area.name == name))).scalar_one_or_none()
+        if exists and mode == "merge":
+            applied["skipped"].append(f"area:{name}")
+            continue
+        row = exists or Area(name=name)
+        row.enabled = bool(a.get("enabled", True))
+        if "notes" in a:
+            row.notes = a.get("notes") or None
+        for kind, col in KIND_DEFAULT_COL.items():
+            key = f"ffmpeg_template_{kind}"
+            if key in a:
+                setattr(row, col, _tpl_id(a.get(key)))
+            elif col in a:
+                setattr(row, col, a.get(col) if a.get(col) in tpl_by_name.values() else None)
+        if not exists:
+            db.add(row)
+        applied["imported"] += 1
+    await db.flush()
+
+    area_by_name = {r.name: r.id for r in
+                    (await db.execute(select(Area))).scalars().all()}
+    known_user = {c.name for c in User.__table__.columns} - {"id"}
     for u in data.get("users", []):
         exists = (await db.execute(select(User).where(User.name == u.get("name")))).scalar_one_or_none()
         if exists:
             applied["skipped"].append(f"user:{u.get('name')}")
             continue
-        db.add(User(**{k: v for k, v in u.items() if k != "id"}))
+        udata = {k: v for k, v in u.items() if k in known_user}
+        area_name = u.get("area")
+        if area_name:
+            udata["area_id"] = area_by_name.get(area_name)
+        elif udata.get("area_id") not in set(area_by_name.values()):
+            udata["area_id"] = None
+        db.add(User(**udata))
+        applied["imported"] += 1
+
+    for ex in data.get("area_item_templates", []):
+        aid = area_by_name.get(ex.get("area"))
+        tid = _tpl_id(ex.get("ffmpeg_template"))
+        kind = (ex.get("kind") or "").strip()
+        pid = int(ex.get("playlist_id") or 0)
+        if not aid or not tid or kind not in KIND_DEFAULT_COL or not pid:
+            continue
+        exists = (await db.execute(select(AreaItemTemplate).where(
+            AreaItemTemplate.area_id == aid, AreaItemTemplate.kind == kind,
+            AreaItemTemplate.playlist_id == pid))).scalar_one_or_none()
+        if exists and mode == "merge":
+            applied["skipped"].append(f"area-item:{ex.get('area')}:{kind}:{pid}")
+            continue
+        if exists:
+            exists.ffmpeg_template_id = tid
+        else:
+            db.add(AreaItemTemplate(area_id=aid, kind=kind, playlist_id=pid,
+                                    ffmpeg_template_id=tid))
         applied["imported"] += 1
 
     known = {c.name for c in Portal.__table__.columns} - {"id"}

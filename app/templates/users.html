@@ -11,17 +11,19 @@
 
 {% block scripts %}
 <script>
-let table, GROUPS = { live: [], vod: [], series: [], local: [] };
+let table, GROUPS = { live: [], vod: [], series: [], local: [] }, AREAS = [];
 function make() {
   table = new DataTable($("#users-table"), {
     server: async () => {
       const d = await api("/api/users");
       GROUPS = d.groups_available;
+      AREAS = d.areas || [];
       return { total: d.items.length, items: d.items };
     },
     columns: [
       { key: "enabled", label: "On", width: "36px", render: r => `<span class="badge ${r.enabled ? "st-online" : "st-unknown"}">${r.enabled ? "on" : "off"}</span>` },
-      { key: "name", label: "User", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono">${esc(r.password)}</div>` },
+      { key: "name", label: "User", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono">${esc(r.password)}</div>`
+        + (r.area_name ? `<div><span class="badge text-bg-light">${esc(r.area_name)}</span></div>` : "") },
       { key: "access", label: "Access", render: r => `${r.m3u_enabled ? '<span class="badge st-online me-1">m3u</span>' : ""}${r.xtream_enabled ? '<span class="badge st-online">xtream</span>' : ""}` },
       { key: "expire_date", label: "Expires", render: r => esc(r.expire_date || "—") },
       { key: "max_connections", label: "Max conn", width: "80px" },
@@ -69,7 +71,7 @@ window.showLinks = (id) => {
   footer.append(mBtn("Close", "btn-outline-secondary", m.close));
 };
 window.editUser = (id) => {
-  const u = id ? table.items.find(x => x.id === id) : { name: "", password: "", m3u_enabled: true, xtream_enabled: true, expire_date: "", max_connections: 1, enabled: true, groups: {} };
+  const u = id ? table.items.find(x => x.id === id) : { name: "", password: "", m3u_enabled: true, xtream_enabled: true, expire_date: "", max_connections: 1, enabled: true, groups: {}, area_id: null };
   const body = el("div");
   const grpChk = (kind) => {
     const have = GROUPS[kind] || [];
@@ -89,6 +91,11 @@ window.editUser = (id) => {
       <div class="col-md-4"><label class="muted-label">Password</label><input class="form-control form-control-sm mono" id="u-pass" value="${esc(u.password)}"></div>
       <div class="col-md-2"><label class="muted-label">Max conn.</label><input class="form-control form-control-sm" type="number" min="1" id="u-max" value="${u.max_connections}"></div>
       <div class="col-md-2"><label class="muted-label">Expires</label><input class="form-control form-control-sm" type="date" id="u-exp" value="${esc(u.expire_date || "")}"></div>
+      <div class="col-md-6"><label class="muted-label">Area (FFmpeg overlay — empty = playlist defaults)</label>
+        <select class="form-select form-select-sm" id="u-area">
+          <option value="">(no area — playlist FFmpeg column)</option>
+          ${AREAS.map(a => `<option value="${a.id}" ${u.area_id === a.id ? "selected" : ""}>${esc(a.name)}${a.enabled ? "" : " (off)"}</option>`).join("")}
+        </select></div>
       <div class="col-12 d-flex gap-3">
         <label class="small"><input type="checkbox" id="u-m3u" ${u.m3u_enabled ? "checked" : ""}> M3U playlist</label>
         <label class="small"><input type="checkbox" id="u-xtream" ${u.xtream_enabled ? "checked" : ""}> Xtream API</label>
@@ -123,7 +130,8 @@ window.editUser = (id) => {
       const payload = { name: $("#u-name", body).value.trim(), password: $("#u-pass", body).value,
         m3u_enabled: $("#u-m3u", body).checked, xtream_enabled: $("#u-xtream", body).checked,
         enabled: $("#u-enabled", body).checked, max_connections: +$("#u-max", body).value || 1,
-        expire_date: $("#u-exp", body).value || null, groups };
+        expire_date: $("#u-exp", body).value || null,
+        area_id: +$("#u-area", body).value || null, groups };
       if (id) await api(`/api/users/${id}`, { method: "PUT", body: payload });
       else await api("/api/users", { method: "POST", body: payload });
       toast("user saved", "ok"); m.close(); table.reload();

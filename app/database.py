@@ -381,6 +381,9 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "serie_sources": {
         "raw_series": ("TEXT", "NULL"),
     },
+    "users": {
+        "area_id": ("INTEGER", "NULL"),
+    },
 }
 
 

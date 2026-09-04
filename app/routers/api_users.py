@@ -12,7 +12,7 @@ from sqlalchemy import select
 
 from ..database import get_db
 from ..models import (
-    LivePlaylist, LocalPlaylist, SeriePlaylist, User, VodPlaylist,
+    Area, LivePlaylist, LocalPlaylist, SeriePlaylist, User, VodPlaylist,
 )
 from ..security import require_admin
 
@@ -30,7 +30,8 @@ async def _base(request: Request) -> str:
     return f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
 
 
-def _row(u: User, base: str, available: dict | None = None) -> dict:
+def _row(u: User, base: str, available: dict | None = None,
+         areas: dict[int, str] | None = None) -> dict:
     groups = json.loads(u.groups_json or "{}")
     stale: dict[str, list[str]] | None = None
     if available is not None:
@@ -45,6 +46,8 @@ def _row(u: User, base: str, available: dict | None = None) -> dict:
             "m3u_enabled": u.m3u_enabled, "xtream_enabled": u.xtream_enabled,
             "expire_date": u.expire_date, "max_connections": u.max_connections,
             "enabled": u.enabled, "groups": groups,
+            "area_id": u.area_id,
+            "area_name": (areas or {}).get(u.area_id) if u.area_id else None,
             "m3u_url": f"{base}/playlist.m3u?u={u.name}&p={u.password}",
             "xtream": {"server": base.rsplit(":", 1)[0].replace("://", "://") ,
                        "url": base, "username": u.name, "password": u.password,
@@ -68,8 +71,11 @@ async def list_users(request: Request, db=Depends(get_db)):
         "live": await distinct(LivePlaylist), "vod": await distinct(VodPlaylist),
         "series": await distinct(SeriePlaylist), "local": await distinct(LocalPlaylist),
     }
-    return {"items": [_row(u, base, groups_available) for u in rows],
-            "groups_available": groups_available}
+    area_rows = (await db.execute(select(Area).order_by(Area.name))).scalars().all()
+    areas = {a.id: a.name for a in area_rows}
+    return {"items": [_row(u, base, groups_available, areas) for u in rows],
+            "groups_available": groups_available,
+            "areas": [{"id": a.id, "name": a.name, "enabled": a.enabled} for a in area_rows]}
 
 
 def _clean_groups(value) -> dict:
@@ -109,6 +115,8 @@ async def create_user(payload: dict, db=Depends(get_db)):
         if f in payload:
             setattr(u, f, payload[f])
     u.groups_json = json.dumps(_clean_groups(payload.get("groups")))
+    if "area_id" in payload:
+        u.area_id = int(payload["area_id"]) if payload.get("area_id") else None
     db.add(u)
     await db.commit()
     return {"id": u.id}
@@ -124,6 +132,8 @@ async def update_user(uid: int, payload: dict, db=Depends(get_db)):
             setattr(u, f, payload[f])
     if "groups" in payload:
         u.groups_json = json.dumps(_clean_groups(payload["groups"]))
+    if "area_id" in payload:
+        u.area_id = int(payload["area_id"]) if payload.get("area_id") else None
     await db.commit()
     return {"ok": True}
 

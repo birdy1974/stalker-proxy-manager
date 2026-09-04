@@ -20,14 +20,14 @@ import time
 
 from ..database import SessionLocal
 from ..models import (
-    LivePlaylist, LocalFile, LocalPlaylist, LocalSource, SerieEpisode,
-    SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource, User,
-    VodPlaylist, VodSource,
+    Area, AreaItemTemplate, LivePlaylist, LocalFile, LocalPlaylist, LocalSource,
+    SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource,
+    User, VodPlaylist, VodSource,
 )
 from .db_logging import db_log
 from .local_files import extinf_duration, play_extension
 from .runtime_settings import get_setting  # noqa: F401  (re-export; EPG scheduler)
-from .titles import best_title, m3u_attr
+from .titles import best_title, m3u_attr, m3u_display_title
 
 
 class UserAuth:
@@ -137,7 +137,8 @@ _M3U_CACHE: dict[tuple, tuple[float, str]] = {}
 _M3U_CACHE_TTL = 120
 # Tables whose row count / max(id) form the cheap cache-bust signature.
 _REVISION_TABLES = (LivePlaylist, VodPlaylist, SeriePlaylist, LocalPlaylist,
-                    SeriePlaylistSeason, LocalFile, SerieEpisode)
+                    SeriePlaylistSeason, LocalFile, SerieEpisode,
+                    Area, AreaItemTemplate)
 
 
 def clear_m3u_cache() -> None:
@@ -165,14 +166,15 @@ async def _playlist_revision(s) -> tuple:
 
 
 def _extinf_title(title: str | None) -> str:
-    """Display name after the EXTINF comma — must be a single physical line."""
-    return (title or "").replace("\r", " ").replace("\n", " ").replace("\0", "")
+    """Display name after the EXTINF comma: one line, VLC-safe dashes."""
+    return m3u_display_title(title)
 
 
 async def build_m3u(base_url: str, user: User) -> str:
     async with SessionLocal() as s:
         revision = await _playlist_revision(s)
-    key = (user.id, user.groups_json or "", base_url, revision)
+    key = (user.id, user.groups_json or "", getattr(user, "area_id", None),
+           base_url, revision)
     cached = _M3U_CACHE.get(key)
     if cached and time.monotonic() - cached[0] < _M3U_CACHE_TTL:
         return cached[1]
@@ -195,6 +197,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
     to load the playlist" complaint, because VLC blocks on this response before
     it shows a single channel.
     """
+    from .playback import template_map_for
     groups = _groups(user)
     u, p = quote(user.name), quote(user.password)
     # No url-tvg / x-tvg-url: VLC (and several other players) block playlist
@@ -203,6 +206,7 @@ async def _build_m3u(base_url: str, user: User) -> str:
     lines = ["#EXTM3U"]
 
     async with SessionLocal() as s:
+        tmap = await template_map_for(s, user)
         # ---- live ------------------------------------------------------
         items = (await s.execute(select(LivePlaylist).where(LivePlaylist.enabled.is_(True))
                                  .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
@@ -239,7 +243,8 @@ async def _build_m3u(base_url: str, user: User) -> str:
                     f'tvg-logo="{m3u_attr(it.poster or it.logo or "")}" '
                     f'group-title="{m3u_attr(it.group_name or "VOD")}"')
             lines.append(f"#EXTINF:-1 {attr},{title}")
-            lines.append(f"{base_url}/play/vod/{it.id}.ts?u={u}&p={p}")
+            ext = tmap.resolve("vod", it).container
+            lines.append(f"{base_url}/play/vod/{it.id}.{ext}?u={u}&p={p}")
 
         # ---- series: one m3u entry per episode of enabled seasons ------
         # Filter by the user's group whitelist FIRST, then fetch seasons and
@@ -280,7 +285,8 @@ async def _build_m3u(base_url: str, user: User) -> str:
                             f'tvg-logo="{m3u_attr(sp.poster or sp.logo or "")}" '
                             f'group-title="{m3u_attr("Series: " + (sp.group_name or sp.custom_name))}"')
                     lines.append(f"#EXTINF:-1 {attr},{name}")
-                    lines.append(f"{base_url}/play/episode/{ep_id}.ts?u={u}&p={p}")
+                    ext = tmap.resolve("series", sp).container
+                    lines.append(f"{base_url}/play/episode/{ep_id}.{ext}?u={u}&p={p}")
 
         # ---- local files ------------------------------------------------
         locals_ = (await s.execute(select(LocalPlaylist).where(LocalPlaylist.enabled.is_(True))
@@ -380,6 +386,8 @@ async def xtream_vod(user: User) -> list[dict]:
     groups = _groups(user)
     cats = {c["category_name"]: c["category_id"] for c in await xtream_categories(user, "vod")}
     async with SessionLocal() as s:
+        from .playback import template_map_for
+        tmap = await template_map_for(s, user)
         items = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                                  .order_by(VodPlaylist.order))).scalars().all()
     src_names: dict[int, str] = {}
@@ -395,7 +403,8 @@ async def xtream_vod(user: User) -> list[dict]:
         "stream_id": it.id, "stream_icon": it.poster or it.logo or "",
         "rating": it.rating or "", "rating_5based": 0, "added": "0",
         "category_id": cats.get(it.group_name or "VOD", "1"),
-        "container_extension": "ts", "custom_sid": "", "direct_source": "",
+        "container_extension": tmap.resolve("vod", it).container,
+        "custom_sid": "", "direct_source": "",
     } for it in items if _allowed(it.group_name, groups["vod"])]
 
 
@@ -404,10 +413,12 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
     the portal source as fallback (poster/plot/year/rating may live on either)."""
     groups = _groups(user)
     async with SessionLocal() as s:
+        from .playback import template_map_for
         it = await s.get(VodPlaylist, vod_id)
         if not it or not it.enabled or not _allowed(it.group_name, groups["vod"]):
             return None
         src = await s.get(VodSource, it.vod_source_id)
+        ext = (await template_map_for(s, user)).resolve("vod", it).container
     poster = it.poster or (src.poster if src else "") or it.logo or ""
     plot = it.overview or (src.description if src else "") or ""
     rating = it.rating or (src.rating if src else "") or ""
@@ -428,7 +439,7 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
     return {"info": info,
             "movie_data": {"stream_id": it.id, "name": title, "added": "0",
                            "category_id": cats.get(it.group_name or "VOD", "1"),
-                           "container_extension": "ts", "custom_sid": "", "direct_source": ""}}
+                           "container_extension": ext, "custom_sid": "", "direct_source": ""}}
 
 
 async def xtream_series(user: User) -> list[dict]:
@@ -452,10 +463,12 @@ async def xtream_series(user: User) -> list[dict]:
 async def xtream_series_info(user: User, series_id: int) -> dict | None:
     groups = _groups(user)
     async with SessionLocal() as s:
+        from .playback import template_map_for
         sp = await s.get(SeriePlaylist, series_id)
         if not sp or not _allowed(sp.group_name, groups["series"]):
             return None
         src = await s.get(SerieSource, sp.serie_source_id)
+        ep_ext = (await template_map_for(s, user)).resolve("series", sp).container
         season_rows = (await s.execute(
             select(SeriePlaylistSeason, SerieSeason)
             .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
@@ -476,7 +489,7 @@ async def xtream_series_info(user: User, series_id: int) -> dict | None:
                 lst.append({
                     "id": str(ep.id), "episode_num": ep.episode_number,
                     "title": ep.name or f"Episode {ep.episode_number}",
-                    "container_extension": "ts",
+                    "container_extension": ep_ext,
                     "info": {"duration": (ep.duration or "42:00"),
                              "movie_image": sp.poster or "",
                              "tmdb_id": str(sp.tmdb_id or "") if sp.tmdb_id else "",

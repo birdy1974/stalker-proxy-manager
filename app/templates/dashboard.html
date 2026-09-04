@@ -46,6 +46,7 @@
         <a class="btn btn-sm btn-accent" href="/portals"><i class="bi bi-plus-circle"></i> Add portal</a>
         <a class="btn btn-sm btn-outline-secondary" href="/portals"><i class="bi bi-cloud-download"></i> Fetch channels</a>
         <a class="btn btn-sm btn-outline-secondary" href="/playlist"><i class="bi bi-pencil-square"></i> Edit playlist</a>
+        <a class="btn btn-sm btn-outline-secondary" href="/areas"><i class="bi bi-geo-alt"></i> Areas</a>
         <a class="btn btn-sm btn-outline-secondary" href="/users"><i class="bi bi-person-plus"></i> Xtream users</a>
         <a class="btn btn-sm btn-outline-secondary" href="/settings"><i class="bi bi-download"></i> Backup / restore</a>
       </div>
@@ -91,6 +92,7 @@ async function refreshStats() {
     card("Series", `${s.series_enabled}/${s.series_available}`, "enabled / available", "/playlist?tab=series") +
     card("Playlist items", s.playlist_items, "", "/playlist") +
     card("FFmpeg templates", s.ffmpeg_templates, "enabled", "/ffmpeg") +
+    card("Areas", s.areas ?? 0, "playback overlays", "/areas") +
     card("Users", s.users, "", "/users") +
     card("Enigma2", s.enigma2_profiles, "receivers", "/enigma2") +
     card("Active streams", d.streams.length);
