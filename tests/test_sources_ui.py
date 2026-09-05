@@ -21,9 +21,13 @@ def test_local_files_table_has_bulk_enable_disable():
     assert 'mBtn("Disable selected", "btn-outline-secondary", bulkLocalFiles(false)' in SOURCES
 
 
-def test_live_playlist_click_selects_the_whole_name():
+def test_live_playlist_first_click_selects_name_and_second_click_places_caret():
     assert "onfocus=\"this.select()\"" in SOURCES
-    assert "onmouseup=\"event.preventDefault()\"" in SOURCES
+    # The first click must preserve select-all, but subsequent clicks must not
+    # have their normal caret placement prevented.
+    assert "document.activeElement === this" in SOURCES
+    assert "if(this.dataset.wasFocused === 'false') event.preventDefault()" in SOURCES
+    assert 'onmouseup="event.preventDefault()"' not in SOURCES
     # disabled channels stay blank, not an input
     assert "enable the channel to give it a custom name" in SOURCES
 

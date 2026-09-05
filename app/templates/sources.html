@@ -117,16 +117,18 @@ function playlistNameCell(r) {
   } else if (r.playlist_id && r.playlist_is_primary) {
     badge = ` <span class="badge text-bg-success" title="primary source of this custom channel">primary</span>`;
   }
-  // stopPropagation so typing / clicking the input does not select the row
-  // mouseup preventDefault keeps the select-all from collapsing when the
-  // click that focused the field also places the caret.
+  // stopPropagation so typing / clicking the input does not select the row.
+  // On the click that focuses the input, keep the focus handler's select-all
+  // from collapsing. On later clicks the input was already focused, so allow
+  // the browser to place the caret (or select a smaller range) normally.
   return `<div class="d-flex align-items-center gap-1" onclick="event.stopPropagation()">
     <input class="form-control form-control-sm flex-grow-1" style="min-width:200px"
       value="${esc(name)}"
       placeholder="custom channel name…"
       title="Click to edit. Unique name → new custom channel. Existing name → this source becomes a fallback."
+      onmousedown="this.dataset.wasFocused = document.activeElement === this ? 'true' : 'false'"
       onfocus="this.select()"
-      onmouseup="event.preventDefault()"
+      onmouseup="if(this.dataset.wasFocused === 'false') event.preventDefault(); delete this.dataset.wasFocused"
       onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
       onblur="saveLivePlaylistName(${r.id}, this)">
     ${badge}
