@@ -1,6 +1,7 @@
 2026-09-05
 - add favicon (for all tabs)
 - on "input source" tab change the header name of field "Playlist" (between "channel" and "portal") to "Custom Channel Name". also make the width of column "channel" smaller and the width of column "Custom Channel Name" bigger
+- if you click on the "Custom Channel Name" information it is directly selected so the user can overwrite the value, but when it is selected and the user clicks it again, the user should be able to change the existing value, now he can only type a new value.
 - in case a live channel is enabled in "input source" tab, it directly needs to be added as as a new custom channel, where the custom channel name is the same as the original channel name. after the channel is added the channel name should appear in the "Custom Channel Name" column so the user can edit it.
 - on "input source" tab also add the column "Custom Group" which is the same information of the "Group" in the Playlist tab. this field will have the same functionality as the "custom channel name" only for the group/genre information.
 - it takes a really long time before local files are playing (no ffmpeg transcoding assigned))
