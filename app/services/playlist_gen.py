@@ -25,8 +25,10 @@ from ..models import (
     User, VodPlaylist, VodSource,
 )
 from .db_logging import db_log
+from .ffmpeg_templates import serves_original_file
 from .local_files import extinf_duration, play_extension
-from .runtime_settings import get_setting  # noqa: F401  (re-export; EPG scheduler)
+from .runtime_settings import (get_setting,  # noqa: F401  (re-export; EPG scheduler)
+                               vlc_local_network_caching_ms)
 from .titles import best_title, m3u_attr, m3u_display_title
 
 
@@ -173,12 +175,13 @@ def _extinf_title(title: str | None) -> str:
 async def build_m3u(base_url: str, user: User) -> str:
     async with SessionLocal() as s:
         revision = await _playlist_revision(s)
+    local_cache_ms = await vlc_local_network_caching_ms()
     key = (user.id, user.groups_json or "", getattr(user, "area_id", None),
-           base_url, revision)
+           base_url, local_cache_ms, revision)
     cached = _M3U_CACHE.get(key)
     if cached and time.monotonic() - cached[0] < _M3U_CACHE_TTL:
         return cached[1]
-    text = await _build_m3u(base_url, user)
+    text = await _build_m3u(base_url, user, local_cache_ms=local_cache_ms)
     _M3U_CACHE[key] = (time.monotonic(), text)
     # Bound memory when users/URLs change.
     if len(_M3U_CACHE) > 100:
@@ -186,7 +189,7 @@ async def build_m3u(base_url: str, user: User) -> str:
         _M3U_CACHE.pop(oldest, None)
     return text
 
-async def _build_m3u(base_url: str, user: User) -> str:
+async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) -> str:
     """
     Render the final per-user playlist (groups filtered per user).
 
@@ -306,9 +309,17 @@ async def _build_m3u(base_url: str, user: User) -> str:
                 continue
             name = _extinf_title(best_title(it.custom_name, lf.filename))
             dur = extinf_duration(lf.duration_s)
-            ext = play_extension(lf.filename)
+            resolved = tmap.resolve("local", it)
+            direct = serves_original_file(resolved.command)
+            # Direct VLC playback must advertise the file's real on-disk
+            # extension. A `.ts` alias forces _local_response through ffmpeg,
+            # even when the item otherwise qualifies for zero-copy serving.
+            ext = (play_extension(lf.relative_path or lf.filename) if direct
+                   else "." + resolved.container)
             lines.append(f'#EXTINF:{dur} tvg-name="{m3u_attr(name)}" '
                          f'group-title="{m3u_attr(it.group_name or "vod-local")}",{name}')
+            if direct and local_cache_ms > 0:
+                lines.append(f"#EXTVLCOPT:network-caching={local_cache_ms}")
             lines.append(f"{base_url}/play/local/{it.id}{ext}?u={u}&p={p}")
 
     return "\n".join(lines) + "\n"

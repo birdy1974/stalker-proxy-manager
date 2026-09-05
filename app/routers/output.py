@@ -320,14 +320,18 @@ async def _local_response(pid: int, user, request: Request, ext: str | None = No
     path, item_name = await MANAGER.local_disk_path(pid)
     if not path:
         raise HTTPException(404, f"local #{pid}: file not found on disk")
-    if await MANAGER.local_serves_original(pid) and _requested_matches_file(path, ext):
+    if await MANAGER.local_serves_original(
+            pid, user.name if user else None) and _requested_matches_file(path, ext):
         if not MANAGER.can_open_for(user.name if user else None,
                                     user.max_connections if user else None):
             await db_log("WARNING", "output",
                          f"user {user.name if user else 'admin'} exceeded max_connections")
             raise HTTPException(429, "max connections reached for this user")
         media_type = media_type_for(path)
-        headers = {"Cache-Control": "no-store"}
+        # Do not let nginx-compatible reverse proxies fill a large response
+        # buffer before VLC receives the first bytes. FileResponse supplies
+        # Content-Length, Accept-Ranges and efficient asynchronous file reads.
+        headers = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
         if request.method == "HEAD":
             return FileResponse(path, media_type=media_type, headers=headers)
         handle = await MANAGER.register_local_file(

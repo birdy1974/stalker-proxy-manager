@@ -59,6 +59,19 @@ async def fetch_page_budget() -> int:
         return 30
 
 
+async def vlc_local_network_caching_ms() -> int:
+    """VLC network cache advertised for direct local-file M3U entries.
+
+    Zero disables the VLC-specific directive. Keep bad restored/imported values
+    from producing unreasonable playlists.
+    """
+    val = await get_setting("vlc_local_network_caching_ms", 500)
+    try:
+        return min(60_000, max(0, int(val)))
+    except (TypeError, ValueError):
+        return 500
+
+
 async def output_base_url() -> str:
     """Public URL override (no trailing slash). Empty = derive from the request.
 

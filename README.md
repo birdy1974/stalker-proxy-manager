@@ -179,6 +179,14 @@ Shipped presets (stored as rows in the database and **re-seeded on every boot** 
 
 **Redirect (bypass ffmpeg) is the default.** The old global *proxy vs redirect* switch in Settings is gone: redirect is now a built-in template **and the default**. An item without an explicit template assignment is 302-redirected straight to the portal's CDN — instant start and zero CPU, but no transcode, no transport-stream rewriting and no mid-stream fallback. Assign any other template (inline *FFmpeg tpl* dropdown, the edit dialog, or bulk *Assign template…* in the Playlist Builder) to switch that channel back to ffmpeg proxying/transcoding. The `?mode=redirect` / `?mode=proxy` query parameter still works as a per-URL override.
 
+**Fast local playback in VLC.** A local item whose effective template is Redirect, Copy, or otherwise
+unassigned is advertised with the file's real on-disk extension and served directly with HTTP Range
+support—never through the `.ts` FFmpeg remux path. Its M3U entry includes
+`#EXTVLCOPT:network-caching=500` by default, configurable under **Settings → VLC local-file network
+cache** (`0` leaves caching to the player). Direct responses also send `X-Accel-Buffering: no`, so an
+nginx-compatible reverse proxy does not hold back the first bytes. A genuinely transcoding local
+item continues to use the template's `.ts` or `.mkv` output extension.
+
 **Default templates are persistent (stored in the database).** The shipped presets are real `ffmpeg_templates` rows marked `is_builtin`. On every boot the app reconciles them by name, so:
 
 * they survive deletion (delete one, restart → it is back),

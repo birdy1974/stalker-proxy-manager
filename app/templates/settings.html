@@ -91,6 +91,7 @@
 const SETTING_DEFS = [
   ["playlist_url_format", "Playlist URL format", "text", "{base}/play/{type}/{id}.ts?u={u}&p={p}"],
   ["output_base_url", "Public base URL override (reverse proxy/NAT)", "text", ""],
+  ["vlc_local_network_caching_ms", "VLC local-file network cache (ms, 0 = player default)", "number", 500],
   ["fallback_strategy", "Fallback order strategy", ["macs_first", "portal_first"], "macs_first"],
   ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
   ["epg_refresh_hours", "EPG refresh interval (hours)", "number", 24],
@@ -100,6 +101,7 @@ const SETTING_DEFS = [
   ["tmdb_api_key", "TMDB API key (detail-popups enrichment)", "text", ""],
 ];
 const SETTING_HELP = {
+  vlc_local_network_caching_ms: "Written as #EXTVLCOPT:network-caching before each directly served local file. Lower starts faster; increase it on an unstable network. Takes effect when the playlist is reloaded.",
   fallback_strategy: "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately. Takes effect on the next play/fetch (no restart).",
   mac_health_minutes: "Background handshake of every MAC on multi-MAC portals (status + expire date). MACs holding a live stream are skipped. 0 pauses the scheduler.",
   mac_health_multi_only: "When true, single-MAC portals are left alone (they are cheap to Test by hand). When false, every enabled portal is swept.",
