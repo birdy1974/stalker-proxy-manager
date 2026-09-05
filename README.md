@@ -523,7 +523,9 @@ channel and made paging the list expensive. It is gone. In its place, between **
 read like a link to the Playlist *tab* rather than an editable name):
 
 - shown only for **enabled** channels (disabled rows stay blank);
-- default value = the portal's original channel name;
+- enabling a channel immediately adds it to the live playlist using the portal's original channel name;
+  if that custom name already exists (case-insensitive), the source is appended to its fallback chain;
+- the resulting primary/fallback name appears in this column as soon as the switch completes;
 - edit the cell (blur / Enter) to set the custom name used in the final M3U / Xtream output:
   - **unique name** → a new custom live channel is created (or the channel this source already owns as primary is renamed);
   - **name already used** (case-insensitive) → this source is attached as a **fallback** on that existing custom channel.

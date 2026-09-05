@@ -252,8 +252,9 @@ async def toggle(payload: dict, db=Depends(get_db)):
     rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
     for r in rows:
         r.enabled = enabled
-    # mirror the switch into the output playlist (vod/series; live channels are
-    # curated custom channels and are added explicitly from the Playlist tab)
+    # Mirror the switch into the output playlist. A newly enabled live source
+    # is created under its original name, or joins the same-name channel as a
+    # fallback; existing custom edits are preserved on later re-enables.
     synced = {}
     if payload.get("kind") in SYNC_KINDS:
         synced = await sync_sources(db, payload["kind"], [r.id for r in rows], enabled)
@@ -278,6 +279,7 @@ async def toggle(payload: dict, db=Depends(get_db)):
     await db_log("INFO", "sources",
                  f"{payload['kind']}: {len(rows)} items -> enabled={enabled}"
                  + (f" (playlist: +{synced.get('created', 0)} new, "
+                    f"+{synced.get('fallback', 0)} fallback, "
                     f"{synced.get('enabled', 0)} re-enabled, "
                     f"{synced.get('disabled', 0)} switched off)" if synced else ""))
     return {"ok": True, "count": len(rows), "playlist": synced,

@@ -62,6 +62,64 @@ async def test_live_list_carries_playlist_name_only_when_enabled():
         assert off["playlist_id"] is None
 
 
+async def test_enabling_live_sources_creates_channel_and_same_name_fallback():
+    ids = await _seed(n=2, enable=False)
+    async with SessionLocal() as s:
+        second = await s.get(LiveSource, ids[1])
+        second.original_name = "npo 1 hd"  # matching is case-insensitive
+        await s.commit()
+
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        response = await c.post("/api/sources/toggle", json={
+            "kind": "live", "ids": ids, "enabled": True,
+        })
+        assert response.status_code == 200, response.text
+        sync = response.json()["playlist"]
+        assert sync["created"] == 1
+        assert sync["fallback"] == 1
+
+        listing = await c.get("/api/sources/live?per_page=50")
+        by_id = {item["id"]: item for item in listing.json()["items"]}
+        assert by_id[ids[0]]["playlist_name"] == "NPO 1 HD"
+        assert by_id[ids[0]]["playlist_is_primary"] is True
+        assert by_id[ids[1]]["playlist_name"] == "NPO 1 HD"
+        assert by_id[ids[1]]["playlist_is_primary"] is False
+        assert by_id[ids[1]]["playlist_priority"] == 2
+
+    async with SessionLocal() as s:
+        playlists = (await s.execute(select(LivePlaylist))).scalars().all()
+        assert len(playlists) == 1
+        links = (await s.execute(select(LivePlaylistSource).order_by(
+            LivePlaylistSource.priority))).scalars().all()
+        assert [link.live_source_id for link in links] == ids
+
+
+async def test_reenable_preserves_an_edited_live_custom_name():
+    ids = await _seed(n=1)
+    async with SessionLocal() as s:
+        created = await assign_live_custom_name(s, ids[0], "My edited channel")
+        await s.commit()
+
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        for enabled in (False, True):
+            response = await c.post("/api/sources/toggle", json={
+                "kind": "live", "ids": ids, "enabled": enabled,
+            })
+            assert response.status_code == 200, response.text
+        listing = await c.get("/api/sources/live?per_page=50")
+        row = next(item for item in listing.json()["items"] if item["id"] == ids[0])
+        assert row["playlist_id"] == created["playlist_id"]
+        assert row["playlist_name"] == "My edited channel"
+
+
 async def test_unique_name_creates_a_custom_channel():
     ids = await _seed(n=1)
     async with SessionLocal() as s:

@@ -52,7 +52,7 @@ function sourceTable(kind, hostSel) {
     mBtn("Disable selected", "btn-outline-secondary", bulk(false), "bi-x"));
   const cols = {
     live: [
-      { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'${kind}',ids:[${r.id}],enabled:this.checked}})"></div>` },
+      { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'${kind}',ids:[${r.id}],enabled:this.checked}}).then(()=>TABS.live&&TABS.live.reload())"></div>` },
       { key: "number", label: "#", sort: "id", width: "50px", render: r => esc(r.number || "") },
       { key: "logo", label: "Logo", width: "70px", render: r => r.logo ? `<img class="logo-thumb" loading="lazy" src="${esc(r.logo)}" onerror="this.style.display='none'">` : "" },
       { key: "name", label: "Channel", sort: "name", class: "col-channel", width: "190px",

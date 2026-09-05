@@ -32,6 +32,10 @@ def test_live_playlist_first_click_selects_name_and_second_click_places_caret():
     assert "enable the channel to give it a custom name" in SOURCES
 
 
+def test_enabling_one_live_source_reloads_its_custom_name_cell():
+    assert ".then(()=>TABS.live&&TABS.live.reload())" in SOURCES
+
+
 def test_the_editable_column_is_named_and_sized_for_typing():
     """The column between Channel and Portal is the one people type in.
 

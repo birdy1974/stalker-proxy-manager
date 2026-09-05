@@ -12,9 +12,9 @@ Rules
   * source enabled  -> create the playlist row (idempotent) or switch it on
   * source disabled -> keep the row and its edits, but switch it off, so a
     later re-enable restores it without losing the group/template the user set
-  * live channels are NOT auto-created: they are curated custom channels with
-    an ordered fallback chain, so they are added explicitly (in bulk, see
-    `add_sources`) instead of implicitly
+  * a newly enabled live source gets an automatic custom channel named after
+    the portal channel; when that name already exists it joins the existing
+    channel's ordered fallback chain instead
 
 Everything runs in ONE transaction and with a handful of queries per call - the
 old per-item path (one session + commit per row) is what made bulk operations
@@ -33,7 +33,7 @@ from ..models import (LiveGenre, LivePlaylist, LivePlaylistSource, LiveSource,
 from .titles import best_title
 
 # kinds whose "enabled" switch mirrors straight into the output playlist
-SYNC_KINDS = ("vod", "series", "local")
+SYNC_KINDS = ("live", "vod", "series", "local")
 # kinds that can be pushed into the playlist from an explicit (bulk) action
 ADD_KINDS = ("live", "vod", "series", "local")
 
@@ -144,13 +144,83 @@ async def _sync_local(db, ids: list[int], enabled: bool) -> dict:
     return {"created": created, "enabled": enabled_n, "disabled": disabled_n}
 
 
+# -------------------------------------------------------------------- live
+async def _sync_live(db, ids: list[int], enabled: bool) -> dict:
+    """Add newly enabled live sources to the custom-channel playlist.
+
+    Existing links are deliberately preserved. In particular, re-enabling a
+    source must not overwrite a custom name the user edited earlier. Disabling
+    a source likewise leaves its placement intact so it can be restored.
+    """
+    if not enabled:
+        return {"created": 0, "fallback": 0, "enabled": 0, "disabled": 0}
+
+    linked = {sid for (sid,) in (await db.execute(
+        select(LivePlaylistSource.live_source_id).where(
+            LivePlaylistSource.live_source_id.in_(ids)))).all()}
+    sources = {src.id: src for src in (await db.execute(
+        select(LiveSource).where(LiveSource.id.in_(ids)))).scalars().all()}
+    playlists = (await db.execute(select(LivePlaylist))).scalars().all()
+    by_name: dict[str, LivePlaylist] = {}
+    for playlist in playlists:
+        # Keep matching deterministic if an old database already contains
+        # duplicate names: the oldest playlist wins, as in the editor path.
+        by_name.setdefault(_name_key(playlist.custom_name), playlist)
+    priorities = {pid: int(priority or 0) for pid, priority in (await db.execute(
+        select(LivePlaylistSource.live_playlist_id,
+               func.max(LivePlaylistSource.priority))
+        .group_by(LivePlaylistSource.live_playlist_id))).all()}
+    genre_ids = {src.live_genre_id for src in sources.values() if src.live_genre_id}
+    genres = {genre.id: genre for genre in (await db.execute(
+        select(LiveGenre).where(LiveGenre.id.in_(genre_ids)))).scalars().all()}
+    nxt = await _next_order(db, LivePlaylist, 1)
+
+    created = fallback = 0
+    for source_id in ids:
+        src = sources.get(source_id)
+        if src is None or not src.enabled or source_id in linked:
+            continue
+        name = (src.original_name or "").strip()
+        if not name:
+            continue
+        playlist = by_name.get(_name_key(name))
+        if playlist is not None:
+            priority = priorities.get(playlist.id, 0) + 1
+            db.add(LivePlaylistSource(live_playlist_id=playlist.id,
+                                      live_source_id=source_id, priority=priority))
+            priorities[playlist.id] = priority
+            fallback += 1
+            continue
+
+        genre = genres.get(src.live_genre_id)
+        playlist = LivePlaylist(
+            custom_name=name,
+            group_name=(genre.name if genre else None) or "Live",
+            number=int(src.number) if str(src.number or "").isdigit() else None,
+            epg_id=src.epg_original, logo=src.logo_original,
+            enabled=True, order=nxt,
+        )
+        db.add(playlist)
+        await db.flush()  # its id is required by the primary-source link
+        db.add(LivePlaylistSource(live_playlist_id=playlist.id,
+                                  live_source_id=source_id, priority=1))
+        by_name[_name_key(name)] = playlist
+        priorities[playlist.id] = 1
+        created += 1
+        nxt += 1
+    return {"created": created, "fallback": fallback,
+            "enabled": 0, "disabled": 0}
+
+
 # ------------------------------------------------------------------- public
 async def sync_sources(db, kind: str, ids, enabled: bool) -> dict:
     """Mirror an Input-Sources switch into the output playlist (no commit)."""
     ids = _clean_ids(ids)
     if kind not in SYNC_KINDS or not ids:
         return {"kind": kind, "created": 0, "enabled": 0, "disabled": 0}
-    if kind == "vod":
+    if kind == "live":
+        out = await _sync_live(db, ids, enabled)
+    elif kind == "vod":
         out = await _sync_vod(db, ids, enabled)
     elif kind == "series":
         out = await _sync_series(db, ids, enabled)
