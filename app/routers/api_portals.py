@@ -116,7 +116,12 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
                       "force_ch_link_check": bool(m.force_ch_link_check),
                       "sn": m.sn or "", "device_id": m.device_id or "",
                       "fail_count": m.fail_count,
-                      "last_checked": m.last_checked.isoformat() if m.last_checked else None}
+                      "last_checked": m.last_checked.isoformat() if m.last_checked else None,
+                      "genre_counts": {"live": m.genre_count_live,
+                                       "vod": m.genre_count_vod,
+                                       "series": m.genre_count_series},
+                      "genres_compared_at": (m.genres_compared_at.isoformat()
+                                             if m.genres_compared_at else None)}
                      for m in macs]}
 
 

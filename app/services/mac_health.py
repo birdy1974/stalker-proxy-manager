@@ -332,6 +332,29 @@ def _diff_kind(per_mac: list[dict], kind: str) -> dict:
     }
 
 
+async def _persist_mac_genre_counts(per_mac: list[dict]) -> int:
+    """Store successful per-kind counts without erasing older partial results."""
+    updated = 0
+    compared_at = datetime.now(timezone.utc)
+    async with SessionLocal() as s:
+        for block in per_mac:
+            if not block.get("ok") or not block.get("mac_id"):
+                continue
+            mac = await s.get(MacAddress, int(block["mac_id"]))
+            if mac is None:
+                continue
+            wrote = False
+            for kind in ("live", "vod", "series"):
+                if not block.get(f"{kind}_error"):
+                    setattr(mac, f"genre_count_{kind}", len(block.get(kind) or []))
+                    wrote = True
+            if wrote:
+                mac.genres_compared_at = compared_at
+                updated += 1
+        await s.commit()
+    return updated
+
+
 async def _persist_genres_from_compare(portal_id: int, per_mac: list[dict]) -> dict:
     """
     Union every successfully fetched genre list into the portal's genre tables.
@@ -437,10 +460,13 @@ async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> di
     failed = [b for b in per_mac if not b.get("ok") or any(
         b.get(f"{kind}_error") for kind in ("live", "vod", "series"))]
 
-    # Persist the union so secondary packages land in the catalogue tables.
+    # Persist both the package summary on each MAC and the union used by the
+    # portal genre editor. Either write may fail without losing the report.
     stored = {"live": 0, "vod": 0, "series": 0}
+    counts_stored = 0
     try:
         if any(b.get("ok") for b in per_mac):
+            counts_stored = await _persist_mac_genre_counts(per_mac)
             stored = await _persist_genres_from_compare(portal_id, per_mac)
     except Exception:  # noqa: BLE001 - compare report must still return
         log.exception("genre persist after compare failed for portal %s", portal_id)
@@ -498,6 +524,6 @@ async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> di
         "identical": identical and not failed, "message": msg,
         "macs": mac_summary, "results": per_mac, "packages": packages,
         "live": live, "vod": vod, "series": series,
-        "stored": stored,
+        "stored": stored, "mac_counts_stored": counts_stored,
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }

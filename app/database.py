@@ -372,6 +372,10 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         "force_ch_link_check": ("BOOLEAN", "0"),
         "sn": ("VARCHAR(40)", "NULL"),
         "device_id": ("VARCHAR(80)", "NULL"),
+        "genre_count_live": ("INTEGER", "NULL"),
+        "genre_count_vod": ("INTEGER", "NULL"),
+        "genre_count_series": ("INTEGER", "NULL"),
+        "genres_compared_at": ("DATETIME", "NULL"),
     },
     "ffmpeg_templates": {
         "low_power": ("BOOLEAN", "1"),

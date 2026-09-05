@@ -149,9 +149,16 @@ function makeTable() {
           const multi = (r.macs || []).length >= 2;
           const rows = (r.macs || []).map(m => {
             const checked = m.last_checked ? ` · checked ${esc(m.last_checked.slice(0, 16).replace("T", " "))}` : "";
-            return `<div class="d-flex align-items-center gap-2 mb-1">
+            const gc = m.genre_counts || {};
+            const compared = m.genres_compared_at
+              ? `Compared ${esc(m.genres_compared_at.slice(0,16).replace("T"," "))}` : "Not compared yet";
+            const genreCounts = [gc.live, gc.vod, gc.series].some(v => v !== null && v !== undefined)
+              ? `<span class="badge text-bg-light" title="${compared}">Genres L ${gc.live ?? '?'} · V ${gc.vod ?? '?'} · S ${gc.series ?? '?'}</span>`
+              : `<span class="small text-muted" title="Run Compare genres across MACs">genres not compared</span>`;
+            return `<div class="d-flex flex-wrap align-items-center gap-2 mb-1">
               <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
               <span class="small text-muted" title="expire date from the panel">${esc(m.expire_date || "")}</span>
+              ${genreCounts}
               <span class="small text-muted">${checked}</span>
               <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="STB identity this portal is told (serial, device id) - pin the values your box really sends"
                 onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
@@ -629,6 +636,7 @@ window.compareGenres = async (pid) => {
       const d = await api(`/api/portals/${pid}/compare-genres`, {method:"POST", body:{mac_ids:ids}});
       const stored = await api(`/api/portals/${pid}/genres`);
       choose.close();
+      table.reload(); // expose the newly persisted per-MAC counts in the portal list
       showGenreMatrix(pid, d, stored);
     } catch (e) { go.disabled = false; go.textContent = "Fetch & compare"; throw e; }
   });
