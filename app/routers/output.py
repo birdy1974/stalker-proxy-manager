@@ -277,7 +277,7 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
 
 @router.api_route("/play/live/{pid}.ts", methods=["GET", "HEAD"])
 async def play_live(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
     if request.method == "HEAD":
         return _stream_head()
     return await _stream_response("live", pid, user, f"live #{pid}", request, mode)
@@ -285,7 +285,7 @@ async def play_live(request: Request, pid: int, u: str = "", p: str = "", mode: 
 
 @router.api_route("/play/vod/{pid}.ts", methods=["GET", "HEAD"])
 async def play_vod(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
     if request.method == "HEAD":
         return _stream_head()
     return await _stream_response("vod", pid, user, f"vod #{pid}", request, mode)
@@ -293,7 +293,7 @@ async def play_vod(request: Request, pid: int, u: str = "", p: str = "", mode: s
 
 @router.api_route("/play/episode/{eid}.ts", methods=["GET", "HEAD"])
 async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
     if request.method == "HEAD":
         return _stream_head()
     return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode)
@@ -306,7 +306,7 @@ async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mod
 # arrive intact: MPEG-TS has no slot for text subtitles, Matroska has.
 @router.api_route("/play/live/{pid}.mkv", methods=["GET", "HEAD"])
 async def play_live_mkv(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
     if request.method == "HEAD":
         return _stream_head(MEDIA_TYPES["mkv"])
     return await _stream_response("live", pid, user, f"live #{pid}", request, mode,
@@ -315,7 +315,7 @@ async def play_live_mkv(request: Request, pid: int, u: str = "", p: str = "", mo
 
 @router.api_route("/play/vod/{pid}.mkv", methods=["GET", "HEAD"])
 async def play_vod_mkv(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
     if request.method == "HEAD":
         return _stream_head(MEDIA_TYPES["mkv"])
     return await _stream_response("vod", pid, user, f"vod #{pid}", request, mode,
@@ -324,7 +324,7 @@ async def play_vod_mkv(request: Request, pid: int, u: str = "", p: str = "", mod
 
 @router.api_route("/play/episode/{eid}.mkv", methods=["GET", "HEAD"])
 async def play_episode_mkv(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
     if request.method == "HEAD":
         return _stream_head(MEDIA_TYPES["mkv"])
     return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode,
@@ -334,7 +334,7 @@ async def play_episode_mkv(request: Request, eid: int, u: str = "", p: str = "",
 @router.api_route("/play/local/{pid}.{ext}", methods=["GET", "HEAD"])
 async def play_local(request: Request, pid: int, ext: str, u: str = "", p: str = "",
                      mode: str = ""):  # noqa: ARG001
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
     # _local_response handles HEAD without opening FFmpeg while preserving the
     # real file's Content-Length and Range metadata for direct playback.
     return await _local_response(pid, user, request, ext)
@@ -407,29 +407,40 @@ async def _local_response(pid: int, user, request: Request, ext: str | None = No
 
 
 # Xtream-style stream URLs -----------------------------------------------
+async def _xtream_stream(request: Request, kind: str, sid: int, u: str, p: str,
+                         mode: str, container: str = "ts"):
+    """Xtream namespace is gated by xtream_enabled, independent of M3U access."""
+    user = await _authed(u, p, "xtream")
+    media_type = MEDIA_TYPES.get(container, MEDIA_TYPES["ts"])
+    if request.method == "HEAD":
+        return _stream_head(media_type)
+    return await _stream_response(kind, sid, user, f"{kind} #{sid}", request,
+                                  mode, media_type)
+
+
 @router.api_route("/live/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xlive(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_live(request, sid, u, p, mode)
+    return await _xtream_stream(request, "live", sid, u, p, mode)
 
 
 @router.api_route("/movie/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xmovie(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_vod(request, sid, u, p, mode)
+    return await _xtream_stream(request, "vod", sid, u, p, mode)
 
 
 @router.api_route("/series/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xseries(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_episode(request, sid, u, p, mode)
+    return await _xtream_stream(request, "episode", sid, u, p, mode)
 
 
 @router.api_route("/movie/{u}/{p}/{sid}.mkv", methods=["GET", "HEAD"])
 async def xmovie_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_vod_mkv(request, sid, u, p, mode)
+    return await _xtream_stream(request, "vod", sid, u, p, mode, "mkv")
 
 
 @router.api_route("/series/{u}/{p}/{sid}.mkv", methods=["GET", "HEAD"])
 async def xseries_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_episode_mkv(request, sid, u, p, mode)
+    return await _xtream_stream(request, "episode", sid, u, p, mode, "mkv")
 
 
 # -------------------------------------------------- admin quick-play (GUI)

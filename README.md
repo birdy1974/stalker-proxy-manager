@@ -154,6 +154,12 @@ Stream:   http://<host>:8880/play/live/{id}.ts?username=..&password=..
 xmltv:    http://<host>:8880/xmltv.php?username=USER&password=PASS
 ```
 
+Xtream identity advertises only the implemented MPEG-TS output format, and its
+`server_info` reports the externally visible scheme, host, and explicit/default
+port correctly. Xtream-only users can play both `/live|movie|series/...` URLs
+and the `/play/...` URLs returned by `get.php`; native M3U and Xtream catalogue
+permissions remain independently gated.
+
 Users only ever talk to port **8880** — GUI, streams, playlists and APIs share it.
 
 ### Fast playlist and stream startup

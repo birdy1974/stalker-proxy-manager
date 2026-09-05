@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from sqlalchemy import func, select
 import time
@@ -47,6 +47,11 @@ class UserAuth:
             if need == "m3u" and not user.m3u_enabled:
                 return None
             if need == "xtream" and not user.xtream_enabled:
+                return None
+            # /get.php is Xtream-authenticated but intentionally returns the
+            # same /play/... M3U URLs as the native playlist endpoint. Those
+            # stream URLs must therefore accept either enabled output protocol.
+            if need == "stream" and not (user.m3u_enabled or user.xtream_enabled):
                 return None
             if user.expire_date:
                 try:
@@ -331,6 +336,12 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
 async def xtream_base(user: User, base_url: str) -> dict:
     from .stream_manager import MANAGER as _mgr
     now = int(datetime.now(timezone.utc).timestamp())
+    parsed = urlsplit(base_url if "://" in base_url else "http://" + base_url)
+    scheme = parsed.scheme or "http"
+    try:
+        port = parsed.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        port = 443 if scheme == "https" else 80
     return {
         "user_info": {
             "username": user.name, "password": user.password, "message": "",
@@ -341,12 +352,16 @@ async def xtream_base(user: User, base_url: str) -> dict:
             "active_cons": str(_mgr.user_stream_count(user.name)),
             "created_at": str(now),
             "max_connections": str(user.max_connections),
-            "allowed_output_formats": ["ts", "m3u8"],
+            # We expose MPEG-TS stream routes, not HLS manifests. Advertising
+            # m3u8 makes clients such as IPTV Smarters select
+            # /live/user/pass/id.m3u8, which this server cannot truthfully
+            # provide and results in a playlist that lists but cannot play.
+            "allowed_output_formats": ["ts"],
         },
         "server_info": {
-            "url": base_url.split("://", 1)[-1].split(":")[0],
-            "port": base_url.split(":")[-1].split("/")[0],
-            "https": False, "server_protocol": base_url.split("://", 1)[0],
+            "url": parsed.hostname or parsed.netloc,
+            "port": str(port),
+            "https": scheme == "https", "server_protocol": scheme,
             "rtmp_port": "0", "timestamp_now": now,
             "time_now": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "timezone": "Europe/Amsterdam",
