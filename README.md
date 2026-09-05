@@ -153,6 +153,20 @@ xmltv:    http://<host>:8880/xmltv.php?username=USER&password=PASS
 
 Users only ever talk to port **8880** — GUI, streams, playlists and APIs share it.
 
+### Fast playlist and stream startup
+
+Generated M3Us and Enigma2 bundles are cached until an output-relevant database
+write invalidates them; repeated player refreshes no longer recalculate a full
+catalogue or run revision queries. Playlist Builder live/VOD source chains and
+local-file metadata are loaded in batches rather than one query per row.
+
+VLC and Enigma2 commonly issue `HEAD` before `GET`. Every portal stream alias
+answers that authenticated probe with metadata only—it does not resolve a
+portal, occupy a MAC, or launch FFmpeg. Actual GET startup writes an
+`[output] startup timing` log and a `Server-Timing` response header separating
+prepare/resolve, first-byte, and total time. Direct local playback additionally
+reports path, template, and stream-registration timings.
+
 ---
 
 ## ffmpeg templates & transcoding (DS918+ Quick Sync)

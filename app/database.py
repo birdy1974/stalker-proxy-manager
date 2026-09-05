@@ -28,6 +28,27 @@ else:
 
 engine = create_async_engine(DATABASE_URL, **_engine_kwargs)
 
+# Rendered M3U and Enigma2 bundles are process-local caches. Invalidate them on
+# catalogue/configuration writes, but not on high-frequency logs and active
+# stream bookkeeping (those do not alter output and would destroy cache value).
+_CACHE_TABLES = (
+    "live_playlist", "live_playlist_sources", "vod_playlist", "vod_playlist_sources",
+    "serie_playlist", "serie_playlist_sources", "serie_playlist_seasons",
+    "local_playlist", "local_files", "local_sources", "ffmpeg_templates",
+    "users", "areas", "area_item_templates", "settings", "enigma2_profiles",
+)
+
+
+@event.listens_for(engine.sync_engine, "after_cursor_execute")
+def _invalidate_rendered_output(_conn, _cursor, statement, _params, _context, _many):  # noqa: ANN001
+    sql = (statement or "").lstrip().lower()
+    if not sql.startswith(("insert", "update", "delete")):
+        return
+    if any(name in sql for name in _CACHE_TABLES):
+        from .services.content_cache import invalidate
+        invalidate()
+
+
 # Enable WAL + foreign keys on SQLite (big perf + correctness win for dev).
 if DATABASE_URL.startswith("sqlite"):
 

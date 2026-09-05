@@ -136,7 +136,6 @@ async def _warn_if_blackholed(user: User, kind: str, items: list,
 
 
 _M3U_CACHE: dict[tuple, tuple[float, str]] = {}
-_M3U_CACHE_TTL = 120
 # Tables whose row count / max(id) form the cheap cache-bust signature.
 _REVISION_TABLES = (LivePlaylist, VodPlaylist, SeriePlaylist, LocalPlaylist,
                     SeriePlaylistSeason, LocalFile, SerieEpisode,
@@ -173,13 +172,14 @@ def _extinf_title(title: str | None) -> str:
 
 
 async def build_m3u(base_url: str, user: User) -> str:
-    async with SessionLocal() as s:
-        revision = await _playlist_revision(s)
+    from .content_cache import generation
     local_cache_ms = await vlc_local_network_caching_ms()
+    # Writes to output-relevant tables bump this generation in database.py.
+    # A cache hit therefore needs no catalogue revision query at all.
     key = (user.id, user.groups_json or "", getattr(user, "area_id", None),
-           base_url, local_cache_ms, revision)
+           base_url, local_cache_ms, generation())
     cached = _M3U_CACHE.get(key)
-    if cached and time.monotonic() - cached[0] < _M3U_CACHE_TTL:
+    if cached:
         return cached[1]
     text = await _build_m3u(base_url, user, local_cache_ms=local_cache_ms)
     _M3U_CACHE[key] = (time.monotonic(), text)
