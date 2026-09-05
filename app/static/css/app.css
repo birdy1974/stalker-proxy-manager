@@ -72,6 +72,13 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 @media (max-width: 991.98px) { .navbar-divider { display: none; } }
 .navbar .nav-link[title] { cursor: help; }
 
+/* Input Sources → Live: the portal's own channel name is read-only reference,
+   so it is kept narrow (ellipsis + title tooltip) and the column people type
+   in - "Custom Channel Name" - gets the room. Without the max-width the cell
+   would fall back to the generic 460px td cap and eat that room back. */
+.table-spm td.col-channel { max-width: 190px; }
+.table-spm td.col-name .form-control { width: 100%; }
+
 /* favicon picker (Settings): one tile per candidate tab icon, the active one
    outlined in the accent colour. Tiles are <button>s so the whole thing is
    keyboard-reachable. */

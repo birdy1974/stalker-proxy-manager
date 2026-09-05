@@ -25,4 +25,24 @@ def test_live_playlist_click_selects_the_whole_name():
     assert "onfocus=\"this.select()\"" in SOURCES
     assert "onmouseup=\"event.preventDefault()\"" in SOURCES
     # disabled channels stay blank, not an input
-    assert "enable the channel to assign a playlist name" in SOURCES
+    assert "enable the channel to give it a custom name" in SOURCES
+
+
+def test_the_editable_column_is_named_and_sized_for_typing():
+    """The column between Channel and Portal is the one people type in.
+
+    It used to be headed "Playlist" - which reads like the Playlist *tab* - and
+    it was narrower than the read-only portal name beside it. Both are pinned
+    here because both are one careless edit away from coming back.
+    """
+    assert 'label: "Custom Channel Name"' in SOURCES
+    assert 'label: "Playlist"' not in SOURCES
+    channel = SOURCES.index('label: "Channel"')
+    custom = SOURCES.index('label: "Custom Channel Name"')
+    portal = SOURCES.index('label: "Portal"', channel)
+    assert channel < custom < portal
+    # the editable column is the wider of the two
+    def _width(at: int) -> int:
+        import re
+        return int(re.search(r'width: "(\d+)px"', SOURCES[at:at + 400]).group(1))
+    assert _width(custom) > _width(channel)

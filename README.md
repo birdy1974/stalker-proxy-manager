@@ -515,16 +515,22 @@ that endpoint cannot maintain.
 
 ---
 
-## Input Sources → Live: Playlist custom name
+## Input Sources → Live: the "Custom Channel Name" column
 
 The old **Now** column on *Sources → Live* asked the panel (`get_short_epg`) once per visible
-channel and made paging the list expensive. It is gone. In its place sits a **Playlist** column:
+channel and made paging the list expensive. It is gone. In its place, between **Channel** and
+**Portal**, sits the **Custom Channel Name** column (it was briefly headed just "Playlist", which
+read like a link to the Playlist *tab* rather than an editable name):
 
 - shown only for **enabled** channels (disabled rows stay blank);
 - default value = the portal's original channel name;
 - edit the cell (blur / Enter) to set the custom name used in the final M3U / Xtream output:
   - **unique name** → a new custom live channel is created (or the channel this source already owns as primary is renamed);
   - **name already used** (case-insensitive) → this source is attached as a **fallback** on that existing custom channel.
+
+It is also the **wide** column of the two: the portal's own **Channel** name next to it is
+read-only reference and is kept narrow (ellipsised, full text in the cell tooltip), so the field
+you actually type in gets the room.
 
 The list payload carries the placement (`playlist_id`, `playlist_name`, primary/fallback badge) in
 the same `/api/sources/live` response — no extra round trip per page.
