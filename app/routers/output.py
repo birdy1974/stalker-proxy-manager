@@ -342,10 +342,15 @@ async def _local_response(pid: int, user, request: Request, ext: str | None = No
                      f"[{item_name}] serving original file ({media_type})")
         return FileResponse(path, media_type=media_type, headers=headers,
                             background=BackgroundTask(MANAGER.kill, handle.id))
+    # The URL alias follows the selected template. In particular, an Enigma2
+    # Matroska remux must be announced as video/x-matroska rather than TS.
+    media_type = MEDIA_TYPES["mkv"] if (ext or "").lower().lstrip(".") == "mkv" \
+        else MEDIA_TYPES["ts"]
     if request.method == "HEAD":
-        return Response(status_code=200, media_type="video/mp2t",
+        return Response(status_code=200, media_type=media_type,
                         headers={"Cache-Control": "no-store"})
-    return await _stream_response("local", pid, user, f"local #{pid}", request, "proxy")
+    return await _stream_response("local", pid, user, f"local #{pid}", request,
+                                  "proxy", media_type)
 
 
 # Xtream-style stream URLs -----------------------------------------------

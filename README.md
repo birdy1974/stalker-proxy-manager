@@ -241,6 +241,7 @@ Play those items through the **`.mkv` URL aliases**, which exist next to the `.t
 ```text
 /play/vod/{id}.mkv?u=…&p=…        /movie/{user}/{pass}/{id}.mkv
 /play/episode/{id}.mkv?u=…&p=…    /series/{user}/{pass}/{id}.mkv
+/play/local/{id}.mkv?u=…&p=…
 /play/live/{id}.mkv?u=…&p=…
 ```
 
@@ -277,6 +278,12 @@ Defaults are the Vu+ Duo2 recipe: live = `4097` + `.ts`, VOD and series = **`500
 | `@redirect` (bypass ffmpeg) | the profile's alias, player ≥ `4097` | the container is the panel's, not ours — the alias is cosmetic because the box follows the redirect and sniffs the body. Best case for VOD: original subtitles **and** seeking survive |
 | `output_format = matroska` | `.mkv` | the remux carries text subtitles |
 | anything else | `.ts` | MPEG-TS out of ffmpeg |
+
+This per-item rule also applies to **Local** bouquets. A local MP4/AVI assigned
+**Enigma2 VOD - remux + subtitles (MKV)** is written as `/play/local/{id}.mkv`,
+not forced back to `.ts`; the response is announced as `video/x-matroska` and
+FFmpeg keeps `-f matroska`. Regenerate and push/pull the bouquet after changing
+a local item's template.
 
 Service type `1` hands the bytes straight to the DVB demuxer, which only understands raw TS: items that are MKV or direct are automatically raised to `4097` and the preview says so (use `5002` if you want their subtitles). The summary line counts the split — *114 services · 0 ts · 0 mkv · 114 direct* — so you can see at a glance which delivery your library is really on. Set *Container choice* to `fixed` for the old profile-wide behaviour.
 

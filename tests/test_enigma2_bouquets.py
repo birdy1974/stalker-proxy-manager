@@ -27,7 +27,7 @@ from sqlalchemy import select
 from app.database import SessionLocal
 from app.main import app
 from app.models import (
-    Enigma2Profile, LivePlaylist, LocalFile, LocalPlaylist, LocalSource, Portal,
+    Enigma2Profile, FFmpegTemplate, LivePlaylist, LocalFile, LocalPlaylist, LocalSource, Portal,
     SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource,
     User, VodPlaylist, VodSource,
 )
@@ -253,9 +253,9 @@ async def test_group_filters_of_user_and_profile_both_apply():
     assert not [f for f in bundle2.files if "_live_" in f.name]
 
 
-async def test_local_files_are_advertised_as_mpegts():
-    """Enigma2 plays audio-only on a progressive MP4 and on a live MKV pipe.
-    Local bouquet lines therefore always ask for `.ts` so the play path remuxes."""
+async def test_default_local_files_are_advertised_as_mpegts():
+    """An unassigned local MP4 uses the default redirect/copy path, which an
+    Enigma2 profile safely requests as MPEG-TS rather than progressive MP4."""
     async with SessionLocal() as s:
         user = User(name="locbox", password="pw", enabled=True)
         s.add(user)
@@ -276,6 +276,42 @@ async def test_local_files_are_advertised_as_mpegts():
     assert "/play/local/" in text and ".ts?u=locbox&p=pw" in text
     assert ".mp4" not in text
     assert "#SERVICE 4097:" in text or "#SERVICE 5002:" in text
+
+
+async def test_local_matroska_template_is_advertised_as_mkv():
+    """The MKV remux must not be silently forced through a `.ts` bouquet URL.
+
+    That mismatch selected the local MPEG-TS fallback and produced audio-only
+    playback for MP4/AVI files on Enigma2.
+    """
+    async with SessionLocal() as s:
+        user = User(name="locmkv", password="pw", enabled=True)
+        template = FFmpegTemplate(
+            name="Enigma2 VOD - remux + subtitles (MKV)", enabled=True,
+            output_format="matroska", video_codec="copy", audio_codec="copy",
+            command="ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -map 0:s? "
+                    "-c:v copy -c:a copy -c:s copy -f matroska -live 1 pipe:1")
+        s.add_all([user, template])
+        source = LocalSource(directory="/tmp", enabled=True)
+        s.add(source)
+        await s.flush()
+        local_file = LocalFile(local_source_id=source.id, relative_path="movie.mp4",
+                               filename="movie.mp4", size_bytes=1)
+        s.add(local_file)
+        await s.flush()
+        s.add(LocalPlaylist(local_file_id=local_file.id, custom_name="MKV Movie",
+                            group_name="Files", enabled=True,
+                            ffmpeg_template_id=template.id))
+        await s.commit()
+
+    bundle = await e2.build_bundle(
+        _profile(user, include_live=False, include_vod=False,
+                 include_series=False, include_local=True,
+                 container_mode="auto", player_vod="5002"), NAS)
+    text = next(f for f in bundle.files if "local" in f.name).text
+    assert ".mkv?u=locmkv&p=pw" in text
+    assert ".ts?u=locmkv&p=pw" not in text
+    assert "#SERVICE 5002:" in text
 
 
 async def test_content_types_can_be_switched_off():

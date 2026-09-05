@@ -21,7 +21,8 @@ from app.models import (
     FFmpegTemplate, LocalFile, LocalPlaylist, LocalSource, User,
 )
 from app.services.ffmpeg_templates import (
-    COPY_PRESET_NAME, REDIRECT_PRESET_NAME, REFERENCE_PRESET_NAME,
+    COPY_PRESET_NAME, E2_VOD_REMUX_PRESET_NAME, REDIRECT_PRESET_NAME,
+    REFERENCE_PRESET_NAME,
     URL_PLACEHOLDER, build_command, FFmpegOptions,
 )
 from app.services.local_files import extinf_duration, play_extension
@@ -256,6 +257,20 @@ async def test_transcode_template_goes_through_ffmpeg_with_quoted_path(
     assert seen and seen[0] == str(media)
     assert "file:" not in seen[0]
     await MANAGER.kill_all()
+
+
+async def test_local_mkv_alias_advertises_matroska_content_type(tmp_path):
+    await _seed_defaults()
+    async with SessionLocal() as s:
+        template_id = (await s.execute(select(FFmpegTemplate.id).where(
+            FFmpegTemplate.name == E2_VOD_REMUX_PRESET_NAME))).scalar_one()
+    pid, _ = await _seed_file(tmp_path, name="movie.mp4", template_id=template_id)
+    await _user()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url=BASE) as c:
+        response = await c.head(f"/play/local/{pid}.mkv?u=loc&p=pw")
+    assert response.status_code == 200, response.text
+    assert "video/x-matroska" in response.headers.get("content-type", "")
 
 
 async def test_ts_url_remuxes_local_mp4_instead_of_serving_the_file(
