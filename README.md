@@ -531,6 +531,33 @@ the same `/api/sources/live` response — no extra round trip per page.
 
 ---
 
+## Browser tab icon (favicon)
+
+Every page of the GUI — dashboard, portals, playlist, **and the login screen** — carries a tab
+icon, and *which picture* it is, is a setting rather than a hard-coded file:
+
+* **Settings → Browser tab icon (favicon)** shows seven built-in pictures (broadcast, satellite
+  dish, TV screen, play, signal bars, antenna tower, minimal dot). Click one; it is live on the
+  next page load, no restart.
+* **Use my own picture** uploads a `.png` / `.svg` / `.ico` / `.jpg` / `.gif` / `.webp` (max
+  512 kB). It is stored on the **config volume** (`/config/branding/`), not inside the image, so a
+  `docker pull` of a new build keeps it. The trash button deletes it again and the selection falls
+  back to a built-in.
+
+Under the hood the choice is one `settings` row (`favicon`), so it rides along in a
+*Settings* backup and is restored with it. `/favicon.ico` (and `/apple-touch-icon.png`) serve the
+active picture and are deliberately public — a browser asks for them on the login page too,
+before there is a session. The `<link>` tags carry a `?v=<fingerprint>` that changes with the
+picture, because a browser otherwise keeps showing the previous favicon roughly forever.
+
+Uploads are validated: unsupported extensions and oversized files are refused with a readable
+message, and a **scripted SVG is rejected** (`<script>`, `on…=` handlers, external entities) —
+a tab icon is reachable as a document at `/favicon.ico` on the admin origin, so it must not be
+able to run anything. What is served is additionally sent with `nosniff` and a
+`default-src 'none'; sandbox` CSP.
+
+---
+
 ## Built-in mock portal (testing without a real subscription)
 `SPM_MOCK_PORTAL=1` mounts a fake Stalker portal at `http://<host>:8880/mock/c/` with MACs `00:1A:79:AA:AA:01` / `…02`, expired `…BB:BB:01` and blocked `…CC:CC:01`, 3 live genres × 4 channels, 2 VOD genres × 12 movies, 2 series genres × 6 series × 3 seasons × 5 episodes. `POST /mock/_control {...}` emulates what the portal can do to you, so the client's behaviour is testable without a subscription: `offline`, `slow`, `max_per_mac`, `http_status`, `require_prehash` (demand the second handshake step), `fingerprint_required` (403 a `get_profile` with no serial), `profile_mode` (`full`/`no_id`/`none`), `not_valid` (short-lived token), `token_rejects` (answer 200 + `{"error":"token"}`), `js_error`, `empty_reply`, `corrupt_stream`, `require_tls`, `require_host`, `reject_no_cookie`, `reject_no_referer`. `version_mode` (`full`/`none`/`html` — the last one is a captive portal answering `version.js`), `modules`, `modules_disabled` and `no_modules` (404 the action, which means *we do not know*, not *it has nothing*) emulate what the panel *says about itself*, `xtream_mode=1` makes its `create_link` answers carry `/live/<user>/<pass>/…` (with `xtream_user`/`xtream_pass`, `xtream_status`, `xtream_exp_days` and `xtream_refuse` — the last answers `player_api.php` with `{"user_info": []}`, i.e. "wrong password"), and `epg_mode` (`normal`/`empty`/`absent`/`flaky` — busy twice then fine) is what "no guide", "no such action" and "try again" look like separately. `GET /mock/player_api.php` serves the Xtream account, stream lists (with the two flaws the matcher needs: a channel that is not on the Xtream side, and a duplicated `Sky Sports` name) and media at `/mock/live/…`, `/mock/movie/…`, `/mock/series/…` **with the credentials enforced** — under `/mock/`, never at the root, because `/live/<u>/<p>/<id>.ts` and `/player_api.php` are *our own* Xtream output API and a mock route there would be shadowed by it (a lesson learned from the demo 403ing while every test passed), and `get_short_epg` renders its schedule in the timezone from the `timezone=` cookie so the identity→guide chain is exercised rather than assumed, and the live catalogue ships five deliberate link shapes — permanent, tmp-link, load-balanced, no flags at all, and a "permanent" URL that still carries a `play_token` — so the conditional-`create_link` rules are testable instead of theoretical. `GET /mock/_state` answers with those settings *and* what the portal actually received (`seen_profile`, the handshake `prehash`es, `seen_create_link`, the `handshakes`/`version_calls`/`modules_calls`/`create_links`/`player_api`/`short_epg` counters and the `seen_player_api` query, and per-MAC usage) — which is how the identity and link tests prove a request arrived, or that one deliberately did not, instead of trusting the client.
 

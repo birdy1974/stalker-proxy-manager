@@ -120,14 +120,16 @@ async def access_log(request: Request, call_next):
                           request.method, path, qs[:120], status, ms)
 
 # --------------------------------------------------------------- sub-routers
-from .routers import (api_areas, api_enigma2, api_ffmpeg, api_epg, api_misc, api_playlist,  # noqa: E402
-                      api_portals, api_sources, api_users, output, web)
+from .routers import (api_areas, api_branding, api_enigma2, api_ffmpeg, api_epg,  # noqa: E402
+                      api_misc, api_playlist, api_portals, api_sources, api_users,
+                      output, web)
 
 app.include_router(web.router)
 app.include_router(output.router)
 for r in (api_portals.router, api_sources.router, api_playlist.router,
           api_ffmpeg.router, api_users.router, api_areas.router, api_misc.router,
-          api_epg.router, api_enigma2.router, api_enigma2.public):
+          api_epg.router, api_enigma2.router, api_enigma2.public,
+          api_branding.router, api_branding.public):
     app.include_router(r)
 
 if MOCK_PORTAL_ENABLED:
@@ -163,6 +165,9 @@ async def startup() -> None:
     await MANAGER.purge_runtime_rows()
     await cleanup_logs()
     await _seed_defaults()
+    # tab icon: prime the ?v= fingerprint the page templates stamp on <link>
+    from .services.branding import refresh as refresh_favicon
+    await refresh_favicon()
     await _heal_season_links()
     await _hardware_sanity()
     await db_log("INFO", "boot",

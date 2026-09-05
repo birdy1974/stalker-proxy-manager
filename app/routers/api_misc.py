@@ -19,6 +19,7 @@ from ..models import (
     SerieGenre, SeriePlaylist, SerieSource, Setting, User, VodGenre, VodPlaylist,
     VodSource,
 )
+from ..services.branding import DEFAULT_ID as DEFAULT_FAVICON, refresh as refresh_favicon
 from ..services.playback import KIND_DEFAULT_COL
 from ..security import require_admin
 from ..services.db_logging import db_log
@@ -118,6 +119,9 @@ DEFAULT_SETTINGS = {
     # Only portals with ≥2 MACs are visited when mac_health_multi_only is true.
     "mac_health_minutes": 60,
     "mac_health_multi_only": True,
+    # Browser tab icon: id of a built-in (services/branding.py) or "custom" for
+    # an uploaded picture. Picked in Settings, rides along in a settings backup.
+    "favicon": DEFAULT_FAVICON,
 }
 
 
@@ -142,6 +146,11 @@ async def set_settings(payload: dict, db=Depends(get_db)):
             db.add(row)
         row.value = json.dumps(v)
     await db.commit()
+    # The tab icon is normally changed from its own picker, but it is a settings
+    # row like any other (and a restored backup writes it here): re-stamp the
+    # cache-busting fingerprint so open tabs pick the new picture up.
+    if "favicon" in payload:
+        await refresh_favicon()
     await db_log("INFO", "settings", f"settings updated: {sorted(payload.keys())}")
     return {"ok": True}
 
@@ -390,6 +399,8 @@ async def import_config(payload: dict, db=Depends(get_db)):
         row.value = json.dumps(v)
 
     await db.commit()
+    # a restored `favicon` row selects a different tab icon
+    await refresh_favicon()
     await db_log("INFO", "import", f"config import: {applied['imported']} imported, "
                                    f"{len(applied['skipped'])} skipped ({mode})")
     return applied

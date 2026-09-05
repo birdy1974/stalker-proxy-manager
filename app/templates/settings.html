@@ -43,6 +43,26 @@
 
   <div class="col-lg-6">
     <div class="card">
+      <div class="card-header"><i class="bi bi-browser-safari"></i> Browser tab icon (favicon)</div>
+      <div class="card-body">
+        <div class="small text-muted mb-2">
+          Shown on the tab of every page of this GUI (dashboard, portals, login …).
+          Pick one of the built-in pictures, or upload your own.
+        </div>
+        <div id="favicon-grid" class="d-flex flex-wrap gap-2"><span class="small text-muted">loading…</span></div>
+        <hr class="my-3">
+        <label class="muted-label" for="favicon-file">Use my own picture</label>
+        <div class="d-flex gap-2">
+          <input class="form-control form-control-sm" type="file" id="favicon-file"
+                 accept=".png,.svg,.ico,.jpg,.jpeg,.gif,.webp,image/*">
+          <button class="btn btn-sm btn-outline-danger" id="favicon-clear"
+                  title="delete the uploaded picture and fall back to a built-in"><i class="bi bi-trash"></i></button>
+        </div>
+        <div class="small text-muted mt-1" id="favicon-status"></div>
+      </div>
+    </div>
+
+    <div class="card mt-3">
       <div class="card-header"><i class="bi bi-download"></i> Backup / restore</div>
       <div class="card-body">
         <div class="d-flex flex-wrap gap-2 mb-3">
@@ -164,8 +184,68 @@ $("#import-file").addEventListener("change", async (e) => {
   } catch (err) { $("#import-result").textContent = "invalid file: " + err.message; }
   e.target.value = "";
 });
+/* ---------------------------------------------------------------- favicon
+   Tab icon picker. The choice is one settings row; /favicon.ico serves it to
+   every page. Browsers cache favicons hard, so after a change the <link> tags
+   on THIS page are re-pointed with a fresh ?v= (the other tabs pick the new
+   picture up on their next load). */
+let FAVICON_MAX = 512 * 1024;
+function applyFaviconNow(version) {
+  $$('link[rel~="icon"], link[rel="apple-touch-icon"]').forEach(l => {
+    const base = l.href.split("?")[0];
+    l.href = `${base}?v=${version}-${Date.now()}`;
+  });
+}
+async function loadFavicons() {
+  const d = await api("/api/branding/favicons");
+  FAVICON_MAX = d.max_bytes || FAVICON_MAX;
+  const tile = (it) => `
+    <button type="button" class="favicon-tile ${d.selected === it.id ? "active" : ""}" data-id="${esc(it.id)}"
+            title="${esc(it.label)}${it.builtin ? "" : " (uploaded)"}">
+      <img src="${esc(it.url)}" alt="${esc(it.label)}">
+      <span>${esc(it.label)}</span>
+    </button>`;
+  const items = d.items.concat(d.custom ? [d.custom] : []);
+  $("#favicon-grid").innerHTML = items.map(tile).join("");
+  $$("#favicon-grid .favicon-tile").forEach(b =>
+    b.addEventListener("click", () => pickFavicon(b.dataset.id)));
+  $("#favicon-status").innerHTML = d.custom
+    ? `uploaded picture: <span class="mono">${esc(d.custom.filename)}</span> · ${Math.max(1, Math.round(d.custom.bytes / 1024))} kB`
+    : `no uploaded picture yet · max ${Math.round(FAVICON_MAX / 1024)} kB, ${d.accept.join(" ")}`;
+  applyFaviconNow(d.version);
+}
+async function pickFavicon(id) {
+  /* api() already toasts the server's message on failure */
+  const r = await api("/api/branding/favicon", { method: "POST", body: { id } });
+  toast("tab icon updated", "ok");
+  await loadFavicons();
+  applyFaviconNow(r.version);
+}
+$("#favicon-file").addEventListener("change", (e) => {
+  const f = e.target.files[0];
+  e.target.value = "";
+  if (!f) return;
+  if (f.size > FAVICON_MAX) {
+    toast(`that picture is ${Math.round(f.size / 1024)} kB, the limit is ${Math.round(FAVICON_MAX / 1024)} kB`, "error");
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const r = await api("/api/branding/favicon/upload",
+                        { method: "POST", body: { filename: f.name, data: reader.result } });
+    toast("tab icon uploaded", "ok");
+    await loadFavicons();
+    applyFaviconNow(r.version);
+  };
+  reader.readAsDataURL(f);
+});
+$("#favicon-clear").addEventListener("click", async () => {
+  const r = await api("/api/branding/favicon/custom", { method: "DELETE" });
+  toast(r.removed ? "uploaded picture removed" : "there was no uploaded picture", r.removed ? "ok" : "warn");
+  await loadFavicons();
+});
 (async () => {
-  await loadSettings(); await loadEpg(); await loadEpgStatus();
+  await loadSettings(); await loadEpg(); await loadEpgStatus(); await loadFavicons();
   const d = await api("/api/dashboard");
   $("#runtime-info").innerHTML =
     `portals: ${d.stats.portals} · live ${d.stats.live_enabled}/${d.stats.live_available} · ` +

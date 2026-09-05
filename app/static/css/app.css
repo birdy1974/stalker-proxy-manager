@@ -71,3 +71,14 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 .navbar-divider { width: 1px; height: 22px; margin: 0 .45rem; background: rgba(255,255,255,.22); align-self: center; }
 @media (max-width: 991.98px) { .navbar-divider { display: none; } }
 .navbar .nav-link[title] { cursor: help; }
+
+/* favicon picker (Settings): one tile per candidate tab icon, the active one
+   outlined in the accent colour. Tiles are <button>s so the whole thing is
+   keyboard-reachable. */
+.favicon-tile { width: 84px; padding: .45rem .25rem; background: #fff; border: 1px solid var(--spm-border);
+  border-radius: .5rem; display: flex; flex-direction: column; align-items: center; gap: .3rem; cursor: pointer; }
+.favicon-tile:hover { border-color: var(--spm-accent); background: #f0fdfa; }
+.favicon-tile img { width: 34px; height: 34px; object-fit: contain; }
+.favicon-tile span { font-size: .68rem; line-height: 1.1; color: #6b7280; text-align: center; word-break: break-word; }
+.favicon-tile.active { border-color: var(--spm-accent); box-shadow: 0 0 0 2px rgba(13,148,136,.25); }
+.favicon-tile.active span { color: var(--spm-slate); font-weight: 600; }
