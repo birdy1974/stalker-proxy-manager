@@ -66,8 +66,10 @@ function sourceTable(kind, hostSel) {
          exists. Resolved in the /api/sources/live payload — no extra round trip.
          It is the column people actually TYPE in, so it is the wide one; the
          portal's own (read-only) channel name next to it is ellipsised. */
-      { key: "playlist_name", label: "Custom Channel Name", class: "col-name", width: "340px",
+      { key: "playlist_name", label: "Custom Channel Name", class: "col-name", width: "300px",
         render: r => playlistNameCell(r) },
+      { key: "playlist_group", label: "Custom Group", class: "col-name", width: "220px",
+        render: r => playlistGroupCell(r) },
       { key: "portal_id", label: "Portal", sort: "portal", filter: { type: "select", options: PORTALS }, render: r => esc(r.portal) },
       { key: "genre_id", label: "Genre", filter: { type: "select", options: GENRES.live, placeholder: "enabled genres" }, render: r => esc(r.genre) },
       { key: "play", label: "", width: "40px", render: r => `<button class="btn btn-sm btn-outline-secondary" title="Test stream (original)" onclick="event.stopPropagation();playInModal('/preview/live/${r.id}.ts',${JSON.stringify(r.name).replace(/"/g, '&quot;')})"><i class="bi bi-play-btn"></i></button>` },
@@ -150,6 +152,44 @@ window.saveLivePlaylistName = async (sid, input) => {
               : res.action === "fallback" ? `added as fallback on "${res.custom_name}"`
               : "unchanged";
     toast(msg, "ok");
+    TABS.live && TABS.live.reload();
+  } catch (e) {
+    /* api() already toasted the error */
+  } finally {
+    input.disabled = false;
+  }
+};
+
+/* "Custom Group" is the same group value shown in Playlist → Live. Sources
+   on one primary/fallback chain therefore display and edit the same value. */
+function playlistGroupCell(r) {
+  if (!r.enabled) {
+    return `<span class="text-muted small" title="enable the channel to give it a custom group">—</span>`;
+  }
+  const group = r.playlist_group || r.genre || "Live";
+  return `<div onclick="event.stopPropagation()">
+    <input class="form-control form-control-sm" style="min-width:150px"
+      value="${esc(group)}"
+      placeholder="custom group…"
+      title="Click to edit the Group shown on the Playlist tab. This updates the whole custom channel, including its fallback sources."
+      onmousedown="this.dataset.wasFocused = document.activeElement === this ? 'true' : 'false'"
+      onfocus="this.select()"
+      onmouseup="if(this.dataset.wasFocused === 'false') event.preventDefault(); delete this.dataset.wasFocused"
+      onkeydown="if(event.key==='Enter'){event.preventDefault();this.blur();}"
+      onblur="saveLivePlaylistGroup(${r.id}, this)">
+  </div>`;
+}
+window.saveLivePlaylistGroup = async (sid, input) => {
+  const value = (input.value || "").trim();
+  if (!value) { toast("group required", "warn"); return; }
+  const row = (TABS.live?.items || []).find(x => x.id === sid);
+  if (row && (row.playlist_group || row.genre || "Live") === value) return;
+  try {
+    input.disabled = true;
+    await api(`/api/sources/live/${sid}/playlist-group`, {
+      method: "POST", body: { group_name: value },
+    });
+    toast(`custom group changed to "${value}"`, "ok");
     TABS.live && TABS.live.reload();
   } catch (e) {
     /* api() already toasted the error */

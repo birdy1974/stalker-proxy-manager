@@ -287,7 +287,7 @@ async def live_playlist_links_for(db, source_ids: list[int]) -> dict[int, dict]:
     """Map live_source_id -> playlist placement used by Input Sources → Live.
 
     One query for the page of ids. Each value is
-      {playlist_id, custom_name, priority, is_primary, chain_len}
+      {playlist_id, custom_name, group_name, priority, is_primary, chain_len}
     or missing when the source is not (yet) on any live playlist row.
     """
     ids = _clean_ids(source_ids)
@@ -295,16 +295,16 @@ async def live_playlist_links_for(db, source_ids: list[int]) -> dict[int, dict]:
         return {}
     rows = (await db.execute(
         select(LivePlaylistSource.live_source_id, LivePlaylistSource.priority,
-               LivePlaylist.id, LivePlaylist.custom_name)
+               LivePlaylist.id, LivePlaylist.custom_name, LivePlaylist.group_name)
         .join(LivePlaylist, LivePlaylist.id == LivePlaylistSource.live_playlist_id)
         .where(LivePlaylistSource.live_source_id.in_(ids))
         .order_by(LivePlaylistSource.priority))).all()
     # Prefer the lowest-priority (primary) link when a source sits on several chains.
     best: dict[int, tuple] = {}
-    for sid, prio, pid, cname in rows:
+    for sid, prio, pid, cname, group_name in rows:
         cur = best.get(sid)
         if cur is None or prio < cur[0]:
-            best[sid] = (prio, pid, cname)
+            best[sid] = (prio, pid, cname, group_name)
     if not best:
         return {}
     # chain lengths for the playlists we care about (badge: "fallback #2 of 3")
@@ -319,11 +319,12 @@ async def live_playlist_links_for(db, source_ids: list[int]) -> dict[int, dict]:
         sid: {
             "playlist_id": pid,
             "custom_name": cname,
+            "group_name": group_name,
             "priority": prio,
             "is_primary": prio == 1,
             "chain_len": lengths.get(pid, 1),
         }
-        for sid, (prio, pid, cname) in best.items()
+        for sid, (prio, pid, cname, group_name) in best.items()
     }
 
 
@@ -428,6 +429,39 @@ async def assign_live_custom_name(db, source_id: int, custom_name: str) -> dict:
     await db.flush()
     return {"action": "created", "playlist_id": pl.id, "custom_name": pl.custom_name,
             "priority": 1, "is_primary": True}
+
+
+async def assign_live_custom_group(db, source_id: int, group_name: str) -> dict:
+    """Update the custom group shared by a live source's playlist chain.
+
+    Legacy enabled sources without a playlist placement are first added using
+    their original channel name, matching the automatic-enable behaviour.
+    Does not commit.
+    """
+    group = (group_name or "").strip()
+    if not group:
+        raise ValueError("custom group required")
+    src = await db.get(LiveSource, source_id)
+    if not src:
+        raise ValueError("source not found")
+    if not src.enabled:
+        raise ValueError("enable the channel first")
+
+    link = (await db.execute(select(LivePlaylistSource).where(
+        LivePlaylistSource.live_source_id == source_id)
+        .order_by(LivePlaylistSource.priority))).scalars().first()
+    if link is None:
+        placed = await assign_live_custom_name(db, source_id, src.original_name)
+        playlist_id = placed["playlist_id"]
+    else:
+        playlist_id = link.live_playlist_id
+    playlist = await db.get(LivePlaylist, playlist_id)
+    if playlist is None:  # defensive against a corrupt dangling link
+        raise ValueError("custom channel not found")
+    playlist.group_name = group
+    await db.flush()
+    return {"playlist_id": playlist.id, "custom_name": playlist.custom_name,
+            "group_name": playlist.group_name}
 
 
 async def _existing_ids(db, kind: str, ids: list[int]) -> set[int]:

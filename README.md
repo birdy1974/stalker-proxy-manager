@@ -534,8 +534,13 @@ It is also the **wide** column of the two: the portal's own **Channel** name nex
 read-only reference and is kept narrow (ellipsised, full text in the cell tooltip), so the field
 you actually type in gets the room.
 
-The list payload carries the placement (`playlist_id`, `playlist_name`, primary/fallback badge) in
-the same `/api/sources/live` response — no extra round trip per page.
+Beside the channel name, **Custom Group** shows the same group as Playlist → Live. It starts with
+the source genre when the channel is added and can be edited with the same first-click-select,
+blur/Enter-to-save interaction. A custom channel has one shared group, so editing it from either a
+primary or fallback source updates every source row on that channel and the Playlist tab.
+
+The list payload carries the placement (`playlist_id`, `playlist_name`, `playlist_group`, and the
+primary/fallback badge) in the same `/api/sources/live` response — no extra round trip per page.
 
 ---
 

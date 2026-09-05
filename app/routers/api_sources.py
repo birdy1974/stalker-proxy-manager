@@ -21,6 +21,7 @@ from ..config import MEDIA_ROOT
 from ..database import get_db, spawn
 from ..services.permissions import describe_access, permission_hint
 from ..services.playlist_sync import (SYNC_KINDS, add_sources,
+                                        assign_live_custom_group,
                                         assign_live_custom_name,
                                         live_playlist_links_for, sync_sources)
 from ..models import (
@@ -70,6 +71,8 @@ def _live_item(r: LiveSource, genre_names, portal_names, pl_link: dict | None = 
             "xtream_url": r.xtream_url or None,
             "playlist_id": pl["playlist_id"] if pl else None,
             "playlist_name": (pl["custom_name"] if pl else (r.original_name if r.enabled else "")),
+            "playlist_group": (pl["group_name"] if pl else
+                               (genre_names.get(r.live_genre_id, "") if r.enabled else "")),
             "playlist_priority": pl["priority"] if pl else None,
             "playlist_is_primary": pl["is_primary"] if pl else None,
             "playlist_chain_len": pl["chain_len"] if pl else None}
@@ -142,6 +145,20 @@ async def set_live_playlist_name(sid: int, payload: dict, db=Depends(get_db)):
     await db_log("INFO", "sources",
                  f"live source #{sid} playlist name → {res['action']}: "
                  f"'{res['custom_name']}' (playlist #{res['playlist_id']})")
+    return {"ok": True, **res}
+
+
+@router.post("/live/{sid}/playlist-group")
+async def set_live_playlist_group(sid: int, payload: dict, db=Depends(get_db)):
+    """Set the Playlist group for an enabled live source's custom channel."""
+    try:
+        res = await assign_live_custom_group(db, sid, payload.get("group_name") or "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.commit()
+    await db_log("INFO", "sources",
+                 f"live source #{sid} custom group → '{res['group_name']}' "
+                 f"(playlist #{res['playlist_id']})")
     return {"ok": True, **res}
 
 

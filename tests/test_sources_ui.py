@@ -36,19 +36,28 @@ def test_enabling_one_live_source_reloads_its_custom_name_cell():
     assert ".then(()=>TABS.live&&TABS.live.reload())" in SOURCES
 
 
-def test_the_editable_column_is_named_and_sized_for_typing():
-    """The column between Channel and Portal is the one people type in.
+def test_custom_group_has_the_same_inline_edit_interaction():
+    assert "playlistGroupCell(r)" in SOURCES
+    assert "saveLivePlaylistGroup" in SOURCES
+    assert "/playlist-group`" in SOURCES
+    assert "enable the channel to give it a custom group" in SOURCES
 
-    It used to be headed "Playlist" - which reads like the Playlist *tab* - and
-    it was narrower than the read-only portal name beside it. Both are pinned
-    here because both are one careless edit away from coming back.
+
+def test_the_editable_columns_are_named_and_sized_for_typing():
+    """The editable custom fields sit between Channel and Portal.
+
+    The name used to be headed "Playlist" - which reads like the Playlist
+    *tab* - and was narrower than the read-only portal name beside it. These
+    details are pinned because they are one careless edit away from regressing.
     """
     assert 'label: "Custom Channel Name"' in SOURCES
+    assert 'label: "Custom Group"' in SOURCES
     assert 'label: "Playlist"' not in SOURCES
     channel = SOURCES.index('label: "Channel"')
     custom = SOURCES.index('label: "Custom Channel Name"')
+    group = SOURCES.index('label: "Custom Group"')
     portal = SOURCES.index('label: "Portal"', channel)
-    assert channel < custom < portal
+    assert channel < custom < group < portal
     # the editable column is the wider of the two
     def _width(at: int) -> int:
         import re

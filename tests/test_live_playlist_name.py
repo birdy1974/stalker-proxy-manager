@@ -12,7 +12,9 @@ from sqlalchemy import select
 
 from app.database import SessionLocal
 from app.models import LiveGenre, LivePlaylist, LivePlaylistSource, LiveSource, Portal
-from app.services.playlist_sync import assign_live_custom_name, live_playlist_links_for
+from app.services.playlist_sync import (assign_live_custom_group,
+                                        assign_live_custom_name,
+                                        live_playlist_links_for)
 
 
 async def _seed(*, n: int = 3, enable: bool = True) -> list[int]:
@@ -56,9 +58,11 @@ async def test_live_list_carries_playlist_name_only_when_enabled():
         off = by_id[ids[1]]
         assert on["enabled"] is True
         assert on["playlist_name"] == "NPO 1 HD"          # default = original
+        assert on["playlist_group"] == "NL"                # default = source genre
         assert on["playlist_id"] is None                  # not linked yet
         assert off["enabled"] is False
         assert off["playlist_name"] == ""                 # blank when disabled
+        assert off["playlist_group"] == ""
         assert off["playlist_id"] is None
 
 
@@ -118,6 +122,43 @@ async def test_reenable_preserves_an_edited_live_custom_name():
         row = next(item for item in listing.json()["items"] if item["id"] == ids[0])
         assert row["playlist_id"] == created["playlist_id"]
         assert row["playlist_name"] == "My edited channel"
+
+
+async def test_custom_group_updates_playlist_and_all_fallback_rows():
+    ids = await _seed(n=2)
+    async with SessionLocal() as s:
+        first = await assign_live_custom_name(s, ids[0], "Shared")
+        await assign_live_custom_name(s, ids[1], "Shared")
+        changed = await assign_live_custom_group(s, ids[1], "Dutch Public TV")
+        await s.commit()
+        assert changed["playlist_id"] == first["playlist_id"]
+        playlist = await s.get(LivePlaylist, first["playlist_id"])
+        assert playlist.group_name == "Dutch Public TV"
+
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        listing = await c.get("/api/sources/live?per_page=50")
+        by_id = {item["id"]: item for item in listing.json()["items"]}
+        assert by_id[ids[0]]["playlist_group"] == "Dutch Public TV"
+        assert by_id[ids[1]]["playlist_group"] == "Dutch Public TV"
+
+        response = await c.post(f"/api/sources/live/{ids[0]}/playlist-group",
+                                json={"group_name": "News"})
+        assert response.status_code == 200, response.text
+        assert response.json()["group_name"] == "News"
+
+
+async def test_custom_group_adds_a_legacy_unlinked_enabled_source():
+    ids = await _seed(n=1)
+    async with SessionLocal() as s:
+        changed = await assign_live_custom_group(s, ids[0], "Sports")
+        await s.commit()
+        assert changed["custom_name"] == "NPO 1 HD"
+        playlist = await s.get(LivePlaylist, changed["playlist_id"])
+        assert playlist.group_name == "Sports"
 
 
 async def test_unique_name_creates_a_custom_channel():
