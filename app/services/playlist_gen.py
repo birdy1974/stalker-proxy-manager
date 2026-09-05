@@ -32,6 +32,20 @@ from .runtime_settings import (get_setting,  # noqa: F401  (re-export; EPG sched
 from .titles import best_title, m3u_attr, m3u_display_title
 
 
+# Xtream stream ids share one numeric namespace across portal VOD and mapped
+# local files. Keep local ids in a high, Android-player-safe signed-32-bit range.
+XTREAM_LOCAL_ID_BASE = 1_000_000_000
+
+
+def xtream_local_id(local_playlist_id: int) -> int:
+    return XTREAM_LOCAL_ID_BASE + int(local_playlist_id)
+
+
+def local_id_from_xtream(stream_id: int) -> int | None:
+    value = int(stream_id)
+    return value - XTREAM_LOCAL_ID_BASE if value >= XTREAM_LOCAL_ID_BASE else None
+
+
 class UserAuth:
     """Validates ?u=&p= credentials and applies expiry/enabled rules."""
 
@@ -372,19 +386,28 @@ async def xtream_base(user: User, base_url: str) -> dict:
 async def xtream_categories(user: User, kind: str) -> list[dict]:
     """kind: live|vod|series - distinct group names of enabled playlist items."""
     groups = _groups(user)
-    key = {"live": "live", "vod": "vod", "series": "series"}[kind]
     model = {"live": LivePlaylist, "vod": VodPlaylist, "series": SeriePlaylist}[kind]
     async with SessionLocal() as s:
         rows = (await s.execute(select(model.group_name).where(model.enabled.is_(True))
                                 .distinct())).scalars().all()
+        local_rows = []
+        if kind == "vod":
+            local_rows = (await s.execute(select(LocalPlaylist.group_name).where(
+                LocalPlaylist.enabled.is_(True)).distinct())).scalars().all()
+    names = [n or kind.title() for n in rows
+             if _allowed(n or kind.title(), groups[kind])]
+    if kind == "vod":
+        # Local files appear as Movies in Xtream, but retain their independent
+        # Local group whitelist rather than inheriting VOD permissions.
+        names += [n or "Local files" for n in local_rows
+                  if _allowed(n or "Local files", groups["local"])]
     out, seen = [], set()
-    for i, name in enumerate(sorted(n or f"{kind.title()}" for n in rows), 1):
-        if not _allowed(name, groups[key]):
-            continue
+    for name in sorted(names, key=str.casefold):
         if name.lower() in seen:
             continue
         seen.add(name.lower())
-        out.append({"category_id": str(i), "category_name": name, "parent_id": 0})
+        out.append({"category_id": str(len(out) + 1), "category_name": name,
+                    "parent_id": 0})
     return out
 
 
@@ -416,13 +439,20 @@ async def xtream_vod(user: User) -> list[dict]:
         tmap = await template_map_for(s, user)
         items = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                                  .order_by(VodPlaylist.order))).scalars().all()
+        locals_ = (await s.execute(select(LocalPlaylist).where(
+            LocalPlaylist.enabled.is_(True)).order_by(LocalPlaylist.order))).scalars().all()
+        files: dict[int, LocalFile] = {}
+        for batch in _chunked([it.local_file_id for it in locals_ if it.local_file_id]):
+            for local_file in (await s.execute(select(LocalFile).where(
+                    LocalFile.id.in_(batch)))).scalars().all():
+                files[local_file.id] = local_file
     src_names: dict[int, str] = {}
     async with SessionLocal() as s2:
         wanted = [it.vod_source_id for it in items if it.vod_source_id]
         for batch in _chunked(wanted):
             for src in (await s2.execute(select(VodSource).where(VodSource.id.in_(batch)))).scalars().all():
                 src_names[src.id] = src.original_name
-    return [{
+    out = [{
         "num": it.order,
         "name": best_title(it.custom_name, src_names.get(it.vod_source_id)),
         "stream_type": "movie",
@@ -432,12 +462,63 @@ async def xtream_vod(user: User) -> list[dict]:
         "container_extension": tmap.resolve("vod", it).container,
         "custom_sid": "", "direct_source": "",
     } for it in items if _allowed(it.group_name, groups["vod"])]
+    for it in locals_:
+        if not _allowed(it.group_name, groups["local"]):
+            continue
+        local_file = files.get(it.local_file_id)
+        if not local_file:
+            continue
+        resolved = tmap.resolve("local", it)
+        ext = (play_extension(local_file.relative_path or local_file.filename).lstrip(".")
+               if serves_original_file(resolved.command) else resolved.container)
+        out.append({
+            "num": len(out) + 1,
+            "name": best_title(it.custom_name, local_file.filename),
+            "stream_type": "movie", "stream_id": xtream_local_id(it.id),
+            "stream_icon": "", "rating": "", "rating_5based": 0, "added": "0",
+            "category_id": cats.get(it.group_name or "Local files", "1"),
+            "container_extension": ext, "custom_sid": "", "direct_source": "",
+        })
+    return out
 
 
 async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
     """Real get_vod_info answer (Phase 3): metadata from the playlist row with
     the portal source as fallback (poster/plot/year/rating may live on either)."""
     groups = _groups(user)
+    local_id = local_id_from_xtream(vod_id)
+    if local_id is not None:
+        async with SessionLocal() as s:
+            from .playback import template_map_for
+            item = await s.get(LocalPlaylist, local_id)
+            if not item or not item.enabled or not _allowed(item.group_name, groups["local"]):
+                return None
+            local_file = await s.get(LocalFile, item.local_file_id)
+            if not local_file:
+                return None
+            resolved = (await template_map_for(s, user)).resolve("local", item)
+            ext = (play_extension(local_file.relative_path or local_file.filename).lstrip(".")
+                   if serves_original_file(resolved.command) else resolved.container)
+        title = best_title(item.custom_name, local_file.filename)
+        seconds = float(local_file.duration_s or 0)
+        duration = (f"{int(seconds) // 3600:02d}:"
+                    f"{(int(seconds) % 3600) // 60:02d}:{int(seconds) % 60:02d}") \
+            if seconds > 0 else ""
+        cats = {c["category_name"]: c["category_id"]
+                for c in await xtream_categories(user, "vod")}
+        info = {
+            "name": title, "o_name": title, "cover_big": "", "movie_image": "",
+            "releasedate": "", "episode_run_time": round(seconds / 60) if seconds else 0,
+            "description": "Local file", "plot": "Local file", "genre": item.group_name,
+            "duration_secs": int(seconds), "duration": duration, "video": [], "audio": [],
+            "bitrate": 0, "rating": "", "backdrop_path": [],
+        }
+        return {"info": info, "movie_data": {
+            "stream_id": xtream_local_id(item.id), "name": title, "added": "0",
+            "category_id": cats.get(item.group_name or "Local files", "1"),
+            "container_extension": ext, "custom_sid": "", "direct_source": "",
+        }}
+
     async with SessionLocal() as s:
         from .playback import template_map_for
         it = await s.get(VodPlaylist, vod_id)

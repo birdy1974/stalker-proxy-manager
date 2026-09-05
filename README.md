@@ -158,7 +158,11 @@ Xtream identity advertises only the implemented MPEG-TS output format, and its
 `server_info` reports the externally visible scheme, host, and explicit/default
 port correctly. Xtream-only users can play both `/live|movie|series/...` URLs
 and the `/play/...` URLs returned by `get.php`; native M3U and Xtream catalogue
-permissions remain independently gated.
+permissions remain independently gated. For Xtream API clients, enabled Local
+playlist files are additionally mapped into **Movies/VOD** using their Local
+group names, local group whitelist, effective Area template, and real file or
+transcoded container extension. They are not exposed as Series; native M3U and
+Enigma2 organization remain unchanged.
 
 Users only ever talk to port **8880** — GUI, streams, playlists and APIs share it.
 

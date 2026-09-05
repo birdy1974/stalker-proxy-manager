@@ -33,8 +33,8 @@ from ..models import (
 )
 from ..services.db_logging import db_log
 from ..services.playlist_gen import (
-    UserAuth, build_m3u, xtream_base, xtream_categories, xtream_live,
-    xtream_series, xtream_series_info, xtream_vod,
+    UserAuth, build_m3u, local_id_from_xtream, xtream_base, xtream_categories,
+    xtream_live, xtream_series, xtream_series_info, xtream_vod,
 )
 from ..services.local_files import media_type_for
 from ..services.stream_manager import MANAGER
@@ -423,9 +423,22 @@ async def xlive(request: Request, sid: int, u: str, p: str, mode: str = ""):
     return await _xtream_stream(request, "live", sid, u, p, mode)
 
 
+async def _xtream_movie(request: Request, sid: int, u: str, p: str,
+                        mode: str, ext: str):
+    user = await _authed(u, p, "xtream")
+    local_id = local_id_from_xtream(sid)
+    if local_id is not None:
+        return await _local_response(local_id, user, request, ext)
+    media_type = MEDIA_TYPES.get(ext, MEDIA_TYPES["ts"])
+    if request.method == "HEAD":
+        return _stream_head(media_type)
+    return await _stream_response("vod", sid, user, f"vod #{sid}", request,
+                                  mode, media_type)
+
+
 @router.api_route("/movie/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xmovie(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await _xtream_stream(request, "vod", sid, u, p, mode)
+    return await _xtream_movie(request, sid, u, p, mode, "ts")
 
 
 @router.api_route("/series/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
@@ -435,7 +448,16 @@ async def xseries(request: Request, sid: int, u: str, p: str, mode: str = ""):
 
 @router.api_route("/movie/{u}/{p}/{sid}.mkv", methods=["GET", "HEAD"])
 async def xmovie_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await _xtream_stream(request, "vod", sid, u, p, mode, "mkv")
+    return await _xtream_movie(request, sid, u, p, mode, "mkv")
+
+
+@router.api_route("/movie/{u}/{p}/{sid}.{ext}", methods=["GET", "HEAD"])
+async def xmovie_file(request: Request, sid: int, ext: str, u: str, p: str,
+                      mode: str = ""):
+    """Original local-file extensions (mp4/avi/webm/...) advertised as VOD."""
+    if local_id_from_xtream(sid) is None:
+        raise HTTPException(404, "unknown movie extension")
+    return await _xtream_movie(request, sid, u, p, mode, ext)
 
 
 @router.api_route("/series/{u}/{p}/{sid}.mkv", methods=["GET", "HEAD"])
