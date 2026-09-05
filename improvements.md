@@ -1,5 +1,8 @@
 2026-09-05
 - add favicon (for all tabs)
+- on "input source" tab change the header name of field "Playlist" (between "channel" and "portal") to "Custom Channel Name". also make the width of column "channel" smaller and the width of column "Custom Channel Name" bigger
+- in case a live channel is enabled in "input source" tab, it directly needs to be added as as a new custom channel, where the custom channel name is the same as the original channel name. after the channel is added the channel name should appear in the "Custom Channel Name" column so the user can edit it.
+- on "input source" tab also add the column "Custom Group" which is the same information of the "Group" in the Playlist tab. this field will have the same functionality as the "custom channel name" only for the group/genre information.
 - it takes a really long time before local files are playing (no ffmpeg transcoding assigned))
 - playing local files (mp4 or avi) on enigma2 with ffmpeg: Enigma2 VOD - remux + subtitles (MKV) gives only sound, no picture. stream shows still .ts
 2026-09-04 16:53:54	DEBUG	ffmpeg	spawn command: /usr/bin/ffmpeg -fflags +genpts+discardcorrupt -err_detect ignore_err -re -i /media/1-Giebel/2b.kraantje lek 1976.mp4 -map 0:v:0 -map 0:a:0? -dn -sn -c:v copy -c:a copy -bsf:v h264_mp4toannexb max_interleave_delta 2000000 -metadata title=2b.kraantje lek 1976.mp4 -f mpegts -mpegts_flags +resend_headers -flush_packets 1 pipe:1
