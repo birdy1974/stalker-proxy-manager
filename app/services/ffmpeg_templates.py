@@ -734,6 +734,10 @@ def default_presets() -> list[dict]:
     # bitrate numbers still filled in - flip the template to VBR or CBR and the
     # tuning above is what you get back, no retyping.
     mk = lambda name, **kw: {**asdict(FFmpegOptions(**kw)), "name": name}   # noqa: E731
+    # Bound demux analysis on latency-oriented Enigma2 presets. One megabyte /
+    # one second is ample for ordinary MP4/MKV/TS headers while avoiding the
+    # multi-second default analysis wait on slow disks and portal VOD links.
+    fast_input = "-analyzeduration 1000000 -probesize 1000000"
     # Every template ships subs="dvb" (hardware-safe BITMAP subtitle
     # passthrough): the subtitle track is demuxed and re-encoded independently
     # of the video, so the hw decode->scale->encode pipeline stays untouched,
@@ -762,9 +766,10 @@ def default_presets() -> list[dict]:
         #  * VAAPI  - 4K/HEVC rescue: GPU H.264 High@4.0 1080p (BCM7424
         #             ceiling) + AC3, subtitles copied beside the GPU path.
         mk(E2_VOD_REMUX_PRESET_NAME, hw_accel="none", video_codec="copy",
-           audio_codec="copy", resolution="source",
+           audio_codec="copy", resolution="source", extra_input=fast_input,
            output_format="matroska", subs="keep"),
         mk(E2_VOD_TRANSCODE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
+           extra_input=fast_input,
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            maxrate="4400k", bufsize="8000k", fps="25", gop="50",
            profile="high", level="4.0", low_power=True, async_depth="4",
@@ -775,12 +780,14 @@ def default_presets() -> list[dict]:
         # renders natively.
         mk(E2_DUO2_LIVE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
+           extra_input=fast_input,
            maxrate="4400k", bufsize="8000k", fps="25", gop="50",
            profile="high", level="4.0", low_power=True, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
            subs="dvb"),
         mk("Dreambox DM800se (Enigma2 / MPEG2-SD)", hw_accel="vaapi",
            resolution="576p", aspect="16:9", video_codec="h264_vaapi",
+           extra_input=fast_input,
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k",
            fps="25", gop="50", profile="main", level="3.1",
            low_power=True, async_depth="4",

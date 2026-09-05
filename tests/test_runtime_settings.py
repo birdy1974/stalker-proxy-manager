@@ -21,6 +21,7 @@ from app.models import (
 )
 from app.services.runtime_settings import (
     fallback_strategy, fetch_page_budget, output_base_url,
+    vlc_local_network_caching_ms,
 )
 from app.services.stream_manager import MANAGER
 from app.services.fetch_jobs import _paged_upsert
@@ -57,6 +58,13 @@ async def test_helpers_prefer_the_db_over_env():
     await _put("output_base_url", "   ")
     # empty GUI value = no override
     assert await output_base_url() == ""
+
+    await _put("vlc_local_network_caching_ms", 250)
+    assert await vlc_local_network_caching_ms() == 250
+    await _put("vlc_local_network_caching_ms", -1)
+    assert await vlc_local_network_caching_ms() == 0
+    await _put("vlc_local_network_caching_ms", "invalid")
+    assert await vlc_local_network_caching_ms() == 500
 
 
 async def _two_mac_channel() -> int:

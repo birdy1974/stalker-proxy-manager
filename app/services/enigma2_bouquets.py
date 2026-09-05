@@ -552,16 +552,15 @@ async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
         lf = files.get(it.local_file_id)
         if not lf:
             continue
-        d = res.for_item(it.ffmpeg_template_id, "local")
-        # Progressive MP4 over HTTP is audio-only on Enigma2 (no picture), and
-        # a live Matroska pipe is the same. Local items are always advertised
-        # as MPEG-TS; /play/local/{id}.ts remuxes with h264_mp4toannexb even
-        # when the template would otherwise FileResponse the original file.
-        # Service type 1 cannot demux a remuxed AAC/H.264 TS from an MP4.
+        # Resolve area/user overrides exactly like live, VOD and series. In
+        # auto mode the bouquet URL must describe the template's real output:
+        # asking for `.ts` makes _local_response take the MPEG-TS path, which
+        # turns a Matroska remux into the audio-only symptom on Enigma2.
+        d = res.for_item(tmap.resolve("local", it).id, "local")
         player = d.player if d.player in FFMPEG_PLAYERS else "4097"
         w.service(player, it.id,
-                  stream_url(base_url, "local", it.id, "ts", user,
-                             mode, ext=".ts"),
+                  stream_url(base_url, "local", it.id, d.container, user,
+                             mode, ext="." + d.container),
                   best_title(it.custom_name, lf.filename))
     return w.done()
 

@@ -21,7 +21,8 @@ from app.models import (
     FFmpegTemplate, LocalFile, LocalPlaylist, LocalSource, User,
 )
 from app.services.ffmpeg_templates import (
-    COPY_PRESET_NAME, REDIRECT_PRESET_NAME, REFERENCE_PRESET_NAME,
+    COPY_PRESET_NAME, E2_VOD_REMUX_PRESET_NAME, REDIRECT_PRESET_NAME,
+    REFERENCE_PRESET_NAME,
     URL_PLACEHOLDER, build_command, FFmpegOptions,
 )
 from app.services.local_files import extinf_duration, play_extension
@@ -127,13 +128,52 @@ async def test_file_inputs_are_paced_with_re_and_live_is_not():
 
 async def test_m3u_uses_real_duration_and_original_extension(tmp_path):
     pid, _ = await _seed_file(tmp_path, duration_s=125.4)
+    # The relative path is the on-disk truth. Even stale display metadata must
+    # never turn a directly served MP4 URL into the `.ts` FFmpeg path.
+    async with SessionLocal() as s:
+        playlist = await s.get(LocalPlaylist, pid)
+        local_file = await s.get(LocalFile, playlist.local_file_id)
+        local_file.filename = "stale-name.ts"
+        await s.commit()
     user = await _user()
     text = await build_m3u(BASE, user)
     assert f"#EXTINF:{extinf_duration(125.4)} " in text
     assert "#EXTINF:-1 tvg-name=\"Home video\"" not in text
-    assert f"{BASE}/play/local/{pid}.mp4?u=loc&p=pw" in text
+    assert f"#EXTVLCOPT:network-caching=500\n{BASE}/play/local/{pid}.mp4?u=loc&p=pw" in text
     assert f"/play/local/{pid}.ts?" not in text
     assert play_extension("The Movie.mkv") == ".mkv"
+
+
+async def test_vlc_local_cache_setting_updates_the_next_playlist(tmp_path):
+    await _seed_file(tmp_path, name="quick.mkv")
+    user = await _user()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url=BASE) as c:
+        saved = await c.post("/api/settings", json={
+            "vlc_local_network_caching_ms": 250,
+        })
+        assert saved.status_code == 200, saved.text
+        text = await build_m3u(BASE, user)
+        assert "#EXTVLCOPT:network-caching=250" in text
+
+        saved = await c.post("/api/settings", json={
+            "vlc_local_network_caching_ms": 0,
+        })
+        assert saved.status_code == 200, saved.text
+        text = await build_m3u(BASE, user)
+        assert "#EXTVLCOPT:network-caching=" not in text
+
+
+async def test_transcoded_local_m3u_uses_template_container_not_file_suffix(tmp_path):
+    await _seed_defaults()
+    async with SessionLocal() as s:
+        template_id = (await s.execute(select(FFmpegTemplate.id).where(
+            FFmpegTemplate.name == REFERENCE_PRESET_NAME))).scalar_one()
+    pid, _ = await _seed_file(tmp_path, name="transcoded.mkv", template_id=template_id)
+    user = await _user()
+    text = await build_m3u(BASE, user)
+    assert f"{BASE}/play/local/{pid}.ts?u=loc&p=pw" in text
+    assert "#EXTVLCOPT:network-caching=" not in text
 
 
 async def test_direct_and_copy_serve_the_original_file(tmp_path):
@@ -161,6 +201,7 @@ async def test_direct_and_copy_serve_the_original_file(tmp_path):
             assert r.content == payload
             assert "video/mp4" in r.headers.get("content-type", "")
             assert r.headers.get("accept-ranges") == "bytes"
+            assert r.headers.get("x-accel-buffering") == "no"
             assert "attachment" not in r.headers.get("content-disposition", "")
         head = await c.head(f"/play/local/{pid_redir}.mp4?u=loc&p=pw")
         assert head.status_code == 200
@@ -216,6 +257,20 @@ async def test_transcode_template_goes_through_ffmpeg_with_quoted_path(
     assert seen and seen[0] == str(media)
     assert "file:" not in seen[0]
     await MANAGER.kill_all()
+
+
+async def test_local_mkv_alias_advertises_matroska_content_type(tmp_path):
+    await _seed_defaults()
+    async with SessionLocal() as s:
+        template_id = (await s.execute(select(FFmpegTemplate.id).where(
+            FFmpegTemplate.name == E2_VOD_REMUX_PRESET_NAME))).scalar_one()
+    pid, _ = await _seed_file(tmp_path, name="movie.mp4", template_id=template_id)
+    await _user()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url=BASE) as c:
+        response = await c.head(f"/play/local/{pid}.mkv?u=loc&p=pw")
+    assert response.status_code == 200, response.text
+    assert "video/x-matroska" in response.headers.get("content-type", "")
 
 
 async def test_ts_url_remuxes_local_mp4_instead_of_serving_the_file(

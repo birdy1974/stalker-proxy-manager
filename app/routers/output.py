@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
@@ -32,8 +33,8 @@ from ..models import (
 )
 from ..services.db_logging import db_log
 from ..services.playlist_gen import (
-    UserAuth, build_m3u, xtream_base, xtream_categories, xtream_live,
-    xtream_series, xtream_series_info, xtream_vod,
+    UserAuth, build_m3u, local_id_from_xtream, xtream_base, xtream_categories,
+    xtream_live, xtream_series, xtream_series_info, xtream_vod,
 )
 from ..services.local_files import media_type_for
 from ..services.stream_manager import MANAGER
@@ -208,6 +209,12 @@ async def _wants_redirect(kind: str, ref_id: int, mode: str,
 MEDIA_TYPES = {"ts": "video/mp2t", "mkv": "video/x-matroska"}
 
 
+def _stream_head(media_type: str = "video/mp2t") -> Response:
+    """Metadata-only player probe: never resolve a portal or start FFmpeg."""
+    return Response(status_code=200, media_type=media_type,
+                    headers=STREAM_HEADERS | {"Accept-Ranges": "none"})
+
+
 async def _stream_response(kind: str, ref_id: int, user: User | None, label: str,
                             request: Request, mode: str = "",
                             media_type: str = "video/mp2t"):
@@ -223,14 +230,21 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     templates serve the original file; transcode templates still go through
     ffmpeg.
     """
+    started = time.perf_counter()
     if kind != "local" and await _wants_redirect(
             kind, ref_id, mode, user.name if user else None):
         from fastapi.responses import RedirectResponse
+        resolve_started = time.perf_counter()
         url, item_name = await MANAGER.resolve(kind, ref_id)
+        resolve_ms = (time.perf_counter() - resolve_started) * 1000
         if url:
+            total_ms = (time.perf_counter() - started) * 1000
             await db_log("INFO", "output",
-                         f"[{item_name}] redirect mode -> sending client to the source")
-            return RedirectResponse(url, status_code=302)
+                         f"[{item_name}] startup timing: redirect resolve={resolve_ms:.0f}ms "
+                         f"total={total_ms:.0f}ms")
+            return RedirectResponse(url, status_code=302, headers={
+                "Server-Timing": f"resolve;dur={resolve_ms:.1f}, total;dur={total_ms:.1f}",
+            })
         raise HTTPException(502, f"{label}: no source produced a link to redirect to")
 
     if not MANAGER.can_open_for(user.name if user else None,
@@ -238,33 +252,50 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
         await db_log("WARNING", "output",
                      f"user {user.name if user else 'admin'} exceeded max_connections")
         raise HTTPException(429, "max connections reached for this user")
+    open_started = time.perf_counter()
     handle, gen = await MANAGER.open(kind, ref_id, user.name if user else None)
+    open_ms = (time.perf_counter() - open_started) * 1000
     if handle.dead:
         raise HTTPException(404, f"{label}: no available source (all busy or unreachable)")
     # watchdog lives until the stream deregisters (normal end) or the client
     # disappears (then it kills the stream; see watch_disconnect). watch() keeps
     # a strong reference, so the task cannot be garbage-collected mid-flight.
     MANAGER.watch(request, handle)
+    first_started = time.perf_counter()
     body = await _guarded(gen, label, handle.item_name)
+    first_ms = (time.perf_counter() - first_started) * 1000
+    total_ms = (time.perf_counter() - started) * 1000
+    await db_log("INFO", "output",
+                 f"[{handle.item_name}] startup timing: prepare={open_ms:.0f}ms "
+                 f"source+ffmpeg+first-byte={first_ms:.0f}ms total={total_ms:.0f}ms")
+    timing = (f"prepare;dur={open_ms:.1f}, first-byte;dur={first_ms:.1f}, "
+              f"total;dur={total_ms:.1f}")
     return StreamingResponse(body, media_type=media_type,
-                             headers=STREAM_HEADERS | {"X-SPM-Stream": handle.id})
+                             headers=STREAM_HEADERS | {"X-SPM-Stream": handle.id,
+                                                       "Server-Timing": timing})
 
 
 @router.api_route("/play/live/{pid}.ts", methods=["GET", "HEAD"])
 async def play_live(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
+    if request.method == "HEAD":
+        return _stream_head()
     return await _stream_response("live", pid, user, f"live #{pid}", request, mode)
 
 
-@router.get("/play/vod/{pid}.ts")
+@router.api_route("/play/vod/{pid}.ts", methods=["GET", "HEAD"])
 async def play_vod(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
+    if request.method == "HEAD":
+        return _stream_head()
     return await _stream_response("vod", pid, user, f"vod #{pid}", request, mode)
 
 
-@router.get("/play/episode/{eid}.ts")
+@router.api_route("/play/episode/{eid}.ts", methods=["GET", "HEAD"])
 async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
+    if request.method == "HEAD":
+        return _stream_head()
     return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode)
 
 
@@ -275,21 +306,27 @@ async def play_episode(request: Request, eid: int, u: str = "", p: str = "", mod
 # arrive intact: MPEG-TS has no slot for text subtitles, Matroska has.
 @router.api_route("/play/live/{pid}.mkv", methods=["GET", "HEAD"])
 async def play_live_mkv(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
+    if request.method == "HEAD":
+        return _stream_head(MEDIA_TYPES["mkv"])
     return await _stream_response("live", pid, user, f"live #{pid}", request, mode,
                                   MEDIA_TYPES["mkv"])
 
 
-@router.get("/play/vod/{pid}.mkv")
+@router.api_route("/play/vod/{pid}.mkv", methods=["GET", "HEAD"])
 async def play_vod_mkv(request: Request, pid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
+    if request.method == "HEAD":
+        return _stream_head(MEDIA_TYPES["mkv"])
     return await _stream_response("vod", pid, user, f"vod #{pid}", request, mode,
                                   MEDIA_TYPES["mkv"])
 
 
-@router.get("/play/episode/{eid}.mkv")
+@router.api_route("/play/episode/{eid}.mkv", methods=["GET", "HEAD"])
 async def play_episode_mkv(request: Request, eid: int, u: str = "", p: str = "", mode: str = ""):
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
+    if request.method == "HEAD":
+        return _stream_head(MEDIA_TYPES["mkv"])
     return await _stream_response("episode", eid, user, f"episode #{eid}", request, mode,
                                   MEDIA_TYPES["mkv"])
 
@@ -297,7 +334,9 @@ async def play_episode_mkv(request: Request, eid: int, u: str = "", p: str = "",
 @router.api_route("/play/local/{pid}.{ext}", methods=["GET", "HEAD"])
 async def play_local(request: Request, pid: int, ext: str, u: str = "", p: str = "",
                      mode: str = ""):  # noqa: ARG001
-    user = await _authed(u, p, "m3u")
+    user = await _authed(u, p, "stream")
+    # _local_response handles HEAD without opening FFmpeg while preserving the
+    # real file's Content-Length and Range metadata for direct playback.
     return await _local_response(pid, user, request, ext)
 
 
@@ -317,57 +356,113 @@ def _requested_matches_file(path: str, ext: str | None) -> bool:
 
 async def _local_response(pid: int, user, request: Request, ext: str | None = None):
     """Serve a local playlist item: original file for direct/copy, else ffmpeg."""
+    started = time.perf_counter()
+    path_started = time.perf_counter()
     path, item_name = await MANAGER.local_disk_path(pid)
+    path_ms = (time.perf_counter() - path_started) * 1000
     if not path:
         raise HTTPException(404, f"local #{pid}: file not found on disk")
-    if await MANAGER.local_serves_original(pid) and _requested_matches_file(path, ext):
+    template_started = time.perf_counter()
+    serves_original = await MANAGER.local_serves_original(
+        pid, user.name if user else None)
+    template_ms = (time.perf_counter() - template_started) * 1000
+    if serves_original and _requested_matches_file(path, ext):
         if not MANAGER.can_open_for(user.name if user else None,
                                     user.max_connections if user else None):
             await db_log("WARNING", "output",
                          f"user {user.name if user else 'admin'} exceeded max_connections")
             raise HTTPException(429, "max connections reached for this user")
         media_type = media_type_for(path)
-        headers = {"Cache-Control": "no-store"}
+        # Do not let nginx-compatible reverse proxies fill a large response
+        # buffer before VLC receives the first bytes. FileResponse supplies
+        # Content-Length, Accept-Ranges and efficient asynchronous file reads.
+        headers = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
         if request.method == "HEAD":
             return FileResponse(path, media_type=media_type, headers=headers)
+        register_started = time.perf_counter()
         handle = await MANAGER.register_local_file(
             pid, user.name if user else None, path, item_name)
+        register_ms = (time.perf_counter() - register_started) * 1000
         MANAGER.watch(request, handle)
+        total_ms = (time.perf_counter() - started) * 1000
         headers["X-SPM-Stream"] = handle.id
+        headers["Server-Timing"] = (
+            f"path;dur={path_ms:.1f}, template;dur={template_ms:.1f}, "
+            f"register;dur={register_ms:.1f}, total;dur={total_ms:.1f}")
         await db_log("INFO", "output",
-                     f"[{item_name}] serving original file ({media_type})")
+                     f"[{item_name}] startup timing: direct-local path={path_ms:.0f}ms "
+                     f"template={template_ms:.0f}ms register={register_ms:.0f}ms "
+                     f"total={total_ms:.0f}ms")
         return FileResponse(path, media_type=media_type, headers=headers,
                             background=BackgroundTask(MANAGER.kill, handle.id))
+    # The URL alias follows the selected template. In particular, an Enigma2
+    # Matroska remux must be announced as video/x-matroska rather than TS.
+    media_type = MEDIA_TYPES["mkv"] if (ext or "").lower().lstrip(".") == "mkv" \
+        else MEDIA_TYPES["ts"]
     if request.method == "HEAD":
-        return Response(status_code=200, media_type="video/mp2t",
+        return Response(status_code=200, media_type=media_type,
                         headers={"Cache-Control": "no-store"})
-    return await _stream_response("local", pid, user, f"local #{pid}", request, "proxy")
+    return await _stream_response("local", pid, user, f"local #{pid}", request,
+                                  "proxy", media_type)
 
 
 # Xtream-style stream URLs -----------------------------------------------
-@router.get("/live/{u}/{p}/{sid}.ts")
+async def _xtream_stream(request: Request, kind: str, sid: int, u: str, p: str,
+                         mode: str, container: str = "ts"):
+    """Xtream namespace is gated by xtream_enabled, independent of M3U access."""
+    user = await _authed(u, p, "xtream")
+    media_type = MEDIA_TYPES.get(container, MEDIA_TYPES["ts"])
+    if request.method == "HEAD":
+        return _stream_head(media_type)
+    return await _stream_response(kind, sid, user, f"{kind} #{sid}", request,
+                                  mode, media_type)
+
+
+@router.api_route("/live/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xlive(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_live(request, sid, u, p, mode)
+    return await _xtream_stream(request, "live", sid, u, p, mode)
 
 
-@router.get("/movie/{u}/{p}/{sid}.ts")
+async def _xtream_movie(request: Request, sid: int, u: str, p: str,
+                        mode: str, ext: str):
+    user = await _authed(u, p, "xtream")
+    local_id = local_id_from_xtream(sid)
+    if local_id is not None:
+        return await _local_response(local_id, user, request, ext)
+    media_type = MEDIA_TYPES.get(ext, MEDIA_TYPES["ts"])
+    if request.method == "HEAD":
+        return _stream_head(media_type)
+    return await _stream_response("vod", sid, user, f"vod #{sid}", request,
+                                  mode, media_type)
+
+
+@router.api_route("/movie/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xmovie(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_vod(request, sid, u, p, mode)
+    return await _xtream_movie(request, sid, u, p, mode, "ts")
 
 
-@router.get("/series/{u}/{p}/{sid}.ts")
+@router.api_route("/series/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xseries(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_episode(request, sid, u, p, mode)
+    return await _xtream_stream(request, "episode", sid, u, p, mode)
 
 
-@router.get("/movie/{u}/{p}/{sid}.mkv")
+@router.api_route("/movie/{u}/{p}/{sid}.mkv", methods=["GET", "HEAD"])
 async def xmovie_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_vod_mkv(request, sid, u, p, mode)
+    return await _xtream_movie(request, sid, u, p, mode, "mkv")
 
 
-@router.get("/series/{u}/{p}/{sid}.mkv")
+@router.api_route("/movie/{u}/{p}/{sid}.{ext}", methods=["GET", "HEAD"])
+async def xmovie_file(request: Request, sid: int, ext: str, u: str, p: str,
+                      mode: str = ""):
+    """Original local-file extensions (mp4/avi/webm/...) advertised as VOD."""
+    if local_id_from_xtream(sid) is None:
+        raise HTTPException(404, "unknown movie extension")
+    return await _xtream_movie(request, sid, u, p, mode, ext)
+
+
+@router.api_route("/series/{u}/{p}/{sid}.mkv", methods=["GET", "HEAD"])
 async def xseries_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""):
-    return await play_episode_mkv(request, sid, u, p, mode)
+    return await _xtream_stream(request, "episode", sid, u, p, mode, "mkv")
 
 
 # -------------------------------------------------- admin quick-play (GUI)

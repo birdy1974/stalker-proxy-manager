@@ -115,6 +115,8 @@ DEFAULT_SETTINGS = {
     "tmdb_api_key": "",
     "fetch_page_budget": FETCH_PAGE_BUDGET,
     "output_base_url": OUTPUT_BASE_URL,
+    # VLC honours this per local-file entry; 0 omits the directive.
+    "vlc_local_network_caching_ms": 500,
     # Background multi-MAC status/expiry sweep (minutes). 0 = paused.
     # Only portals with ≥2 MACs are visited when mac_health_multi_only is true.
     "mac_health_minutes": 60,
@@ -146,6 +148,10 @@ async def set_settings(payload: dict, db=Depends(get_db)):
             db.add(row)
         row.value = json.dumps(v)
     await db.commit()
+    # Settings such as VLC's local-file cache directive alter generated M3Us;
+    # do not serve the previous value for the normal two-minute cache window.
+    from ..services.playlist_gen import clear_m3u_cache
+    clear_m3u_cache()
     # The tab icon is normally changed from its own picker, but it is a settings
     # row like any other (and a restored backup writes it here): re-stamp the
     # cache-busting fingerprint so open tabs pick the new picture up.

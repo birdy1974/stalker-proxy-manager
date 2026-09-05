@@ -21,6 +21,7 @@ from ..config import MEDIA_ROOT
 from ..database import get_db, spawn
 from ..services.permissions import describe_access, permission_hint
 from ..services.playlist_sync import (SYNC_KINDS, add_sources,
+                                        assign_live_custom_group,
                                         assign_live_custom_name,
                                         live_playlist_links_for, sync_sources)
 from ..models import (
@@ -70,6 +71,8 @@ def _live_item(r: LiveSource, genre_names, portal_names, pl_link: dict | None = 
             "xtream_url": r.xtream_url or None,
             "playlist_id": pl["playlist_id"] if pl else None,
             "playlist_name": (pl["custom_name"] if pl else (r.original_name if r.enabled else "")),
+            "playlist_group": (pl["group_name"] if pl else
+                               (genre_names.get(r.live_genre_id, "") if r.enabled else "")),
             "playlist_priority": pl["priority"] if pl else None,
             "playlist_is_primary": pl["is_primary"] if pl else None,
             "playlist_chain_len": pl["chain_len"] if pl else None}
@@ -142,6 +145,20 @@ async def set_live_playlist_name(sid: int, payload: dict, db=Depends(get_db)):
     await db_log("INFO", "sources",
                  f"live source #{sid} playlist name → {res['action']}: "
                  f"'{res['custom_name']}' (playlist #{res['playlist_id']})")
+    return {"ok": True, **res}
+
+
+@router.post("/live/{sid}/playlist-group")
+async def set_live_playlist_group(sid: int, payload: dict, db=Depends(get_db)):
+    """Set the Playlist group for an enabled live source's custom channel."""
+    try:
+        res = await assign_live_custom_group(db, sid, payload.get("group_name") or "")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    await db.commit()
+    await db_log("INFO", "sources",
+                 f"live source #{sid} custom group → '{res['group_name']}' "
+                 f"(playlist #{res['playlist_id']})")
     return {"ok": True, **res}
 
 
@@ -252,8 +269,9 @@ async def toggle(payload: dict, db=Depends(get_db)):
     rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
     for r in rows:
         r.enabled = enabled
-    # mirror the switch into the output playlist (vod/series; live channels are
-    # curated custom channels and are added explicitly from the Playlist tab)
+    # Mirror the switch into the output playlist. A newly enabled live source
+    # is created under its original name, or joins the same-name channel as a
+    # fallback; existing custom edits are preserved on later re-enables.
     synced = {}
     if payload.get("kind") in SYNC_KINDS:
         synced = await sync_sources(db, payload["kind"], [r.id for r in rows], enabled)
@@ -278,6 +296,7 @@ async def toggle(payload: dict, db=Depends(get_db)):
     await db_log("INFO", "sources",
                  f"{payload['kind']}: {len(rows)} items -> enabled={enabled}"
                  + (f" (playlist: +{synced.get('created', 0)} new, "
+                    f"+{synced.get('fallback', 0)} fallback, "
                     f"{synced.get('enabled', 0)} re-enabled, "
                     f"{synced.get('disabled', 0)} switched off)" if synced else ""))
     return {"ok": True, "count": len(rows), "playlist": synced,
@@ -462,18 +481,24 @@ async def scan_local(payload: dict, db=Depends(get_db)):
                     continue
                 rel = os.path.relpath(os.path.join(root, fn), base)
                 total_seen += 1
-                exists = await db.scalar(select(func.count()).select_from(LocalFile).where(
-                    LocalFile.local_source_id == d.id, LocalFile.relative_path == rel))
-                if exists:
-                    continue
                 try:
                     st = os.stat(os.path.join(root, fn))
                 except OSError as e:                      # unreadable file: skip, keep scanning
                     skipped.append(f"{os.path.join(root, fn)} ({e.strerror})")
                     continue
+                mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
+                existing = await db.scalar(select(LocalFile).where(
+                    LocalFile.local_source_id == d.id, LocalFile.relative_path == rel))
+                if existing:
+                    if existing.size_bytes != st.st_size or existing.mtime != mtime:
+                        existing.filename = fn
+                        existing.size_bytes = st.st_size
+                        existing.mtime = mtime
+                        existing.duration_s = None
+                        existing.media_probe = None
+                    continue
                 db.add(LocalFile(local_source_id=d.id, relative_path=rel, filename=fn,
-                                 size_bytes=st.st_size,
-                                 mtime=datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()))
+                                 size_bytes=st.st_size, mtime=mtime))
                 n_new += 1
         if skipped:
             total_skipped += len(skipped)

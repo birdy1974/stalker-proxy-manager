@@ -270,7 +270,9 @@ async def test_every_entry_has_a_matching_playable_url():
     urls = [ln for ln in lines if ln.startswith(BASE + "/play/")]
     assert len(extinf) == len(urls), "EXTINF/URL pairs must line up 1:1"
     for i in extinf:
-        assert lines[i + 1].startswith(BASE + "/play/"), f"orphan EXTINF at line {i}"
+        # VLC-specific options belong between EXTINF and that entry's URL.
+        url_i = i + 2 if lines[i + 1].startswith("#EXTVLCOPT:") else i + 1
+        assert lines[url_i].startswith(BASE + "/play/"), f"orphan EXTINF at line {i}"
     assert all("u=user1&p=pw" in u for u in urls), "every url must carry the user's credentials"
 
 

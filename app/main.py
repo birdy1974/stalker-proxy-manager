@@ -191,6 +191,10 @@ async def startup() -> None:
     # slot can never stay occupied until the next restart.
     _bg.add(asyncio.create_task(MANAGER.reap_dead(), name="spm-stream-reaper"))
     _bg.add(asyncio.create_task(_reap_sessions(), name="spm-session-reaper"))
+    # Authenticate resolved portal/MAC sessions before a player asks for its
+    # first link; periodic refresh also keeps healthy sessions ahead of expiry.
+    from .services.portal_warmup import portal_warmup_scheduler
+    _bg.add(asyncio.create_task(portal_warmup_scheduler(), name="spm-portal-warmup"))
 
 
 async def _reap_sessions(interval: float = 300.0) -> None:
@@ -217,6 +221,15 @@ async def _reap_sessions(interval: float = 300.0) -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    # Stop schedulers before closing their database/HTTP resources. In
+    # particular, portal warmup must not authenticate a new client while the
+    # pool is being torn down.
+    tasks = list(_bg)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _bg.clear()
     # Log rows live on a queue drained by a writer task; the pool is torn down
     # right after this, so anything still queued has to be committed now.
     await stop_log_writer()

@@ -1,14 +1,15 @@
 """
-Local-file playback helpers: MIME type, playlist URL suffix, duration cache.
+Local-file playback helpers: MIME type, playlist URL suffix, media cache.
 
 Local items used to be advertised as live MPEG-TS (`#EXTINF:-1` + `/play/…ts`)
 and then forced through ffmpeg, which is why VLC listed them but played
-silence. Direct/copy now serves the original file; duration is probed off the
-request path and stored on `local_files.duration_s`.
+silence. Direct/copy now serves the original file; scan-time media metadata is
+stored for playlist duration and fast first-play remux/subtitle decisions.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import mimetypes
 from pathlib import Path
@@ -18,7 +19,7 @@ from sqlalchemy import select
 from ..database import SessionLocal
 from ..models import LocalFile, LocalPlaylist, LocalSource
 from .item_info import local_file_path
-from .probe import probe_duration
+from .probe import probe_media
 
 log = logging.getLogger("spm.local")
 
@@ -66,7 +67,7 @@ def extinf_duration(seconds: float | None) -> str:
 
 
 async def fill_local_durations(file_ids: list[int]) -> None:
-    """Best-effort duration probe for scanned files. Never raises."""
+    """Best-effort duration/codec/subtitle probe for scanned files. Never raises."""
     for fid in file_ids:
         try:
             await _fill_one(fid)
@@ -89,20 +90,24 @@ async def fill_duration_for_playlist_item(playlist_id: int) -> None:
 async def _fill_one(file_id: int) -> None:
     async with SessionLocal() as s:
         lf = await s.get(LocalFile, file_id)
-        if lf is None or lf.duration_s:
+        if lf is None or lf.media_probe:
             return
         ls = await s.get(LocalSource, lf.local_source_id)
         if not ls:
             return
         path = local_file_path(ls.directory, lf.relative_path)
-    dur = await probe_duration(path)
-    if not dur:
+        expected_mtime, expected_size = lf.mtime, lf.size_bytes
+    probe = await probe_media(path, is_url=False)
+    if not probe or "error" in probe:
         return
     async with SessionLocal() as s:
         lf = await s.get(LocalFile, file_id)
-        if lf is None or lf.duration_s:
+        # Do not attach metadata to a file replaced while ffmpeg was probing it.
+        if lf is None or lf.mtime != expected_mtime or lf.size_bytes != expected_size:
             return
-        lf.duration_s = float(dur)
+        lf.media_probe = json.dumps(probe, separators=(",", ":"))
+        if probe.get("duration_s"):
+            lf.duration_s = float(probe["duration_s"])
         await s.commit()
 
 
@@ -113,5 +118,5 @@ async def missing_duration_ids(source_ids: list[int]) -> list[int]:
         rows = (await s.execute(
             select(LocalFile.id).where(
                 LocalFile.local_source_id.in_(source_ids),
-                LocalFile.duration_s.is_(None)))).scalars().all()
+                LocalFile.media_probe.is_(None)))).scalars().all()
     return list(rows)

@@ -112,6 +112,12 @@ class MacAddress(Base):
     last_error: Mapped[str | None] = mapped_column(String(200))           # why, in the panel's own words
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
     last_checked: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Last successful per-package genre comparison. Counts are nullable so
+    # "never compared" and a genuine zero-category package remain distinct.
+    genre_count_live: Mapped[int | None] = mapped_column(Integer)
+    genre_count_vod: Mapped[int | None] = mapped_column(Integer)
+    genre_count_series: Mapped[int | None] = mapped_column(Integer)
+    genres_compared_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # The panel asks every link to be re-validated for this account (create_link
     # with force_ch_link_check=1). Stored so the stream path can honour it.
     force_ch_link_check: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -317,6 +323,9 @@ class LocalFile(Base):
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     mtime: Mapped[str | None] = mapped_column(String(40))
     duration_s: Mapped[float | None] = mapped_column(Float)   # probed; drives M3U EXTINF
+    # Full probe result (container/A/V/subtitle codecs). Valid while mtime/size
+    # match; lets first playback skip synchronous ffmpeg analysis.
+    media_probe: Mapped[str | None] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 

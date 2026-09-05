@@ -116,7 +116,12 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
                       "force_ch_link_check": bool(m.force_ch_link_check),
                       "sn": m.sn or "", "device_id": m.device_id or "",
                       "fail_count": m.fail_count,
-                      "last_checked": m.last_checked.isoformat() if m.last_checked else None}
+                      "last_checked": m.last_checked.isoformat() if m.last_checked else None,
+                      "genre_counts": {"live": m.genre_count_live,
+                                       "vod": m.genre_count_vod,
+                                       "series": m.genre_count_series},
+                      "genres_compared_at": (m.genres_compared_at.isoformat()
+                                             if m.genres_compared_at else None)}
                      for m in macs]}
 
 
@@ -577,8 +582,8 @@ async def mac_health_refresh(payload: dict | None = None):
 
 
 @router.post("/{pid}/compare-genres")
-async def compare_portal_genres(pid: int):
-    """Ask every online MAC of this portal for its genre lists and report diffs.
+async def compare_portal_genres(pid: int, payload: dict | None = None):
+    """Compare selected `mac_ids` (or every online MAC for legacy callers).
 
     The union of every genre any compared MAC returned is upserted into the
     portal's live/vod/series genre tables (existing `enabled` flags are kept;
@@ -587,7 +592,11 @@ async def compare_portal_genres(pid: int):
     different package (shared-login resellers often do that).
     """
     from ..services import mac_health
-    out = await mac_health.compare_genres(pid)
+    body = payload or {}
+    raw_ids = body.get("mac_ids") or []
+    if not isinstance(raw_ids, list):
+        raise HTTPException(400, "mac_ids must be a list")
+    out = await mac_health.compare_genres(pid, raw_ids)
     if not out.get("ok") and out.get("error") == "portal not found":
         raise HTTPException(404, "portal not found")
     if not out.get("ok"):

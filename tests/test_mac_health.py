@@ -157,12 +157,15 @@ async def test_compare_genres_reports_and_stores(monkeypatch):
                 "series": []}
 
     monkeypatch.setattr(svc, "_genres_for_mac", fake_genres)
-    out = await svc.compare_genres(pid)
+    out = await svc.compare_genres(pid, mids)
     assert out["ok"] is True
     assert out["compared"] == 2
     assert len(out["skipped"]) == 1
     assert out["identical"] is False
     assert out["live"]["identical"] is False
+    assert len(out["results"]) == 2
+    assert len(out["packages"]) == 2  # each MAC has a distinct exact signature
+    assert all(p["counts"]["live"] == 2 for p in out["packages"])
     # News is common; Sport only on 01; Kids only on 02.
     common_names = {g["name"] for g in out["live"]["common"]}
     assert "News" in common_names
@@ -174,6 +177,15 @@ async def test_compare_genres_reports_and_stores(monkeypatch):
     assert out["stored"]["live"] == 3   # News, Sport, Kids
     assert out["stored"]["vod"] == 2    # Action, Comedy
     async with SessionLocal() as s:
+        compared_macs = [await s.get(MacAddress, mid) for mid in mids]
+        assert (compared_macs[0].genre_count_live,
+                compared_macs[0].genre_count_vod,
+                compared_macs[0].genre_count_series) == (2, 1, 0)
+        assert (compared_macs[1].genre_count_live,
+                compared_macs[1].genre_count_vod,
+                compared_macs[1].genre_count_series) == (2, 2, 0)
+        assert compared_macs[0].genres_compared_at is not None
+        assert compared_macs[2].genres_compared_at is None  # expired/skipped
         live = {(r.genre_portal_id, r.name, r.enabled)
                 for r in (await s.execute(select(LiveGenre).where(LiveGenre.portal_id == pid))).scalars()}
         vod = {(r.genre_portal_id, r.name, r.enabled)
@@ -193,6 +205,18 @@ async def test_compare_genres_reports_and_stores(monkeypatch):
         row = (await s.execute(select(LiveGenre).where(
             LiveGenre.portal_id == pid, LiveGenre.genre_portal_id == "1"))).scalar_one()
         assert row.enabled is True
+
+    # A partial later comparison updates successful kinds but does not turn a
+    # failed VOD request into a persisted zero.
+    await svc._persist_mac_genre_counts([{
+        "mac_id": mids[0], "ok": True, "live": [], "vod": [], "series": [],
+        "vod_error": "temporary failure",
+    }])
+    async with SessionLocal() as s:
+        mac = await s.get(MacAddress, mids[0])
+        assert mac.genre_count_live == 0
+        assert mac.genre_count_vod == 1
+        assert mac.genre_count_series == 0
 
 
 async def test_compare_genres_identical_when_same_package(monkeypatch):
@@ -215,6 +239,8 @@ async def test_compare_genres_identical_when_same_package(monkeypatch):
     assert out["identical"] is True
     assert out["live"]["identical"] is True
     assert out["live"]["only"] == {}
+    assert len(out["packages"]) == 1
+    assert len(out["packages"][0]["mac_ids"]) == 2
     assert out["stored"]["live"] == 2
 
 

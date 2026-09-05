@@ -45,6 +45,9 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here �
 | `SPM_ADMIN_USERNAME` / `SPM_ADMIN_PASSWORD` | `admin` / *(required)* | GUI login |
 | `SPM_VAAPI_DEVICE` | `/dev/dri/renderD128` | Intel Quick Sync render node |
 | `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
+| `SPM_PORTAL_WARM_INTERVAL` | `600` | seconds between background pre-authentication passes for resolved portal/MAC sessions |
+| `SPM_ROUTE_AFFINITY_TTL` | `1800` | seconds to prefer the source/MAC that most recently produced stream bytes |
+| `SPM_SOURCE_BREAKER_FAILURES` / `SPM_SOURCE_BREAKER_COOLDOWN` | `2` / `45` | source-specific failures before temporarily skipping it, and seconds before a half-open retry |
 | `SPM_MOCK_PORTAL` | `0` | `1` boots a built-in demo portal (test data, busy-MAC emulation) |
 | `SPM_LOG_LEVEL` | `INFO` | Python log level (all records go to container stdout) |
 | `SPM_SKIP_LOGIN` | `0` | **Mockup/preview only**: bypass admin login (`*** LOGIN DISABLED ***` banner in log). Never set on a real deployment |
@@ -135,7 +138,7 @@ and, when the ids do not match:
 
 1. **Portals** – add each Stalker portal base URL and its MAC addresses (optionally per-MAC password). *Check Portal* resolves the real endpoint (`/c/`, `/client/`, `/portal.php`, …) and verifies each MAC online (busy-ness and subscription expiry included); the per-MAC result now carries **why** a failure happened (`code` + the panel's own wording), not just "failed". Two per-portal network switches live in the same editor: **HTTP proxy** and **Allow broken TLS** (certificate verification is ON for every portal unless that box is ticked — a `TLS unverified` badge then marks the portal in the list, because it is a deliberate exception, not a setting to forget). *Delete* offers a replacement-dialog cleanup for playlists that reference it.
 
-   **Multi-MAC health.** Portals with two or more MACs get a background sweep (Settings → *Multi-MAC status refresh*, default every 60 min; `0` pauses it) that handshakes every MAC and refreshes `status` / `online` / `expire_date` / `last_checked` — the same work *Check Portal* does, kept honest overnight. MACs currently occupied are skipped so a viewer is never kicked: that covers both ffmpeg-proxied plays (hard `mac_locks`) and redirect/direct plays (a soft lease after the 302, because once the player is sent to the panel CDN we no longer hold the socket). The Portals toolbar *Refresh MAC health* button runs the same sweep on demand. On a multi-MAC portal, **Compare genres across MACs** asks each *online* MAC for its live/VOD/series genre lists, reports what is common vs only-on-this-MAC, and **upserts the union into the portal's genre tables** (existing `enabled` flags are kept; brand-new genres land disabled). Useful when a "secondary" MAC is actually a different package from a shared-login reseller. Removing a MAC or deleting a portal also drops its runtime leftovers (mac locks, redirect leases, pooled Stalker sessions) — DB cascades already wipe the durable rows.
+   **Multi-MAC health.** Portals with two or more MACs get a background sweep (Settings → *Multi-MAC status refresh*, default every 60 min; `0` pauses it) that handshakes every MAC and refreshes `status` / `online` / `expire_date` / `last_checked` — the same work *Check Portal* does, kept honest overnight. MACs currently occupied are skipped so a viewer is never kicked: that covers both ffmpeg-proxied plays (hard `mac_locks`) and redirect/direct plays (a soft lease after the 302, because once the player is sent to the panel CDN we no longer hold the socket). The Portals toolbar *Refresh MAC health* button runs the same sweep on demand. On a multi-MAC portal, **Compare genres across MACs** first lets the operator select which online accounts to contact, then renders Live/VOD/Series genre-by-MAC matrices with text, difference, coverage, MAC and package filters. Exact matching signatures are grouped as packages; selected or visible stored genres can be enabled/disabled in bulk. Successful Live/VOD/Series genre counts and the comparison time are persisted per MAC and shown directly on the portal list (`Genres L … · V … · S …`); failed content-kind requests retain their previous count instead of being recorded as zero. The comparison **upserts the selected MACs' union into the portal's genre tables** (existing `enabled` flags are kept; brand-new genres land disabled). Useful when a "secondary" MAC is actually a different package from a shared-login reseller. Removing a MAC or deleting a portal also drops its runtime leftovers (mac locks, redirect leases, pooled Stalker sessions) — DB cascades already wipe the durable rows.
 2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season. In the **Edit portal** popup this is a two-step flow: *Fetch genres* loads the live/VOD/series genre lists (all disabled by default — including the synthetic *(All VOD)* / *(All series)* a portal without categories gets), you tick the genres you want (the filter box narrows the list as you type), and **Save** then fetches the items of exactly those enabled genres.
 3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels. Clicking a **VOD** or **Series** row (or its ⓘ button) opens the same detail popup as Input Sources — stored portal metadata, a lazy **stream probe** (codec/resolution/bitrate) and **TMDB** enrichment. The ▶ *test stream* buttons (here and in Input Sources) open the preview player, which closes via its header **×** or the **Stop & Close** button.
 4. **Users** – each user gets `username/password` and can receive **M3U** and/or **Xtream** URLs (copy-buttons in the GUI). Per-user active-connection caps enforced.
@@ -151,7 +154,46 @@ Stream:   http://<host>:8880/play/live/{id}.ts?username=..&password=..
 xmltv:    http://<host>:8880/xmltv.php?username=USER&password=PASS
 ```
 
+Xtream identity advertises only the implemented MPEG-TS output format, and its
+`server_info` reports the externally visible scheme, host, and explicit/default
+port correctly. Xtream-only users can play both `/live|movie|series/...` URLs
+and the `/play/...` URLs returned by `get.php`; native M3U and Xtream catalogue
+permissions remain independently gated. For Xtream API clients, enabled Local
+playlist files are additionally mapped into **Movies/VOD** using their Local
+group names, local group whitelist, effective Area template, and real file or
+transcoded container extension. They are not exposed as Series; native M3U and
+Enigma2 organization remain unchanged.
+
 Users only ever talk to port **8880** — GUI, streams, playlists and APIs share it.
+
+### Fast playlist and stream startup
+
+Generated M3Us and Enigma2 bundles are cached until an output-relevant database
+write invalidates them; repeated player refreshes no longer recalculate a full
+catalogue or run revision queries. Playlist Builder live/VOD source chains and
+local-file metadata are loaded in batches rather than one query per row.
+
+VLC and Enigma2 commonly issue `HEAD` before `GET`. Every portal stream alias
+answers that authenticated probe with metadata only—it does not resolve a
+portal, occupy a MAC, or launch FFmpeg. Actual GET startup writes an
+`[output] startup timing` log and a `Server-Timing` response header separating
+prepare/resolve, first-byte, and total time. Direct local playback additionally
+reports path, template, and stream-registration timings.
+
+Local directory scans also persist container, codec, and subtitle metadata next
+to each file's size and modification time. Local remux/subtitle startup gates
+reuse that metadata after a restart instead of launching duplicate FFmpeg
+probes; changed or unsuccessfully probed files safely fall back to runtime
+probing. The managed Enigma2 VOD/remux, Vu+ live, and Dreambox presets bound
+FFmpeg input analysis to one second/megabyte (`-analyzeduration`/`-probesize`)
+to reduce time-to-first-byte without changing area or template selection.
+
+Resolved portal/MAC sessions are pre-authenticated in the background, so the
+first play normally reuses a live token and HTTP connection. Once a source/MAC
+actually produces bytes it is preferred for later plays of that same playlist
+item. A short process-local circuit breaker suppresses repeatedly failing
+sources while alternatives exist, then automatically half-opens after the
+cooldown; configured playlist priority and database rows are never rewritten.
 
 ---
 
@@ -178,6 +220,14 @@ Shipped presets (stored as rows in the database and **re-seeded on every boot** 
 | **Redirect (bypass ffmpeg)** | not an ffmpeg command at all — the player is 302-redirected straight to the portal's CDN. **The default template**: any item without an explicit template assignment redirects (see below) |
 
 **Redirect (bypass ffmpeg) is the default.** The old global *proxy vs redirect* switch in Settings is gone: redirect is now a built-in template **and the default**. An item without an explicit template assignment is 302-redirected straight to the portal's CDN — instant start and zero CPU, but no transcode, no transport-stream rewriting and no mid-stream fallback. Assign any other template (inline *FFmpeg tpl* dropdown, the edit dialog, or bulk *Assign template…* in the Playlist Builder) to switch that channel back to ffmpeg proxying/transcoding. The `?mode=redirect` / `?mode=proxy` query parameter still works as a per-URL override.
+
+**Fast local playback in VLC.** A local item whose effective template is Redirect, Copy, or otherwise
+unassigned is advertised with the file's real on-disk extension and served directly with HTTP Range
+support—never through the `.ts` FFmpeg remux path. Its M3U entry includes
+`#EXTVLCOPT:network-caching=500` by default, configurable under **Settings → VLC local-file network
+cache** (`0` leaves caching to the player). Direct responses also send `X-Accel-Buffering: no`, so an
+nginx-compatible reverse proxy does not hold back the first bytes. A genuinely transcoding local
+item continues to use the template's `.ts` or `.mkv` output extension.
 
 **Default templates are persistent (stored in the database).** The shipped presets are real `ffmpeg_templates` rows marked `is_builtin`. On every boot the app reconciles them by name, so:
 
@@ -233,6 +283,7 @@ Play those items through the **`.mkv` URL aliases**, which exist next to the `.t
 ```text
 /play/vod/{id}.mkv?u=…&p=…        /movie/{user}/{pass}/{id}.mkv
 /play/episode/{id}.mkv?u=…&p=…    /series/{user}/{pass}/{id}.mkv
+/play/local/{id}.mkv?u=…&p=…
 /play/live/{id}.mkv?u=…&p=…
 ```
 
@@ -269,6 +320,12 @@ Defaults are the Vu+ Duo2 recipe: live = `4097` + `.ts`, VOD and series = **`500
 | `@redirect` (bypass ffmpeg) | the profile's alias, player ≥ `4097` | the container is the panel's, not ours — the alias is cosmetic because the box follows the redirect and sniffs the body. Best case for VOD: original subtitles **and** seeking survive |
 | `output_format = matroska` | `.mkv` | the remux carries text subtitles |
 | anything else | `.ts` | MPEG-TS out of ffmpeg |
+
+This per-item rule also applies to **Local** bouquets. A local MP4/AVI assigned
+**Enigma2 VOD - remux + subtitles (MKV)** is written as `/play/local/{id}.mkv`,
+not forced back to `.ts`; the response is announced as `video/x-matroska` and
+FFmpeg keeps `-f matroska`. Regenerate and push/pull the bouquet after changing
+a local item's template.
 
 Service type `1` hands the bytes straight to the DVB demuxer, which only understands raw TS: items that are MKV or direct are automatically raised to `4097` and the preview says so (use `5002` if you want their subtitles). The summary line counts the split — *114 services · 0 ts · 0 mkv · 114 direct* — so you can see at a glance which delivery your library is really on. Set *Container choice* to `fixed` for the old profile-wide behaviour.
 
@@ -523,7 +580,9 @@ channel and made paging the list expensive. It is gone. In its place, between **
 read like a link to the Playlist *tab* rather than an editable name):
 
 - shown only for **enabled** channels (disabled rows stay blank);
-- default value = the portal's original channel name;
+- enabling a channel immediately adds it to the live playlist using the portal's original channel name;
+  if that custom name already exists (case-insensitive), the source is appended to its fallback chain;
+- the resulting primary/fallback name appears in this column as soon as the switch completes;
 - edit the cell (blur / Enter) to set the custom name used in the final M3U / Xtream output:
   - **unique name** → a new custom live channel is created (or the channel this source already owns as primary is renamed);
   - **name already used** (case-insensitive) → this source is attached as a **fallback** on that existing custom channel.
@@ -532,8 +591,13 @@ It is also the **wide** column of the two: the portal's own **Channel** name nex
 read-only reference and is kept narrow (ellipsised, full text in the cell tooltip), so the field
 you actually type in gets the room.
 
-The list payload carries the placement (`playlist_id`, `playlist_name`, primary/fallback badge) in
-the same `/api/sources/live` response — no extra round trip per page.
+Beside the channel name, **Custom Group** shows the same group as Playlist → Live. It starts with
+the source genre when the channel is added and can be edited with the same first-click-select,
+blur/Enter-to-save interaction. A custom channel has one shared group, so editing it from either a
+primary or fallback source updates every source row on that channel and the Playlist tab.
+
+The list payload carries the placement (`playlist_id`, `playlist_name`, `playlist_group`, and the
+primary/fallback badge) in the same `/api/sources/live` response — no extra round trip per page.
 
 ---
 

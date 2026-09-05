@@ -108,17 +108,24 @@ async def logo_suggest(name: str = ""):
 
 
 # ----------------------------------------------------------------- live CRUD
-async def _chain(db, playlist_id: int, link_model, src_model, fk_name: str):
-    rows = (await db.execute(select(link_model).where(link_model.live_playlist_id == playlist_id)
-                             .order_by(link_model.priority))).scalars().all()
-    out = []
-    for r in rows:
-        src = await db.get(src_model, getattr(r, fk_name))
-        if not src:
-            continue
-        portal = await db.get(Portal, src.portal_id)
-        out.append({"link_id": r.id, "source_id": src.id, "priority": r.priority,
-                    "name": src.original_name, "portal": portal.name if portal else "?"})
+async def _chains_for(db, playlist_ids: list[int], link_model, src_model,
+                      playlist_fk, source_fk) -> dict[int, list[dict]]:
+    """Load every source chain on a page in one joined query."""
+    if not playlist_ids:
+        return {}
+    rows = (await db.execute(
+        select(playlist_fk, link_model.id, source_fk, link_model.priority,
+               src_model.original_name, Portal.name)
+        .join(src_model, src_model.id == source_fk)
+        .outerjoin(Portal, Portal.id == src_model.portal_id)
+        .where(playlist_fk.in_(playlist_ids))
+        .order_by(playlist_fk, link_model.priority))).all()
+    out: dict[int, list[dict]] = {}
+    for pid, link_id, source_id, priority, name, portal in rows:
+        out.setdefault(pid, []).append({
+            "link_id": link_id, "source_id": source_id, "priority": priority,
+            "name": name, "portal": portal or "?",
+        })
     return out
 
 
@@ -148,9 +155,12 @@ async def live_list(db=Depends(get_db), q: str = "", group: str = "", portal_id:
     groups = [g[0] for g in (await db.execute(
         select(LivePlaylist.group_name).distinct().order_by(LivePlaylist.group_name))).all() if g[0]]
     tpls = {t.id: t.name for t in (await db.execute(select(FFmpegTemplate))).scalars().all()}
+    chains = await _chains_for(db, [r.id for r in rows], LivePlaylistSource, LiveSource,
+                               LivePlaylistSource.live_playlist_id,
+                               LivePlaylistSource.live_source_id)
     items = []
     for r in rows:
-        chain = await _chain(db, r.id, LivePlaylistSource, LiveSource, "live_source_id")
+        chain = chains.get(r.id, [])
         items.append({"id": r.id, "custom_name": r.custom_name, "group_name": r.group_name,
                       "epg_id": r.epg_id, "logo": r.logo, "number": r.number,
                       "ffmpeg_template_id": r.ffmpeg_template_id,
@@ -309,18 +319,6 @@ async def local_bulk(payload: dict, db=Depends(get_db)):
 
 
 # ----------------------------------------------------------------- vod / series / local
-async def _map_chain(db, model_pl, link_model, src_model, link_fk, src_fk, pl_id):
-    rows = (await db.execute(select(link_model).where(src_fk == pl_id)
-                             .order_by(link_model.priority))).scalars().all()
-    out = []
-    for r in rows:
-        src = await db.get(src_model, r.vod_source_id if hasattr(r, "vod_source_id") else r.serie_source_id)
-        portal = await db.get(Portal, src.portal_id) if src else None
-        out.append({"link_id": r.id, "source_id": src.id if src else 0, "priority": r.priority,
-                    "name": src.original_name if src else "?", "portal": portal.name if portal else "?"})
-    return out
-
-
 @router.post("/add-from-source")
 async def add_from_source(payload: dict, db=Depends(get_db)):
     """Add a source item to the playlist (kind: vod|series|localfile)."""
@@ -502,11 +500,13 @@ async def vod_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1
     per_page = min(max(per_page, 5), 500)
     total, rows, groups, tpls = await _pl_list(db, VodPlaylist, VodSource, "vod_source_id",
                                                q, group, {}, page, per_page, sort, direction)
+    chains = await _chains_for(db, [r.id for r in rows], VodPlaylistSource, VodSource,
+                               VodPlaylistSource.vod_playlist_id,
+                               VodPlaylistSource.vod_source_id)
     items = []
     dirty = False
     for r in rows:
-        chain = await _map_chain(db, VodPlaylist, VodPlaylistSource, VodSource,
-                                 VodPlaylistSource, VodPlaylistSource.vod_playlist_id, r.id)
+        chain = chains.get(r.id, [])
         src_title = chain[0]["name"] if chain else None
         title = best_title(r.custom_name, src_title)
         if title != (r.custom_name or "") and title != "?":
@@ -655,15 +655,23 @@ async def local_pl(db=Depends(get_db), q: str = "", group: str = "", page: int =
     stmt = stmt.order_by(primary, LocalPlaylist.id.asc())
     rows = (await db.execute(stmt.offset((page - 1) * per_page).limit(per_page))).scalars().all()
     tpls = {t.id: t.name for t in (await db.execute(select(FFmpegTemplate))).scalars().all()}
+    file_ids = [r.local_file_id for r in rows if r.local_file_id]
+    local_meta = {}
+    if file_ids:
+        for lf, directory in (await db.execute(
+                select(LocalFile, LocalSource.directory)
+                .join(LocalSource, LocalSource.id == LocalFile.local_source_id)
+                .where(LocalFile.id.in_(file_ids)))).all():
+            local_meta[lf.id] = (lf, directory)
     items = []
     for r in rows:
-        lf = await db.get(LocalFile, r.local_file_id)
-        ls = await db.get(LocalSource, lf.local_source_id) if lf else None
+        meta = local_meta.get(r.local_file_id)
+        lf, directory = meta if meta else (None, None)
         items.append({"id": r.id, "custom_name": r.custom_name,
                       "group_name": r.group_name, "enabled": r.enabled, "order": r.order,
                       "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""),
-                      "file": (f"{ls.directory}/{lf.relative_path}" if ls and lf else "?"),
+                      "file": (f"{directory}/{lf.relative_path}" if directory and lf else "?"),
                       "size_bytes": lf.size_bytes if lf else 0})
     groups = [g[0] for g in (await db.execute(
         select(LocalPlaylist.group_name).distinct().order_by(LocalPlaylist.group_name))).all() if g[0]]

@@ -40,6 +40,26 @@ EDITABLE = [
 ]
 READONLY = ["id", "token", "last_build_at", "bouquet_count", "service_count",
             "last_push_at", "last_push_result"]
+_BUNDLE_CACHE: dict[tuple, e2.Bundle] = {}
+
+
+def _bundle_key(p: Enigma2Profile, base: str) -> tuple:
+    from ..services.content_cache import generation
+    # Include editable values so an unsaved/test profile cannot reuse a bundle
+    # rendered for different receiver options.
+    return (p.id, base, generation(), tuple(str(getattr(p, k, "")) for k in EDITABLE))
+
+
+async def _cached_build(p: Enigma2Profile, base: str) -> e2.Bundle:
+    key = _bundle_key(p, base)
+    bundle = _BUNDLE_CACHE.get(key)
+    if bundle is not None:
+        return bundle
+    bundle = await e2.build_bundle(p, base)
+    _BUNDLE_CACHE[key] = bundle
+    if len(_BUNDLE_CACHE) > 32:
+        _BUNDLE_CACHE.pop(next(iter(_BUNDLE_CACHE)))
+    return bundle
 
 
 def _row(p: Enigma2Profile) -> dict:
@@ -173,11 +193,15 @@ async def _bundle(pid: int, request: Request, db) -> tuple[Enigma2Profile, e2.Bu
     if not p:
         raise HTTPException(404, "profile not found")
     base = await _base_url(request)
-    bundle = await e2.build_bundle(p, base)
+    bundle = await _cached_build(p, base)
     p.last_build_at = datetime.now(timezone.utc)
     p.bouquet_count = len(bundle.files)
     p.service_count = bundle.services
     await db.commit()
+    # The status UPDATE bumps the content generation; carry this same bundle
+    # forward under the post-commit key so status bookkeeping does not defeat
+    # the cache on the next preview/download/push.
+    _BUNDLE_CACHE[_bundle_key(p, base)] = bundle
     return p, bundle, base
 
 
@@ -274,10 +298,11 @@ async def _by_token(token: str, db) -> Enigma2Profile:
 async def public_tarball(token: str, request: Request, db=Depends(get_db)):
     p = await _by_token(token, db)
     base = await _base_url(request)
-    bundle = await e2.build_bundle(p, base)
+    bundle = await _cached_build(p, base)
     p.last_build_at = datetime.now(timezone.utc)
     p.bouquet_count, p.service_count = len(bundle.files), bundle.services
     await db.commit()
+    _BUNDLE_CACHE[_bundle_key(p, base)] = bundle
     await db_log("INFO", "enigma2",
                  f"profile '{p.name}': receiver pulled {len(bundle.files)} bouquets "
                  f"({bundle.services} services)")

@@ -149,9 +149,16 @@ function makeTable() {
           const multi = (r.macs || []).length >= 2;
           const rows = (r.macs || []).map(m => {
             const checked = m.last_checked ? ` · checked ${esc(m.last_checked.slice(0, 16).replace("T", " "))}` : "";
-            return `<div class="d-flex align-items-center gap-2 mb-1">
+            const gc = m.genre_counts || {};
+            const compared = m.genres_compared_at
+              ? `Compared ${esc(m.genres_compared_at.slice(0,16).replace("T"," "))}` : "Not compared yet";
+            const genreCounts = [gc.live, gc.vod, gc.series].some(v => v !== null && v !== undefined)
+              ? `<span class="badge text-bg-light" title="${compared}">Genres L ${gc.live ?? '?'} · V ${gc.vod ?? '?'} · S ${gc.series ?? '?'}</span>`
+              : `<span class="small text-muted" title="Run Compare genres across MACs">genres not compared</span>`;
+            return `<div class="d-flex flex-wrap align-items-center gap-2 mb-1">
               <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
               <span class="small text-muted" title="expire date from the panel">${esc(m.expire_date || "")}</span>
+              ${genreCounts}
               <span class="small text-muted">${checked}</span>
               <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="STB identity this portal is told (serial, device id) - pin the values your box really sends"
                 onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
@@ -160,7 +167,7 @@ function makeTable() {
             </div>`;
           }).join("") || '<span class="text-muted small">none</span>';
           const cmp = multi
-            ? `<button class="btn btn-xs btn-outline-secondary mt-1" title="Ask every online MAC for its genre lists and show what differs"
+            ? `<button class="btn btn-xs btn-outline-secondary mt-1" title="Select MACs and compare their Live, VOD and Series packages"
                  onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button>`
             : "";
           return rows + cmp;
@@ -587,65 +594,159 @@ $("#btn-mac-health").addEventListener("click", async () => {
   table.reload();
 });
 
-/* Compare genres across every online MAC of one portal.
-   Offline/expired MACs are listed but not asked. Differences are shown per
-   kind (live/vod/series) as "only on this MAC" lists — that's the package
-   split shared-login resellers often hide behind one portal URL. */
+/* Multi-MAC genre comparison: choose accounts first, then inspect a
+   searchable genre × MAC matrix. Exact portal genre IDs are the identity;
+   similarly named categories are deliberately not merged behind the user's back. */
 window.compareGenres = async (pid) => {
-  const p = table.items.find(x => x.id === pid);
-  toast(`comparing genres across MACs of ${p?.name || "portal"}…`);
-  const d = await api(`/api/portals/${pid}/compare-genres`, { method: "POST" });
+  const portal = table.items.find(x => x.id === pid);
+  const macs = portal?.macs || [];
   const body = el("div");
-  const skipped = (d.skipped || []).map(s =>
-    `<div class="small text-muted">· <span class="mono">${esc(s.mac)}</span> skipped (${esc(s.status || "")}: ${esc(s.reason || "")})</div>`
-  ).join("");
-  const macRows = (d.macs || []).map(m => {
-    if (!m.ok) return `<tr><td class="mono small">${esc(m.mac)}</td><td colspan="6" class="text-danger small">${esc(m.error || "failed")}</td></tr>`;
-    const flag = (n) => n ? `<span class="badge text-bg-warning">${n} only here</span>` : '<span class="badge text-bg-success">match</span>';
-    return `<tr>
-      <td class="mono small">${esc(m.mac)}</td>
-      <td class="text-end">${m.live}</td><td>${flag(m.only_live)}</td>
-      <td class="text-end">${m.vod}</td><td>${flag(m.only_vod)}</td>
-      <td class="text-end">${m.series}</td><td>${flag(m.only_series)}</td>
-    </tr>`;
-  }).join("");
-  const onlyBlock = (kind, diff) => {
-    if (!diff || diff.identical !== false) return "";
-    const parts = Object.entries(diff.only || {}).map(([mac, list]) =>
-      `<div class="mb-2"><div class="small fw-semibold mono">${esc(mac)} — ${list.length} only on this MAC</div>
-        <div class="small">${list.map(g => `<span class="badge text-bg-light me-1 mb-1">${esc(g.name)}</span>`).join("")}</div></div>`
-    ).join("");
-    return `<div class="mt-3"><div class="muted-label">${kind.toUpperCase()} differences</div>${parts || '<div class="small text-muted">none</div>'}</div>`;
-  };
-  const headCls = d.identical ? "text-success" : "text-warning";
   body.innerHTML = `
-    <div class="alert ${d.identical ? "alert-success" : "alert-warning"} py-2 small mb-2">
-      <b class="${headCls}">${esc(d.message || "")}</b>
-      <div class="text-muted">${d.compared || 0} MAC(s) compared · fetched ${esc((d.fetched_at || "").replace("T", " ").slice(0, 19))}</div>
+    <p class="small text-muted">Choose at least two online MACs. Only the selected accounts are contacted.</p>
+    <div class="d-flex gap-2 mb-2">
+      <button class="btn btn-xs btn-outline-secondary" id="cmp-all">Select all online</button>
+      <button class="btn btn-xs btn-outline-secondary" id="cmp-none">Clear</button>
+      <span class="small text-muted ms-auto" id="cmp-est"></span>
     </div>
-    ${skipped ? `<div class="mb-2">${skipped}</div>` : ""}
-    <div class="table-responsive"><table class="table table-sm align-middle mb-0">
-      <thead><tr>
-        <th>MAC</th>
-        <th class="text-end">Live</th><th></th>
-        <th class="text-end">VOD</th><th></th>
-        <th class="text-end">Series</th><th></th>
-      </tr></thead>
-      <tbody>${macRows || '<tr><td colspan="7" class="text-muted small">no online MAC to ask — press Test first</td></tr>'}</tbody>
-    </table></div>
-    ${onlyBlock("live", d.live)}
-    ${onlyBlock("vod", d.vod)}
-    ${onlyBlock("series", d.series)}
-    <div class="small text-muted mt-3">Genres seen by any compared MAC are upserted into this portal's genre tables (new ones land <em>disabled</em>; your existing enable ticks stay). A MAC with genres the others lack is usually a different package on the same portal URL — keep it as a fallback source rather than treating every MAC as interchangeable.${d.stored ? ` Stored: ${d.stored.live||0} live / ${d.stored.vod||0} vod / ${d.stored.series||0} series.` : ""}</div>`;
-  const footer = el("div", { class: "d-flex gap-2" });
-  const m = openModal({ title: `Genre compare: ${esc(d.name || p?.name || "")}`, body, footer, size: "lg" });
-  footer.append(mBtn("Close", "btn-outline-secondary", m.close),
-    mBtn("Refresh MAC status first", "btn-outline-secondary", async () => {
-      await api("/api/portals/mac-health/refresh", { method: "POST", body: { portal_id: pid } });
-      m.close(); table.reload();
-      toast("status refreshed — run Compare again", "ok");
-    }, "bi-heart-pulse"));
+    <div class="list-group">${macs.map(m => {
+      const usable = m.online && !["expired","banned"].includes(m.status);
+      return `<label class="list-group-item d-flex gap-2 align-items-center ${usable ? "" : "text-muted"}">
+        <input class="form-check-input cmp-mac" type="checkbox" value="${m.id}" ${usable ? "checked" : "disabled"}>
+        <span class="mono">${esc(m.mac)}</span>${statusBadge(m)}
+        <span class="small ms-auto">${m.last_checked ? "checked " + esc(m.last_checked.slice(0,16).replace("T"," ")) : "not checked"}</span>
+      </label>`;
+    }).join("")}</div>`;
+  const footer = el("div", {class:"d-flex gap-2"});
+  const choose = openModal({title:`Compare packages: ${esc(portal?.name || "")}`, body, footer, size:"lg"});
+  const boxes = () => $$(".cmp-mac", body);
+  const update = () => {
+    const n = boxes().filter(x => x.checked).length;
+    $("#cmp-est", body).textContent = `${n} MACs · up to ${n * 3} genre requests`;
+    $("#cmp-go", footer).disabled = n < 2;
+  };
+  $("#cmp-all", body).onclick = () => { boxes().filter(x=>!x.disabled).forEach(x=>x.checked=true); update(); };
+  $("#cmp-none", body).onclick = () => { boxes().forEach(x=>x.checked=false); update(); };
+  boxes().forEach(x => x.onchange = update);
+  footer.append(mBtn("Cancel", "btn-outline-secondary", choose.close));
+  const go = mBtn("Fetch & compare", "btn-accent", async () => {
+    const ids = boxes().filter(x=>x.checked).map(x=>+x.value);
+    if (ids.length < 2) return;
+    go.disabled = true; go.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Comparing…';
+    try {
+      const d = await api(`/api/portals/${pid}/compare-genres`, {method:"POST", body:{mac_ids:ids}});
+      const stored = await api(`/api/portals/${pid}/genres`);
+      choose.close();
+      table.reload(); // expose the newly persisted per-MAC counts in the portal list
+      showGenreMatrix(pid, d, stored);
+    } catch (e) { go.disabled = false; go.textContent = "Fetch & compare"; throw e; }
+  });
+  go.id = "cmp-go"; footer.append(go); update();
 };
+
+function showGenreMatrix(pid, d, stored) {
+  const body = el("div");
+  body.className = "genre-compare";
+  const results = d.results || [];
+  const good = results.filter(r => r.ok);
+  const storedMaps = {};
+  for (const kind of ["live","vod","series"]) {
+    storedMaps[kind] = new Map();
+    for (const g of (stored[kind] || [])) {
+      storedMaps[kind].set(`id:${g.genre_portal_id}`, g);
+      storedMaps[kind].set(`name:${String(g.name).trim().toLowerCase().replace(/\s+/g," ")}`, g);
+    }
+  }
+  const state = {kind:"summary", mode:"diff", q:"", mac:"", pkg:"", selected:new Set()};
+  const union = kind => {
+    const rows = new Map();
+    for (const r of good) for (const g of (r[kind] || []))
+      if (!rows.has(g.key)) rows.set(g.key, {key:g.key, name:g.name});
+    return [...rows.values()].sort((a,b)=>a.name.localeCompare(b.name));
+  };
+  const present = (r, kind, key) => new Set((r[kind] || []).map(g=>g.key)).has(key);
+  const kindError = (r, kind) => !r.ok || !!r[`${kind}_error`];
+
+  const render = () => {
+    const tabs = ["summary","live","vod","series"].map(k =>
+      `<button class="btn btn-sm ${state.kind===k?'btn-accent':'btn-outline-secondary'} cmp-tab" data-kind="${k}">${k[0].toUpperCase()+k.slice(1)}</button>`).join("");
+    let content = "";
+    if (state.kind === "summary") {
+      const cards = (d.packages || []).map(p => `<div class="col-md-6"><div class="border rounded p-2 h-100">
+        <div class="d-flex"><b>${esc(p.name)}</b><span class="badge text-bg-light ms-auto">${p.macs.length} MAC${p.macs.length===1?'':'s'}</span></div>
+        <div class="small mono my-1">${p.macs.map(esc).join('<br>')}</div>
+        <div class="small text-muted">Live ${p.counts.live} · VOD ${p.counts.vod} · Series ${p.counts.series}</div>
+      </div></div>`).join("");
+      content = `<div class="alert ${d.identical?'alert-success':'alert-warning'} py-2 small">${esc(d.message || "")}
+        <div class="text-muted">${d.compared} MACs · ${d.packages?.length || 0} distinct package signature(s) · ${esc((d.fetched_at||"").replace("T"," "))}</div></div>
+        <div class="row g-2">${cards}</div>
+        ${(d.skipped||[]).length ? `<div class="small text-muted mt-2">Skipped: ${(d.skipped||[]).map(x=>esc(x.mac)).join(', ')}</div>`:''}`;
+    } else {
+      const kind = state.kind, allRows = union(kind), macs = results;
+      const packageRow = (d.packages || []).find(p=>String(p.id)===state.pkg);
+      const packageIds = packageRow ? new Set(packageRow.mac_ids) : null;
+      let visible = allRows.filter(row => {
+        if (state.q && !row.name.toLowerCase().includes(state.q)) return false;
+        const known = macs.filter(m=>!kindError(m,kind));
+        const count = known.filter(m=>present(m,kind,row.key)).length;
+        if (state.mode === "diff" && (count===0 || count===known.length)) return false;
+        if (state.mode === "common" && count!==known.length) return false;
+        if (state.mode === "unique" && count!==1) return false;
+        if (state.mode === "missing" && count===known.length) return false;
+        if (state.mac) {
+          const m = macs.find(x=>String(x.mac_id)===state.mac);
+          if (!m || !present(m,kind,row.key)) return false;
+        }
+        if (packageIds) {
+          const members = macs.filter(m=>packageIds.has(m.mac_id) && !kindError(m,kind));
+          if (!members.some(m=>present(m,kind,row.key))) return false;
+        }
+        return true;
+      });
+      const controls = `<div class="row g-1 mb-2">
+        <div class="col-md-3"><input class="form-control form-control-sm" id="cmp-q" placeholder="filter genre…" value="${esc(state.q)}"></div>
+        <div class="col-md-2"><select class="form-select form-select-sm" id="cmp-mode">
+          ${[["all","All genres"],["diff","Differences only"],["common","Common to all"],["unique","Only one MAC"],["missing","Missing somewhere"]].map(([v,l])=>`<option value="${v}" ${state.mode===v?'selected':''}>${l}</option>`).join('')}
+        </select></div>
+        <div class="col-md-3"><select class="form-select form-select-sm" id="cmp-mac"><option value="">Any MAC</option>${macs.map(m=>`<option value="${m.mac_id}" ${state.mac===String(m.mac_id)?'selected':''}>On ${esc(m.mac)}</option>`).join('')}</select></div>
+        <div class="col-md-2"><select class="form-select form-select-sm" id="cmp-pkg"><option value="">Any package</option>${(d.packages||[]).map(p=>`<option value="${p.id}" ${state.pkg===String(p.id)?'selected':''}>${esc(p.name)}</option>`).join('')}</select></div>
+        <div class="col-md-2 small text-muted d-flex align-items-center justify-content-end">${visible.length}/${allRows.length} genres</div>
+      </div>
+      <div class="d-flex gap-1 mb-2"><button class="btn btn-xs btn-outline-secondary" id="cmp-sel-visible">Select visible</button><button class="btn btn-xs btn-outline-secondary" id="cmp-clear">Clear</button>
+        <button class="btn btn-xs btn-outline-success ms-auto" id="cmp-enable">Enable selected</button><button class="btn btn-xs btn-outline-danger" id="cmp-disable">Disable selected</button></div>`;
+      const rows = visible.map(row => {
+        const db = storedMaps[kind].get(row.key);
+        const cells = macs.map(m => kindError(m,kind)
+          ? `<td class="text-center text-warning" title="${esc(m[`${kind}_error`] || m.error || 'request failed')}">?</td>`
+          : present(m,kind,row.key) ? '<td class="text-center text-success fw-bold">✓</td>' : '<td class="text-center text-muted">—</td>').join('');
+        const count = macs.filter(m=>!kindError(m,kind)&&present(m,kind,row.key)).length;
+        return `<tr><td><input class="form-check-input cmp-genre" type="checkbox" data-id="${db?.id||''}" data-key="${esc(row.key)}" ${state.selected.has(row.key)?'checked':''} ${db?'':'disabled'}></td><td>${esc(row.name)} ${db?.enabled?'<span class="badge text-bg-success">enabled</span>':'<span class="badge text-bg-light">disabled</span>'}</td>${cells}<td class="text-end small">${count}/${macs.length}</td></tr>`;
+      }).join('');
+      content = controls + `<div class="table-responsive" style="max-height:55vh"><table class="table table-sm table-hover align-middle mb-0 cmp-matrix"><thead class="sticky-top bg-body"><tr><th></th><th style="min-width:220px">Genre</th>${macs.map(m=>`<th class="text-center mono small" title="${esc(m.mac)}">…${esc(m.mac.slice(-5))}</th>`).join('')}<th>Coverage</th></tr></thead><tbody>${rows||'<tr><td colspan="99" class="text-muted">No genres match these filters.</td></tr>'}</tbody></table></div>`;
+    }
+    body.innerHTML = `<div class="btn-group mb-3">${tabs}</div>${content}`;
+    $$(".cmp-tab",body).forEach(x=>x.onclick=()=>{state.kind=x.dataset.kind;state.selected.clear();render();});
+    if (state.kind === "summary") return;
+    $("#cmp-q",body).onchange = e => { state.q=e.target.value.toLowerCase(); render(); };
+    $("#cmp-mode",body).onchange=e=>{state.mode=e.target.value;render();};
+    $("#cmp-mac",body).onchange=e=>{state.mac=e.target.value;render();};
+    $("#cmp-pkg",body).onchange=e=>{state.pkg=e.target.value;render();};
+    $$(".cmp-genre",body).forEach(x=>x.onchange=()=>x.checked?state.selected.add(x.dataset.key):state.selected.delete(x.dataset.key));
+    $("#cmp-sel-visible",body).onclick=()=>{$$(".cmp-genre",body).filter(x=>!x.disabled).forEach(x=>state.selected.add(x.dataset.key));render();};
+    $("#cmp-clear",body).onclick=()=>{state.selected.clear();render();};
+    const bulk = async enabled => {
+      const ids = $$(".cmp-genre",body).filter(x=>state.selected.has(x.dataset.key)&&x.dataset.id).map(x=>+x.dataset.id);
+      if (!ids.length) return toast("select stored genres first", "warn");
+      const r = await api(`/api/portals/${pid}/genres/toggle`, {method:"POST",body:{kind:state.kind,ids,enabled}});
+      for (const g of stored[state.kind]||[]) if(ids.includes(g.id)) g.enabled=enabled;
+      toast(`${r.count} ${state.kind} genre(s) ${enabled?'enabled':'disabled'}`,"ok"); render();
+    };
+    $("#cmp-enable",body).onclick=()=>bulk(true); $("#cmp-disable",body).onclick=()=>bulk(false);
+  };
+  const footer = el("div");
+  const modal = openModal({title:`Genre/package comparison: ${esc(d.name||"")}`,body,footer,size:"xl"});
+  footer.append(mBtn("Close","btn-outline-secondary",modal.close), mBtn("Compare different MACs","btn-outline-secondary",()=>{modal.close();compareGenres(pid);},"bi-arrow-repeat"));
+  render();
+}
 $("#btn-del-sel").addEventListener("click", async () => {
   const ids = [...table.selected]; if (!ids.length) return toast("select portals first", "warn");
   confirmDialog({ title: "Delete portals", body: `Delete ${ids.length} portal(s)? Fallback usage is checked per portal.`, okText: "Delete", okClass: "btn-danger",
