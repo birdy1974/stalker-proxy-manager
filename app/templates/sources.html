@@ -55,15 +55,18 @@ function sourceTable(kind, hostSel) {
       { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'${kind}',ids:[${r.id}],enabled:this.checked}})"></div>` },
       { key: "number", label: "#", sort: "id", width: "50px", render: r => esc(r.number || "") },
       { key: "logo", label: "Logo", width: "70px", render: r => r.logo ? `<img class="logo-thumb" loading="lazy" src="${esc(r.logo)}" onerror="this.style.display='none'">` : "" },
-      { key: "name", label: "Channel", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" },
+      { key: "name", label: "Channel", sort: "name", class: "col-channel", width: "190px",
+        filter: { type: "text", param: "q", placeholder: "name…" },
         render: r => esc(r.name) + (r.xtream_url
           ? ` <span class="badge text-bg-light" title="${esc(r.xtream_url)}">this channel plays the portal's own Xtream link (no create_link, no MAC slot)</span>`
           : "") },
-      /* Playlist custom name: filled only for enabled sources. Editing assigns
+      /* Custom Channel Name: filled only for enabled sources. Editing assigns
          a new custom channel when the name is unique, or attaches this source
          as a fallback on the existing custom channel when the name already
-         exists. Resolved in the /api/sources/live payload — no extra round trip. */
-      { key: "playlist_name", label: "Playlist", class: "col-name", width: "220px",
+         exists. Resolved in the /api/sources/live payload — no extra round trip.
+         It is the column people actually TYPE in, so it is the wide one; the
+         portal's own (read-only) channel name next to it is ellipsised. */
+      { key: "playlist_name", label: "Custom Channel Name", class: "col-name", width: "340px",
         render: r => playlistNameCell(r) },
       { key: "portal_id", label: "Portal", sort: "portal", filter: { type: "select", options: PORTALS }, render: r => esc(r.portal) },
       { key: "genre_id", label: "Genre", filter: { type: "select", options: GENRES.live, placeholder: "enabled genres" }, render: r => esc(r.genre) },
@@ -100,12 +103,12 @@ function sourceTable(kind, hostSel) {
   return t;
 }
 
-/* Playlist custom-name cell (Input Sources → Live).
+/* "Custom Channel Name" cell (Input Sources → Live).
    Disabled sources stay blank. Enabled ones show the current custom name
    (or the portal original as the default) and save on blur / Enter. */
 function playlistNameCell(r) {
   if (!r.enabled) {
-    return `<span class="text-muted small" title="enable the channel to assign a playlist name">—</span>`;
+    return `<span class="text-muted small" title="enable the channel to give it a custom name">—</span>`;
   }
   const name = r.playlist_name || r.name || "";
   let badge = "";
@@ -118,9 +121,9 @@ function playlistNameCell(r) {
   // mouseup preventDefault keeps the select-all from collapsing when the
   // click that focused the field also places the caret.
   return `<div class="d-flex align-items-center gap-1" onclick="event.stopPropagation()">
-    <input class="form-control form-control-sm" style="min-width:140px"
+    <input class="form-control form-control-sm flex-grow-1" style="min-width:200px"
       value="${esc(name)}"
-      placeholder="playlist name…"
+      placeholder="custom channel name…"
       title="Click to edit. Unique name → new custom channel. Existing name → this source becomes a fallback."
       onfocus="this.select()"
       onmouseup="event.preventDefault()"

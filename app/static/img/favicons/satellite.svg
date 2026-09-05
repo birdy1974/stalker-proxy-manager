@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Satellite dish">
+  <rect width="64" height="64" rx="14" fill="#1f2937"/>
+  <path d="M12 52a30 30 0 0 1 30-30v30z" fill="#0d9488"/>
+  <circle cx="42" cy="22" r="6" fill="#5eead4"/>
+  <path d="M42 22 55 9" stroke="#5eead4" stroke-width="4" stroke-linecap="round"/>
+  <path d="M10 54h44" stroke="#94a3b8" stroke-width="4" stroke-linecap="round"/>
+</svg>

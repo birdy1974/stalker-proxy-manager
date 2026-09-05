@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Antenna tower">
+  <rect width="64" height="64" rx="14" fill="#1f2937"/>
+  <circle cx="32" cy="15" r="5" fill="#5eead4"/>
+  <g fill="none" stroke="#0d9488" stroke-width="4" stroke-linecap="round">
+    <path d="M22 8a17 17 0 0 0 0 14"/>
+    <path d="M42 8a17 17 0 0 1 0 14"/>
+  </g>
+  <path d="M32 22 20 54h8l4-13 4 13h8z" fill="#0d9488"/>
+  <path d="M25 40h14" stroke="#1f2937" stroke-width="3" stroke-linecap="round"/>
+</svg>

@@ -14,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 
 from ..config import ADMIN_USERNAME, HTTP_PORT, MOCK_PORTAL_ENABLED
 from ..security import check_credentials, require_admin
+from ..services import branding
 
 templates = Jinja2Templates(directory="app/templates")
 router = APIRouter(tags=["gui"])
@@ -42,6 +43,9 @@ def _static_versions() -> dict:
 
 
 templates.env.globals["static_v"] = _static_versions()
+# Tab icon <link> tags for every page, including /login: the choice lives in the
+# `favicon` settings row, so it must be read at render time, not at import.
+templates.env.globals["favicon_tags"] = branding.favicon_tags
 
 PAGES = {
     "/": ("dashboard.html", "Dashboard", "dashboard"),

@@ -515,10 +515,12 @@ that endpoint cannot maintain.
 
 ---
 
-## Input Sources → Live: Playlist custom name
+## Input Sources → Live: the "Custom Channel Name" column
 
 The old **Now** column on *Sources → Live* asked the panel (`get_short_epg`) once per visible
-channel and made paging the list expensive. It is gone. In its place sits a **Playlist** column:
+channel and made paging the list expensive. It is gone. In its place, between **Channel** and
+**Portal**, sits the **Custom Channel Name** column (it was briefly headed just "Playlist", which
+read like a link to the Playlist *tab* rather than an editable name):
 
 - shown only for **enabled** channels (disabled rows stay blank);
 - default value = the portal's original channel name;
@@ -526,8 +528,39 @@ channel and made paging the list expensive. It is gone. In its place sits a **Pl
   - **unique name** → a new custom live channel is created (or the channel this source already owns as primary is renamed);
   - **name already used** (case-insensitive) → this source is attached as a **fallback** on that existing custom channel.
 
+It is also the **wide** column of the two: the portal's own **Channel** name next to it is
+read-only reference and is kept narrow (ellipsised, full text in the cell tooltip), so the field
+you actually type in gets the room.
+
 The list payload carries the placement (`playlist_id`, `playlist_name`, primary/fallback badge) in
 the same `/api/sources/live` response — no extra round trip per page.
+
+---
+
+## Browser tab icon (favicon)
+
+Every page of the GUI — dashboard, portals, playlist, **and the login screen** — carries a tab
+icon, and *which picture* it is, is a setting rather than a hard-coded file:
+
+* **Settings → Browser tab icon (favicon)** shows seven built-in pictures (broadcast, satellite
+  dish, TV screen, play, signal bars, antenna tower, minimal dot). Click one; it is live on the
+  next page load, no restart.
+* **Use my own picture** uploads a `.png` / `.svg` / `.ico` / `.jpg` / `.gif` / `.webp` (max
+  512 kB). It is stored on the **config volume** (`/config/branding/`), not inside the image, so a
+  `docker pull` of a new build keeps it. The trash button deletes it again and the selection falls
+  back to a built-in.
+
+Under the hood the choice is one `settings` row (`favicon`), so it rides along in a
+*Settings* backup and is restored with it. `/favicon.ico` (and `/apple-touch-icon.png`) serve the
+active picture and are deliberately public — a browser asks for them on the login page too,
+before there is a session. The `<link>` tags carry a `?v=<fingerprint>` that changes with the
+picture, because a browser otherwise keeps showing the previous favicon roughly forever.
+
+Uploads are validated: unsupported extensions and oversized files are refused with a readable
+message, and a **scripted SVG is rejected** (`<script>`, `on…=` handlers, external entities) —
+a tab icon is reachable as a document at `/favicon.ico` on the admin origin, so it must not be
+able to run anything. What is served is additionally sent with `nosniff` and a
+`default-src 'none'; sandbox` CSP.
 
 ---
 
