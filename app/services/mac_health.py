@@ -18,8 +18,9 @@ even see the same catalogue?"
      the operator wants to know whether a "secondary" MAC is actually a
      different package (common with shared-login resellers).
 
-Neither path is a fetch: nothing is written into the genre/source tables.
-Comparison results are pure report.
+The comparison does not fetch source items, but it upserts the discovered genre
+union so the matrix can enable/disable those rows without losing package-only
+categories when the dialog closes.
 """
 
 from __future__ import annotations
@@ -303,7 +304,7 @@ def _diff_kind(per_mac: list[dict], kind: str) -> dict:
     sets: dict[str, set[str]] = {}
     labels: dict[str, str] = {}
     for block in per_mac:
-        if not block.get("ok"):
+        if not block.get("ok") or block.get(f"{kind}_error"):
             continue
         keys = set()
         for g in block.get(kind) or []:
@@ -372,9 +373,9 @@ async def _persist_genres_from_compare(portal_id: int, per_mac: list[dict]) -> d
     return stored
 
 
-async def compare_genres(portal_id: int) -> dict:
+async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> dict:
     """
-    Ask every *online* MAC of a portal for its genre lists and report diffs.
+    Ask selected (or, for legacy callers, every) online MAC for genre lists.
 
     Offline / expired / banned MACs are listed but not asked — their package
     is unknown, and a handshake failure is already visible on the status badge.
@@ -405,20 +406,36 @@ async def compare_genres(portal_id: int) -> dict:
         return {"ok": False, "portal_id": portal_id, "name": name,
                 "error": "portal URL could not be resolved"}
 
-    usable = [m for m in macs if m.online and m.status not in ("expired", "banned")]
-    skipped = [{"mac": m.mac, "status": m.status, "online": m.online,
+    selected = {int(i) for i in (mac_ids or []) if str(i).isdigit()}
+    candidates = [m for m in macs if not selected or m.id in selected]
+    if selected and len(candidates) < 2:
+        return {"ok": False, "portal_id": portal_id, "name": name,
+                "error": "select at least two MAC addresses from this portal"}
+    usable = [m for m in candidates
+              if m.online and m.status not in ("expired", "banned")]
+    skipped = [{"mac": m.mac, "mac_id": m.id, "status": m.status, "online": m.online,
                 "reason": "not online — refresh status first"}
-               for m in macs if m not in usable]
+               for m in candidates if m not in usable]
+    if selected and len(usable) < 2:
+        return {"ok": False, "portal_id": portal_id, "name": name,
+                "error": "fewer than two selected MACs are online and usable"}
 
-    per_mac = []
-    for m in usable:
-        per_mac.append(await _genres_for_mac(p, m, url))
+    # Selected comparisons are an operator action, but do not hammer a portal
+    # without bound when it has many accounts.
+    gate = asyncio.Semaphore(4)
+
+    async def fetch_one(mac):
+        async with gate:
+            return await _genres_for_mac(p, mac, url)
+
+    per_mac = list(await asyncio.gather(*(fetch_one(m) for m in usable)))
 
     live = _diff_kind(per_mac, "live")
     vod = _diff_kind(per_mac, "vod")
     series = _diff_kind(per_mac, "series")
     identical = live["identical"] and vod["identical"] and series["identical"]
-    failed = [b for b in per_mac if not b.get("ok")]
+    failed = [b for b in per_mac if not b.get("ok") or any(
+        b.get(f"{kind}_error") for kind in ("live", "vod", "series"))]
 
     # Persist the union so secondary packages land in the catalogue tables.
     stored = {"live": 0, "vod": 0, "series": 0}
@@ -439,6 +456,24 @@ async def compare_genres(portal_id: int) -> dict:
             "only_vod": len((vod.get("only") or {}).get(b["mac"]) or []),
             "only_series": len((series.get("only") or {}).get(b["mac"]) or []),
         })
+
+    signatures: dict[tuple, list[dict]] = {}
+    for block in per_mac:
+        signature = tuple(
+            (kind, str(block.get(f"{kind}_error") or ""),
+             tuple(sorted(g["key"] for g in (block.get(kind) or []))))
+            for kind in ("live", "vod", "series")
+        ) if block.get("ok") else (("failed", block.get("error") or ""),)
+        signatures.setdefault(signature, []).append(block)
+    packages = [{
+        "id": index + 1,
+        "name": f"Package {chr(65 + index) if index < 26 else index + 1}",
+        "mac_ids": [b["mac_id"] for b in blocks],
+        "macs": [b["mac"] for b in blocks],
+        "counts": {kind: len(blocks[0].get(kind) or [])
+                   for kind in ("live", "vod", "series")},
+        "ok": all(b.get("ok") for b in blocks),
+    } for index, blocks in enumerate(signatures.values())]
 
     if identical and not failed:
         msg = f"all {len(per_mac)} online MAC(s) see the same genres"
@@ -461,7 +496,7 @@ async def compare_genres(portal_id: int) -> dict:
         "ok": True, "portal_id": portal_id, "name": name,
         "compared": len(per_mac), "skipped": skipped,
         "identical": identical and not failed, "message": msg,
-        "macs": mac_summary,
+        "macs": mac_summary, "results": per_mac, "packages": packages,
         "live": live, "vod": vod, "series": series,
         "stored": stored,
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

@@ -157,12 +157,15 @@ async def test_compare_genres_reports_and_stores(monkeypatch):
                 "series": []}
 
     monkeypatch.setattr(svc, "_genres_for_mac", fake_genres)
-    out = await svc.compare_genres(pid)
+    out = await svc.compare_genres(pid, mids)
     assert out["ok"] is True
     assert out["compared"] == 2
     assert len(out["skipped"]) == 1
     assert out["identical"] is False
     assert out["live"]["identical"] is False
+    assert len(out["results"]) == 2
+    assert len(out["packages"]) == 2  # each MAC has a distinct exact signature
+    assert all(p["counts"]["live"] == 2 for p in out["packages"])
     # News is common; Sport only on 01; Kids only on 02.
     common_names = {g["name"] for g in out["live"]["common"]}
     assert "News" in common_names
@@ -215,6 +218,8 @@ async def test_compare_genres_identical_when_same_package(monkeypatch):
     assert out["identical"] is True
     assert out["live"]["identical"] is True
     assert out["live"]["only"] == {}
+    assert len(out["packages"]) == 1
+    assert len(out["packages"][0]["mac_ids"]) == 2
     assert out["stored"]["live"] == 2
 
 

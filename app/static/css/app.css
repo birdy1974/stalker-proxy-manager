@@ -89,3 +89,24 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 .favicon-tile span { font-size: .68rem; line-height: 1.1; color: #6b7280; text-align: center; word-break: break-word; }
 .favicon-tile.active { border-color: var(--spm-accent); box-shadow: 0 0 0 2px rgba(13,148,136,.25); }
 .favicon-tile.active span { color: var(--spm-slate); font-weight: 600; }
+.genre-compare .cmp-matrix th:nth-child(1),
+.genre-compare .cmp-matrix td:nth-child(1) {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  background: var(--bs-body-bg);
+}
+.genre-compare .cmp-matrix th:nth-child(2),
+.genre-compare .cmp-matrix td:nth-child(2) {
+  position: sticky;
+  left: 34px;
+  z-index: 2;
+  background: var(--bs-body-bg);
+}
+.genre-compare .cmp-matrix thead th {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: var(--bs-body-bg);
+}
+.genre-compare .cmp-matrix thead th:nth-child(-n+2) { z-index: 4; }
