@@ -137,6 +137,30 @@ class ClientPool:
             self._used[key] = time.monotonic()
             return client
 
+    async def warm(self, sessions: list[PortalSession], concurrency: int = 4) -> dict:
+        """Create and authenticate sessions ahead of stream requests.
+
+        Failures are isolated: a blocked MAC must not prevent healthy portal
+        sessions from being ready, and normal playback remains the retry path.
+        """
+        gate = asyncio.Semaphore(max(1, concurrency))
+        ready = failed = 0
+
+        async def one(session: PortalSession) -> None:
+            nonlocal ready, failed
+            async with gate:
+                try:
+                    client = await self.get(session)
+                    await client.ensure_auth()
+                    ready += 1
+                except Exception as exc:  # noqa: BLE001 - best-effort warmup
+                    failed += 1
+                    log.debug("portal pre-auth failed for %s/%s: %s",
+                              session.portal_url, session.mac, exc)
+
+        await asyncio.gather(*(one(session) for session in sessions))
+        return {"ready": ready, "failed": failed}
+
     async def reap(self, idle_ttl: float = IDLE_TTL) -> int:
         """Close sessions nothing has used recently. Returns how many."""
         now = time.monotonic()

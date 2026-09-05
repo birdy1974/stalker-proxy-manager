@@ -95,6 +95,62 @@ _TS_VIDEO_BSF = {"h264": "h264_mp4toannexb", "hevc": "hevc_mp4toannexb",
 # VOD on top of a slow portal, a hard disk that has to spin up). Two seconds
 # is plenty for normal A/V skew and keeps stream start responsive.
 MAX_INTERLEAVE_DELTA_US = os.environ.get("SPM_MAX_INTERLEAVE_DELTA_US", "2000000")
+ROUTE_AFFINITY_TTL = float(os.environ.get("SPM_ROUTE_AFFINITY_TTL", "1800"))
+SOURCE_BREAKER_FAILURES = max(1, int(os.environ.get("SPM_SOURCE_BREAKER_FAILURES", "2")))
+SOURCE_BREAKER_COOLDOWN = float(os.environ.get("SPM_SOURCE_BREAKER_COOLDOWN", "45"))
+
+
+class _RouteHealth:
+    """Process-local route affinity and a short source circuit breaker.
+
+    Playlist priority remains the fallback order; only a route that actually
+    produced bytes is promoted on its next play. Repeated source-specific
+    failures temporarily suppress that source when another choice exists.
+    """
+
+    def __init__(self) -> None:
+        self.success: dict[tuple, tuple[float, tuple, int | None]] = {}
+        self.failures: dict[tuple, tuple[int, float]] = {}
+
+    @staticmethod
+    def source_key(source) -> tuple:
+        return type(source).__name__, int(getattr(source, "id", 0) or 0)
+
+    def ordered_chain(self, route: tuple | None, chain: list) -> list:
+        now = time.monotonic()
+        preferred = self.success.get(route) if route else None
+        if preferred and now - preferred[0] > ROUTE_AFFINITY_TTL:
+            self.success.pop(route, None)
+            preferred = None
+        healthy, open_ = [], []
+        for step in chain:
+            state = self.failures.get(self.source_key(step[0]))
+            (open_ if state and state[0] >= SOURCE_BREAKER_FAILURES
+             and now - state[1] < SOURCE_BREAKER_COOLDOWN else healthy).append(step)
+        # Keep one half-open candidate if every configured route is cooling down.
+        ordered = healthy if healthy else open_[:1]
+        if preferred:
+            source_key = preferred[1]
+            ordered.sort(key=lambda step: self.source_key(step[0]) != source_key)
+        return ordered
+
+    def ordered_macs(self, route: tuple | None, source, macs: list) -> list:
+        preferred = self.success.get(route) if route else None
+        if not preferred or preferred[1] != self.source_key(source):
+            return macs
+        mac_id = preferred[2]
+        return sorted(macs, key=lambda mac: getattr(mac, "id", None) != mac_id)
+
+    def failed(self, source) -> None:
+        key = self.source_key(source)
+        count, _ = self.failures.get(key, (0, 0.0))
+        self.failures[key] = (count + 1, time.monotonic())
+
+    def succeeded(self, route: tuple | None, source, mac) -> None:
+        key = self.source_key(source)
+        self.failures.pop(key, None)
+        if route:
+            self.success[route] = (time.monotonic(), key, getattr(mac, "id", None))
 
 
 class _WithTemplate:
@@ -124,6 +180,7 @@ class StreamHandle:
     bytes_sent: int = 0
     proc: asyncio.subprocess.Process | None = None
     dead: bool = False
+    route_key: tuple | None = None
 
     def public(self) -> dict:
         return {"id": self.id, "kind": self.kind, "item_name": self.item_name,
@@ -157,6 +214,7 @@ class StreamManager:
         self.redirect_leases: dict[int, float] = {}
         self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
         self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
+        self.route_health = _RouteHealth()
 
     # ------------------------------------------------------------- occupancy
     def is_mac_busy(self, mac_id: int | None) -> bool:
@@ -1404,8 +1462,12 @@ class StreamManager:
         else:
             raise ValueError(f"kind {kind!r} cannot be redirected (no portal URL)")
 
+        route_key = (kind, ref_id)
+        chain = self.route_health.ordered_chain(route_key, chain)
         for _src, portal, macs in chain:
-            for mac_row in self._macs_for(portal, _src, macs):
+            candidates = self._macs_for(portal, _src, macs)
+            candidates = self.route_health.ordered_macs(route_key, _src, candidates)
+            for mac_row in candidates:
                 # ffmpeg lock OR a recent redirect lease — both mean "leave this
                 # MAC alone". Redirects never enter mac_locks (we no longer hold
                 # the socket after the 302), so the lease is the only signal.
@@ -1420,9 +1482,12 @@ class StreamManager:
                 if plan.policy.direct:
                     await db_log("INFO", "stream",
                                  f"[{item_name}] playing the stored link via "
-                                 f"{portal.name}/{mac_row.mac}: {plan.policy.reason}")
+                                 f"{portal.name}/"
+                                 f"{mac_row.mac if mac_row is not None else 'xtream'}: "
+                                 f"{plan.policy.reason}")
                     if mac_row is not None:
                         self.lease_mac(mac_row.id)
+                    self.route_health.succeeded(route_key, _src, mac_row)
                     return plan.direct_url, item_name
                 client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                 try:
@@ -1442,7 +1507,10 @@ class StreamManager:
                     await db_log("WARNING", "stream",
                                  f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
                                  f"{exc.detail()} -> next")
-                    continue
+                    if exc.mac_suspect:
+                        continue
+                    self.route_health.failed(_src)
+                    break
                 except Exception as exc:  # noqa: BLE001
                     await db_log("WARNING", "stream",
                                  f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
@@ -1456,6 +1524,7 @@ class StreamManager:
                                  f"(no ffmpeg)")
                     if mac_row is not None:
                         self.lease_mac(mac_row.id)
+                    self.route_health.succeeded(route_key, _src, mac_row)
                     return url, item_name
         await db_log("ERROR", "stream",
                      f"[{item_name}] redirect failed: no source produced a link")
@@ -1495,7 +1564,8 @@ class StreamManager:
             tpl_name = "(local mpegts remux)"
             command = mpegts_copy_command()
         handle = StreamHandle(id=uuid.uuid4().hex, kind=kind, item_name=item_name,
-                              user_name=user_name, template_name=tpl_name, command=command)
+                              user_name=user_name, template_name=tpl_name, command=command,
+                              route_key=(kind, ref_id))
         # Pre-check: empty chain or EVERY mac currently occupied -> fail fast
         # with 404 instead of hanging a client with a 200 + empty body.
         if kind == "local":
@@ -1576,10 +1646,18 @@ class StreamManager:
                     yield chunk
                 return
 
+            configured_count = len(chain)
+            chain = self.route_health.ordered_chain(h.route_key, chain)
+            if len(chain) < configured_count:
+                await db_log("INFO", "stream",
+                             f"[{h.item_name}] circuit breaker skipped "
+                             f"{configured_count - len(chain)} cooling source(s)")
             for idx, (src, portal, macs) in enumerate(chain, 1):
                 if h.dead:
                     return
-                for mac_row in self._macs_for(portal, src, macs):
+                candidates = self._macs_for(portal, src, macs)
+                candidates = self.route_health.ordered_macs(h.route_key, src, candidates)
+                for mac_row in candidates:
                     if h.dead:
                         return
                     # Decided before the portal is touched, for the same reason the
@@ -1629,7 +1707,10 @@ class StreamManager:
                                          f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
                                          f"{exc.detail()}"
                                          f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
-                            continue
+                            if exc.mac_suspect:
+                                continue
+                            self.route_health.failed(src)
+                            break  # source-specific failure: another MAC cannot repair it
                         except Exception as exc:  # noqa: BLE001
                             await db_log("WARNING", "stream",
                                          f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
@@ -1661,6 +1742,7 @@ class StreamManager:
                     if proc is None:
                         if locked is not None:
                             self.mac_locks.pop(locked, None)
+                        self.route_health.failed(src)
                         if adopted:
                             break
                         continue
@@ -1685,11 +1767,14 @@ class StreamManager:
                         await self._kill_quiet(proc)
                         if locked is not None:
                             self.mac_locks.pop(locked, None)
+                        self.route_health.failed(src)
                         if adopted:
                             break
                         continue
+                    self.route_health.succeeded(h.route_key, src, mac_row)
                     await db_log("INFO", "stream",
-                                 f"[{h.item_name}] playing via {portal.name}/{mac_row.mac} "
+                                 f"[{h.item_name}] playing via {portal.name}/"
+                                 f"{mac_row.mac if mac_row is not None else 'xtream'} "
                                  f"({'transcode' if ' -c:v copy' not in h.command else 'copy'})")
                     yield first
                     async for chunk in self._read_proc(h, proc):

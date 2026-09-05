@@ -108,8 +108,13 @@ async def _reset_portal_pool():
     installed by one test would be handed to the next one.
     """
     from app.portal.pool import POOL
+    from app.services.stream_manager import MANAGER, _RouteHealth
     await POOL.close_all()
     POOL.hits = POOL.misses = 0
+    MANAGER.redirect_leases.clear()
+    MANAGER.route_health = _RouteHealth()
     yield
     await POOL.close_all()
     POOL.hits = POOL.misses = 0
+    MANAGER.redirect_leases.clear()
+    MANAGER.route_health = _RouteHealth()

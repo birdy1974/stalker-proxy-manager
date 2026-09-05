@@ -45,6 +45,9 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 | `SPM_ADMIN_USERNAME` / `SPM_ADMIN_PASSWORD` | `admin` / *(required)* | GUI login |
 | `SPM_VAAPI_DEVICE` | `/dev/dri/renderD128` | Intel Quick Sync render node |
 | `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
+| `SPM_PORTAL_WARM_INTERVAL` | `600` | seconds between background pre-authentication passes for resolved portal/MAC sessions |
+| `SPM_ROUTE_AFFINITY_TTL` | `1800` | seconds to prefer the source/MAC that most recently produced stream bytes |
+| `SPM_SOURCE_BREAKER_FAILURES` / `SPM_SOURCE_BREAKER_COOLDOWN` | `2` / `45` | source-specific failures before temporarily skipping it, and seconds before a half-open retry |
 | `SPM_MOCK_PORTAL` | `0` | `1` boots a built-in demo portal (test data, busy-MAC emulation) |
 | `SPM_LOG_LEVEL` | `INFO` | Python log level (all records go to container stdout) |
 | `SPM_SKIP_LOGIN` | `0` | **Mockup/preview only**: bypass admin login (`*** LOGIN DISABLED ***` banner in log). Never set on a real deployment |
@@ -174,6 +177,13 @@ probes; changed or unsuccessfully probed files safely fall back to runtime
 probing. The managed Enigma2 VOD/remux, Vu+ live, and Dreambox presets bound
 FFmpeg input analysis to one second/megabyte (`-analyzeduration`/`-probesize`)
 to reduce time-to-first-byte without changing area or template selection.
+
+Resolved portal/MAC sessions are pre-authenticated in the background, so the
+first play normally reuses a live token and HTTP connection. Once a source/MAC
+actually produces bytes it is preferred for later plays of that same playlist
+item. A short process-local circuit breaker suppresses repeatedly failing
+sources while alternatives exist, then automatically half-opens after the
+cooldown; configured playlist priority and database rows are never rewritten.
 
 ---
 
