@@ -28,6 +28,7 @@ _RE_STREAM_SUBTITLE = re.compile(
     r"Stream\s+#\d+:(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*Subtitle:\s*([A-Za-z0-9_]+)", re.I)
 _RE_STREAM_AV = re.compile(
     r"Stream\s+#\d+:\d+.*?:\s*(Video|Audio):\s*([A-Za-z0-9_]+)", re.I)
+_RE_INPUT_FORMAT = re.compile(r"Input #0,\s*([^,]+(?:,[^,]+)*?),\s*from", re.I)
 
 # Wall-clock cap on a single probe. Network streams can be slow to connect and
 # to deliver enough data for analysis, so 10s was far too tight; 30s is the
@@ -111,6 +112,7 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
             try:
                 out = probe_ts(target)
                 if "error" not in out:
+                    out.setdefault("container", _P(target).suffix.lower().lstrip("."))
                     _CACHE[key] = (time.time(), out)
                     return out
             except Exception:  # noqa: BLE001 - fall through to ffmpeg
@@ -142,6 +144,9 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
         if i != -1:
             text = text[:i]
     out: dict = {"video": None, "audio": []}
+    container = _RE_INPUT_FORMAT.search(text)
+    if container:
+        out["container"] = container.group(1).strip().lower()
     m = _RE_DURATION.search(text)
     if m:
         h, mnt, sec = int(m.group(1)), int(m.group(2)), float(m.group(3))
@@ -244,6 +249,29 @@ async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
 # failed - the caller then leaves the command untouched (status quo).
 # --------------------------------------------------------------------------
 _CODECS_CACHE: dict[str, tuple[float, dict | None]] = {}
+
+
+def prime_local_startup_cache(target: str, media: dict | None) -> None:
+    """Hydrate (or invalidate) startup-gate caches from scan-persisted data."""
+    subs_key = f"{target}|False"
+    codecs_key = f"codecs|{target}|False"
+    if not media:
+        _SUBS_CACHE.pop(subs_key, None)
+        _CODECS_CACHE.pop(codecs_key, None)
+        return
+    now = time.time()
+    subs = media.get("subtitles")
+    if isinstance(subs, list):
+        _SUBS_CACHE[subs_key] = (now, subs)
+    video = media.get("video")
+    audio = media.get("audio")
+    codecs = {
+        "video": video.get("codec") if isinstance(video, dict) else None,
+        "audio": audio[0].get("codec") if isinstance(audio, list) and audio
+                 and isinstance(audio[0], dict) else None,
+    }
+    if codecs["video"] is not None or codecs["audio"] is not None:
+        _CODECS_CACHE[codecs_key] = (now, codecs)
 
 
 def _parse_codecs(text: str) -> dict | None:

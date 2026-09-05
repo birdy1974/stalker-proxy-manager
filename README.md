@@ -167,6 +167,14 @@ portal, occupy a MAC, or launch FFmpeg. Actual GET startup writes an
 prepare/resolve, first-byte, and total time. Direct local playback additionally
 reports path, template, and stream-registration timings.
 
+Local directory scans also persist container, codec, and subtitle metadata next
+to each file's size and modification time. Local remux/subtitle startup gates
+reuse that metadata after a restart instead of launching duplicate FFmpeg
+probes; changed or unsuccessfully probed files safely fall back to runtime
+probing. The managed Enigma2 VOD/remux, Vu+ live, and Dreambox presets bound
+FFmpeg input analysis to one second/megabyte (`-analyzeduration`/`-probesize`)
+to reduce time-to-first-byte without changing area or template selection.
+
 ---
 
 ## ffmpeg templates & transcoding (DS918+ Quick Sync)

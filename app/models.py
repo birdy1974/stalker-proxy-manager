@@ -317,6 +317,9 @@ class LocalFile(Base):
     size_bytes: Mapped[int | None] = mapped_column(BigInteger)
     mtime: Mapped[str | None] = mapped_column(String(40))
     duration_s: Mapped[float | None] = mapped_column(Float)   # probed; drives M3U EXTINF
+    # Full probe result (container/A/V/subtitle codecs). Valid while mtime/size
+    # match; lets first playback skip synchronous ffmpeg analysis.
+    media_probe: Mapped[str | None] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 

@@ -22,6 +22,7 @@ unlogged.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import logging
@@ -29,6 +30,7 @@ import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from sqlalchemy import delete, select
 
@@ -49,7 +51,7 @@ from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
                                HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
                                URL_PLACEHOLDER, mpegts_copy_command,
                                serves_original_file)
-from .probe import media_codecs, subtitle_streams
+from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
 from .item_info import local_file_path
 
 log = logging.getLogger("spm.stream")
@@ -1287,14 +1289,34 @@ class StreamManager:
     async def local_disk_path(self, ref_id: int) -> tuple[str | None, str]:
         """Absolute path of a local playlist item, or (None, name) if missing."""
         async with SessionLocal() as s:
-            lp = await s.get(LocalPlaylist, ref_id)
-            lf = await s.get(LocalFile, lp.local_file_id) if lp else None
-            ls = await s.get(LocalSource, lf.local_source_id) if lf else None
-        name = (lp.custom_name or lf.filename) if lp and lf else "local file"
-        if not (lf and ls):
-            return None, name
+            row = (await s.execute(
+                select(LocalPlaylist, LocalFile, LocalSource)
+                .join(LocalFile, LocalPlaylist.local_file_id == LocalFile.id)
+                .join(LocalSource, LocalFile.local_source_id == LocalSource.id)
+                .where(LocalPlaylist.id == ref_id)
+            )).one_or_none()
+        if not row:
+            return None, "local file"
+        lp, lf, ls = row
+        name = lp.custom_name or lf.filename
         path = local_file_path(ls.directory, lf.relative_path)
         if path and os.path.isfile(path):
+            probe = None
+            try:
+                stat = os.stat(path)
+                stored_ts = datetime.fromisoformat(lf.mtime).timestamp() if lf.mtime else None
+                unchanged = (stat.st_size == lf.size_bytes and stored_ts is not None
+                             and abs(stat.st_mtime - stored_ts) < 0.001)
+            except (OSError, TypeError, ValueError):
+                unchanged = False
+            if unchanged and lf.media_probe:
+                try:
+                    probe = json.loads(lf.media_probe)
+                except (TypeError, ValueError):
+                    pass
+            # Missing/invalid/stale metadata deliberately evicts an older
+            # in-memory answer, so a replaced file falls back to a safe probe.
+            prime_local_startup_cache(path, probe)
             return path, name
         return None, name
 

@@ -481,18 +481,24 @@ async def scan_local(payload: dict, db=Depends(get_db)):
                     continue
                 rel = os.path.relpath(os.path.join(root, fn), base)
                 total_seen += 1
-                exists = await db.scalar(select(func.count()).select_from(LocalFile).where(
-                    LocalFile.local_source_id == d.id, LocalFile.relative_path == rel))
-                if exists:
-                    continue
                 try:
                     st = os.stat(os.path.join(root, fn))
                 except OSError as e:                      # unreadable file: skip, keep scanning
                     skipped.append(f"{os.path.join(root, fn)} ({e.strerror})")
                     continue
+                mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
+                existing = await db.scalar(select(LocalFile).where(
+                    LocalFile.local_source_id == d.id, LocalFile.relative_path == rel))
+                if existing:
+                    if existing.size_bytes != st.st_size or existing.mtime != mtime:
+                        existing.filename = fn
+                        existing.size_bytes = st.st_size
+                        existing.mtime = mtime
+                        existing.duration_s = None
+                        existing.media_probe = None
+                    continue
                 db.add(LocalFile(local_source_id=d.id, relative_path=rel, filename=fn,
-                                 size_bytes=st.st_size,
-                                 mtime=datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()))
+                                 size_bytes=st.st_size, mtime=mtime))
                 n_new += 1
         if skipped:
             total_skipped += len(skipped)
