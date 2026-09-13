@@ -5,10 +5,11 @@ Two independent, env-gated behaviours for ``StreamManager.resolve()``
 
 1. **Open-time link validation** (`link_is_alive`). Before the 302 is issued,
    the candidate URL gets a cheap liveness check: HEAD first, then - only if
-   the server answers HEAD with 403/405/501 (alive, but method-shy) - one
-   ranged GET for byte 0 whose connection is closed before any body arrives.
-   Dead links are skipped for the next chain candidate instead of 302-ing the
-   player into a black screen.
+   HEAD is inconclusive (403/405/501: alive but method-shy; 500/502/503/504:
+   gateway error, which on HEAD may be the upstream refusing the *method*,
+   not the stream being dead) - one ranged GET for byte 0 whose connection
+   is closed before any body arrives. Dead links are skipped for the next
+   chain candidate instead of 302-ing the player into a black screen.
 
    Deliberately conservative, two ways: anything inconclusive (non-HTTP URL,
    unexpected status) counts as ALIVE - the check may only veto a link it
@@ -45,6 +46,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass
 
 import httpx
 
@@ -101,8 +103,31 @@ def reset() -> None:
     _handed.clear()
 
 
-# HEAD answers that mean "server alive, try GET differently" rather than dead.
-_HEAD_STATUSES_TRY_GET = frozenset({403, 405, 501})
+# HEAD answers that do NOT settle the question on HEAD alone: confirm with a
+# ranged GET instead of vetoing.
+#   403/405/501 - server alive, method-shy.
+#   500/502/503/504 - gateway error. On a *streaming* endpoint a 5xx on HEAD
+#     is not proof the stream is dead: several panels' stream origins answer
+#     HEAD with 502/503 while serving the very same URL to GET fine (observed
+#     on the nexusconnects-style portal: every fresh create_link token died
+#     on the HEAD probe while the links were usable). The ranged GET - which
+#     asks for actual bytes - is the verdict; if IT answers 5xx the link is
+#     genuinely dead and still vetoed. A 404/410 stays a hard veto: the
+#     token/channel is gone regardless of method.
+_HEAD_STATUSES_TRY_GET = frozenset({403, 405, 500, 501, 502, 503, 504})
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """Verdict of `link_is_alive`. `bool(result)` is `alive`, so
+    `if not await link_is_alive(url)` keeps working unchanged; `detail` is
+    the probe trace ("HEAD 200", "HEAD 502 -> GET 206", ...) for the logs."""
+
+    alive: bool
+    detail: str
+
+    def __bool__(self) -> bool:
+        return self.alive
 
 
 def _referer_of(url: str) -> str:
@@ -113,13 +138,13 @@ def _referer_of(url: str) -> str:
 
 
 async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
-                        client: httpx.AsyncClient | None = None) -> bool:
+                        client: httpx.AsyncClient | None = None) -> ProbeResult:
     """Whether a redirect candidate URL answers (conservative: inconclusive
     counts as alive). `client` is a test seam; production builds its own."""
     if not VALIDATE_ENABLED:
-        return True
+        return ProbeResult(True, "validation disabled")
     if str(url or "").split("://", 1)[0].lower() not in ("http", "https"):
-        return True
+        return ProbeResult(True, "non-HTTP url, not probed")
     own = client is None
     if own:
         client = httpx.AsyncClient(timeout=timeout, follow_redirects=True,
@@ -128,21 +153,24 @@ async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
     try:
         try:
             head = await client.head(url)
-        except httpx.HTTPError:
-            return False
+        except httpx.HTTPError as exc:
+            return ProbeResult(False, f"HEAD {type(exc).__name__}")
         if 200 <= head.status_code < 300:
-            return True
+            return ProbeResult(True, f"HEAD {head.status_code}")
         if head.status_code not in _HEAD_STATUSES_TRY_GET:
-            return False
-        # Alive but method-shy: one ranged GET, closed before any body. The
-        # status line alone is the verdict - even a 200-with-ignored-Range
-        # (full stream) costs us nothing, because we never read the body.
+            return ProbeResult(False, f"HEAD {head.status_code}")
+        # Inconclusive on HEAD (method-shy or gateway error): one ranged GET,
+        # closed before any body. The status line alone is the verdict - even
+        # a 200-with-ignored-Range (full stream) costs us nothing, because we
+        # never read the body.
         try:
             async with client.stream("GET", url,
                                      headers={"Range": "bytes=0-0"}) as resp:
-                return 200 <= resp.status_code < 300
-        except httpx.HTTPError:
-            return False
+                return ProbeResult(200 <= resp.status_code < 300,
+                                   f"HEAD {head.status_code} -> GET {resp.status_code}")
+        except httpx.HTTPError as exc:
+            return ProbeResult(False,
+                               f"HEAD {head.status_code} -> GET {type(exc).__name__}")
     finally:
         if own:
             await client.aclose()

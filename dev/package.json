@@ -1,0 +1,8 @@
+{
+  "name": "spm-dev-checks",
+  "private": true,
+  "description": "Node-side dev checks (dev/check-genre-popup.js). Install with: npm install --prefix dev",
+  "dependencies": {
+    "jsdom": "^24.0.0"
+  }
+}

@@ -16,7 +16,7 @@ from app.models import (
 )
 from app.services import redirect_guard
 from app.services.redirect_guard import (
-    demote_recently_handed, link_is_alive, note_handed_out,
+    ProbeResult, demote_recently_handed, link_is_alive, note_handed_out,
 )
 from app.services.stream_manager import MANAGER
 
@@ -104,7 +104,8 @@ async def test_validation_skips_a_dead_first_link(monkeypatch):
     monkeypatch.setattr("app.services.stream_manager.POOL", _FakePool(client))
 
     async def fake_alive(url, **kw):
-        return "one" not in url and "/1.ts" not in url
+        ok = "one" not in url and "/1.ts" not in url
+        return ProbeResult(ok, "fake")
 
     monkeypatch.setattr("app.services.stream_manager.link_is_alive", fake_alive)
     url, _name = await MANAGER.resolve("live", pid)
@@ -114,7 +115,7 @@ async def test_validation_skips_a_dead_first_link(monkeypatch):
 
 async def test_validation_disabled_hands_out_untested(monkeypatch):
     monkeypatch.setattr("app.services.redirect_guard.VALIDATE_ENABLED", False)
-    assert await link_is_alive("http://cdn/x.ts", client=None) is True
+    assert (await link_is_alive("http://cdn/x.ts", client=None)).alive is True
 
 
 # --------------------------------------------------------- feature 2: resolve
@@ -128,7 +129,7 @@ async def test_rapid_reopen_demotes_the_last_handoff(monkeypatch):
                         _FakePool(_FakeClient()))
 
     async def always_alive(url, **kw):
-        return True
+        return ProbeResult(True, "fake")
 
     monkeypatch.setattr("app.services.stream_manager.link_is_alive", always_alive)
     first, _ = await MANAGER.resolve("live", pid)
@@ -148,7 +149,7 @@ async def test_reopen_after_the_window_keeps_the_primary(monkeypatch):
                         _FakePool(_FakeClient()))
 
     async def always_alive(url, **kw):
-        return True
+        return ProbeResult(True, "fake")
 
     monkeypatch.setattr("app.services.stream_manager.link_is_alive", always_alive)
     first, _ = await MANAGER.resolve("live", pid)
@@ -210,7 +211,10 @@ def _recording_client(handler):
 async def test_alive_on_head_ok_without_get():
     client, seen = _recording_client(lambda r: httpx.Response(200))
     try:
-        assert await link_is_alive("http://cdn/x.ts", client=client) is True
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD 200"
+        assert bool(result) is True
         assert [(r.method, r.url.path) for r in seen] == [("HEAD", "/x.ts")]
     finally:
         await client.aclose()
@@ -225,7 +229,42 @@ async def test_head_405_falls_back_to_ranged_get():
 
     client, seen = _recording_client(h)
     try:
-        assert await link_is_alive("http://cdn/x.ts", client=client) is True
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD 405 -> GET 206"
+        assert [r.method for r in seen] == ["HEAD", "GET"]
+    finally:
+        await client.aclose()
+
+
+async def test_head_502_falls_back_to_ranged_get():
+    """A gateway error on HEAD is NOT proof the stream is dead: several
+    panels' stream origins answer HEAD with 502 while serving the very same
+    URL to GET. Confirm with the ranged GET before vetoing."""
+    def h(request):
+        if request.method == "HEAD":
+            return httpx.Response(502)
+        assert request.headers["Range"] == "bytes=0-0"
+        return httpx.Response(206)
+
+    client, seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD 502 -> GET 206"
+        assert [r.method for r in seen] == ["HEAD", "GET"]
+    finally:
+        await client.aclose()
+
+
+async def test_dead_when_head_and_get_both_502():
+    """Both probes 502: the stream side really is down -> veto, with the
+    full trace in the detail for the operator."""
+    client, seen = _recording_client(lambda r: httpx.Response(502))
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is False
+        assert result.detail == "HEAD 502 -> GET 502"
         assert [r.method for r in seen] == ["HEAD", "GET"]
     finally:
         await client.aclose()
@@ -237,7 +276,9 @@ async def test_dead_when_get_also_fails():
 
     client, seen = _recording_client(h)
     try:
-        assert await link_is_alive("http://cdn/x.ts", client=client) is False
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is False
+        assert result.detail == "HEAD 405 -> GET 404"
         assert [r.method for r in seen] == ["HEAD", "GET"]
     finally:
         await client.aclose()
@@ -246,7 +287,9 @@ async def test_dead_when_get_also_fails():
 async def test_dead_on_head_404_without_get():
     client, seen = _recording_client(lambda r: httpx.Response(404))
     try:
-        assert await link_is_alive("http://cdn/x.ts", client=client) is False
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is False
+        assert result.detail == "HEAD 404"
         assert [r.method for r in seen] == ["HEAD"]
     finally:
         await client.aclose()
@@ -258,7 +301,9 @@ async def test_dead_on_head_error_without_get():
 
     client, seen = _recording_client(h)
     try:
-        assert await link_is_alive("http://cdn/x.ts", client=client) is False
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is False
+        assert result.detail == "HEAD ConnectError"
         assert [r.method for r in seen] == ["HEAD"]
     finally:
         await client.aclose()
@@ -267,7 +312,8 @@ async def test_dead_on_head_error_without_get():
 async def test_non_http_urls_are_never_vetoed():
     client, seen = _recording_client(lambda r: httpx.Response(500))
     try:
-        assert await link_is_alive("rtmp://cdn/x", client=client) is True
+        result = await link_is_alive("rtmp://cdn/x", client=client)
+        assert result.alive is True
         assert seen == []
     finally:
         await client.aclose()
