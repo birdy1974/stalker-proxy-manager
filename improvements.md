@@ -1,3 +1,38 @@
+Quick check that I give you the exact marker text:
+
+Verified — 4 marked blocks in stream_manager.py, 1 in conftest.py. Paste this in a future session and I'll handle the rest:
+
+Delete the redirect-guard experiment: remove app/services/redirect_guard.py and tests/test_redirect_guard.py, then remove every block between the # >>> redirect-guard and # <<< redirect-guard marker comments in app/services/stream_manager.py and tests/conftest.py. Verify with grep that no redirect-guard markers or references remain, then run the full test suite and confirm it's green apart from the 2 known pre-existing failures.
+
+That's all I need — the markers make everything self-locating, so no line numbers or extra context required. When you say that, I will delete the two files, cut the five marked blocks, grep to prove nothing is left, and re-run the suite as confirmation.
+
+Two notes:
+
+Say "delete" only if you mean the code gone. If you just want it off (reversible, no code change), the instruction instead is: "disable the redirect guard via SPM_REDIRECT_VALIDATE=0 / SPM_REOPEN_DEMOTE=0" — that leaves everything in place but inert.
+Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix, not part of the experiment, and deleting it would bring the flake back.
+
+
+
+- epg
+- tv archive, like https://github.com/kiddac/EStalker for xtream users
+- replace 1 portal by another portal
+
+
+
+---= DONE =---
+
+2026-09-13
+- check output stream or ffmpeg template to enigma2 box as the stream is not working on my enigma2 box
+- on dashboard change positions of "Background jobs" and "Messages" with each other
+- check time stamp in message pane (2 hours behind). check for all time stamps.
+- move "Quick actions" under "Background jobs"
+- remove the following message from msglog "[spm.api] GET /api/dashboard -> 200", "[spm.api] GET /api/streams -> 200", "[spm.api] GET /login -> 200". also remove them from "API status" in dashboard
+- tab "input source" add option to bulk change the selected "custom group names", select from list and free text.
+- Edit portal popup, make detailed gerne list at the bottom the same width as the popup window. so I prefer the scroll down and up instead of left and right
+- make default "Portal identity we advertise" value "minimal"
+- is there a possibility / any posibility to check if there is a client streaming if "Redirect (bypass ffmpeg)" is used, so we can still use fallback channels? only give advise no implementation yet
+- give advise how to add possibility to force (Override) a specific Mac and or portal to be used as primary source
+
 2026-09-05
 - add favicon (for all tabs)
 - on "input source" tab change the header name of field "Playlist" (between "channel" and "portal") to "Custom Channel Name". also make the width of column "channel" smaller and the width of column "Custom Channel Name" bigger
@@ -13,15 +48,6 @@
 - after the "compare genres across macs" is done put the information on the number of genres in the persistent database and show it on the portal list (per Mac)
 - xtream users: I get the xtream Playlist correct in the "smarters player" android application, but I cannot play the streams. it does not connect or I don't get data
 - explain where the xtream user can find the local files in the android application. is it mapped to vod or series
-
-
-- epg
-- tv archive, like https://github.com/kiddac/EStalker for xtream users
-- replace 1 portal by another portal
-
-
-
----= DONE =---
 
 2026-09-03
 - it looks like vlc playlist cannot handle a minus "-" in the title, make sure "-" is handled correctly in the output Playlist for vlc.
