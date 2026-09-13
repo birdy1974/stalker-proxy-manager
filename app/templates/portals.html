@@ -279,8 +279,10 @@ async function editPortal(id) {
           <input class="form-control form-control-sm" style="max-width:260px" id="genre-q-${k}" placeholder="filter genres…">
           <span class="small text-muted ms-auto" id="genre-count-${k}"></span>
         </div>
-        <!-- single full-width genre list: scroll up/down, never left/right -->
-        <div class="border rounded p-2" style="max-height:260px;overflow:auto" id="genre-list-${k}"><div class="text-muted small p-1">No genres fetched yet — press “Fetch genres”.</div></div>
+        <!-- multi-column genre band: a long list flows sideways into more
+             columns instead of growing tall - scroll left/right only, never
+             up/down (column sizing in .genre-cols, app/static/css/app.css) -->
+        <div class="border rounded p-2 genre-cols" id="genre-list-${k}"><div class="text-muted small p-1 genre-empty">No genres fetched yet — press “Fetch genres”.</div></div>
       </div>`).join("")}`;
   const footer = el("div", { class: "d-flex gap-2 w-100" });
   const m = openModal({ title: id ? `Edit portal: ${p.name}` : "Add portal", body, footer, size: "xl" });
@@ -462,9 +464,9 @@ async function loadGenres(pid, kind) {
     <label class="d-flex align-items-center gap-2 small mb-1" data-name="${esc(g.name.toLowerCase())}">
       <span class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox"
         value="${g.id}" ${g.enabled ? "checked" : ""}></span>
-      <span class="flex-grow-1">${esc(g.name)}</span>
+      <span class="flex-grow-1 genre-item-name">${esc(g.name)}</span>
       <span class="text-muted">${g.item_count ?? "?"} items ${g.fetched ? "· fetched" : ""}</span>
-    </label>`).join("") : '<div class="text-muted small p-1">No genres fetched yet — press “Fetch genres”.</div>';
+    </label>`).join("") : '<div class="text-muted small p-1 genre-empty">No genres fetched yet — press “Fetch genres”.</div>';
   $$(`input[type=checkbox]`, host).forEach(cb => cb.addEventListener("change", async () => {
     await api(`/api/portals/${pid}/genres/toggle`, { method: "POST",
       body: { kind, ids: [+cb.value], enabled: cb.checked } });

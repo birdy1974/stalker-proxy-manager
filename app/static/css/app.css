@@ -106,3 +106,25 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
   background: var(--bs-body-bg);
 }
 .genre-compare .cmp-matrix thead th:nth-child(-n+2) { z-index: 4; }
+
+/* Genre lists in the "Edit portal:" popup: a band of fixed-height columns.
+   Items flow down each column (15 rows) and then to the NEXT column, so a
+   long list gets wider instead of taller - the box scrolls left/right only,
+   never up/down. The scrollable modal dialog takes over if even the band
+   grows past the viewport. Long names ellipsize inside their 300px column. */
+.genre-cols {
+  display: grid;
+  grid-auto-flow: column;
+  grid-template-rows: repeat(15, min-content);
+  grid-auto-columns: 300px;
+  gap: .25rem 1rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.genre-cols .genre-item-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.genre-cols .genre-empty { grid-column: 1 / -1; }
