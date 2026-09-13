@@ -209,7 +209,7 @@ async def test_fingerprint_reaches_the_portal(monkeypatch):
     """The point of R1 is observable on the wire, not in our own data structures."""
     w = Wired(monkeypatch)
     set_state(fingerprint_required=True, not_valid=True)
-    c = w.client(GOOD)
+    c = w.client(GOOD, identity_mode="mag250")
     await c.handshake()                       # must not raise: the panel is happy
     seen = (await w.state())["seen_profile"]
     idn = derive_identity(GOOD)
@@ -242,7 +242,7 @@ async def test_a_portal_without_get_profile_is_still_usable(monkeypatch):
 async def test_profile_without_id_falls_back_to_the_minimal_shape(monkeypatch):
     w = Wired(monkeypatch)
     set_state(profile_mode="no_id")
-    c = w.client(GOOD)
+    c = w.client(GOOD, identity_mode="mag250")
     await c.handshake()
     state = await w.state()
     assert state["counters"]["profile_calls"] == 2, "full shape, then the box's own fallback"
@@ -400,11 +400,12 @@ def test_session_from_rows_carry_every_connection_setting():
     assert (s.sn, s.device_id, s.mac, s.password) == ("PINNED", "DEV", M.mac, M.password)
     c = s.client()
     assert (c.tls_insecure, c.identity_mode, c.identity.sn) == (True, "minimal", "PINNED")
-    # a row from before these columns existed must still produce a session
+    # a row from before these columns existed must still produce a session,
+    # on the current default
     class Old:
         base_url = "http://p/c/portal.php"
     s2 = PortalSession.from_rows(Old, M)
-    assert s2.identity_mode == "mag250" and s2.tls_insecure is False
+    assert s2.identity_mode == "minimal" and s2.tls_insecure is False
 
 
 async def test_test_endpoint_marks_the_mac_the_way_the_panel_does(monkeypatch):
@@ -685,10 +686,10 @@ async def test_defaults_land_on_rows_that_predate_the_columns(tmp_path):
             await conn.run_sync(_add_missing_columns)
         async with eng.connect() as conn:
             mode = (await conn.execute(text("SELECT identity_mode FROM portals"))).scalar()
-        assert mode == "mag250", (
+        assert mode == "minimal", (
             "ALTER TABLE ADD COLUMN ... DEFAULT fills existing rows; without the "
-            "default an old portal would compare NULL against 'mag250' forever "
-            "and never get the fingerprint it needs")
+            "default an old portal would compare NULL forever instead of taking "
+            "the current default")
     finally:
         await eng.dispose()
 

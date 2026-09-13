@@ -49,11 +49,12 @@ class Portal(Base):
     resolved_path: Mapped[str | None] = mapped_column(String(120))        # the path that won (/c/, ...)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     proxy_url: Mapped[str | None] = mapped_column(String(300))            # optional http proxy
-    # What we tell the panel we are. "mag250" sends the device fingerprint a real
-    # box sends (see app/portal/identity.py); "minimal" is the escape hatch for a
-    # panel that rejects an identity it never enrolled - a WRONG fingerprint is
-    # worse than none, so the user has to be able to switch without a code change.
-    identity_mode: Mapped[str] = mapped_column(String(12), default="mag250")
+    # What we tell the panel we are. "minimal" (the default) sends the bare
+    # sn/timestamp profile (empty device id, no signature); "mag250" sends the
+    # full device fingerprint a real box sends (see app/portal/identity.py) for
+    # panels that withhold data until they see the box they enrolled. A WRONG
+    # fingerprint is worse than none, which is why it is opt-in, not the default.
+    identity_mode: Mapped[str] = mapped_column(String(12), default="minimal")
     stb_timezone: Mapped[str | None] = mapped_column(String(64))          # cookie a MAG sends
     # Opt-out for panels with a broken/self-signed certificate chain. False by
     # default: verification is ON for every portal, and this only ever widens

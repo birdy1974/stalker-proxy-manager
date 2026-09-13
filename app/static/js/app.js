@@ -22,6 +22,24 @@ const el = (tag, attrs = {}, ...kids) => {
   return n;
 };
 
+/* ----------------------------------------------------- time formatting */
+/* Every timestamp the API sends is UTC (ISO 8601, usually WITHOUT an offset
+ * suffix - SQLite returns naive datetimes, so `isoformat()` carries no zone).
+ * Browsers parse an offset-less ISO string as LOCAL time, which displays the
+ * raw UTC wall clock (2h behind on a Berlin summer evening). fmtTime treats
+ * offset-less datetimes as UTC and renders them in the browser's local zone.
+ * `seconds: false` keeps the short `YYYY-MM-DD HH:MM` form some cards use. */
+function fmtTime(iso, { seconds = true } = {}) {
+  if (!iso) return "";
+  const s = String(iso).trim().replace(" ", "T");
+  const stamped = /[T]\d{2}:/.test(s) && !/[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s + "Z" : s;
+  const d = new Date(stamped);
+  if (isNaN(d)) return String(iso);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}${seconds ? ":" + p(d.getSeconds()) : ""}`;
+}
+
 /* ---------------------------------------------------------------- API */
 async function api(path, { method = "GET", body, raw = false } = {}) {
   const opts = { method, headers: {} };

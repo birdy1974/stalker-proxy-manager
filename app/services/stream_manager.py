@@ -53,6 +53,9 @@ from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
                                serves_original_file)
 from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
 from .item_info import local_file_path
+# >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
+from .redirect_guard import demote_recently_handed, link_is_alive, note_handed_out
+# <<< redirect-guard
 
 log = logging.getLogger("spm.stream")
 
@@ -223,7 +226,18 @@ REAP_GRACE = 45.0
 # handshake on that same MAC mid-play can kick the viewer (or burn the slot).
 # A soft lease covers the typical live-zap window; VOD leases outlive a movie
 # only if the operator re-asks within the window, which is rare and harmless.
-REDIRECT_LEASE_S = 180.0
+# Overridable: zap-heavy Enigma2 setups on a single MAC can lower this
+# (e.g. 45) so a zap never waits out a lease held by the channel it left.
+REDIRECT_LEASE_S = float(os.environ.get("SPM_REDIRECT_LEASE_S", "180.0"))
+
+
+# Second-chance delay when a fresh open finds every route busy or failing.
+# Enigma2 zaps fast: the box often asks for the new channel while the panel
+# still counts the old one against the MAC's single slot (or while our own
+# disconnect watchdog, <=0.5s, is still tearing the old ffmpeg pipe down).
+# One delayed retry turns "zap to black" into "zap takes ~3s".
+ZAP_RETRY = os.environ.get("SPM_ZAP_RETRY", "1") == "1"
+ZAP_RETRY_DELAY = float(os.environ.get("SPM_ZAP_RETRY_DELAY", "2.5"))
 
 
 class StreamManager:
@@ -1296,21 +1310,32 @@ class StreamManager:
         probe = src if template_id is None else _WithTemplate(src, template_id)
         tpl_name, command = await self._template_for(probe)
         if command == REDIRECT_COMMAND:
-            async with SessionLocal() as s:
-                copy_tpl = (await s.execute(select(FFmpegTemplate).where(
-                    FFmpegTemplate.name == COPY_PRESET_NAME,
-                    FFmpegTemplate.enabled.is_(True)))).scalar_one_or_none()
-            if copy_tpl is not None:
-                tpl_name, command = copy_tpl.name, copy_tpl.command
-            else:
-                tpl_name = "(copy)"
-                command = f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1"
+            tpl_name, command = await self._copy_fallback_command()
         h = StreamHandle(id=uuid.uuid4().hex, kind="preview",
                          item_name=name or getattr(src, "original_name", None)
                          or getattr(src, "name", "preview"),
                          user_name="admin", template_name=tpl_name, command=command)
         gen = self._pump(h, [(src, portal, macs)], "live" if kind == "live" else "vod")
         return h, gen
+
+    async def _copy_fallback_command(self) -> tuple[str, str]:
+        """(name, command) for 'proxy this without transcoding'.
+
+        Used wherever a play is forced through ffmpeg but the resolved template
+        is the `@redirect` marker - which is not a command and would die in
+        _spawn with a 502: the preview probe, and an explicit `?mode=proxy`
+        (or an Enigma2 profile with delivery=proxy) on a redirect-template
+        item. Prefers the Copy preset; the synthetic command is the last resort
+        when it is missing or disabled. Always plain MPEG-TS, which is what the
+        Enigma2 bouquet announces for these items.
+        """
+        async with SessionLocal() as s:
+            copy_tpl = (await s.execute(select(FFmpegTemplate).where(
+                FFmpegTemplate.name == COPY_PRESET_NAME,
+                FFmpegTemplate.enabled.is_(True)))).scalar_one_or_none()
+        if copy_tpl is not None and (copy_tpl.command or "").strip():
+            return copy_tpl.name, copy_tpl.command
+        return "(copy)", f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1"
 
     async def _template_for(self, item, *, kind: str | None = None,
                             user_name: str | None = None) -> tuple[str, str]:
@@ -1485,82 +1510,117 @@ class StreamManager:
 
         route_key = (kind, ref_id)
         chain = self.route_health.ordered_chain(route_key, chain)
-        for _src, portal, macs in chain:
-            candidates = self._macs_for(portal, _src, macs)
-            candidates = self.route_health.ordered_macs(route_key, _src, candidates)
-            for mac_row in candidates:
-                # ffmpeg lock OR a recent redirect lease — both mean "leave this
-                # MAC alone". Redirects never enter mac_locks (we no longer hold
-                # the socket after the 302), so the lease is the only signal.
-                if mac_row is not None and self.is_mac_busy(mac_row.id):
-                    continue
-                # Decided first, before any portal session exists: the point of
-                # R2 is that a channel the panel described as permanent costs the
-                # player one redirect and us *nothing* - no handshake reuse, no
-                # token, no create_link. The old shape paid for all of that and
-                # then threw the answer away in favour of the stored URL anyway.
-                plan = self._plan(_src, mac_row, portal)
-                if plan.policy.direct:
-                    await db_log("INFO", "stream",
-                                 f"[{item_name}] playing the stored link via "
-                                 f"{portal.name}/"
-                                 f"{mac_row.mac if mac_row is not None else 'xtream'}: "
-                                 f"{plan.policy.reason}")
-                    if mac_row is not None:
-                        self.lease_mac(mac_row.id)
-                    self.route_health.succeeded(route_key, _src, mac_row)
-                    return plan.direct_url, item_name
-                client = await POOL.get(PortalSession.from_rows(portal, mac_row))
-                try:
-                    if not portal.resolved_url:
-                        from ..portal.resolver import resolve_portal
-                        res = await resolve_portal(portal.base_url, mac=mac_row.mac,
-                                                  proxy=portal.proxy_url,
-                                                  tls_insecure=portal.tls_insecure)
-                        if res.ok:
-                            portal.resolved_url = res.portal_url
-                            portal.resolved_path = res.path
-                            await _store_resolved_portal(portal.id, res.portal_url, res.path)
-                            client.portal_url = res.portal_url
-                            client.invalidate()   # token was for the old URL
-                    await client.ensure_auth()
-                    url = await client.create_link(plan.cmd, link_kind,
-                                                   **plan.request_kwargs())
-                except PortalError as exc:
-                    await db_log("WARNING", "stream",
-                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
-                                 f"{exc.detail()} -> next")
-                    if exc.mac_suspect:
+        # >>> redirect-guard (feature 2; delete with app/services/redirect_guard.py)
+        chain = demote_recently_handed(route_key, chain)
+        # <<< redirect-guard
+        attempts = 2 if (ZAP_RETRY and chain) else 1
+        for pass_no in range(attempts):
+            if pass_no == 1:
+                await db_log("INFO", "stream",
+                             f"[{item_name}] redirect: first pass found no link "
+                             f"-> retrying once in {ZAP_RETRY_DELAY:.1f}s (zap overlap?)")
+                await asyncio.sleep(ZAP_RETRY_DELAY)
+            for _src, portal, macs in chain:
+                candidates = self._macs_for(portal, _src, macs)
+                candidates = self.route_health.ordered_macs(route_key, _src, candidates)
+                for mac_row in candidates:
+                    # ffmpeg lock OR a recent redirect lease — both mean "leave this
+                    # MAC alone". Redirects never enter mac_locks (we no longer hold
+                    # the socket after the 302), so the lease is the only signal.
+                    if mac_row is not None and self.is_mac_busy(mac_row.id):
+                        await db_log("INFO", "stream",
+                                     f"[{item_name}] redirect: mac {mac_row.mac} busy "
+                                     "(ffmpeg pipe or redirect lease) -> skip")
                         continue
-                    self.route_health.failed(_src)
-                    break
-                except Exception as exc:  # noqa: BLE001
-                    await db_log("WARNING", "stream",
-                                 f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
-                                 f"{type(exc).__name__}: {exc} -> next")
-                    # Transport errors are source failures too. Keep trying
-                    # other MACs/sources for this request, but make subsequent
-                    # starts skip a source that just timed out.
-                    self.route_health.failed(_src)
-                    continue
-                finally:
-                    await client.close()
-                if url:
-                    await db_log("INFO", "stream",
-                                 f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
-                                 f"(no ffmpeg)")
-                    if mac_row is not None:
-                        self.lease_mac(mac_row.id)
-                    self.route_health.succeeded(route_key, _src, mac_row)
-                    return url, item_name
+                    # Decided first, before any portal session exists: the point of
+                    # R2 is that a channel the panel described as permanent costs the
+                    # player one redirect and us *nothing* - no handshake reuse, no
+                    # token, no create_link. The old shape paid for all of that and
+                    # then threw the answer away in favour of the stored URL anyway.
+                    plan = self._plan(_src, mac_row, portal)
+                    if plan.policy.direct:
+                        await db_log("INFO", "stream",
+                                     f"[{item_name}] playing the stored link via "
+                                     f"{portal.name}/"
+                                     f"{mac_row.mac if mac_row is not None else 'xtream'}: "
+                                     f"{plan.policy.reason}")
+                        # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
+                        if not await link_is_alive(plan.direct_url):
+                            await db_log("WARNING", "stream",
+                                         f"[{item_name}] redirect: stored link dead "
+                                         f"({portal.name}) -> next candidate")
+                            continue
+                        note_handed_out(route_key, _src, mac_row)
+                        # <<< redirect-guard
+                        if mac_row is not None:
+                            self.lease_mac(mac_row.id)
+                        self.route_health.succeeded(route_key, _src, mac_row)
+                        return plan.direct_url, item_name
+                    client = await POOL.get(PortalSession.from_rows(portal, mac_row))
+                    try:
+                        if not portal.resolved_url:
+                            from ..portal.resolver import resolve_portal
+                            res = await resolve_portal(portal.base_url, mac=mac_row.mac,
+                                                      proxy=portal.proxy_url,
+                                                      tls_insecure=portal.tls_insecure)
+                            if res.ok:
+                                portal.resolved_url = res.portal_url
+                                portal.resolved_path = res.path
+                                await _store_resolved_portal(portal.id, res.portal_url, res.path)
+                                client.portal_url = res.portal_url
+                                client.invalidate()   # token was for the old URL
+                        await client.ensure_auth()
+                        url = await client.create_link(plan.cmd, link_kind,
+                                                       **plan.request_kwargs())
+                    except PortalError as exc:
+                        await db_log("WARNING", "stream",
+                                     f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
+                                     f"{exc.detail()} -> next")
+                        if exc.mac_suspect:
+                            continue
+                        self.route_health.failed(_src)
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        await db_log("WARNING", "stream",
+                                     f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
+                                     f"{type(exc).__name__}: {exc} -> next")
+                        # Transport errors are source failures too. Keep trying
+                        # other MACs/sources for this request, but make subsequent
+                        # starts skip a source that just timed out.
+                        self.route_health.failed(_src)
+                        continue
+                    finally:
+                        await client.close()
+                    if url:
+                        # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
+                        if not await link_is_alive(url):
+                            await db_log("WARNING", "stream",
+                                         f"[{item_name}] redirect: fresh link dead "
+                                         f"({portal.name}/{mac_row.mac}) -> next candidate")
+                            continue
+                        note_handed_out(route_key, _src, mac_row)
+                        # <<< redirect-guard
+                        await db_log("INFO", "stream",
+                                     f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
+                                     f"(no ffmpeg)")
+                        if mac_row is not None:
+                            self.lease_mac(mac_row.id)
+                        self.route_health.succeeded(route_key, _src, mac_row)
+                        return url, item_name
         await db_log("ERROR", "stream",
                      f"[{item_name}] redirect failed: no source produced a link")
         return None, item_name
 
-    async def open(self, kind: str, ref_id: int, user_name: str | None) -> tuple[StreamHandle, object]:
+    async def open(self, kind: str, ref_id: int, user_name: str | None,
+                 force_proxy: bool = False) -> tuple[StreamHandle, object]:
         """
         Build fallback chain for a playlist item and return
         (handle, async generator yielding mpegts bytes).
+
+        `force_proxy` is the explicit `?mode=proxy` URL flag (or an Enigma2
+        profile with delivery=proxy): the caller already decided against the
+        302, so an item assigned the redirect marker is proxied as a plain
+        MPEG-TS copy instead of dying in _spawn with a 502.
         """
         chain: list = []
         tpl_name = "(default)"
@@ -1583,6 +1643,10 @@ class StreamManager:
 
         tpl_name, command = await self._template_for(
             item, kind=kind, user_name=user_name)
+        if force_proxy and kind != "local" \
+                and (command or "").strip() == REDIRECT_COMMAND:
+            tpl_name, command = await self._copy_fallback_command()
+            tpl_name = f"{tpl_name} (proxy override)"
         # Local files never 302 (the client cannot see our disk). The default
         # template is the redirect marker, which is not an ffmpeg command: when
         # we reach the pipe (Enigma2 asked for `.ts`, not the original MP4)
@@ -1679,144 +1743,155 @@ class StreamManager:
                 await db_log("INFO", "stream",
                              f"[{h.item_name}] circuit breaker skipped "
                              f"{configured_count - len(chain)} cooling source(s)")
-            for idx, (src, portal, macs) in enumerate(chain, 1):
-                if h.dead:
-                    return
-                candidates = self._macs_for(portal, src, macs)
-                candidates = self.route_health.ordered_macs(h.route_key, src, candidates)
-                for mac_row in candidates:
+            yielded_any = False
+            attempts = 2 if (ZAP_RETRY and chain) else 1
+            for pass_no in range(attempts):
+                if pass_no == 1:
+                    await db_log("INFO", "stream",
+                                 f"[{h.item_name}] first pass produced no data "
+                                 f"-> retrying once in {ZAP_RETRY_DELAY:.1f}s (zap overlap?)")
+                    await asyncio.sleep(ZAP_RETRY_DELAY)
+                for idx, (src, portal, macs) in enumerate(chain, 1):
                     if h.dead:
                         return
-                    # Decided before the portal is touched, for the same reason the
-                    # redirect path decides first: for a source the user adopted onto
-                    # the panel's Xtream side (R7) there is no MAC to spend and no
-                    # session to open, and reaching for a client "just in case"
-                    # would put the portal back in the loop we removed.
-                    plan = self._plan(src, mac_row, portal, ffmpeg=True)
-                    adopted = plan.adopted
-                    if not adopted and self.is_mac_busy(mac_row.id):
-                        await db_log("INFO", "stream",
-                                     f"[{h.item_name}] mac {mac_row.mac} busy -> skip "
-                                     f"(fallback step {idx}/{len(chain)})")
-                        continue
-                    await db_log("INFO", "stream",
-                                 f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
-                                 + (f"portal '{portal.name}' - {plan.policy.reason}" if adopted
-                                    else f"portal '{portal.name}' mac {mac_row.mac}"))
-                    url = None
-                    if adopted:
-                        url = plan.direct_url
-                    else:
-                        client = await POOL.get(PortalSession.from_rows(portal, mac_row))
-                        try:
-                            if not portal.resolved_url:
-                                from ..portal.resolver import resolve_portal  # local import: avoids cycle
-                                res = await resolve_portal(portal.base_url, mac=mac_row.mac,
-                                                           proxy=portal.proxy_url,
-                                                           tls_insecure=portal.tls_insecure)
-                                if res.ok:
-                                    portal.resolved_url = res.portal_url
-                                    portal.resolved_path = res.path
-                                    await _store_resolved_portal(portal.id, res.portal_url, res.path)
-                                    client.portal_url = res.portal_url
-                                    client.invalidate()   # token was for the old URL
-                            await client.ensure_auth()
-                            link_kind = "live" if kind == "live" else "vod"
-                            # ffmpeg owns this stream, so the plan is always "ask"
-                            # (fresh token + the liveness answer); the flags still
-                            # decide what we tell the panel about ads and re-checks
-                            url = await client.create_link(plan.cmd, link_kind,
-                                                           **plan.request_kwargs())
-                        except PortalError as exc:
-                            # The code decides what this means for the rest of the
-                            # chain: `limit` is "this MAC is busy over there", so
-                            # the next MAC is the right move, while `nothing_to_play`
-                            # is "this source is dead", so hopping MACs is pointless.
-                            await db_log("WARNING", "stream",
-                                         f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
-                                         f"{exc.detail()}"
-                                         f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
-                            if exc.mac_suspect:
-                                continue
-                            self.route_health.failed(src)
-                            break  # source-specific failure: another MAC cannot repair it
-                        except Exception as exc:  # noqa: BLE001
-                            await db_log("WARNING", "stream",
-                                         f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
-                                         f"unexpected {type(exc).__name__}: {exc} -> next")
+                    candidates = self._macs_for(portal, src, macs)
+                    candidates = self.route_health.ordered_macs(h.route_key, src, candidates)
+                    for mac_row in candidates:
+                        if h.dead:
+                            return
+                        # Decided before the portal is touched, for the same reason the
+                        # redirect path decides first: for a source the user adopted onto
+                        # the panel's Xtream side (R7) there is no MAC to spend and no
+                        # session to open, and reaching for a client "just in case"
+                        # would put the portal back in the loop we removed.
+                        plan = self._plan(src, mac_row, portal, ffmpeg=True)
+                        adopted = plan.adopted
+                        if not adopted and self.is_mac_busy(mac_row.id):
+                            await db_log("INFO", "stream",
+                                         f"[{h.item_name}] mac {mac_row.mac} busy -> skip "
+                                         f"(fallback step {idx}/{len(chain)})")
                             continue
-                        finally:
-                            await client.close()
-                    if not url:
-                        # An Xtream URL that will not open is not a MAC problem:
-                        # the next MAC would be handed exactly the same URL, so
-                        # move on to the next source instead of walking the list.
+                        await db_log("INFO", "stream",
+                                     f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
+                                     + (f"portal '{portal.name}' - {plan.policy.reason}" if adopted
+                                        else f"portal '{portal.name}' mac {mac_row.mac}"))
+                        url = None
                         if adopted:
-                            break
-                        continue
-
-                    # lock the MAC BEFORE starting ffmpeg so parallel requests
-                    # see it as occupied immediately. An adopted play owns no MAC,
-                    # and `locked` is what keeps the three release sites below from
-                    # popping a slot that a *different* stream on this MAC is holding.
-                    locked = None
-                    if not adopted:
-                        self.mac_locks[mac_row.id] = h.id
-                        locked = mac_row.id
-                    # VOD/episode links are FILES (mkv/mp4 over the CDN): pace
-                    # them to real time like local files, or the player hits
-                    # EOF early. Live is paced by its own encoder - never -re.
-                    proc = await self._spawn(h.command, url, h.item_name,
-                                             pace=(kind != "live"))
-                    if proc is None:
-                        if locked is not None:
-                            self.mac_locks.pop(locked, None)
-                        self.route_health.failed(src)
-                        if adopted:
-                            break
-                        continue
-                    h.portal_name, h.mac, h.url, h.proc = (
-                        f"{portal.name} (xtream)" if adopted else portal.name,
-                        "" if adopted else mac_row.mac, url, proc)
-                    if not registered:
-                        await self._register(h)
-                        registered = True
-                    first = await self._first_bytes(proc)
-                    if not first:
-                        if proc.returncode is None:
-                            await db_log("WARNING", "stream",
-                                         f"[{h.item_name}] no data within {STREAM_START_TIMEOUT}s from "
-                                         f"{portal.name}/{mac_row.mac} -> fallback")
+                            url = plan.direct_url
                         else:
-                            # ffmpeg is gone and will never send a byte: say so
-                            # (the [ffmpeg] log line has the stderr tail)
-                            await db_log("WARNING", "stream",
-                                         f"[{h.item_name}] ffmpeg exited rc={proc.returncode} before sending "
-                                         f"data ({portal.name}/{mac_row.mac}) -> fallback")
-                        await self._kill_quiet(proc)
+                            client = await POOL.get(PortalSession.from_rows(portal, mac_row))
+                            try:
+                                if not portal.resolved_url:
+                                    from ..portal.resolver import resolve_portal  # local import: avoids cycle
+                                    res = await resolve_portal(portal.base_url, mac=mac_row.mac,
+                                                               proxy=portal.proxy_url,
+                                                               tls_insecure=portal.tls_insecure)
+                                    if res.ok:
+                                        portal.resolved_url = res.portal_url
+                                        portal.resolved_path = res.path
+                                        await _store_resolved_portal(portal.id, res.portal_url, res.path)
+                                        client.portal_url = res.portal_url
+                                        client.invalidate()   # token was for the old URL
+                                await client.ensure_auth()
+                                link_kind = "live" if kind == "live" else "vod"
+                                # ffmpeg owns this stream, so the plan is always "ask"
+                                # (fresh token + the liveness answer); the flags still
+                                # decide what we tell the panel about ads and re-checks
+                                url = await client.create_link(plan.cmd, link_kind,
+                                                               **plan.request_kwargs())
+                            except PortalError as exc:
+                                # The code decides what this means for the rest of the
+                                # chain: `limit` is "this MAC is busy over there", so
+                                # the next MAC is the right move, while `nothing_to_play`
+                                # is "this source is dead", so hopping MACs is pointless.
+                                await db_log("WARNING", "stream",
+                                             f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
+                                             f"{exc.detail()}"
+                                             f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
+                                if exc.mac_suspect:
+                                    continue
+                                self.route_health.failed(src)
+                                break  # source-specific failure: another MAC cannot repair it
+                            except Exception as exc:  # noqa: BLE001
+                                await db_log("WARNING", "stream",
+                                             f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
+                                             f"unexpected {type(exc).__name__}: {exc} -> next")
+                                continue
+                            finally:
+                                await client.close()
+                        if not url:
+                            # An Xtream URL that will not open is not a MAC problem:
+                            # the next MAC would be handed exactly the same URL, so
+                            # move on to the next source instead of walking the list.
+                            if adopted:
+                                break
+                            continue
+
+                        # lock the MAC BEFORE starting ffmpeg so parallel requests
+                        # see it as occupied immediately. An adopted play owns no MAC,
+                        # and `locked` is what keeps the three release sites below from
+                        # popping a slot that a *different* stream on this MAC is holding.
+                        locked = None
+                        if not adopted:
+                            self.mac_locks[mac_row.id] = h.id
+                            locked = mac_row.id
+                        # VOD/episode links are FILES (mkv/mp4 over the CDN): pace
+                        # them to real time like local files, or the player hits
+                        # EOF early. Live is paced by its own encoder - never -re.
+                        proc = await self._spawn(h.command, url, h.item_name,
+                                                 pace=(kind != "live"))
+                        if proc is None:
+                            if locked is not None:
+                                self.mac_locks.pop(locked, None)
+                            self.route_health.failed(src)
+                            if adopted:
+                                break
+                            continue
+                        h.portal_name, h.mac, h.url, h.proc = (
+                            f"{portal.name} (xtream)" if adopted else portal.name,
+                            "" if adopted else mac_row.mac, url, proc)
+                        if not registered:
+                            await self._register(h)
+                            registered = True
+                        first = await self._first_bytes(proc)
+                        if not first:
+                            if proc.returncode is None:
+                                await db_log("WARNING", "stream",
+                                             f"[{h.item_name}] no data within {STREAM_START_TIMEOUT}s from "
+                                             f"{portal.name}/{mac_row.mac} -> fallback")
+                            else:
+                                # ffmpeg is gone and will never send a byte: say so
+                                # (the [ffmpeg] log line has the stderr tail)
+                                await db_log("WARNING", "stream",
+                                             f"[{h.item_name}] ffmpeg exited rc={proc.returncode} before sending "
+                                             f"data ({portal.name}/{mac_row.mac}) -> fallback")
+                            await self._kill_quiet(proc)
+                            if locked is not None:
+                                self.mac_locks.pop(locked, None)
+                            self.route_health.failed(src)
+                            if adopted:
+                                break
+                            continue
+                        self.route_health.succeeded(h.route_key, src, mac_row)
+                        await db_log("INFO", "stream",
+                                     f"[{h.item_name}] playing via {portal.name}/"
+                                     f"{mac_row.mac if mac_row is not None else 'xtream'} "
+                                     f"({'transcode' if ' -c:v copy' not in h.command else 'copy'})")
+                        yielded_any = True
+                        yield first
+                        async for chunk in self._read_proc(h, proc):
+                            yield chunk
+                        # EOF: stream ended/died -> move to next fallback silently
                         if locked is not None:
                             self.mac_locks.pop(locked, None)
-                        self.route_health.failed(src)
-                        if adopted:
-                            break
-                        continue
-                    self.route_health.succeeded(h.route_key, src, mac_row)
-                    await db_log("INFO", "stream",
-                                 f"[{h.item_name}] playing via {portal.name}/"
-                                 f"{mac_row.mac if mac_row is not None else 'xtream'} "
-                                 f"({'transcode' if ' -c:v copy' not in h.command else 'copy'})")
-                    yield first
-                    async for chunk in self._read_proc(h, proc):
-                        yield chunk
-                    # EOF: stream ended/died -> move to next fallback silently
-                    if locked is not None:
-                        self.mac_locks.pop(locked, None)
-                    await self._kill_quiet(proc)
-                    if not h.dead:
-                        await db_log("WARNING", "stream",
-                                     f"[{h.item_name}] stream ended from {portal.name}/{mac_row.mac}"
-                                     f" -> trying next fallback")
-                # next portal in chain
+                        await self._kill_quiet(proc)
+                        if not h.dead:
+                            await db_log("WARNING", "stream",
+                                         f"[{h.item_name}] stream ended from {portal.name}/{mac_row.mac}"
+                                         f" -> trying next fallback")
+                    # next portal in chain
+                if yielded_any:
+                    break
             await db_log("ERROR", "stream", f"[{h.item_name}] all fallbacks exhausted")
         except asyncio.CancelledError:
             pass

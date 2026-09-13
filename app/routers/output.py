@@ -154,6 +154,11 @@ FIRST_CHUNK_TIMEOUT = float(os.environ.get("SPM_FIRST_CHUNK_TIMEOUT", "25"))
 # the browser aborts the fetch long before the first frame.
 STREAM_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no",
                   "Connection": "keep-alive"}
+# One retry for zap overlap: Enigma2 opens the new channel while our
+# disconnect watchdog (<=0.5s) is still tearing down the old pipe, so a
+# user at max_connections would otherwise 429 on every fast zap. Honest
+# overload still 429s, one short delay later.
+MAXCONN_RETRY_DELAY = float(os.environ.get("SPM_MAXCONN_RETRY_DELAY", "1.2"))
 
 
 async def _guarded(gen, label: str, item_name: str = ""):
@@ -215,6 +220,25 @@ def _stream_head(media_type: str = "video/mp2t") -> Response:
                     headers=STREAM_HEADERS | {"Accept-Ranges": "none"})
 
 
+async def _ensure_slot(user: User | None) -> None:
+    """A connection slot for one more stream, with one retry for zap overlap.
+
+    See MAXCONN_RETRY_DELAY: without the wait, a user at max_connections
+    429s whenever the box opens the new channel before our watchdog has
+    noticed the old socket is gone.
+    """
+    uname = user.name if user else None
+    max_conn = user.max_connections if user else None
+    if MANAGER.can_open_for(uname, max_conn):
+        return
+    await asyncio.sleep(MAXCONN_RETRY_DELAY)
+    if MANAGER.can_open_for(uname, max_conn):
+        return
+    await db_log("WARNING", "output",
+                 f"user {uname or 'admin'} exceeded max_connections")
+    raise HTTPException(429, "max connections reached for this user")
+
+
 async def _stream_response(kind: str, ref_id: int, user: User | None, label: str,
                             request: Request, mode: str = "",
                             media_type: str = "video/mp2t"):
@@ -247,13 +271,10 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
             })
         raise HTTPException(502, f"{label}: no source produced a link to redirect to")
 
-    if not MANAGER.can_open_for(user.name if user else None,
-                                user.max_connections if user else None):
-        await db_log("WARNING", "output",
-                     f"user {user.name if user else 'admin'} exceeded max_connections")
-        raise HTTPException(429, "max connections reached for this user")
+    await _ensure_slot(user)
     open_started = time.perf_counter()
-    handle, gen = await MANAGER.open(kind, ref_id, user.name if user else None)
+    handle, gen = await MANAGER.open(kind, ref_id, user.name if user else None,
+                                     force_proxy=(mode == "proxy"))
     open_ms = (time.perf_counter() - open_started) * 1000
     if handle.dead:
         raise HTTPException(404, f"{label}: no available source (all busy or unreachable)")
@@ -367,11 +388,7 @@ async def _local_response(pid: int, user, request: Request, ext: str | None = No
         pid, user.name if user else None)
     template_ms = (time.perf_counter() - template_started) * 1000
     if serves_original and _requested_matches_file(path, ext):
-        if not MANAGER.can_open_for(user.name if user else None,
-                                    user.max_connections if user else None):
-            await db_log("WARNING", "output",
-                         f"user {user.name if user else 'admin'} exceeded max_connections")
-            raise HTTPException(429, "max connections reached for this user")
+        await _ensure_slot(user)
         media_type = media_type_for(path)
         # Do not let nginx-compatible reverse proxies fill a large response
         # buffer before VLC receives the first bytes. FileResponse supplies

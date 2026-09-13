@@ -339,7 +339,7 @@ async def init_db() -> None:
 _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "portals": {
         "tls_insecure": ("BOOLEAN", "0"),
-        "identity_mode": ("VARCHAR(12)", "'mag250'"),
+        "identity_mode": ("VARCHAR(12)", "'minimal'"),
         "stb_timezone": ("VARCHAR(64)", "NULL"),
         "direct_links": ("BOOLEAN", "1"),
         "portal_version": ("VARCHAR(120)", "NULL"),

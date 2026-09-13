@@ -421,21 +421,23 @@ At boot the app performs a **hardware sanity check**: if the default template ne
 A Stalker portal does not authenticate a user, it authenticates a *set-top box* — so a
 proxy that announces itself as `python-httpx/0.28` gets a token and a playlist, and then
 either 403s on the stream or starts behaving in ways no box ever does. Every portal request
-now carries the identity of a MAG250, per MAC and derived from the MAC itself
-(`md5(mac)` for the serial, `sha256(mac)` for the device id, …) so it is **stable across
-restarts and unique per MAC** — nothing is stored on disk, and two MACs never look like the
-same box:
+carries a box identity, per MAC and derived from the MAC itself (`md5(mac)` for the
+serial, `sha256(mac)` for the device id, …) so it is **stable across restarts and unique
+per MAC** — nothing is stored on disk, and two MACs never look like the same box. The
+default is the minimal profile (bare `sn`/timestamp, empty device id, no signature); a
+portal can opt into the full MAG250 fingerprint when its panel demands it:
 
 - **The full handshake dance.** Some panels answer the first handshake with
   `{"js":{"msg":"missing"}}` plus a random seed and expect a *second* request carrying
   `mac=` and `prehash=sha1(<the bearer we just invented>)`. Both steps are performed, and the
   `Authorization: Bearer` header and the `token=` cookie are set together, as the stalker
   app does.
-- **`get_profile` with the device fingerprint** (serial, device id, signature, hw versions,
-  `api_signature=262`, a `metrics` blob quoting the random seed), and `not_valid_token`
-  echoed from the handshake. The answer's `blocked` / `status` / `force_ch_link_check` are
-  consumed (see above). A panel that answers nothing usable falls back to the minimal
-  `sn`/`device_id`/`timestamp` request, because some panels 403 the full one.
+- **`get_profile` with the device fingerprint** (MAG250 mode: serial, device id, signature,
+  hw versions, `api_signature=262`, a `metrics` blob quoting the random seed), and
+  `not_valid_token` echoed from the handshake. The answer's `blocked` / `status` /
+  `force_ch_link_check` are consumed (see above). A panel that answers nothing usable
+  falls back to the minimal `sn`/`device_id`/`timestamp` request, because some panels 403
+  the full one.
 - **Headers and cookies on every request, including portal *discovery*:** the MAG200
   `User-Agent`, `X-User-Agent: Model: MAG250; Link: WiFi`, `Referer: <portal>/index.html`,
   and `mac=…; stb_lang=en; timezone=<yours>` cookies (plus `adid=<md5(sn+mac)>` for
@@ -446,7 +448,7 @@ Per portal you can tune what it is told, in the portal dialog or via the API:
 
 | Field | Default | why you would change it |
 |---|---|---|
-| `identity_mode` | `mag250` | `minimal` sends only `sn`/`device_id`/`timestamp` to `get_profile` — some panels 403 the full fingerprint |
+| `identity_mode` | `minimal` | `mag250` sends the full device fingerprint to `get_profile` — only for panels that withhold data until they see the box they enrolled |
 | `stb_timezone` | `Europe/Amsterdam` | what the box's `timezone=` cookie says; some panels key content or sessions on it |
 | per-MAC `sn` | derived | the box's **real** serial, if you captured one (see below) |
 | per-MAC `device_id` | derived | same, for `device_id`/`device_id2`/`signature` |
@@ -686,6 +688,8 @@ docker logs stalker-proxy-manager 2>&1 \
 | `[stream] [Ch] playing the stored link via portal/mac: the channel flags say nothing needs rebuilding…` | no `create_link` was asked, by design (see *Fallback engine semantics*) | if that channel is black, the panel lied about its links: tick **Play stored links when the panel allows** off for that portal, or re-fetch the sources |
 | `[fetch] series categories skipped: the panel says it has no sclub` | the portal's own `get_modules` answer gated the fetch | informational; if the panel *does* have series, press Resolve to re-read the answer |
 | `[output] user … exceeded max_connections` | a previous stream of that user was still counted when the player reconnected | raise `max_connections` for that user; the slot frees as soon as the disconnect watchdog notices the client is gone (≤0.5 s) |
+| `[stream] … first pass … retrying once in 2.5s (zap overlap?)` | the box zapped while the panel still counted the old channel against the MAC's single slot (or our watchdog was still tearing the old pipe down) | informational — the open is retried once automatically; tune with `SPM_ZAP_RETRY_DELAY`, disable with `SPM_ZAP_RETRY=0` |
+| `[stream] redirect: mac … busy (ffmpeg pipe or redirect lease) -> skip` | that MAC is streaming through ffmpeg or still holds a post-302 lease | zapping on a single MAC: lower `SPM_REDIRECT_LEASE_S` (default 180); otherwise give the portal another MAC |
 
 Two things the proxy does for you here: the outgoing `create_link` cmd is stripped of its stale `play_token` (panels that receive their own token back tend to mangle the answer), and ffmpeg gets the MAG user-agent plus a referer for `http(s)` inputs, because `Lavf/61.x` is refused by quite a few panels with a 403/405.
 

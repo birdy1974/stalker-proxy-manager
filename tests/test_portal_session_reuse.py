@@ -53,7 +53,7 @@ async def test_pool_keys_separate_macs_and_portals_apart():
 async def test_pool_keys_separate_identities_apart():
     """Two clients that differ only in what they claim to be are not one session."""
     pool = ClientPool()
-    a = await pool.get(S("http://p/c/", "00:11:22:33:44:55"))
+    a = await pool.get(S("http://p/c/", "00:11:22:33:44:55", identity_mode="mag250"))
     b = await pool.get(S("http://p/c/", "00:11:22:33:44:55", identity_mode="minimal"))
     c = await pool.get(S("http://p/c/", "00:11:22:33:44:55", sn="PINNED-SN"))
     d = await pool.get(S("http://p/c/", "00:11:22:33:44:55", timezone="Europe/Oslo"))

@@ -349,7 +349,7 @@ class Page:
 class StalkerClient:
     def __init__(self, portal_url: str, mac: str, password: str | None = None,
                  proxy: str | None = None, timeout: float = PORTAL_HTTP_TIMEOUT,
-                 tls_insecure: bool = False, *, identity_mode: str = MAG250,
+                 tls_insecure: bool = False, *, identity_mode: str = MINIMAL,
                  timezone: str = STB_TIMEZONE, lang: str = STB_LANG,
                  sn: str | None = None, device_id: str | None = None) -> None:
         self.portal_url = portal_url

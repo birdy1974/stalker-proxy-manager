@@ -114,7 +114,8 @@ async def access_log(request: Request, call_next):
         path = request.url.path
         api_stats.record(request.method, path, status, ms,
                          request.client.host if request.client else "")
-        if ACCESS_LOG and not path.startswith(ACCESS_LOG_SKIP):
+        if ACCESS_LOG and not path.startswith(ACCESS_LOG_SKIP) \
+                and not api_stats.is_quiet(request.method, path, status):
             qs = f"?{request.url.query}" if request.url.query else ""
             _api_log.info("%s %s%s -> %d (%.0f ms)",
                           request.method, path, qs[:120], status, ms)

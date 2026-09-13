@@ -63,3 +63,15 @@ def test_the_editable_columns_are_named_and_sized_for_typing():
         import re
         return int(re.search(r'width: "(\d+)px"', SOURCES[at:at + 400]).group(1))
     assert _width(custom) > _width(channel)
+
+
+def test_live_bulk_bar_can_set_the_custom_group():
+    # live-only button next to Enable/Disable selected (the label uses a JS
+    # unicode escape for the ellipsis, like the modal's dash and arrow)
+    assert 'if (kind === "live")' in SOURCES
+    assert 'mBtn("Set group\\u2026", "btn-outline-primary"' in SOURCES
+    assert "bulkLivePlaylistGroup(t)" in SOURCES
+    # ...opening a combobox: existing groups as the pick-list, free text allowed
+    assert "<datalist" in SOURCES
+    assert "/api/playlist/live?per_page=1" in SOURCES
+    assert "/api/sources/live/playlist-group-bulk" in SOURCES

@@ -547,3 +547,124 @@ async def test_items_without_a_template_follow_the_default_one():
     live = next(f for f in bundle.files if "live_news" in f.name).text
     assert "#SERVICE 4097:" in live and "#SERVICE 1:0" not in live
     assert tpl["redirect"]
+
+
+# --------------------------------------------------------------------------- #
+# delivery override: the player follows what the box ACTUALLY gets
+# --------------------------------------------------------------------------- #
+async def test_delivery_redirect_upgrades_every_player_off_the_dvb_service_type():
+    """delivery=redirect 302s every item to the panel's own container, so even
+    a TS-template item must not stay on service type 1: the DVB pipeline would
+    be handed an MP4/MKV/HLS body and show a black screen."""
+    tpl = await _templates()
+    user = await _mixed_vod(tpl)
+    bundle = await e2.build_bundle(
+        _profile(user, player_vod="1", delivery_mode="redirect"), NAS)
+    text = next(f for f in bundle.files if "vod_mixed" in f.name).text
+    lines = _services(text)
+    assert all(ln.startswith("#SERVICE 4097:") for ln in lines.values())
+    assert all("&mode=redirect" in ln for ln in lines.values())
+    assert bundle.deliveries == {"ts": 0, "mkv": 0, "direct": 3}
+    assert any("delivery setting" in w for w in bundle.warnings)
+    assert tpl["redirect"]
+
+
+async def test_delivery_proxy_announces_redirect_items_as_plain_ts():
+    """delivery=proxy forces redirect-template items through ffmpeg as a plain
+    MPEG-TS copy (StreamManager.open's force_proxy fallback), so service type
+    1 is fine for them - exactly like the TS-transcoded one."""
+    tpl = await _templates()
+    user = await _mixed_vod(tpl)
+    bundle = await e2.build_bundle(
+        _profile(user, player_vod="1", delivery_mode="proxy"), NAS)
+    text = next(f for f in bundle.files if "vod_mixed" in f.name).text
+    lines = _services(text)
+    assert lines["Direct Movie"].startswith("#SERVICE 1:")
+    assert ".ts" in lines["Direct Movie"] and "&mode=proxy" in lines["Direct Movie"]
+    assert lines["Ts Movie"].startswith("#SERVICE 1:")
+    assert lines["Mkv Movie"].startswith("#SERVICE 4097:")
+    assert bundle.deliveries == {"ts": 2, "mkv": 1, "direct": 0}
+    assert tpl["redirect"]
+
+
+async def test_delivery_override_leaves_local_files_on_the_template_call():
+    """Local files never 302 (the client cannot see our disk), so a delivery
+    override must not reclassify them: a local MKV remux stays an MKV line
+    even under delivery=redirect."""
+    async with SessionLocal() as s:
+        user = User(name="locovr", password="pw", enabled=True)
+        template = FFmpegTemplate(
+            name="Enigma2 VOD - remux + subtitles (MKV)", enabled=True,
+            output_format="matroska", video_codec="copy", audio_codec="copy",
+            command="ffmpeg -i <url> -map 0:v:0 -map 0:a:0? -map 0:s? "
+                    "-c:v copy -c:a copy -c:s copy -f matroska -live 1 pipe:1")
+        s.add_all([user, template])
+        source = LocalSource(directory="/tmp", enabled=True)
+        s.add(source)
+        await s.flush()
+        local_file = LocalFile(local_source_id=source.id, relative_path="movie.mp4",
+                               filename="movie.mp4", size_bytes=1)
+        s.add(local_file)
+        await s.flush()
+        s.add(LocalPlaylist(local_file_id=local_file.id, custom_name="MKV Movie",
+                            group_name="Files", enabled=True,
+                            ffmpeg_template_id=template.id))
+        await s.commit()
+    bundle = await e2.build_bundle(
+        _profile(user, include_live=False, include_vod=False,
+                 include_series=False, include_local=True,
+                 container_mode="auto", player_vod="5002",
+                 delivery_mode="redirect"), NAS)
+    text = next(f for f in bundle.files if "local" in f.name).text
+    assert ".mkv?u=locovr&p=pw" in text
+    assert "#SERVICE 5002:" in text
+    assert bundle.deliveries == {"ts": 0, "mkv": 1, "direct": 0}
+
+
+async def test_fixed_mode_warns_when_player_1_cannot_demux_the_stream():
+    """fixed keeps the profile's literal choice - but pushing service type 1
+    with a .mkv/direct item is a black screen, not just missing subtitles, and
+    the preview must say so."""
+    tpl = await _templates()
+    user = await _mixed_vod(tpl)
+    bundle = await e2.build_bundle(
+        _profile(user, container_mode="fixed", player_vod="1"), NAS)
+    text = next(f for f in bundle.files if "vod_mixed" in f.name).text
+    lines = _services(text)
+    assert all(ln.startswith("#SERVICE 1:") for ln in lines.values())
+    assert any("cannot demux" in w for w in bundle.warnings)
+    assert tpl["redirect"]
+
+
+async def test_local_redirect_items_ask_for_the_original_suffix():
+    """Redirect on disk means 'serve the original file': the bouquet URL must
+    carry the file's own suffix (like the M3U does), not the profile's .mkv
+    alias - which remuxed an MP4 to MPEG-TS and labelled it Matroska."""
+    from app.services.ffmpeg_templates import REDIRECT_COMMAND
+
+    async with SessionLocal() as s:
+        user = User(name="locredir", password="pw", enabled=True)
+        template = FFmpegTemplate(name="Redirect (bypass ffmpeg)",
+                                  command=REDIRECT_COMMAND, command_source="fields",
+                                  enabled=True, is_default=True,
+                                  output_format="mpegts", video_codec="copy")
+        s.add_all([user, template])
+        source = LocalSource(directory="/tmp", enabled=True)
+        s.add(source)
+        await s.flush()
+        local_file = LocalFile(local_source_id=source.id, relative_path="movie.mp4",
+                               filename="movie.mp4", size_bytes=1)
+        s.add(local_file)
+        await s.flush()
+        s.add(LocalPlaylist(local_file_id=local_file.id, custom_name="Orig Movie",
+                            group_name="Files", enabled=True,
+                            ffmpeg_template_id=template.id))
+        await s.commit()
+    bundle = await e2.build_bundle(
+        _profile(user, include_live=False, include_vod=False,
+                 include_series=False, include_local=True,
+                 container_mode="auto", player_vod="5002"), NAS)
+    text = next(f for f in bundle.files if "local" in f.name).text
+    assert ".mp4?u=locredir&p=pw" in text
+    assert ".mkv?" not in text and ".ts?" not in text
+    assert "#SERVICE 5002:" in text

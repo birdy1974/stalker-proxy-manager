@@ -52,6 +52,7 @@ from ..models import (
     VodPlaylist, VodSource,
 )
 from .ffmpeg_templates import REDIRECT_COMMAND
+from .local_files import play_extension
 from .playback import template_map_for
 from .playlist_gen import _allowed, _chunked, _groups
 from .titles import best_title
@@ -157,14 +158,23 @@ class _Resolver:
     serves - unknowable from here - so the URL alias stays cosmetic and only
     the PLAYER matters: service type 1 would hand an MP4/MKV/HLS body to the
     DVB pipeline and show a black screen, so it is upgraded to 4097.
+
+    `delivery` is the profile's delivery override (`template`/`proxy`/
+    `redirect`). It rewrites what the box ACTUALLY gets, so the player and the
+    alias follow the override, not the template: `redirect` turns every
+    non-local item into a 302 (upgrade off service type 1), while `proxy`
+    turns redirect-template items into a plain MPEG-TS copy through ffmpeg
+    (see StreamManager.open's force_proxy fallback). Local files never 302 -
+    the client cannot see our disk - so they always keep the template's call.
     """
 
     def __init__(self, templates: dict, default_tpl, profile: Enigma2Profile,
-                 any_tpl=None) -> None:
+                 any_tpl=None, delivery: str = "template") -> None:
         self.tpl = templates
         self.default = default_tpl
         self.any = any_tpl
         self.p = profile
+        self.delivery = delivery if delivery in DELIVERY_MODES else "template"
         self.mode = profile.container_mode if profile.container_mode in CONTAINER_MODES else "auto"
         self.counts = {"ts": 0, "mkv": 0, "direct": 0}
         self.notes: set[str] = set()
@@ -193,17 +203,31 @@ class _Resolver:
             what = "mkv"
         else:
             what = "ts"
-        self.counts[what] += 1
+        # The delivery override rewrites what the box actually receives (see
+        # the class docstring): resolve the EFFECTIVE delivery before the
+        # player/container decision, or a `redirect` profile pushes service
+        # type 1 lines whose 302 target the DVB pipeline cannot play.
+        effective = what
+        if kind != "local":
+            if self.delivery == "redirect":
+                effective = "direct"
+            elif self.delivery == "proxy" and what == "direct":
+                effective = "ts"
+        self.counts[effective] += 1
 
         if self.mode == "fixed":
             if container == "mkv":
                 self.mkv_players.add((kind, player))
-            return Delivery(what, container, player, name)
+            if player == "1" and (effective in ("mkv", "direct") or container == "mkv"):
+                self.notes.add("service type 1 cannot demux Matroska/direct streams - "
+                               "a fixed player 1 with a .mkv/direct item shows a black "
+                               "screen, not just missing subtitles (use 4097, or 5002)")
+            return Delivery(effective, container, player, name)
 
         note = ""
-        if what == "ts":
+        if effective == "ts":
             container = "ts"
-        elif what == "mkv":
+        elif effective == "mkv":
             container = "mkv"
             if player not in FFMPEG_PLAYERS:
                 player, note = "4097", ("service type 1 cannot demux Matroska - "
@@ -216,7 +240,7 @@ class _Resolver:
             self.notes.add(note)
         if container == "mkv":
             self.mkv_players.add((kind, player))
-        return Delivery(what, container, player, name, note)
+        return Delivery(effective, container, player, name, note)
 
 
 @dataclass
@@ -356,7 +380,7 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
                      for r in rows}
         default_tpl = next((templates[r.id] for r in rows if r.is_default), None)
         res = _Resolver(templates, default_tpl, profile,
-                        templates[rows[0].id] if rows else None)
+                        templates[rows[0].id] if rows else None, delivery=mode)
         tmap = await template_map_for(s, user)
 
         if profile.include_live:
@@ -374,11 +398,19 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
     bundle.deliveries = dict(res.counts)
     bundle.warnings += sorted(res.notes)
     if res.counts["direct"]:
-        bundle.warnings.append(
-            f"{res.counts['direct']} item(s) use the redirect template: the box "
-            "fetches the panel's own file, so it keeps the original container, "
-            "its subtitle tracks AND seeking - the .ts/.mkv in our URL is only "
-            "cosmetic there, but the player must be 4097/5001/5002")
+        if mode == "redirect":
+            bundle.warnings.append(
+                f"{res.counts['direct']} item(s) are delivered as direct 302 redirects "
+                "by this profile's delivery setting (not by their template): the box "
+                "fetches the panel's own file, so it keeps the original container, "
+                "its subtitle tracks AND seeking - the .ts/.mkv in our URL is only "
+                "cosmetic there, but the player must be 4097/5001/5002")
+        else:
+            bundle.warnings.append(
+                f"{res.counts['direct']} item(s) use the redirect template: the box "
+                "fetches the panel's own file, so it keeps the original container, "
+                "its subtitle tracks AND seeking - the .ts/.mkv in our URL is only "
+                "cosmetic there, but the player must be 4097/5001/5002")
 
     if not bundle.files:
         bundle.warnings.append("nothing to write: no enabled playlist items match "
@@ -558,9 +590,20 @@ async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
         # turns a Matroska remux into the audio-only symptom on Enigma2.
         d = res.for_item(tmap.resolve("local", it).id, "local")
         player = d.player if d.player in FFMPEG_PLAYERS else "4097"
+        if d.kind == "direct":
+            # Redirect on disk means "serve the original file" (there is no
+            # panel CDN to 302 to - the client reads it through us). Ask for
+            # the file's OWN suffix, exactly like the M3U does, so
+            # _local_response FileResponse's it with the right media type (and
+            # seeking) instead of remuxing an MP4 to MPEG-TS under an .mkv
+            # label. The player stays >= 4097: service type 1 cannot demux
+            # the arbitrary original containers.
+            ext = play_extension(lf.relative_path or lf.filename)
+        else:
+            ext = "." + d.container
         w.service(player, it.id,
                   stream_url(base_url, "local", it.id, d.container, user,
-                             mode, ext="." + d.container),
+                             mode, ext=ext),
                   best_title(it.custom_name, lf.filename))
     return w.done()
 
