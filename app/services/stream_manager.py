@@ -32,7 +32,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from ..config import FFMPEG_BIN, STREAM_START_TIMEOUT
 from ..database import SessionLocal, run_uncancelled
@@ -55,6 +55,27 @@ from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
 from .item_info import local_file_path
 
 log = logging.getLogger("spm.stream")
+
+
+async def _store_resolved_portal(portal_id: int, portal_url: str, path: str | None = None) -> None:
+    """Persist endpoint discovery performed on the playback fast path.
+
+    Chain rows are intentionally loaded in a short-lived session, so mutating
+    the detached ``Portal`` object after discovery used to be lost.  That made
+    every first play of an unresolved portal repeat all resolver probes.  The
+    resolver is normally the slowest part of startup; remember its answer for
+    the next play (the portal settings endpoints already clear these fields
+    when the base URL or TLS policy changes).
+    """
+    if not portal_id or not portal_url:
+        return
+    async with SessionLocal() as session:
+        values = {"resolved_url": portal_url}
+        if path:
+            values["resolved_path"] = path
+        await session.execute(update(Portal).where(Portal.id == portal_id).values(**values))
+        await session.commit()
+
 
 STREAM_STALL_TIMEOUT = 25.0   # seconds without a single byte => dead stream
 CHUNK = 64 * 1024
@@ -1498,6 +1519,8 @@ class StreamManager:
                                                   tls_insecure=portal.tls_insecure)
                         if res.ok:
                             portal.resolved_url = res.portal_url
+                            portal.resolved_path = res.path
+                            await _store_resolved_portal(portal.id, res.portal_url, res.path)
                             client.portal_url = res.portal_url
                             client.invalidate()   # token was for the old URL
                     await client.ensure_auth()
@@ -1515,6 +1538,10 @@ class StreamManager:
                     await db_log("WARNING", "stream",
                                  f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
                                  f"{type(exc).__name__}: {exc} -> next")
+                    # Transport errors are source failures too. Keep trying
+                    # other MACs/sources for this request, but make subsequent
+                    # starts skip a source that just timed out.
+                    self.route_health.failed(_src)
                     continue
                 finally:
                     await client.close()
@@ -1689,6 +1716,8 @@ class StreamManager:
                                                            tls_insecure=portal.tls_insecure)
                                 if res.ok:
                                     portal.resolved_url = res.portal_url
+                                    portal.resolved_path = res.path
+                                    await _store_resolved_portal(portal.id, res.portal_url, res.path)
                                     client.portal_url = res.portal_url
                                     client.invalidate()   # token was for the old URL
                             await client.ensure_auth()
