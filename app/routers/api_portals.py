@@ -92,7 +92,7 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
             "resolved_url": p.resolved_url, "resolved_path": p.resolved_path,
             "enabled": p.enabled, "proxy_url": p.proxy_url,
             "tls_insecure": bool(p.tls_insecure),
-            "identity_mode": p.identity_mode or "mag250",
+            "identity_mode": p.identity_mode or "minimal",
             "stb_timezone": p.stb_timezone or "",
             "direct_links": bool(getattr(p, "direct_links", True)),
             # R6: what the panel said about itself. `modules` is None until a
@@ -145,7 +145,7 @@ async def create_portal(payload: dict, db=Depends(get_db)):
     p = Portal(name=name, base_url=base_url, enabled=bool(payload.get("enabled", True)),
                proxy_url=(payload.get("proxy_url") or None),
                tls_insecure=bool(payload.get("tls_insecure", False)),
-               identity_mode=_identity_mode(payload.get("identity_mode", "mag250")),
+               identity_mode=_identity_mode(payload.get("identity_mode", "minimal")),
                stb_timezone=(str(payload.get("stb_timezone") or "").strip() or None),
                direct_links=bool(payload.get("direct_links", True)))
     db.add(p)

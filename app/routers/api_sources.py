@@ -162,6 +162,38 @@ async def set_live_playlist_group(sid: int, payload: dict, db=Depends(get_db)):
     return {"ok": True, **res}
 
 
+@router.post("/live/playlist-group-bulk")
+async def set_live_playlist_group_bulk(payload: dict, db=Depends(get_db)):
+    """Set the Playlist group for many live sources at once: {ids, group_name}.
+
+    One channel move per source; sources sharing a custom channel (primary +
+    fallbacks) converge on the same value. Disabled or missing sources are
+    skipped, not fatal - a bulk selection almost always mixes both.
+    """
+    ids = [i for i in (payload.get("ids") or []) if isinstance(i, int)]
+    group = (payload.get("group_name") or "").strip()
+    if not group:
+        raise HTTPException(400, "custom group required")
+    if not ids:
+        raise HTTPException(400, "no sources selected")
+    updated, channels, skipped = 0, set(), []
+    for sid in ids:
+        try:
+            res = await assign_live_custom_group(db, sid, group)
+        except ValueError as exc:
+            skipped.append({"id": sid, "reason": str(exc)})
+            continue
+        updated += 1
+        channels.add(res["playlist_id"])
+    await db.commit()
+    await db_log("INFO", "sources",
+                 f"bulk custom group → '{group}' for {updated} source(s) / "
+                 f"{len(channels)} channel(s)" +
+                 (f" ({len(skipped)} skipped)" if skipped else ""))
+    return {"ok": True, "group_name": group, "updated": updated,
+            "channels": len(channels), "skipped": skipped}
+
+
 @router.get("/vod")
 async def vod(db=Depends(get_db), portal_id: int = 0, genre_id: int = 0, q: str = "",
               enabled: str = "", page: int = 1, per_page: int = 25,

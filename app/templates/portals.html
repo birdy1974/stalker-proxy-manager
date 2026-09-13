@@ -148,10 +148,10 @@ function makeTable() {
       { key: "macs", label: "MAC addresses", render: r => {
           const multi = (r.macs || []).length >= 2;
           const rows = (r.macs || []).map(m => {
-            const checked = m.last_checked ? ` · checked ${esc(m.last_checked.slice(0, 16).replace("T", " "))}` : "";
+            const checked = m.last_checked ? ` · checked ${esc(fmtTime(m.last_checked, { seconds: false }))}` : "";
             const gc = m.genre_counts || {};
             const compared = m.genres_compared_at
-              ? `Compared ${esc(m.genres_compared_at.slice(0,16).replace("T"," "))}` : "Not compared yet";
+              ? `Compared ${esc(fmtTime(m.genres_compared_at, { seconds: false }))}` : "Not compared yet";
             const genreCounts = [gc.live, gc.vod, gc.series].some(v => v !== null && v !== undefined)
               ? `<span class="badge text-bg-light" title="${compared}">Genres L ${gc.live ?? '?'} · V ${gc.vod ?? '?'} · S ${gc.series ?? '?'}</span>`
               : `<span class="small text-muted" title="Run Compare genres across MACs">genres not compared</span>`;
@@ -235,12 +235,12 @@ async function editPortal(id) {
             incomplete cert chain; it disables certificate verification for THIS portal only</div></div></div>
         <div class="col-md-4"><label class="muted-label" for="p-identity">Portal identity we advertise</label>
           <select class="form-select form-select-sm" id="p-identity">
-            <option value="mag250"${(p.identity_mode || "mag250") === "mag250" ? " selected" : ""}>MAG250 fingerprint (default)</option>
-            <option value="minimal"${(p.identity_mode || "") === "minimal" ? " selected" : ""}>minimal (no fingerprint)</option>
+            <option value="minimal"${(p.identity_mode || "minimal") === "minimal" ? " selected" : ""}>minimal, no fingerprint (default)</option>
+            <option value="mag250"${(p.identity_mode || "") === "mag250" ? " selected" : ""}>MAG250 fingerprint</option>
           </select>
-          <div class="small text-muted">a panel decides how much to answer partly by how much we look
-            like the box it enrolled. Switch to <b>minimal</b> if a portal only started refusing us
-            after we began sending a serial it never enrolled</div></div>
+          <div class="small text-muted">minimal sends only sn/timestamp (empty device id, no
+            signature). Switch to the <b>MAG250 fingerprint</b> if a panel withholds data
+            until it sees the box it enrolled</div></div>
         <div class="col-md-4"><label class="muted-label" for="p-tz">STB timezone cookie</label>
           <input class="form-control form-control-sm" id="p-tz" value="${esc(p.stb_timezone || "")}" placeholder="Europe/Amsterdam">
           <div class="small text-muted">the <span class="mono">timezone</span> cookie a real box sends;
@@ -279,8 +279,8 @@ async function editPortal(id) {
           <input class="form-control form-control-sm" style="max-width:260px" id="genre-q-${k}" placeholder="filter genres…">
           <span class="small text-muted ms-auto" id="genre-count-${k}"></span>
         </div>
-        <!-- multi-column genre list (long genre catalogs stay compact) -->
-        <div class="border rounded p-2 genre-grid" style="max-height:260px;overflow:auto" id="genre-list-${k}"><div class="text-muted small p-1">No genres fetched yet — press “Fetch genres”.</div></div>
+        <!-- single full-width genre list: scroll up/down, never left/right -->
+        <div class="border rounded p-2" style="max-height:260px;overflow:auto" id="genre-list-${k}"><div class="text-muted small p-1">No genres fetched yet — press “Fetch genres”.</div></div>
       </div>`).join("")}`;
   const footer = el("div", { class: "d-flex gap-2 w-100" });
   const m = openModal({ title: id ? `Edit portal: ${p.name}` : "Add portal", body, footer, size: "xl" });
@@ -613,7 +613,7 @@ window.compareGenres = async (pid) => {
       return `<label class="list-group-item d-flex gap-2 align-items-center ${usable ? "" : "text-muted"}">
         <input class="form-check-input cmp-mac" type="checkbox" value="${m.id}" ${usable ? "checked" : "disabled"}>
         <span class="mono">${esc(m.mac)}</span>${statusBadge(m)}
-        <span class="small ms-auto">${m.last_checked ? "checked " + esc(m.last_checked.slice(0,16).replace("T"," ")) : "not checked"}</span>
+        <span class="small ms-auto">${m.last_checked ? "checked " + esc(fmtTime(m.last_checked, { seconds: false })) : "not checked"}</span>
       </label>`;
     }).join("")}</div>`;
   const footer = el("div", {class:"d-flex gap-2"});
@@ -677,7 +677,7 @@ function showGenreMatrix(pid, d, stored) {
         <div class="small text-muted">Live ${p.counts.live} · VOD ${p.counts.vod} · Series ${p.counts.series}</div>
       </div></div>`).join("");
       content = `<div class="alert ${d.identical?'alert-success':'alert-warning'} py-2 small">${esc(d.message || "")}
-        <div class="text-muted">${d.compared} MACs · ${d.packages?.length || 0} distinct package signature(s) · ${esc((d.fetched_at||"").replace("T"," "))}</div></div>
+        <div class="text-muted">${d.compared} MACs · ${d.packages?.length || 0} distinct package signature(s) · ${esc(fmtTime(d.fetched_at))}</div></div>
         <div class="row g-2">${cards}</div>
         ${(d.skipped||[]).length ? `<div class="small text-muted mt-2">Skipped: ${(d.skipped||[]).map(x=>esc(x.mac)).join(', ')}</div>`:''}`;
     } else {

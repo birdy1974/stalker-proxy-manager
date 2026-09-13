@@ -50,6 +50,12 @@ function sourceTable(kind, hostSel) {
     el("span", { class: "muted-label" }, "Bulk:"),
     mBtn("Enable selected", "btn-outline-success", bulk(true), "bi-check2"),
     mBtn("Disable selected", "btn-outline-secondary", bulk(false), "bi-x"));
+  if (kind === "live") {
+    // Custom groups only exist on live channels - VOD/series rows have no
+    // such column, so the button would have nothing to do there.
+    bulkBar.append(mBtn("Set group\u2026", "btn-outline-primary",
+                        () => bulkLivePlaylistGroup(t), "bi-folder"));
+  }
   const cols = {
     live: [
       { key: "enabled", label: "On", width: "36px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/sources/toggle',{method:'POST',body:{kind:'${kind}',ids:[${r.id}],enabled:this.checked}}).then(()=>TABS.live&&TABS.live.reload())"></div>` },
@@ -197,6 +203,45 @@ window.saveLivePlaylistGroup = async (sid, input) => {
     input.disabled = false;
   }
 };
+
+/* Bulk custom-group change (Input Sources -> Live, "Set group..." button).
+   The input is a combobox: the datalist offers every group already in use
+   (pick from the list) while still accepting a brand-new name (free text). */
+async function bulkLivePlaylistGroup(table) {
+  const ids = [...(table?.selected || [])];
+  if (!ids.length) return toast("select rows first", "warn");
+  // Existing groups come from the Playlist side, which owns the values.
+  const { groups } = await api("/api/playlist/live?per_page=1");
+  const listId = `bulk-group-list-${Date.now()}`;
+  const body = el("div");
+  body.innerHTML = `
+    <div class="mb-2">Set the custom group for <b>${ids.length}</b> selected channel(s).
+    Disabled sources are skipped; fallback sources share their channel's group,
+    so a whole channel moves at once.</div>
+    <label class="muted-label" for="bulk-group-input">Group \u2014 pick one or type a new name</label>
+    <input id="bulk-group-input" class="form-control" list="${listId}"
+      placeholder="custom group\u2026" autocomplete="off">
+    <datalist id="${listId}">
+      ${(groups || []).map(g => `<option value="${esc(g)}">`).join("")}
+    </datalist>`;
+  const footer = el("div", { class: "d-flex gap-2" });
+  const m = openModal({ title: "Set custom group", body, footer, size: "md" });
+  const input = $("#bulk-group-input", body);
+  input.focus();
+  footer.append(
+    mBtn("Cancel", "btn-outline-secondary", m.close),
+    mBtn("Set group", "btn-accent", async () => {
+      const value = (input.value || "").trim();
+      if (!value) { toast("group required", "warn"); return; }
+      const res = await api("/api/sources/live/playlist-group-bulk", {
+        method: "POST", body: { ids, group_name: value },
+      });
+      m.close();
+      toast(`custom group \u2192 "${res.group_name}" for ${res.channels} channel(s)` +
+            (res.skipped?.length ? `, ${res.skipped.length} skipped` : ""), "ok");
+      table.reload();
+    }));
+}
 
 window.toggleSerie = async (id, enabled) => {
   const res = await api("/api/sources/toggle", { method: "POST", body: { kind: "series", ids: [id], enabled } });

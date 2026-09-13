@@ -179,7 +179,7 @@ function writeFields(p) {
   $("#f-pass-hint").textContent = p.has_password ? "(stored — leave empty to keep)" : "";
   $("#f-owif-pass-hint").textContent = p.has_owif_pass ? "(stored — leave empty to keep)" : "";
   $("#e2-push-status").innerHTML = p.last_push_at
-    ? `last push ${esc(String(p.last_push_at).replace("T", " ").slice(0, 19))}:
+    ? `last push ${esc(fmtTime(p.last_push_at))}:
        <span class="mono">${esc((p.last_push_result || "").split("\n").pop())}</span>` : "";
 }
 
@@ -228,7 +228,7 @@ async function preview() {
   const tabs = r.files.map((f, i) => `<option value="${i}">${esc(f.title)} — ${f.services} services (${esc(f.name)})</option>`).join("");
   body.innerHTML = `${warn}
     <div class="small text-muted mb-2">${r.summary.bouquets} bouquets · ${r.summary.services} services
-      · <span title="what each item's ffmpeg template actually delivers">${r.summary.deliveries.ts} ts ·
+      · <span title="effective delivery per item: its ffmpeg template, plus this profile's delivery override">${r.summary.deliveries.ts} ts ·
       ${r.summary.deliveries.mkv} mkv · ${r.summary.deliveries.direct} direct</span>
       · URLs point at <span class="mono">${esc(r.base_url)}</span></div>
     <select class="form-select form-select-sm mb-2" id="pv-pick">${tabs}</select>

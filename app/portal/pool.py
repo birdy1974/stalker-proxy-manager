@@ -43,7 +43,7 @@ from dataclasses import dataclass
 
 from ..config import PORTAL_HTTP_TIMEOUT
 from .client import StalkerClient
-from .identity import MAG250, STB_LANG, STB_TIMEZONE, normalize_mac
+from .identity import MINIMAL, STB_LANG, STB_TIMEZONE, normalize_mac
 
 log = logging.getLogger("spm.portal")
 
@@ -68,7 +68,7 @@ class PortalSession:
     proxy: str | None = None
     timeout: float = PORTAL_HTTP_TIMEOUT
     tls_insecure: bool = False
-    identity_mode: str = MAG250
+    identity_mode: str = MINIMAL
     timezone: str = STB_TIMEZONE
     lang: str = STB_LANG
     sn: str | None = None
@@ -107,7 +107,7 @@ class PortalSession:
             proxy=getattr(portal, "proxy_url", None),
             timeout=PORTAL_HTTP_TIMEOUT if timeout is None else float(timeout),
             tls_insecure=bool(getattr(portal, "tls_insecure", False)),
-            identity_mode=getattr(portal, "identity_mode", None) or MAG250,
+            identity_mode=getattr(portal, "identity_mode", None) or MINIMAL,
             timezone=getattr(portal, "stb_timezone", None) or STB_TIMEZONE,
             lang=getattr(portal, "stb_lang", None) or STB_LANG,
             sn=getattr(mac_row, "sn", None),

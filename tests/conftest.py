@@ -17,6 +17,11 @@ os.environ["SPM_DATABASE_URL"] = f"sqlite+aiosqlite:///{pathlib.Path(_DATA, 'spm
 os.environ["SPM_MOCK_PORTAL"] = "0"
 os.environ["SPM_ADMIN_PASSWORD"] = "test-admin"
 os.environ["SPM_SKIP_LOGIN"] = "1"   # the API tests call admin endpoints directly
+# >>> redirect-guard: the experiment stays OFF suite-wide; tests/test_redirect_guard.py
+# re-enables it per test. Delete these lines with app/services/redirect_guard.py.
+os.environ["SPM_REDIRECT_VALIDATE"] = "0"
+os.environ["SPM_REOPEN_DEMOTE"] = "0"
+# <<< redirect-guard
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -81,7 +86,15 @@ async def _schema_and_flush():
 async def pool_errors():
     """Collect ERROR records from SQLAlchemy's pool logger (the noise in the
     bug report comes from there, so the tests watch exactly that logger)."""
+    import gc
     import logging
+
+    # Drain cyclic garbage BEFORE attaching the handler: a pooled connection
+    # an earlier test abandoned mid-cancellation would otherwise be collected
+    # (and warn) at whatever later test first trips a GC threshold - landing
+    # in this test's records and flaking it. Draining here attributes every
+    # warning to the test whose garbage actually produced it.
+    gc.collect()
 
     records: list[str] = []
 

@@ -141,7 +141,7 @@ async function loadEpg() {
       <div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${e.enabled ? "checked" : ""}
         onchange="api('/api/epg/sources/${e.id}',{method:'PATCH',body:{enabled:this.checked}}).then(loadEpg)"></div>
       <span class="small mono flex-grow-1">${esc(e.url)}</span>
-      <span class="small text-muted">${e.status ? esc(e.status) : (e.last_fetch ? "fetched " + e.last_fetch.slice(0, 16) : "not fetched")}</span>
+      <span class="small text-muted">${e.status ? esc(e.status) : (e.last_fetch ? "fetched " + fmtTime(e.last_fetch, { seconds: false }) : "not fetched")}</span>
       <button class="btn btn-sm btn-outline-secondary" title="refresh now"
         onclick="api('/api/epg/sources/${e.id}/refresh',{method:'POST'}).then(loadEpg)"><i class="bi bi-arrow-repeat"></i></button>
       <button class="btn btn-sm btn-outline-danger" onclick="api('/api/epg/sources/${e.id}',{method:'DELETE'}).then(loadEpg)"><i class="bi bi-trash"></i></button>

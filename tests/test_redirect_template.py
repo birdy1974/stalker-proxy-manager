@@ -164,3 +164,18 @@ async def test_boot_seed_never_rewrites_a_hand_edited_builtin_command():
             FFmpegTemplate.name == REFERENCE_PRESET_NAME))).scalar_one()
         assert row.command == custom
         assert row.rc_mode == "CQP"     # the field says what the app now ships
+
+
+async def test_proxy_override_proxies_redirect_items_as_a_ts_copy():
+    """`?mode=proxy` on a redirect-template item must proxy it as a plain
+    MPEG-TS copy - the `@redirect` marker is not a command, so spawning it
+    would die with a 502. This is what an Enigma2 profile with
+    delivery=proxy announces as .ts / service type 1."""
+    rid, _proxy = await _seed_and_get_ids()
+    redir = await _live_channel(rid)
+    handle, _gen = await MANAGER.open("live", redir, None)
+    assert handle.command == REDIRECT_COMMAND      # template path: 302 upstream
+    forced, _gen2 = await MANAGER.open("live", redir, None, force_proxy=True)
+    assert forced.command != REDIRECT_COMMAND
+    assert "-f" in forced.command.split() and "mpegts" in forced.command
+    assert "proxy override" in forced.template_name

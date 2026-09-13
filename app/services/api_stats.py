@@ -35,9 +35,28 @@ def _shape(path: str) -> str:
     return _DIGITS.sub("#", path)[:80]
 
 
+# Poll endpoints the GUI itself hits every few seconds: their successful
+# answers are self-traffic, and counting them would let the dashboard's own
+# polling own the container log and the API card. Failures (4xx/5xx) are
+# still recorded - a poll that starts erroring is exactly what must stay
+# visible. Exact paths, not prefixes: /api/streams/* (kill) is never quiet.
+QUIET_HITS = frozenset({
+    ("GET", "/api/dashboard"),
+    ("GET", "/api/streams"),
+    ("GET", "/login"),
+})
+
+
+def is_quiet(method: str, path: str, status: int) -> bool:
+    """Whether a hit is routine self-traffic not worth logging or counting."""
+    return status < 400 and (method.upper(), path) in QUIET_HITS
+
+
 def record(method: str, path: str, status: int, ms: float, client: str = "") -> None:
     """Called by the access middleware for every request."""
     global _total, _errors, _slowest_ms
+    if is_quiet(method, path, status):
+        return
     now = time.time()
     _total += 1
     if status >= 500:

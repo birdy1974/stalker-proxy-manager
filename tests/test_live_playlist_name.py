@@ -271,3 +271,49 @@ async def test_epg_now_endpoint_is_gone():
     async with AsyncClient(transport=transport, base_url="http://t") as c:
         r = await c.get("/api/epg/now?live=1,2,3")
         assert r.status_code == 404
+
+
+async def test_bulk_group_sets_many_channels_and_skips_disabled():
+    ids = await _seed(n=3)
+    async with SessionLocal() as s:
+        src = await s.get(LiveSource, ids[2])
+        src.enabled = False
+        # two sources, one channel: primary + fallback move as one
+        await assign_live_custom_name(s, ids[0], "Shared")
+        await assign_live_custom_name(s, ids[1], "Shared")
+        await s.commit()
+
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post("/api/sources/live/playlist-group-bulk",
+                         json={"ids": ids, "group_name": "  Bulk TV  "})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["group_name"] == "Bulk TV"     # trimmed like the single endpoint
+        assert body["updated"] == 2
+        assert body["channels"] == 1               # primary + fallback share it
+        assert [s["id"] for s in body["skipped"]] == [ids[2]]
+
+    async with SessionLocal() as s:
+        pls = (await s.execute(select(LivePlaylist))).scalars().all()
+        assert len(pls) == 1
+        assert pls[0].group_name == "Bulk TV"
+        assert pls[0].custom_name == "Shared"
+
+
+async def test_bulk_group_rejects_empty_group_and_empty_selection():
+    ids = await _seed(n=1)
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post("/api/sources/live/playlist-group-bulk",
+                         json={"ids": ids, "group_name": "  "})
+        assert r.status_code == 400
+        r = await c.post("/api/sources/live/playlist-group-bulk",
+                         json={"ids": [], "group_name": "X"})
+        assert r.status_code == 400
