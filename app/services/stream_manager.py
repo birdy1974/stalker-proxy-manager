@@ -1545,10 +1545,11 @@ class StreamManager:
                                      f"{mac_row.mac if mac_row is not None else 'xtream'}: "
                                      f"{plan.policy.reason}")
                         # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
-                        if not await link_is_alive(plan.direct_url):
+                        _probe = await link_is_alive(plan.direct_url)
+                        if not _probe:
                             await db_log("WARNING", "stream",
                                          f"[{item_name}] redirect: stored link dead "
-                                         f"({portal.name}) -> next candidate")
+                                         f"({portal.name}; {_probe.detail}) -> next candidate")
                             continue
                         note_handed_out(route_key, _src, mac_row)
                         # <<< redirect-guard
@@ -1593,10 +1594,12 @@ class StreamManager:
                         await client.close()
                     if url:
                         # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
-                        if not await link_is_alive(url):
+                        _probe = await link_is_alive(url)
+                        if not _probe:
                             await db_log("WARNING", "stream",
                                          f"[{item_name}] redirect: fresh link dead "
-                                         f"({portal.name}/{mac_row.mac}) -> next candidate")
+                                         f"({portal.name}/{mac_row.mac}; {_probe.detail}) "
+                                         f"-> next candidate")
                             continue
                         note_handed_out(route_key, _src, mac_row)
                         # <<< redirect-guard
