@@ -54,7 +54,8 @@ from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
 from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
 from .item_info import local_file_path
 # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
-from .redirect_guard import demote_recently_handed, link_is_alive, note_handed_out
+from .redirect_guard import (demote_recently_handed, link_is_alive, note_handed_out,
+                             shrug_note)
 # <<< redirect-guard
 
 log = logging.getLogger("spm.stream")
@@ -1646,6 +1647,10 @@ class StreamManager:
                                          f"-> next candidate")
                             continue
                         note_handed_out(route_key, _src, mac_row)
+                        _note = shrug_note(url, _probe)
+                        if _note:
+                            await db_log("INFO", "stream",
+                                         f"[{item_name}] redirect: {_note}")
                         # <<< redirect-guard
                         if repair is not None:
                             await _store_media_cmd(_src, repair, item_name)
