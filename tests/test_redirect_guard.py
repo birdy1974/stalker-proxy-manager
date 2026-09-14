@@ -296,6 +296,9 @@ async def test_dead_on_head_404_without_get():
 
 
 async def test_dead_on_head_error_without_get():
+    """Connect-level only: nothing is listening, so a GET would fail the same
+    way and the ladder stops at the first rung. Read-level errors are a shrug
+    and climb instead - see the tests below."""
     def h(request):
         raise httpx.ConnectError("refused")
 
@@ -328,3 +331,168 @@ def test_probe_ua_is_the_stb_ua():
     from app.portal.identity import STB_UA
 
     assert redirect_guard.STB_UA is STB_UA
+
+
+# --------------------------------------- validation: a transport error is a shrug
+# The shape a live-TS origin produces when it cannot answer a probe at all: it
+# takes the connection and hangs up mid-response. That is "I do not do HEAD",
+# not "the channel is off air", and treating it as the latter vetoed every
+# fresh link of a working portal (nexusconnects-style: 3 MACs x 2 passes, then
+# a 502 after 13-33 s, while the very same URLs played fine).
+async def test_head_read_error_falls_back_to_ranged_get():
+    def h(request):
+        if request.method == "HEAD":
+            raise httpx.ReadError("peer closed connection without a complete body")
+        assert request.headers["Range"] == "bytes=0-0"
+        return httpx.Response(200)
+
+    client, seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/play/live.php?stream=1", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD ReadError -> GET 200"
+        assert [r.method for r in seen] == ["HEAD", "GET"]
+    finally:
+        await client.aclose()
+
+
+async def test_head_protocol_error_is_a_shrug_too():
+    def h(request):
+        if request.method == "HEAD":
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+        return httpx.Response(206)
+
+    client, seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD RemoteProtocolError -> GET 206"
+    finally:
+        await client.aclose()
+
+
+async def test_head_read_timeout_is_a_shrug_too():
+    """A live origin that takes longer than the probe timeout to answer a HEAD
+    is thinking, not dead - the player would simply buffer."""
+    def h(request):
+        if request.method == "HEAD":
+            raise httpx.ReadTimeout("timed out")
+        return httpx.Response(200)
+
+    client, _seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD ReadTimeout -> GET 200"
+    finally:
+        await client.aclose()
+
+
+async def test_a_range_shy_live_stream_is_alive_on_416():
+    """A live stream has no byte 0 to range over: 416 proves the origin is
+    there and answering, which is all the guard asks."""
+    def h(request):
+        if request.method == "HEAD":
+            return httpx.Response(502)
+        return httpx.Response(416 if "Range" in request.headers else 200)
+
+    client, seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD 502 -> GET 416"
+        assert [r.method for r in seen] == ["HEAD", "GET"]
+    finally:
+        await client.aclose()
+
+
+async def test_the_plain_get_is_the_last_opinion_when_the_ranged_one_shrugs():
+    """Some origins choke on the Range header itself. The third rung asks
+    without it - byte-for-byte the request a player makes."""
+    def h(request):
+        if request.method == "HEAD":
+            raise httpx.ReadError("hung up")
+        if "Range" in request.headers:
+            raise httpx.ReadError("hung up")
+        return httpx.Response(200)
+
+    client, seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD ReadError -> GET ReadError -> GET-no-range 200"
+        assert [r.method for r in seen] == ["HEAD", "GET", "GET"]
+        assert "Range" not in seen[-1].headers
+    finally:
+        await client.aclose()
+
+
+async def test_an_origin_that_shrugs_at_every_rung_is_not_vetoed():
+    """Nothing was proved, so nothing may veto: a false 'dead' is a certain
+    502 on a channel that may well be on air, a false 'alive' costs one 302
+    the player can recover from."""
+    def h(request):
+        raise httpx.ReadError("hung up")
+
+    client, seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is True
+        assert result.detail == ("HEAD ReadError -> GET ReadError -> "
+                                 "GET-no-range ReadError -> no verdict, not vetoing")
+        assert [r.method for r in seen] == ["HEAD", "GET", "GET"]
+    finally:
+        await client.aclose()
+
+
+async def test_dead_when_the_origin_stops_listening_midway():
+    """A connect-level failure IS proof - nothing is at the other end, and
+    asking again in another shape would not change that."""
+    def h(request):
+        if request.method == "HEAD":
+            return httpx.Response(405)
+        raise httpx.ConnectError("refused")
+
+    client, seen = _recording_client(h)
+    try:
+        result = await link_is_alive("http://cdn/x.ts", client=client)
+        assert result.alive is False
+        assert result.detail == "HEAD 405 -> GET ConnectError"
+        assert [r.method for r in seen] == ["HEAD", "GET"]
+    finally:
+        await client.aclose()
+
+
+async def test_the_probe_budget_ends_in_alive_not_in_a_veto():
+    """A slow origin must not turn one play into seconds of probing per
+    candidate: running out of budget is 'unproven', and unproven is alive."""
+    client, seen = _recording_client(lambda r: httpx.Response(502))
+    try:
+        result = await link_is_alive("http://cdn/x.ts", timeout=0.0, client=client)
+        assert result.alive is True
+        assert result.detail == "HEAD 502 -> probe budget spent"
+        assert [r.method for r in seen] == ["HEAD"]
+    finally:
+        await client.aclose()
+
+
+def test_shrug_note_only_speaks_when_the_ladder_was_climbed():
+    from app.services.redirect_guard import shrug_note
+
+    assert shrug_note("http://cdn/x.ts", ProbeResult(True, "HEAD 200")) == ""
+    assert shrug_note("http://cdn/x.ts", None) == ""
+    note = shrug_note("http://cdn/x.ts", ProbeResult(True, "HEAD 405 -> GET 206"))
+    assert "probe-shy" in note and "HEAD 405 -> GET 206" in note and "cdn" in note
+
+
+def test_shrug_note_is_reported_once_per_origin_and_trace():
+    """The fact matters, the repetition on every play does not: a panel that
+    never answers HEAD must not add a line to every channel's every play."""
+    from app.services.redirect_guard import shrug_note
+
+    probe = ProbeResult(True, "HEAD ReadError -> GET-no-range 200")
+    assert shrug_note("http://panel/play/live.php?stream=1", probe) != ""
+    assert shrug_note("http://panel/play/live.php?stream=2", probe) == ""
+    # another origin, or another trace from the same one, is news again
+    assert shrug_note("http://other/play/live.php?stream=1", probe) != ""
+    assert shrug_note("http://panel/x.ts", ProbeResult(True, "HEAD 502 -> GET 206")) != ""

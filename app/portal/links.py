@@ -264,6 +264,13 @@ class LinkPlan:
     #: the panel picks the episode server-side via `series=<n>` at create_link
     #: time. None for everything that is not such an episode.
     series: int | None = None
+    #: S-B: the OTHER cmd form of the same item. `cmd` is the one to ask with
+    #: first (the learned `/media/file_…` form when the row has one, else the
+    #: catalogue cmd); `alt_cmd` is the fallback the panel may still prefer.
+    alt_cmd: str | None = None
+    #: the panel's own item id, which is what a `get_ordered_list&movie_id=`
+    #: resolution needs to find the file behind a generic `/media/<id>` cmd
+    item_id: str | None = None
 
     @property
     def direct_url(self) -> str:
@@ -275,13 +282,30 @@ class LinkPlan:
                "force_ch_link_check": self.force_ch_link_check}
         if self.series is not None:
             out["series"] = self.series
+        # Only sent when the row actually carries them: create_link's signature
+        # stays honest about what a plain channel row needs, and the existing
+        # "a direct play builds no request at all" assertion stays readable.
+        if self.item_id:
+            out["item_id"] = self.item_id
+        if self.alt_cmd:
+            out["alt_cmd"] = self.alt_cmd
         return out
 
 
 def plan_for(src, mac_row, *, ffmpeg: bool = False,
              allow_direct: bool = True) -> LinkPlan:
     """The single place that reads a source row and a MAC row for a stream open."""
-    cmd = str(getattr(src, "cmd", "") or "")
+    stored = str(getattr(src, "cmd", "") or "")
+    # S-B: a panel that once needed the `/media/file_<id>` form told us so, and
+    # the answer was stored on the row. Ask with that FIRST - re-asking with the
+    # catalogue form would pay for a refusal and a movie resolution on every
+    # single play - and keep the catalogue cmd as the fallback, because the
+    # learned form can go stale (a re-ingested movie gets a new file id) and the
+    # panel's own listing is still the truth.
+    learned = str(getattr(src, "media_cmd", "") or "").strip()
+    cmd = learned or stored
+    alt_cmd = stored if (learned and learned != stored) else None
+    item_id = str(getattr(src, "portal_item_id", "") or "").strip() or None
     url = extract_url(cmd)
     link_flags = getattr(src, "link_flags", None)
     force = bool(getattr(mac_row, "force_ch_link_check", False))
@@ -298,7 +322,7 @@ def plan_for(src, mac_row, *, ffmpeg: bool = False,
                          ffmpeg=ffmpeg, allow_direct=allow_direct and series is None)
     return LinkPlan(policy=policy, cmd=cmd, url=url, link_flags=link_flags,
                     force_ch_link_check=force, mac=str(getattr(mac_row, "mac", "") or ""),
-                    series=series)
+                    series=series, alt_cmd=alt_cmd, item_id=item_id)
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +350,194 @@ def plan_adopted(url: str, *, src=None, mac_row=None) -> LinkPlan:
                     cmd=str(getattr(src, "cmd", "") or ""), url=str(url or ""),
                     link_flags=None, force_ch_link_check=False,
                     mac=str(getattr(mac_row, "mac", "") or ""), adopted=True)
+
+
+# ---------------------------------------------------------------------------
+# S-A: the shapes a create_link ANSWER arrives in
+# ---------------------------------------------------------------------------
+# A panel answers `create_link` with `{"js": {...}}` most of the time - but a
+# panel that has to choose a storage, or that inserts an advertisement, answers
+# with a LIST of candidates instead. Reading only the dict shape turns such a
+# panel into "the portal returned no playable URL" for every item it serves,
+# which is the worst kind of wrong: the log names a dead channel when the truth
+# is an unparsed answer. So the reader is a pure function, it knows every shape,
+# and it can *describe* what it got - the description is what the error carries.
+#: the keys a candidate may hold the link under, in the order panels use them
+LINK_CMD_KEYS = ("cmd", "url", "link")
+#: `type` values that mark an entry as an advertisement, not the programme. A
+#: panel that was asked for `disable_ad=true` and still sent one is answering
+#: honestly about what it serves; picking that URL would play the ad.
+AD_LABELS = frozenset({"ad", "ads", "advert", "adverts", "advertisement",
+                       "advertisements", "commercial", "promo"})
+
+
+@dataclass(frozen=True)
+class LinkAnswer:
+    """What a `create_link` answer actually said, shape included.
+
+    `raw` is the chosen candidate's link text (still un-extracted: it may carry
+    an `ffmpeg ` prefix or a stale token, which is `extract_url`'s and
+    `sanitize_cmd`'s business, not the reader's).
+    """
+
+    raw: str = ""
+    #: dict | str | list | empty | unknown - named, because it goes in the error
+    shape: str = "empty"
+    entries: int = 0        # candidates offered (list shape: entries read)
+    candidates: int = 0     # of those, the ones that carried a link
+    ads: int = 0            # entries refused because the panel labelled them ads
+    storage_id: str = ""    # the storage the panel picked, when it said
+
+    @property
+    def usable(self) -> bool:
+        return bool(self.raw)
+
+    def describe(self) -> str:
+        """The clause that explains a `no_url` failure to whoever reads the log.
+
+        Two different things go wrong, and they need different sentences: the
+        panel offered link text that is not a URL (a relative path, a plugin
+        command we do not speak), or it offered no link at all. Only the second
+        one is a shape problem.
+        """
+        if self.raw:
+            return (f"a {self.shape} answer whose link is not a URL "
+                    f"({str(self.raw)[:60]!r})")
+        if self.shape == "empty":
+            return "an empty payload"
+        if self.shape == "list":
+            if self.ads and not self.entries:
+                return (f"a list of {self.ads} advertisement entr"
+                        f"{'y' if self.ads == 1 else 'ies'} and no stream")
+            if not self.entries:
+                return "an empty list"
+            return (f"a list of {self.entries} entr"
+                    f"{'y' if self.entries == 1 else 'ies'}, none carrying a cmd"
+                    + (f" (+{self.ads} ad(s) skipped)" if self.ads else ""))
+        if self.shape == "dict":
+            return "a payload with no cmd/url/link in it"
+        return "a payload of an unrecognised type"
+
+
+def _label(value) -> str:
+    return str(value if value is not None else "").strip().lower()
+
+
+def _entry_link(entry) -> str:
+    """The first non-empty link text of one candidate ('' when it offers none)."""
+    if isinstance(entry, str):
+        return entry.strip()
+    if not isinstance(entry, dict):
+        return ""
+    for key in LINK_CMD_KEYS:
+        text = str(entry.get(key) or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def read_link_answer(js) -> LinkAnswer:
+    """Read a `create_link` answer in any of the shapes panels use.
+
+    The list rules are the ones that matter: skip anything the panel labelled an
+    advertisement, take the FIRST remaining candidate that offers a link (panels
+    order them by preference - a box that took the last one would pick the
+    worst storage), and keep the `storage_id` that came with it.
+    """
+    if js is None:
+        return LinkAnswer(shape="empty")
+    if isinstance(js, str):
+        text = js.strip()
+        # an empty string is "the panel said nothing", not "a link that is ''":
+        # the two need different sentences in the log
+        return LinkAnswer(raw=text, shape="str") if text else LinkAnswer(shape="empty")
+    if isinstance(js, dict) and not js:
+        return LinkAnswer(shape="empty")
+    if isinstance(js, list) and not js:
+        # an empty LIST is an answer of a known shape with nothing in it - which
+        # reads as "the storage is gone", and naming it beats "empty payload"
+        return LinkAnswer(shape="list")
+    if isinstance(js, dict):
+        raw = _entry_link(js)
+        return LinkAnswer(raw=raw, shape="dict", entries=1,
+                          candidates=1 if raw else 0,
+                          storage_id=_label(js.get("storage_id")))
+    if isinstance(js, list):
+        raw, ads, entries, candidates, storage = "", 0, 0, 0, ""
+        for entry in js:
+            if isinstance(entry, dict) and _label(entry.get("type")) in AD_LABELS:
+                ads += 1
+                continue
+            entries += 1
+            text = _entry_link(entry)
+            if not text:
+                continue
+            candidates += 1
+            if not raw:
+                raw = text                    # first remaining candidate wins
+                if isinstance(entry, dict):
+                    storage = _label(entry.get("storage_id"))
+        return LinkAnswer(raw=raw, shape="list", entries=entries,
+                          candidates=candidates, ads=ads, storage_id=storage)
+    return LinkAnswer(shape="unknown")
+
+
+# ---------------------------------------------------------------------------
+# S-B: the two cmd forms of the same VOD file
+# ---------------------------------------------------------------------------
+# Some panels list a movie with a GENERIC storage reference - `/media/1234.mpg` -
+# and expect the box to ask for the FILE behind it, `/media/file_<id>.mpg`, where
+# `<id>` is the one `get_ordered_list&movie_id=` reports. Handing them the
+# catalogue form answers `nothing_to_play`, which reads exactly like a dead item.
+# The rewrite is a *repair*: it is tried only after the panel refused, because on
+# every other panel the stored form is the right one and an extra request per
+# play is the cost of guessing.
+
+def generic_media_ref(cmd) -> str | None:
+    """The `/media/<ref>` token of a cmd that is NOT yet in `file_` form.
+
+    Only a RELATIVE reference counts. A cmd that is already an absolute URL is a
+    link, not a storage reference, and rewriting a path inside somebody's CDN URL
+    is a guess we would then persist.
+    """
+    for tok in str(cmd or "").split():
+        low = tok.lower()
+        if low.startswith("/media/") and not low.startswith("/media/file_"):
+            return tok
+    return None
+
+
+def media_file_form(cmd, file_id: str | None = None) -> str:
+    """The same cmd with `/media/<ref>` replaced by `/media/file_<id>`.
+
+    `file_id=None` keeps the reference's own number, which is the cheap guess
+    (no extra portal request) and what some panels want; the resolved file id is
+    tried first when the caller has one. The extension is kept, and any prefix
+    (`auto `, `ffmpeg `) survives because only the token is replaced.
+    """
+    text = str(cmd or "")
+    ref = generic_media_ref(text)
+    if not ref:
+        return text
+    tail = ref[len("/media/"):]                 # '1234.mpg'
+    base, dot, rest = tail.partition(".")
+    ident = str(file_id or "").strip() or base
+    return text.replace(ref, f"/media/file_{ident}{dot}{rest}", 1)
+
+
+@dataclass(frozen=True)
+class CmdRepair:
+    """The cmd we were handed and the one the panel actually answered for.
+
+    Not decoration: the stream path persists `worked` on the source row so the
+    next play asks with the form that works instead of paying for a refusal and
+    a resolution again. `how` is the sentence for the stream log.
+    """
+
+    asked: str
+    worked: str
+    #: 'stored' (the row's other form) | 'media_file' (the file_ ladder)
+    how: str = ""
 
 
 def link_request_params(*, link_flags: str | None, force_ch_link_check: bool,

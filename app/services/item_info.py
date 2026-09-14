@@ -59,7 +59,17 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None) -> 
                 ep_num = getattr(src, "episode_number", None)
                 if ep_num is not None:
                     series = int(ep_num)
-            stored = cmd_to_url(cmd) or ""
+            # S-B: ask with the same two cmd forms the stream path uses - the
+            # learned `/media/file_…` form first, so a popup on an item we already
+            # played does not pay for the refusal all over again, and the
+            # catalogue cmd as the fallback. A popup is a read-only view: a repair
+            # it triggers is deliberately NOT persisted (the next real play stores
+            # it), because a tooltip must not be what rewrites a source row.
+            learned = str(getattr(src, "media_cmd", "") or "").strip()
+            ask = learned or cmd
+            alt = cmd if (learned and learned != cmd) else None
+            item_id = str(getattr(src, "portal_item_id", "") or "").strip() or None
+            stored = cmd_to_url(ask) or ""
             policy = link_policy(url=stored, link_flags=flags, force_ch_link_check=force,
                                  allow_direct=bool(getattr(portal, "direct_links", True))
                                  and series is None)
@@ -71,8 +81,9 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None) -> 
             client = await POOL.get(PortalSession.from_rows(portal, mac,
                                                              portal_url=portal.resolved_url))
             try:
-                return await client.create_link(cmd, kind, link_flags=flags,
-                                                force_ch_link_check=force, series=series)
+                return await client.create_link(ask, kind, link_flags=flags,
+                                                force_ch_link_check=force, series=series,
+                                                item_id=item_id, alt_cmd=alt)
             except Exception:  # noqa: BLE001 - fall through to raw cmd
                 pass
             finally:

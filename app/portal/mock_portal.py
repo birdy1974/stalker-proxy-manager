@@ -153,6 +153,18 @@ PAGE_SIZE = 14  # exactly what real portals use
 #                        xtream_exp_days what player_api.php reports, and
 #                        xtream_refuse answers that API with `{"user_info": []}` -
 #                        the shape a *wrong* password produces.
+#   create_link_list     S-A: answer create_link with a LIST of candidates instead
+#                        of one dict - "one" (a single entry), "ad" (an
+#                        advertisement first, then the stream: a client that takes
+#                        the first entry plays the ad), "ads_only" (nothing but
+#                        ads, which must read as "no link", not as a crash)
+#   media_form           S-B: "file_only" = the panel refuses the generic
+#                        `/media/<id>.mpg` form the catalogue lists with a 200
+#                        `nothing_to_play` and answers only `/media/file_<id>.mpg`,
+#                        resolving the file id through
+#                        `type=vod&action=get_ordered_list&movie_id=&category=1`
+#   media_file_id        the id that resolution reports (and that `file_` answer
+#                        carries), so a test can assert the ladder used it
 #   epg_mode             "normal" (a schedule around now, in the timezone the box
 #                        declared) | "empty" (channel has no guide data) |
 #                        "absent" (404: this portal has no short EPG) |
@@ -170,7 +182,10 @@ _STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note"
           "xtream_mode": "off", "xtream_user": "mockuser", "xtream_pass": "mockpass123",
           "xtream_exp_days": 30, "xtream_status": "Active", "xtream_refuse": False,
           "player_api_calls": 0, "seen_player_api": {},
-          "epg_mode": "normal", "short_epg_calls": 0, "flaky_hits": 0}
+          "epg_mode": "normal", "short_epg_calls": 0, "flaky_hits": 0,
+          # S-A/S-B: the answer shape and the two cmd forms of one VOD file
+          "create_link_list": "", "media_form": "", "media_file_id": "9001",
+          "media_refusals": 0, "media_resolutions": 0}
 
 
 def _usage(mac: str) -> int:
@@ -191,6 +206,33 @@ def _base(request: Request) -> str:
 
 def _js(payload) -> JSONResponse:  # Stalker envelope: {"js": ...}
     return JSONResponse({"js": payload})
+
+
+#: what an advertisement entry points at - deliberately NOT a mock stream, so a
+#: client that picked the ad fails an assertion instead of playing something
+AD_CMD = "ffmpeg http://mock/ads/unskippable-90s.mp4"
+
+
+def _link_answer(cmd_text: str) -> JSONResponse:
+    """A `create_link` answer in the shape the `create_link_list` knob selects.
+
+    The dict is what most panels send. The list is what a panel with storage
+    selection or ad insertion sends, and a client that only reads dicts reports
+    "no playable URL" for an item that is perfectly fine (S-A) - which is why the
+    mock can be told to answer with one.
+    """
+    mode = str(_STATE.get("create_link_list") or "").strip().lower()
+    if not mode:
+        return _js({"cmd": cmd_text})
+    entry = {"cmd": cmd_text, "type": "stream",
+             "storage_id": str(_STATE.get("media_file_id") or "7")}
+    ad = {"cmd": AD_CMD, "type": "ad", "storage_id": "0"}
+    if mode == "ad":
+        return _js([ad, entry])
+    if mode == "ads_only":
+        return _js([ad, {"cmd": AD_CMD.replace("90s", "45s"), "type": "ad",
+                         "storage_id": "0"}])
+    return _js([entry])
 
 
 def _paged(items: list, page: int) -> dict:
@@ -519,6 +561,17 @@ async def portal_php(request: Request):  # noqa: A002
     if type in ("vod", "series") and action == "get_ordered_list":
         movie_id = qp.get("movie_id")
         if movie_id:  # series drill-down: seasons or episodes
+            if _STATE.get("media_form") == "file_only" and qp.get("category"):
+                # S-B: the FILE behind a movie, which is what a box asks for when
+                # the catalogue cmd is the generic `/media/<id>` form. `category`
+                # is what tells this apart from the series drill-down (that one
+                # sends `sortby`/`season_id`), and it is answered only while the
+                # knob is on - the series tests keep seeing exactly what they saw.
+                _STATE["media_resolutions"] = int(_STATE.get("media_resolutions", 0)) + 1
+                ident = str(_STATE.get("media_file_id") or "9001")
+                return _js({"data": [{"id": ident, "name": "Mock Movie", "is_series": 0,
+                                      "cmd": f"/media/file_{ident}.mpg"}],
+                            "total_items": 1, "max_page_items": 50})
             season_id = qp.get("season_id")
             if season_id:
                 return _js({"data": _episodes_of(movie_id, season_id),
@@ -559,6 +612,21 @@ async def portal_php(request: Request):  # noqa: A002
         # busy-MAC emulation: refuse when this MAC already streams something
         if _usage(mac) >= _STATE["max_per_mac"]:
             return JSONResponse({"js": {"error": "account is in use"}}, status_code=403)
+        if _STATE.get("media_form") == "file_only" and "/media/" in cmd:
+            # S-B: a panel that keeps its VOD files behind `/media/file_<id>` and
+            # refuses the generic form its own catalogue lists. The refusal is a
+            # 200 carrying an error code - byte-for-byte what a dead item looks
+            # like, which is exactly why a client has to know the two forms are
+            # the same item instead of reporting the channel as gone.
+            m = re.search(r"/media/file_(\d+)", cmd)
+            if not m:
+                _STATE["media_refusals"] = int(_STATE.get("media_refusals", 0)) + 1
+                log.warning("mock portal: create_link refused the generic media form "
+                            "%r (this panel wants /media/file_<id>)", cmd)
+                return _js({"error": "nothing_to_play"})
+            base = str(request.base_url).rstrip("/") + "/mock/"
+            log.info("mock portal: media file link for file_%s", m.group(1))
+            return _link_answer(f"ffmpeg {base}vod/{m.group(1)}.mp4")
         if _STATE.get("xtream_mode") == "on" and (".ts" in cmd or ".mp4" in cmd):
             # The R7 premise, verbatim: the panel builds the stream URL out of an
             # Xtream account. The origin is real for the same reason a real panel's
@@ -581,14 +649,14 @@ async def portal_php(request: Request):  # noqa: A002
                      "Xtream account)", origin, seg)
             # a VOD answer is a bare URL, a live answer keeps the ffmpeg prefix -
             # both shapes are real, and a client that only handles one fails the other
-            return _js({"cmd": url if seg == "movie" else f"ffmpeg {url}"})
+            return _link_answer(url if seg == "movie" else f"ffmpeg {url}")
         if ".ts" in cmd or ".mp4" in cmd or ".m3u8" in cmd:
             base = str(request.base_url).rstrip("/") + "/mock/"
             if _STATE.get("mac_placeholder"):
                 # one template for every box: the STB has to fill in its own MAC
-                return _js({"cmd": f"ffmpeg {base}ts/%mac%.ts?m=%MAC%"})
+                return _link_answer(f"ffmpeg {base}ts/%mac%.ts?m=%MAC%")
             url = cmd.split()[-1].replace("http://mock/", base)
-            return _js({"cmd": "ffmpeg " + url})
+            return _link_answer("ffmpeg " + url)
         return JSONResponse({"js": {"error": "bad cmd"}}, status_code=404)
 
     if type == "itv" and action == "get_short_epg":
@@ -849,7 +917,7 @@ _TOGGLE_KEYS = ("offline", "slow", "max_per_mac", "create_link_error",
                 "require_host", "require_tls", "note", "version_mode", "modules",
                 "modules_disabled", "no_modules", "xtream_mode", "xtream_user",
                 "xtream_pass", "xtream_exp_days", "xtream_status", "xtream_refuse",
-                "epg_mode")
+                "epg_mode", "create_link_list", "media_form", "media_file_id")
 
 
 @router.post("/mock/_control")
@@ -880,7 +948,11 @@ async def state():
                          "modules_calls": _STATE.get("modules_calls", 0),
                          "create_links": _STATE.get("create_links", 0),
                          "player_api": int(_STATE.get("player_api_calls", 0)),
-                         "short_epg": int(_STATE.get("short_epg_calls", 0))},
+                         "short_epg": int(_STATE.get("short_epg_calls", 0)),
+                         # S-A/S-B: the witnesses for "we did not ask twice" and
+                         # "the panel refused the catalogue form once"
+                         "media_refusals": int(_STATE.get("media_refusals", 0)),
+                         "media_resolutions": int(_STATE.get("media_resolutions", 0))},
             "seen_profile": _STATE.get("profile_seen") or {},
             "seen_handshakes": _STATE.get("handshake_seen") or [],
             # R7/R9: how many times the panel was asked for its Xtream side and for

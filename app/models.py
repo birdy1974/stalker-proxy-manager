@@ -232,6 +232,13 @@ class VodSource(Base):
     added: Mapped[str | None] = mapped_column(String(40))
     link_flags: Mapped[str | None] = mapped_column(String(60))   # see LiveSource.link_flags
     xtream_url: Mapped[str | None] = mapped_column(String(600))  # see LiveSource.xtream_url
+    # S-B: the cmd FORM this panel actually answers for, learned at play time -
+    # `/media/file_<id>.mpg` where the catalogue lists `/media/<id>.mpg`. NULL
+    # means "the catalogue cmd works". `cmd` above stays the panel's truth and is
+    # never rewritten: this is a second address for the same item (the same idea
+    # as `xtream_url`), and the stream path falls back to `cmd` when this one is
+    # refused, because a re-ingested movie gets a new file id.
+    media_cmd: Mapped[str | None] = mapped_column(Text)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
 
 
@@ -290,6 +297,7 @@ class SerieEpisode(Base):
     cmd: Mapped[str | None] = mapped_column(Text)                          # set on real portals, empty on pure series-rows
     duration: Mapped[str | None] = mapped_column(String(20))
     link_flags: Mapped[str | None] = mapped_column(String(60))    # see LiveSource.link_flags
+    media_cmd: Mapped[str | None] = mapped_column(Text)           # see VodSource.media_cmd (S-B)
     # Classic-Stalker episode (IPTVnator's "regular series"): `cmd` addresses the
     # whole SEASON container and the panel selects the episode server-side via
     # the `series=<episode_number>` create_link parameter. Without sending that

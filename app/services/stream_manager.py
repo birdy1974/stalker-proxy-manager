@@ -54,7 +54,8 @@ from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
 from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
 from .item_info import local_file_path
 # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
-from .redirect_guard import demote_recently_handed, link_is_alive, note_handed_out
+from .redirect_guard import (demote_recently_handed, link_is_alive, note_handed_out,
+                             shrug_note)
 # <<< redirect-guard
 
 log = logging.getLogger("spm.stream")
@@ -78,6 +79,45 @@ async def _store_resolved_portal(portal_id: int, portal_url: str, path: str | No
             values["resolved_path"] = path
         await session.execute(update(Portal).where(Portal.id == portal_id).values(**values))
         await session.commit()
+
+
+async def _store_media_cmd(src, repair, item_name: str = "") -> None:
+    """Persist the cmd FORM the panel actually answered for (S-B), and say so.
+
+    The same reasoning as `_store_resolved_portal`: chain rows are loaded in a
+    short-lived session, so a form learned during a play has to be written by id
+    or it is gone - and gone means paying the refusal plus the movie resolution
+    on EVERY play of that item, forever.
+
+    Only `media_cmd` is written, never `cmd`: the catalogue value is the panel's
+    truth, it is what the GUI shows, and a re-fetch must not have to guess which
+    half of the row we edited. Writing NULL is a real action too - when a stored
+    form was refused and the catalogue one worked, the learned form is stale
+    (a re-ingested movie gets a new file id) and has to go.
+    """
+    model = type(src)
+    # LiveSource has no storage form to learn, and an adopted Xtream row has no
+    # portal cmd at all; both are "nothing to persist", not an error.
+    if not hasattr(model, "media_cmd") or getattr(src, "id", None) is None:
+        return
+    worked = str(getattr(repair, "worked", "") or "").strip()
+    asked = str(getattr(repair, "asked", "") or "")
+    new = worked if worked and worked != str(getattr(src, "cmd", "") or "") else None
+    if (getattr(src, "media_cmd", None) or None) == new:
+        return                               # the row already says exactly this
+    async with SessionLocal() as session:
+        await session.execute(update(model).where(model.id == src.id).values(media_cmd=new))
+        await session.commit()
+    tag = f"[{item_name}] " if item_name else ""
+    if new:
+        await db_log("INFO", "stream",
+                     f"{tag}this panel wants another cmd form for this item: "
+                     f"{asked!r} -> {new!r} - remembered on the source row, so the "
+                     "next play asks with it directly")
+    else:
+        await db_log("INFO", "stream",
+                     f"{tag}the remembered cmd form {asked!r} was refused and the "
+                     "catalogue cmd worked - cleared it from the source row")
 
 
 STREAM_STALL_TIMEOUT = 25.0   # seconds without a single byte => dead stream
@@ -1558,6 +1598,7 @@ class StreamManager:
                         self.route_health.succeeded(route_key, _src, mac_row)
                         return plan.direct_url, item_name
                     client = await POOL.get(PortalSession.from_rows(portal, mac_row))
+                    repair = None
                     try:
                         if not portal.resolved_url:
                             from ..portal.resolver import resolve_portal
@@ -1573,6 +1614,10 @@ class StreamManager:
                         await client.ensure_auth()
                         url = await client.create_link(plan.cmd, link_kind,
                                                        **plan.request_kwargs())
+                        # getattr, not the attribute: a stand-in client (the test
+                        # doubles, and anything else that grows into this slot)
+                        # owes us a URL, not this hand-off field.
+                        repair = getattr(client, "last_cmd_repair", None)
                     except PortalError as exc:
                         await db_log("WARNING", "stream",
                                      f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
@@ -1602,7 +1647,13 @@ class StreamManager:
                                          f"-> next candidate")
                             continue
                         note_handed_out(route_key, _src, mac_row)
+                        _note = shrug_note(url, _probe)
+                        if _note:
+                            await db_log("INFO", "stream",
+                                         f"[{item_name}] redirect: {_note}")
                         # <<< redirect-guard
+                        if repair is not None:
+                            await _store_media_cmd(_src, repair, item_name)
                         await db_log("INFO", "stream",
                                      f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
                                      f"(no ffmpeg)")
@@ -1783,6 +1834,7 @@ class StreamManager:
                             url = plan.direct_url
                         else:
                             client = await POOL.get(PortalSession.from_rows(portal, mac_row))
+                            repair = None
                             try:
                                 if not portal.resolved_url:
                                     from ..portal.resolver import resolve_portal  # local import: avoids cycle
@@ -1802,6 +1854,7 @@ class StreamManager:
                                 # decide what we tell the panel about ads and re-checks
                                 url = await client.create_link(plan.cmd, link_kind,
                                                                **plan.request_kwargs())
+                                repair = getattr(client, "last_cmd_repair", None)
                             except PortalError as exc:
                                 # The code decides what this means for the rest of the
                                 # chain: `limit` is "this MAC is busy over there", so
@@ -1829,6 +1882,11 @@ class StreamManager:
                             if adopted:
                                 break
                             continue
+                        if repair is not None:
+                            # A form the panel accepted is worth keeping BEFORE the
+                            # pipe is opened: if ffmpeg then fails on the bytes, the
+                            # next attempt still starts from the cmd that got a link.
+                            await _store_media_cmd(src, repair, h.item_name)
 
                         # lock the MAC BEFORE starting ffmpeg so parallel requests
                         # see it as occupied immediately. An adopted play owns no MAC,
