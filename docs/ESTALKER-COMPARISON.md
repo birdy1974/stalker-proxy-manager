@@ -1,6 +1,9 @@
 # EStalker vs. Stalker Proxy Manager — portal-interface comparison
 
-Compared on 2026-08-30.
+Compared on 2026-08-30. **Streaming/playback side:** see
+[`ESTALKER-STREAMING-COMPARISON.md`](ESTALKER-STREAMING-COMPARISON.md) (2026-09-14, against
+EStalker `c91dbfe` / `1.49-20260902`), which re-checks this document's conclusions and adds the
+streaming-only gaps S-A…S-H.
 
 | | ours | EStalker |
 |---|---|---|
