@@ -46,10 +46,10 @@ from app.portal.capabilities import (dumps_modules, enabled_modules,  # noqa: E4
 from app.portal.identity import (cookies_for, derive_identity, normalize_mac,  # noqa: E402
                                  profile_params, referer_for)
 from app.portal.links import (FLAG_DISABLE_AD, FLAG_LOAD_BALANCING,  # noqa: E402
-                              FLAG_TMP_LINK, REBUILD_FLAGS, has_flag,
-                              link_policy, link_request_params,
-                              parse_link_flags, plan_for, split_flags,
-                              why_not_self_served)
+                              FLAG_TMP_LINK, REBUILD_FLAGS, generic_media_ref,
+                              has_flag, link_policy, link_request_params,
+                              media_file_form, parse_link_flags, plan_for,
+                              read_link_answer, split_flags, why_not_self_served)
 
 CASES: list[tuple[str, object, object]] = []
 
@@ -294,9 +294,12 @@ check("%mac% is filled in the stored link",
 Plan = type("R", (), {})
 
 
-def _row(cmd, flags):
+def _row(cmd, flags, media_cmd=None, item_id=""):
     r = Plan()
     r.cmd, r.link_flags = cmd, flags
+    # S-B: what a play learned about this panel's cmd form, and the id a
+    # `get_ordered_list&movie_id=` resolution would need
+    r.media_cmd, r.portal_item_id = media_cmd, item_id
     return r
 
 
@@ -325,6 +328,85 @@ check("the volatile params are the same list both sides use",
       FLAG_DISABLE_AD in REBUILD_FLAGS, False)
 check("stripping the token is what makes the comparison possible",
       strip_volatile(URL + "&play_token=OLD") + "|", URL + "|")
+
+# --------------------------------------------------------------------------- #
+# the shapes a create_link ANSWER arrives in (S-A)
+# --------------------------------------------------------------------------- #
+# A panel that has to choose a storage - or that inserts an advertisement -
+# answers create_link with a LIST of candidates instead of one dict. A reader
+# that only knew the dict shape reported every item such a panel serves as "no
+# playable URL", and the log then reads like a dead channel instead of an
+# unparsed answer. So: every shape reads, an ad is never played, and a failure
+# names the shape it got.
+AD = {"type": "ad", "cmd": "http://host/unskippable.mp4"}
+
+check("answer: the dict shape still reads",
+      read_link_answer({"cmd": f"ffmpeg {URL}"}).raw, f"ffmpeg {URL}")
+check("answer: the other key names a panel may use",
+      (read_link_answer({"url": URL}).raw, read_link_answer({"link": URL}).raw),
+      (URL, URL))
+check("answer: a list of one candidate reads",
+      read_link_answer([{"cmd": f"ffmpeg {URL}"}]).raw, f"ffmpeg {URL}")
+check("answer: an advertisement first is skipped, not played",
+      read_link_answer([AD, {"cmd": URL}]).raw, URL)
+check("answer: ad labels are recognised in any case",
+      read_link_answer([{"type": "AD", "cmd": "http://host/a.mp4"},
+                        {"type": "Advert", "cmd": "http://host/b.mp4"},
+                        {"cmd": URL}]).ads, 2)
+check("answer: only advertisements is no link at all",
+      (read_link_answer([AD]).raw, read_link_answer([AD]).ads), ("", 1))
+check("answer: the first real candidate wins (panels order by preference)",
+      read_link_answer([{"cmd": "http://host/fast.mp4"},
+                        {"cmd": "http://host/slow.mp4"}]).raw, "http://host/fast.mp4")
+check("answer: the storage the panel picked is kept",
+      read_link_answer([{"cmd": URL, "storage_id": "3"}]).storage_id, "3")
+check("answer: a bare string is an answer too",
+      read_link_answer(URL).raw, URL)
+check("answer: an unusable answer names its own shape",
+      "advertisement" in read_link_answer([AD]).describe(), True)
+check("answer: entries without a cmd are counted, not guessed at",
+      "2 entries" in read_link_answer([{"id": 1}, {"id": 2}]).describe(), True)
+check("answer: nothing at all says so",
+      read_link_answer(None).describe(), "an empty payload")
+
+# --------------------------------------------------------------------------- #
+# the two cmd FORMS of one VOD file (S-B)
+# --------------------------------------------------------------------------- #
+# Some panels list a movie as `/media/1234.mpg` and answer create_link only for
+# `/media/file_<id>.mpg`, where the id is what `get_ordered_list&movie_id=`
+# reports. Their refusal for the catalogue form is `nothing_to_play` -
+# byte-for-byte what a dead item looks like - so the recognition rules must not
+# drift: only a RELATIVE storage reference is ever rewritten, and an absolute
+# URL (which is a link, not a reference) never is.
+check("media: a generic storage reference is recognised",
+      generic_media_ref("/media/1234.mpg"), "/media/1234.mpg")
+check("media: a tv_archive prefix does not hide it",
+      generic_media_ref("auto /media/1234.mpg"), "/media/1234.mpg")
+check("media: the file form is already the file form",
+      generic_media_ref("/media/file_1234.mpg"), None)
+check("media: a link is not a storage reference",
+      generic_media_ref(f"ffmpeg {URL}"), None)
+check("media: nor is a path inside somebody's CDN URL",
+      generic_media_ref("http://host/media/1234.mpg"), None)
+check("media: the resolved file id replaces the reference",
+      media_file_form("/media/1234.mpg", "5678"), "/media/file_5678.mpg")
+check("media: without an id the cheap guess keeps the number",
+      media_file_form("/media/1234.mpg"), "/media/file_1234.mpg")
+check("media: extension and prefix survive the rewrite",
+      media_file_form("auto /media/1234.mpg", "9"), "auto /media/file_9.mpg")
+check("media: an absolute URL is never rewritten",
+      media_file_form("http://host/media/1234.mpg", "9"), "http://host/media/1234.mpg")
+check("media: the learned form is what the plan asks with",
+      plan_for(_row("/media/1234.mpg", None, media_cmd="/media/file_5678.mpg",
+                    item_id="1234"), _mac()).cmd, "/media/file_5678.mpg")
+check("media: and the catalogue cmd stays the fallback (a learned form goes stale)",
+      plan_for(_row("/media/1234.mpg", None, media_cmd="/media/file_5678.mpg",
+                    item_id="1234"), _mac()).alt_cmd, "/media/1234.mpg")
+check("media: the resolution id travels with the request",
+      plan_for(_row("/media/1234.mpg", None, item_id="1234"),
+               _mac()).request_kwargs()["item_id"], "1234")
+check("media: a row with nothing learned sends no fallback form",
+      "alt_cmd" in plan_for(_row(f"ffmpeg {URL}", ""), _mac()).request_kwargs(), False)
 
 # --------------------------------------------------------------------------- #
 # capabilities.py - what the panel says about itself

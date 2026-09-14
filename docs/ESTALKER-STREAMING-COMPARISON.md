@@ -17,7 +17,7 @@ what [`ESTALKER-COMPARISON.md`](ESTALKER-COMPARISON.md) already scored, so R1–
 are still correct and still marked delivered. This document answers the *other* half of the question:
 **playback**.
 
-**Do not copy code, only behaviour.** EStalker ships no `LICENSE`; see §7 of the companion doc. Everything
+**Do not copy code, only behaviour.** EStalker ships no `LICENSE`; see §7 (*Legal note*) of the companion doc. Everything
 below is protocol/behaviour description plus our own implementation notes.
 
 ---
@@ -75,8 +75,8 @@ Consequences, all of which follow from that picture:
 | 3 | **`ffmpeg `/`ffrt ` prefix in `cmd`** | string-split off and ignored — the URL is handed to gstreamer regardless (`live.py:1758-1760`) | `extract_url()` picks the URL (`links.py:76`) and the template *actually runs ffmpeg*, which is what the prefix means on a real MAG | **SPM** (faithful), ES (cheaper) |
 | 4 | **`%mac%` substitution** | `re.sub(r"%mac%", self.mac, …, IGNORECASE)` (`live.py:1756`) | `apply_mac_placeholder()` handles `%mac%`, `%MAC%`, `%25mac%`, `%25MAC%` (`links.py:96-108`) | **SPM** (double-encoded variants) |
 | 5 | **Answer repair** | none — the panel's `js.cmd` is used verbatim | `merge_link()` restores request parameters a panel blanked (`&stream=392166` → `&stream=`) while the fresh token always wins (`client.py:103`, used at `client.py:1102`) | **SPM**, and it is the single trick ES lacks that most often decides "plays / doesn't play" |
-| 6 | **`js` answer shapes for `create_link`** | dict **and list**: takes the first candidate with a `cmd`, skips entries with `type == "ad"`, keeps `storage_id` (`vodplayer.py:1080-1096`, `catchup.py:802-806`) | **dict or str only** (`client.py:1087-1092`); a list answer becomes `PortalError(code="no_url")` and the chain moves on | **ES — real gap, see S-A** |
-| 7 | **`/media/<id>` VOD cmds** | resolves the movie first (`type=vod&action=get_ordered_list&movie_id=`) and rewrites to `/media/file_<id><ext>` (`vodplayer.py:1040-1065`, `vod.py:2437-2474`) | nothing — the stored cmd is sent as-is | **ES — conditional gap, see S-B** |
+| 6 | **`js` answer shapes for `create_link`** | dict **and list**: takes the first candidate with a `cmd`, skips entries with `type == "ad"`, keeps `storage_id` (`vodplayer.py:1080-1096`, `catchup.py:802-806`) | ✅ **now dict, str and list** (`links.read_link_answer`, used by `client._ask_for_link`): first non-ad candidate wins, `storage_id` is logged, and an unusable answer *names its own shape* in the `no_url` error | **was ES, now tied** — see S-A (delivered) |
+| 7 | **`/media/<id>` VOD cmds** | resolves the movie first (`type=vod&action=get_ordered_list&movie_id=`) and rewrites to `/media/file_<id><ext>` (`vodplayer.py:1040-1065`, `vod.py:2437-2474`) — on *every* play | ✅ **now a repair, and a remembered one**: tried only after a refusal that can mean "wrong form", and the form that worked is stored on the row (`media_cmd`), so the next play asks with it directly | **was ES, now SPM** — see S-B (delivered); they pay a request per play, we pay one per item |
 | 8 | **Player / service reference** | chosen by the *user* per playlist: live `1`\|`4097`, VOD `4097`\|`5001`\|`5002`\|`8193` (`playsettings.py:80-93`), auto-raised to `4097` for `.m3u8` (`live.py:1764-1767`) | chosen by the *profile* per content kind and per item: `player_live/vod/series` (defaults `4097`/`5002`/`5002`), `container_mode=auto` derives `.ts`/`.mkv` from the item's own ffmpeg template, and `1` is auto-raised to `4097` whenever the bytes cannot be DVB-piped (`enigma2_bouquets.py:61-77`, `:153-240`, `models.py:691-703`) | **SPM** (per item, and it knows the container); ES still wins on `8193` (DreamOS) — see S-E |
 | 9 | **HLS** | streamtype switch only; gstreamer must cope (`live.py:1764`) | `is_hls()` adds `-protocol_whitelist` + `-allowed_extensions ALL` to the ffmpeg input, output is always TS/MKV so the box never sees an m3u8 (`client.py:146`, `stream_manager.py:494`) | **SPM** |
 | 10 | **Codec/container mismatch** | the box decodes whatever the panel serves, or it doesn't; the only remedy is cycling the engine by hand (`toggleStreamType`, `liveplayer.py:759`, `vodplayer.py:901`) | ffmpeg templates: VAAPI/QSV transcode, Matroska remux with `-c:s copy`, DVB-subtitle re-encode, AC3 audio fallback when TS cannot carry the source audio, Annex-B BSF only for codecs that need it (`stream_manager.py:_subs_gate/_remux_gate/_ensure_annexb`) | **SPM**, decisively — this is the whole reason the product exists |
@@ -115,9 +115,9 @@ ones:
 Ordered by value ÷ effort. S-A and S-B are **defect-shaped**: they are not features we lack, they are
 answer shapes we mis-read, and each one turns a playable channel into "no usable url".
 
-### S-A — list-shaped `create_link` answers (+ ad skipping, `storage_id`) — **DO, highest value / lowest cost**
+### S-A — list-shaped `create_link` answers (+ ad skipping, `storage_id`) — ✅ **DELIVERED 2026-09-14**
 
-*Effort ≈ 1–2 h incl. tests and a mock-portal knob.*
+*Effort was ≈ 1–2 h incl. tests and a mock-portal knob; see §7 for what shipped.*
 
 `app/portal/client.py:1087-1092` accepts `js` as a dict or a bare string. Ministra panels answer
 `type=vod`/`type=tv_archive` `create_link` with **a list of candidates** when the storage selection or
@@ -134,9 +134,9 @@ empty list. Add `create_link_list=1` / `create_link_ad=1` knobs to `app/portal/m
 `create_link_error` and assert in `tests/test_link_flags_and_direct_play.py`. This is also a
 prerequisite for S-C: TV-archive links are the shape most likely to arrive as a list.
 
-### S-B — `/media/<id>` → `/media/file_<id>` rewrite for VOD — **DO, but only as a conditional retry**
+### S-B — `/media/<id>` → `/media/file_<id>` rewrite for VOD — ✅ **DELIVERED 2026-09-14** (as a conditional retry, as recommended)
 
-*Effort ≈ 2–3 h.*
+*Effort was ≈ 2–3 h; see §7 for what shipped.*
 
 Some panels list a VOD item with a generic `/media/<id>.mpg` cmd and expect the box to resolve the
 movie (`type=vod&action=get_ordered_list&movie_id=<id>&category=1&p=1`) and ask `create_link` for
@@ -243,14 +243,16 @@ The question has four plausible readings; here is each answer.
 |---|---|
 | **(a) Adopt EStalker's playback model** — let the Enigma2 box talk to the portal itself, SPM only supplies lists | **NO.** We already have that model as *redirect mode*, minus the downsides: no portal credentials or tokens on the box, `create_link` retried across a MAC chain before the 302, and the same URL still playable from VLC/Kodi/Smarters. Turning it into the only mode would delete transcoding, subtitle remuxing, per-user output and mid-stream fallback — i.e. the product. |
 | **(b) Adopt EStalker's `create_link` policy** (conditional, flag-driven) | **ALREADY DONE** (R2, `app/portal/links.py`), and deliberately stricter in one place (a stored link with a session token is never replayed) and looser in another (the ffmpeg path always asks, because the refusal is the liveness signal). Nothing left to implement; the only open item here is the *answer parsing*, which is S-A. |
-| **(c) Adopt EStalker's streaming-side behaviours we lack** | **YES for S-A and S-B** (small, defect-shaped, and prerequisites for S-C), **YES for S-C / TV archive** (the one real feature gap, and the item already on the wish list in `improvements.md`), **opt-in MAYBE for S-D**, **defer S-E**, **don't do S-F/S-G/S-H**. Total for the recommended set: ≈ 16–26 h, of which S-C is the bulk. |
+| **(c) Adopt EStalker's streaming-side behaviours we lack** | **S-A and S-B: ✅ done** (2026-09-14 — small, defect-shaped, and prerequisites for S-C). Still open: **YES for S-C / TV archive** (the one real feature gap, and the item already on the wish list in `improvements.md`), **opt-in MAYBE for S-D**, **defer S-E**, **don't do S-F/S-G/S-H**. Remaining effort for the recommended set: ≈ 14–23 h, of which S-C is the bulk. |
 | **(d) Ship an SPM Enigma2 plugin instead of bouquets** (i.e. become EStalker) | **NO** — already analysed as option B in `docs/ENIGMA2-INTEGRATION-OPTIONS.md:50-51`: the box would pick the streamtype, we would lose per-item transcode-vs-redirect control, and we would inherit a second codebase that breaks on every plugin/image update. Bouquet generation + FTP push + OpenWebif reload (`enigma2_bouquets.py`, `enigma2_push.py`) is the right shape and it is atomic-by-rename, which is more than EStalker's JSON rewriting is. |
 
 ### Recommended order
 
-1. **S-A** list-shaped `create_link` answers (1–2 h) — a latent "whole portal looks dead" failure.
-2. **S-B** `/media/file_` retry (2–3 h) — same class of failure, one panel quirk.
-3. **S-C** TV archive / catch-up (12–20 h) — the feature; depends on S-A for the answer shape.
+1. ~~**S-A** list-shaped `create_link` answers~~ ✅ delivered (§7).
+2. ~~**S-B** `/media/file_` retry~~ ✅ delivered (§7) — and S-A's reader is what makes its answer
+   readable in the first place.
+3. **S-C** TV archive / catch-up (12–20 h) — the feature; its `type=tv_archive` answers arrive as a
+   list, which S-A now reads.
 4. **S-D** watchdog/`set_last_id` keepalive, per-portal opt-in (2–3 h) — only if a panel is observed
    treating our MACs as idle; do not add it pre-emptively, it is recurring portal traffic.
 5. **S-E** `8193` (0.5 h) — when a DreamOS box appears.
@@ -269,3 +271,70 @@ is the same limitation the README already states. That is precisely why S-A and 
 implemented *defensively* (log both shapes, keep `no_url` for the truly empty answer, cache the rewrite)
 rather than on the assumption that one panel's shape is the standard: we cannot enumerate the panels,
 we can only refuse to mis-read an answer they give us.
+
+---
+
+## 7. Delivered (2026-09-14): S-A + S-B
+
+Both implemented as *behaviour*, in our own style, with the witnesses a NAS can run. Nothing was copied
+from EStalker; the field names (`type: "ad"`, `storage_id`, `movie_id`, `category`, `file_`) are the
+panel's own vocabulary.
+
+### S-A — every `create_link` answer shape is read
+
+* `app/portal/links.py`: `LinkAnswer` + `read_link_answer(js)` — a pure reader for dict / bare string /
+  list / empty / unknown. List rules: skip any entry whose `type` is an ad label (`ad`, `ads`, `advert`,
+  `advertisement`, `commercial`, `promo`, any case), take the **first** remaining candidate that carries
+  a `cmd`/`url`/`link` (panels order candidates by preference), keep the `storage_id` that came with it.
+  `LinkAnswer.describe()` is the sentence that goes into the failure, because "no playable URL" is what
+  a dead channel looks like and what an unparsed answer must not look like.
+* `app/portal/client.py`: `create_link` was split — the request/parse/repair steps now live in
+  `_ask_for_link()`, which reads the answer through `read_link_answer` and logs a list answer
+  (`panel answered a list of N candidate(s) plus M ad(s), storage X`). `no_url` keeps its code and now
+  carries the shape.
+* Mock portal knob `create_link_list` = `one` | `ad` | `ads_only` (the last is the case that must read
+  as "no link", not as a crash and not as the ad's URL).
+
+### S-B — the two cmd forms of one VOD file, as a repair that is remembered
+
+* `app/portal/links.py`: `generic_media_ref()` (only a **relative** `/media/<id>` token counts — an
+  absolute URL is a link, not a storage reference, and is never rewritten), `media_file_form(cmd,
+  file_id=None)` (keeps any `auto `/`ffmpeg ` prefix and the extension; `file_id=None` is the cheap
+  same-number guess), and `CmdRepair` (what we asked with, what worked, how).
+* `app/portal/client.py`: `create_link(…, item_id=, alt_cmd=)` now tries the row's forms in order and,
+  only when a refusal can mean "wrong form" (`MEDIA_REPAIR_CODES` = `no_url`, `nothing_to_play`,
+  `link_fault`), runs `_media_form_repair()`: resolve the file id via
+  `type=vod&action=get_ordered_list&movie_id=&category=1` (`_media_file_id`, every failure is `None`,
+  never an exception that would mask the panel's own refusal), else fall back to the `file_` prefix on
+  the stored number. `limit`/`access_denied`/transport errors never trigger it — that is about the MAC,
+  and asking again in another shape would burn a slot. Kill switch `SPM_MEDIA_CMD_REPAIR=0`.
+  The winning form is handed back on `client.last_cmd_repair` (reset every call: a pooled client is
+  shared, so it is a hand-off slot, not state).
+* `app/portal/links.py` `plan_for()` reads the row once for both stream paths: ask with the learned
+  `media_cmd` **first**, keep the catalogue `cmd` as `alt_cmd`, and carry `portal_item_id` as `item_id`.
+* `app/models.py` + `app/database.py`: new nullable `media_cmd` on `vod_sources` and `serie_episodes`,
+  with idempotent `ALTER TABLE`s for existing installs. `cmd` is never rewritten — the catalogue stays
+  the panel's truth — and `_vod_fields()` in `app/services/fetch_jobs.py` deliberately leaves
+  `media_cmd` alone, so a re-fetch cannot wipe what a play learned. A stale learned form self-heals:
+  it is refused, the catalogue form is tried, and the row is re-learned (writing NULL is an action).
+* `app/services/stream_manager.py`: `_store_media_cmd()` persists the learned form on both stream paths
+  (redirect *and* ffmpeg — on the ffmpeg path before the pipe is opened, so a form that got a link is
+  kept even if ffmpeg then fails on the bytes) and logs the swap in the stream log.
+  `app/services/item_info.py` asks with the same two forms so a detail popup does not re-pay the
+  refusal, but never persists: a tooltip must not be what rewrites a source row.
+* Mock portal knobs `media_form=file_only` + `media_file_id`, and the counters `media_refusals` /
+  `media_resolutions` — the witnesses that the second play costs neither.
+
+### Verification
+
+* `tests/test_create_link_answers.py` — 56 tests: the pure readers, the plan plumbing, the client
+  against the mock portal (list/ad/ads-only, the ladder and its rungs, the kill switch, and that a
+  `limit` refusal triggers no second attempt), and the stream path learning a form and then not paying
+  for it again.
+* `dev/check-links.py` — 25 new pins (141 → 166 checks), so the recognition rules are also verifiable
+  on a NAS without pytest.
+* Full suite: **646 passed, 5 skipped, 2 failed** — the two failures are the documented pre-existing
+  ones (`test_ffmpeg_argv_injects_annexb_when_copying_to_mpegts`, and
+  `test_an_existing_install_gets_the_columns_it_is_promised`, whose own setup drops the FK column
+  `users.area_id`). `dev/check-links.py`: 5/166 failed, the same five pre-existing drifts as before
+  this change.

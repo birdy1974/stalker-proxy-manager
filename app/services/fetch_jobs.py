@@ -744,6 +744,11 @@ def _live_fields(row, item, genre_db_id: int) -> None:
 
 
 def _vod_fields(row, item, genre_db_id: int) -> None:
+    # `media_cmd` (S-B) is deliberately NOT in this list: it is what a PLAY
+    # learned about this panel, not something the catalogue reports, and a fetch
+    # that wiped it would put the refusal-and-resolve round trip back on every
+    # play. A stale learned form is self-healing anyway - the stream path falls
+    # back to the `cmd` written below and re-learns from there.
     row.vod_genre_id = genre_db_id
     row.link_flags = parse_link_flags(item)
     row.original_name = portal_item_title(item, limit=400)

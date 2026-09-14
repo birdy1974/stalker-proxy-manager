@@ -407,6 +407,14 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "serie_sources": {
         "raw_series": ("TEXT", "NULL"),
     },
+    # S-B: the learned `/media/file_…` cmd form, one column per table that can
+    # carry a VOD-style storage reference (episodes are addressed the same way).
+    "vod_sources": {
+        "media_cmd": ("TEXT", "NULL"),
+    },
+    "serie_episodes": {
+        "media_cmd": ("TEXT", "NULL"),
+    },
     "users": {
         "area_id": ("INTEGER", "NULL"),
     },

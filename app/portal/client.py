@@ -39,8 +39,9 @@ from .capabilities import (FEATURE_MODULES, PortalVersion, enabled_modules,
 # importing this module (which would be a cycle); the names stay importable from
 # here because probe.py, stream_manager.py, dev/check-links.py and the tests all
 # reach for them on `portal.client`.
-from .links import (VOLATILE_PARAMS, apply_mac_placeholder,  # noqa: F401
-                    extract_url, link_request_params)
+from .links import (VOLATILE_PARAMS, CmdRepair, apply_mac_placeholder,  # noqa: F401
+                    extract_url, generic_media_ref, link_request_params,
+                    media_file_form, read_link_answer)
 from .identity import (MAG250, MINIMAL, STB_LANG, STB_TIMEZONE, STB_UA, cookies_for,
                        derive_identity, headers_for, make_fake_bearer,
                        minimal_profile_params, missing_token, profile_params)
@@ -194,6 +195,19 @@ TOKEN_ERROR_CODES = frozenset({
 MAC_SUSPECT_CODES = frozenset({"limit", "account_is_in_use", "max_connections",
                                "access_denied", "unauthorized", "not_authorized",
                                "no_token", "http_401", "http_403", "blocked"})
+
+# Refusals that can mean "you asked with the wrong FORM of the right item"
+# rather than "this item is gone" - the only codes for which a second attempt
+# with another cmd form is worth a request (S-B). Everything else (`limit`,
+# `access_denied`, transport errors) is about the MAC or the panel, and asking
+# again in another shape would burn a slot and change nothing.
+MEDIA_REPAIR_CODES = frozenset({"no_url", "nothing_to_play", "link_fault"})
+
+#: Kill switch for the `/media/file_` ladder. It costs extra portal requests on
+#: a panel that refuses a link, so a panel that rate-limits aggressively can be
+#: exempted without a code change - the same reasoning as SPM_STB_PROFILE.
+MEDIA_REPAIR_ENABLED = os.environ.get("SPM_MEDIA_CMD_REPAIR", "1").strip().lower() not in (
+    "0", "off", "no", "false")
 
 
 def normalize_error(raw: Any) -> str:
@@ -390,6 +404,11 @@ class StalkerClient:
         # Set by the pool: a shared client's connection is not owned by the
         # caller, so its close() must not tear down anyone else's session.
         self.shared = False
+        #: S-B: the cmd form the panel actually answered for, when it was not the
+        #: one `create_link` was handed. Reset at the start of every call and
+        #: meant to be read immediately after it - a pooled client is shared, so
+        #: this is a hand-off slot, not state anybody may keep.
+        self.last_cmd_repair: CmdRepair | None = None
 
     def _token_stale(self) -> bool:
         """
@@ -1045,7 +1064,9 @@ class StalkerClient:
     # ---------------------------------------------------------------- links
     async def create_link(self, cmd: str, kind: str = "itv", *, link_flags: str | None = None,
                           force_ch_link_check: bool = False,
-                          series: int | str | None = None) -> str:
+                          series: int | str | None = None,
+                          item_id: str | None = None,
+                          alt_cmd: str | None = None) -> str:
         """
         Resolve a portal `cmd` to a playable stream URL.
 
@@ -1066,13 +1087,71 @@ class StalkerClient:
         flags say so, and it re-checks the link when the panel set
         `force_ch_link_check`. Hardcoding `false` for both is a small lie that
         some panels happily answer with a link we must then not use.
+
+        Two more things this method has to survive, because panels differ in
+        more than their flags (see `links.read_link_answer` / S-A and the
+        `/media/file_` ladder / S-B):
+
+        * the ANSWER may be a list of candidates - a storage choice, or an
+          advertisement the box is meant to skip. Only the dict shape used to be
+          read, so such a panel reported every item as "no playable URL".
+        * the CMD we were handed may be the wrong FORM of the right item: a
+          catalogue that lists `/media/1234.mpg` while `create_link` only
+          answers for `/media/file_<id>.mpg`. `item_id` is what makes the
+          resolution possible, `alt_cmd` the row's other stored form.
+
+        A form swap is remembered on `last_cmd_repair` (valid until the next
+        call on this client) so the caller can persist what worked.
         """
+        self.last_cmd_repair = None
         type_ = {"live": "itv", "itv": "itv", "vod": "vod", "series": "vod", "episode": "vod"}.get(kind, "itv")
         if series is not None:
             # Classic-Stalker episode: the panel selects the episode server-side
             # by the `series` parameter of a type=vod create_link (the stored cmd
             # addresses the whole season). Same request IPTVnator sends.
             type_ = "vod"
+        primary = str(cmd or "").strip()
+        forms: list[tuple[str, str]] = [(primary, "the cmd we were handed")]
+        other = str(alt_cmd or "").strip()
+        if other and other != primary:
+            forms.append((other, "the catalogue cmd"))
+        refusal: PortalError | None = None
+        for text, label in forms:
+            try:
+                url = await self._ask_for_link(text, type_, link_flags=link_flags,
+                                               force_ch_link_check=force_ch_link_check,
+                                               series=series)
+            except PortalError as exc:
+                # Only a refusal that can mean "wrong form of the right item"
+                # continues; `limit` and friends are about the MAC, and asking
+                # the same panel a second time would burn a slot for nothing.
+                if exc.code not in MEDIA_REPAIR_CODES:
+                    raise
+                refusal = exc
+                log.info("create_link: %s was refused (%s)%s", label, exc.code,
+                         " - trying the other stored form" if len(forms) > 1 else "")
+                continue
+            if text != primary:
+                self.last_cmd_repair = CmdRepair(asked=primary, worked=text, how="stored")
+                log.info("create_link: the panel answered for the other stored form: %s", text)
+            return url
+        repaired = await self._media_form_repair(
+            primary, type_, item_id, link_flags=link_flags,
+            force_ch_link_check=force_ch_link_check, series=series)
+        if repaired is not None:
+            return repaired
+        # Nothing worked. Report the panel's OWN refusal rather than inventing
+        # one: when the row carried two forms, `refusal` is the second form's,
+        # which is the catalogue cmd the panel itself lists - its verdict
+        # (`nothing_to_play`) is the diagnosis worth having, and "we asked twice"
+        # is not. `forms` is never empty, so the fallback only guards `python -O`.
+        raise refusal or PortalError(
+            f"create_link returned no usable url for cmd={primary!r}", code="no_url")
+
+    async def _ask_for_link(self, cmd: str, type_: str, *, link_flags: str | None,
+                            force_ch_link_check: bool,
+                            series: int | str | None = None) -> str:
+        """One `create_link` request with one cmd form, read in every shape (S-A)."""
         raw_cmd = str(cmd or "").strip()
         requested = extract_url(raw_cmd)
         out_cmd = sanitize_cmd(raw_cmd)
@@ -1084,20 +1163,24 @@ class StalkerClient:
                                   force_ch_link_check=force_ch_link_check,
                                   series=series),
         })
-        js = data.get("js")
-        raw = ""
-        if isinstance(js, dict):
-            raw = js.get("cmd") or js.get("url") or js.get("link") or ""
-        elif isinstance(js, str):
-            raw = js
-        link = extract_url(raw)
+        # a panel may answer the candidates without the {"js": ...} envelope
+        js = data.get("js") if isinstance(data, dict) else data
+        answer = read_link_answer(js)
+        if answer.shape == "list":
+            log.info("create_link: panel answered a list of %d candidate(s)%s%s",
+                     answer.candidates,
+                     f" plus {answer.ads} ad(s)" if answer.ads else "",
+                     f", storage {answer.storage_id}" if answer.storage_id else "")
+        link = extract_url(answer.raw)
         if not link:
             # No link, but no refusal either - the panel answered something we
             # cannot use (an empty cmd, a relative path, a plugin command we do
-            # not speak). Say so, and name the format we got.
+            # not speak, a list of nothing but ads). Say so, name the format we
+            # got, and keep the code the fallback chain branches on.
             raise PortalError(
-                f"create_link returned no usable url for cmd={cmd!r}"
-                + (f" (portal cmd: {str(raw)[:120]!r})" if raw else ""),
+                f"create_link returned no usable url for cmd={raw_cmd!r}"
+                + (f" (portal cmd: {str(answer.raw)[:120]!r})" if answer.raw else "")
+                + f" - the panel answered {answer.describe()}",
                 code="no_url")
         repaired = merge_link(link, requested)
         if repaired != link:
@@ -1111,3 +1194,72 @@ class StalkerClient:
         log.debug("create_link -> %s", with_mac)
         log.info("create_link -> %s", mask_token(with_mac))
         return with_mac
+
+    async def _media_form_repair(self, cmd: str, type_: str, item_id: str | None, *,
+                                 link_flags: str | None, force_ch_link_check: bool,
+                                 series: int | str | None = None) -> str | None:
+        """The `/media/<id>` -> `/media/file_<id>` ladder (S-B).
+
+        Tried ONLY after the panel refused with a code that can mean "wrong form"
+        (`MEDIA_REPAIR_CODES`), and only for a cmd that is a generic storage
+        reference at all. Two rungs, cheapest evidence first: the file id the
+        panel itself reports for this movie, then the stored id with a `file_`
+        prefix. Returns None when there is nothing to try or nothing worked, so
+        the caller can raise the panel's original refusal unchanged.
+        """
+        if not MEDIA_REPAIR_ENABLED or not generic_media_ref(cmd):
+            return None
+        ladder: list[tuple[str, str]] = []
+        if item_id:
+            file_id = await self._media_file_id(item_id)
+            if file_id:
+                ladder.append((media_file_form(cmd, file_id),
+                               f"the file id the panel reports for item {item_id}"))
+        naive = media_file_form(cmd)
+        if naive not in [text for text, _ in ladder]:
+            ladder.append((naive, "the file_ prefix on the stored id"))
+        for text, how in ladder:
+            try:
+                url = await self._ask_for_link(text, type_, link_flags=link_flags,
+                                               force_ch_link_check=force_ch_link_check,
+                                               series=series)
+            except PortalError as exc:
+                log.info("create_link: %s form was refused too (%s)", how, exc.code)
+                continue
+            self.last_cmd_repair = CmdRepair(asked=cmd, worked=text, how="media_file")
+            log.info("create_link: the panel needed the /media/file_ form (%s): %s -> %s",
+                     how, cmd, text)
+            return url
+        return None
+
+    async def _media_file_id(self, item_id: str) -> str | None:
+        """The storage/file id behind a VOD item, the way a box asks for it.
+
+        `type=vod&action=get_ordered_list&movie_id=<item>&category=1` answers
+        with the FILE rows of that movie on panels that keep movie and file
+        apart, and with the movie itself on panels that do not - either way the
+        first row's `id` is what belongs after `file_`. Every failure is None
+        rather than an exception: this is a repair attempt, and it must never
+        replace the refusal that triggered it with its own.
+        """
+        try:
+            data = await self._get({"type": "vod", "action": "get_ordered_list",
+                                    "movie_id": str(item_id), "category": "1",
+                                    "sortby": "", "p": "1", "JsHttpRequest": "1-xml"})
+        except PortalError as exc:
+            log.info("create_link: could not resolve the media file behind item %s (%s)",
+                     item_id, exc.code)
+            return None
+        js = data.get("js") if isinstance(data, dict) else None
+        if isinstance(js, dict):
+            items = js.get("data")
+            if not isinstance(items, list):       # some panels: {id: item}
+                items = [v for v in js.values() if isinstance(v, dict)]
+        elif isinstance(js, list):
+            items = js
+        else:
+            items = []
+        for row in items:
+            if isinstance(row, dict) and str(row.get("id", "")).strip():
+                return str(row["id"]).strip()
+        return None

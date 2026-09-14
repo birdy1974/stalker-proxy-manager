@@ -3,7 +3,8 @@
 Compared on 2026-08-30. **Streaming/playback side:** see
 [`ESTALKER-STREAMING-COMPARISON.md`](ESTALKER-STREAMING-COMPARISON.md) (2026-09-14, against
 EStalker `c91dbfe` / `1.49-20260902`), which re-checks this document's conclusions and adds the
-streaming-only gaps S-A…S-H.
+streaming-only gaps S-A…S-H — S-A (every `create_link` answer shape) and S-B (the two cmd forms of one
+VOD file) are ✅ delivered there, §7.
 
 | | ours | EStalker |
 |---|---|---|
