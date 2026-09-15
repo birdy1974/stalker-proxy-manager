@@ -307,7 +307,7 @@ async def test_local_pump_logs_ffmpeg_tail_after_a_silent_stall(monkeypatch):
     async def fake_log(level, component, message):
         logged.append((level, component, message))
 
-    async def _spawn_stub(self, cmd_template, url, title=None, pace=False):
+    async def _spawn_stub(self, cmd_template, url, title=None, pace=False, user_agent=None):
         proc = await asyncio.create_subprocess_exec(
             "sh", "-c", "echo boom-error >&2; sleep 30",
             stdin=asyncio.subprocess.DEVNULL,

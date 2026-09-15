@@ -14,7 +14,7 @@ from app.database import SessionLocal
 from app.models import (
     LivePlaylist, LivePlaylistSource, LiveSource, MacAddress, Portal,
 )
-from app.services import redirect_guard
+from app.services import redirect_guard, stream_identity
 from app.services.redirect_guard import (
     ProbeResult, demote_recently_handed, link_is_alive, note_handed_out,
 )
@@ -32,6 +32,7 @@ def _clean_state(monkeypatch):
     MANAGER.route_health.failures.clear()
     MANAGER.route_health.success.clear()
     redirect_guard.reset()
+    stream_identity.reset()
     yield
     MANAGER.mac_locks.clear()
     MANAGER.redirect_leases.clear()
@@ -39,6 +40,7 @@ def _clean_state(monkeypatch):
     MANAGER.route_health.failures.clear()
     MANAGER.route_health.success.clear()
     redirect_guard.reset()
+    stream_identity.reset()
 
 
 async def _two_portal_route():
@@ -327,10 +329,72 @@ def test_referer_is_the_origin_root():
             == "https://cdn.example.com:8080/")
 
 
-def test_probe_ua_is_the_stb_ua():
-    from app.portal.identity import STB_UA
+def test_probe_uses_the_player_identity_with_a_browser_fallback():
+    """The liveness probe hits a URL the END PLAYER receives after the 302,
+    so it announces the MAG player UA and keeps the portal browser UA for
+    the one-rung identity fallback - never the other way round."""
+    from app.portal.identity import PLAYER_UA, STB_UA
 
-    assert redirect_guard.STB_UA is STB_UA
+    assert stream_identity.PLAYER_UA is PLAYER_UA == "Lavf53.32.100"
+    assert stream_identity.STB_UA is STB_UA
+    assert stream_identity.ladder("http://cdn/x.ts") == [PLAYER_UA, STB_UA]
+
+
+async def test_probe_walks_player_to_browser_ua_on_456(monkeypatch):
+    """Origin X: the media endpoint answers the player UA with HTTP 456 but
+    plays for the portal browser UA. The old behaviour vetoed this link as
+    dead; the ladder must instead retry once and call it alive, then
+    remember the winning identity for the origin."""
+    import functools
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(456) if "Lavf" in request.headers.get("user-agent", "") \
+            else httpx.Response(200)
+
+    # link_is_alive builds its own clients in production; point those clients
+    # at the mock transport without changing the code path under test.
+    factory = functools.partial(
+        httpx.AsyncClient, transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(redirect_guard.httpx, "AsyncClient", factory)
+
+    result = await link_is_alive("http://cdn/play/live.php?stream=1&token=a")
+    assert result.alive, result.detail
+    # HEAD 456 -> GET 456 with the player UA, then HEAD 200 with the browser
+    assert len(seen) == 3
+    assert all("Lavf" in r.headers["user-agent"] for r in seen[:2])
+    assert "QtEmbedded" in seen[-1].headers["user-agent"]
+    assert stream_identity.learned("http://cdn/play/live.php?stream=1") \
+        == stream_identity.STB_UA
+
+    # second play, fresh token: one HEAD with the learned winner only
+    seen.clear()
+    result2 = await link_is_alive("http://cdn/play/live.php?stream=1&token=b")
+    assert result2.alive
+    assert len(seen) == 1 and "QtEmbedded" in seen[0].headers["user-agent"]
+
+
+async def test_probe_player_ua_plays_without_any_retry(monkeypatch):
+    """The common panel (and the reported one): player UA 200 on the first
+    HEAD - the browser identity must never touch the media endpoint."""
+    import functools
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200)
+
+    factory = functools.partial(
+        httpx.AsyncClient, transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(redirect_guard.httpx, "AsyncClient", factory)
+
+    result = await link_is_alive("http://cdn/play/live.php?stream=9")
+    assert result.alive
+    assert len(seen) == 1
+    assert "Lavf53.32.100" in seen[0].headers["user-agent"]
 
 
 # --------------------------------------- validation: a transport error is a shrug

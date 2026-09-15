@@ -60,7 +60,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from ..portal.identity import STB_UA
+from . import stream_identity
 
 VALIDATE_ENABLED = os.environ.get("SPM_REDIRECT_VALIDATE", "1") == "1"
 VALIDATE_TIMEOUT = float(os.environ.get("SPM_REDIRECT_VALIDATE_TIMEOUT", "2.0"))
@@ -127,7 +127,7 @@ def reset() -> None:
 #     token/channel is gone regardless of method.
 # Transport errors that are not connect-level join this set by `_is_a_shrug`
 # below - same reasoning, different way for the origin to say "not like this".
-_HEAD_STATUSES_TRY_GET = frozenset({403, 405, 500, 501, 502, 503, 504})
+_HEAD_STATUSES_TRY_GET = frozenset({403, 405, 429, 456, 500, 501, 502, 503, 504})
 
 # A transport error on a probe is not a verdict - except one. ConnectError /
 # ConnectTimeout mean nothing listened at the other end (DNS, refused, no
@@ -180,67 +180,90 @@ def _referer_of(url: str) -> str:
 async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
                         client: httpx.AsyncClient | None = None) -> ProbeResult:
     """Whether a redirect candidate URL answers (conservative: inconclusive
-    counts as alive). `client` is a test seam; production builds its own.
+    counts as alive). `client` is a test seam; production builds its own and
+    walks the media-UA ladder (player identity first, one browser-UA retry).
 
-    The ladder is HEAD -> ranged GET -> plain GET, and each rung is only
-    climbed when the one before it failed to *prove* anything. Two rungs are
-    normally enough and cost ~150 ms; the third exists for streaming origins
-    that shrug at both a HEAD and a Range they cannot honour.
+    Each client attempt is HEAD -> ranged GET -> plain GET, and each rung is
+    only climbed when the one before it failed to *prove* anything. Two rungs
+    are normally enough and cost ~150 ms; the third exists for streaming
+    origins that shrug at both a HEAD and a Range they cannot honour.
     """
     if not VALIDATE_ENABLED:
         return ProbeResult(True, "validation disabled")
     if str(url or "").split("://", 1)[0].lower() not in ("http", "https"):
         return ProbeResult(True, "non-HTTP url, not probed")
-    own = client is None
-    if own:
-        client = httpx.AsyncClient(timeout=timeout, follow_redirects=True,
-                                   headers={"User-Agent": STB_UA,
-                                            "Referer": _referer_of(url)})
+    if client is not None:
+        # Explicit test client: one attempt with whatever identity it carries.
+        return await _probe(url, timeout, client)
+    verdict = ProbeResult(True, "")
+    uas = stream_identity.ladder(url)
+    # The URL is handed to the END PLAYER after the 302, so the probe must
+    # look like a media player, not the portal browser: play/live.php origins
+    # answer the browser UA here with HTTP 456/403 and would be vetoed as
+    # "dead" while TiviMate/VLC play the same link. Learned origin first.
+    for idx, ua in enumerate(uas):
+        async with httpx.AsyncClient(
+                timeout=timeout, follow_redirects=True,
+                headers={"User-Agent": ua, "Referer": _referer_of(url)}) as own:
+            verdict = await _probe(url, timeout, own)
+        if verdict.alive:
+            stream_identity.remember(url, ua)
+            return verdict
+        # A policy 4xx as the FINAL verdict may be identity-shaped (the 456
+        # case above); spend the one other identity the ladder offers. A
+        # proved 410, a connect-level error or an inconclusive "alive" verdict
+        # ends the probe.
+        tail = verdict.detail.rsplit(" ", 1)[-1]
+        if tail.isdigit() and int(tail) in stream_identity.UA_POLICY_4XX \
+                and idx + 1 < len(uas):
+            continue
+        return verdict
+    return verdict
+
+
+async def _probe(url: str, timeout: float, client: httpx.AsyncClient) -> ProbeResult:
+    """One identity's HEAD -> ranged GET -> plain GET ladder."""
     started = time.monotonic()
     trace: list[str] = []
+    # Rung 1: HEAD. Cheap, and the whole answer for a well-behaved CDN.
     try:
-        # Rung 1: HEAD. Cheap, and the whole answer for a well-behaved CDN.
+        head = await client.head(url)
+    except httpx.HTTPError as exc:
+        if not _is_a_shrug(exc):
+            return ProbeResult(False, f"HEAD {type(exc).__name__}")
+        trace.append(f"HEAD {type(exc).__name__}")
+    else:
+        if 200 <= head.status_code < 300:
+            return ProbeResult(True, f"HEAD {head.status_code}")
+        if head.status_code not in _HEAD_STATUSES_TRY_GET:
+            return ProbeResult(False, f"HEAD {head.status_code}")
+        trace.append(f"HEAD {head.status_code}")
+    # Rungs 2+3: GET, for actual bytes. Ranged first (polite to a CDN that
+    # honours it), then the plain GET a player sends. Neither reads a body -
+    # the status line alone is the verdict, so even a 200 that ignored the
+    # Range and started the full stream costs us one aborted connection.
+    for label, headers in (("GET", {"Range": "bytes=0-0"}), ("GET-no-range", {})):
+        if time.monotonic() - started >= timeout * 2:
+            # A slow origin must not turn one play into a multi-second wait
+            # per candidate; running out of budget is "unproven", not "dead".
+            return ProbeResult(True, _trace(trace, "probe budget spent"))
         try:
-            head = await client.head(url)
+            async with client.stream("GET", url, headers=headers) as resp:
+                code = resp.status_code
         except httpx.HTTPError as exc:
             if not _is_a_shrug(exc):
-                return ProbeResult(False, f"HEAD {type(exc).__name__}")
-            trace.append(f"HEAD {type(exc).__name__}")
-        else:
-            if 200 <= head.status_code < 300:
-                return ProbeResult(True, f"HEAD {head.status_code}")
-            if head.status_code not in _HEAD_STATUSES_TRY_GET:
-                return ProbeResult(False, f"HEAD {head.status_code}")
-            trace.append(f"HEAD {head.status_code}")
-        # Rungs 2+3: GET, for actual bytes. Ranged first (polite to a CDN that
-        # honours it), then the plain GET a player sends. Neither reads a body -
-        # the status line alone is the verdict, so even a 200 that ignored the
-        # Range and started the full stream costs us one aborted connection.
-        for label, headers in (("GET", {"Range": "bytes=0-0"}), ("GET-no-range", {})):
-            if time.monotonic() - started >= timeout * 2:
-                # A slow origin must not turn one play into a multi-second wait
-                # per candidate; running out of budget is "unproven", not "dead".
-                return ProbeResult(True, _trace(trace, "probe budget spent"))
-            try:
-                async with client.stream("GET", url, headers=headers) as resp:
-                    code = resp.status_code
-            except httpx.HTTPError as exc:
-                if not _is_a_shrug(exc):
-                    return ProbeResult(False, _trace(trace, f"{label} {type(exc).__name__}"))
-                trace.append(f"{label} {type(exc).__name__}")
-                continue
-            if code < 400 or code in _GET_STATUSES_INCONCLUSIVE:
-                # 2xx/3xx: it serves the bytes. 405/416: it is alive and only
-                # objects to the shape of our request - a player asks differently.
-                return ProbeResult(True, _trace(trace, f"{label} {code}"))
-            return ProbeResult(False, _trace(trace, f"{label} {code}"))
-        # Every rung shrugged. That is not proof of death and only proof may
-        # veto: the player's own request may be the one shape this origin likes,
-        # and a false "dead" costs a 502 on a channel that is actually on air.
-        return ProbeResult(True, _trace(trace, "no verdict, not vetoing"))
-    finally:
-        if own:
-            await client.aclose()
+                return ProbeResult(False, _trace(trace, f"{label} {type(exc).__name__}"))
+            trace.append(f"{label} {type(exc).__name__}")
+            continue
+        if code < 400 or code in _GET_STATUSES_INCONCLUSIVE:
+            # 2xx/3xx: it serves the bytes. 405/416: it is alive and only
+            # objects to the shape of our request - a player asks differently.
+            return ProbeResult(True, _trace(trace, f"{label} {code}"))
+        return ProbeResult(False, _trace(trace, f"{label} {code}"))
+    # Every rung shrugged. That is not proof of death and only proof may
+    # veto: the player's own request may be the one shape this origin likes,
+    # and a false "dead" costs a 502 on a channel that is actually on air.
+    return ProbeResult(True, _trace(trace, "no verdict, not vetoing"))
 
 
 #: (origin, trace) pairs already reported - see `shrug_note`

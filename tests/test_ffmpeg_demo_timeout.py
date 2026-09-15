@@ -157,6 +157,38 @@ def test_timeout_hint_reports_panel_refusals():
 
 
 # --------------------------------------------------------------------------
+# 2b. the playlist demo walks the same media-UA ladder as the stream path
+# --------------------------------------------------------------------------
+
+async def test_playlist_demo_retries_456_with_the_browser_ua(monkeypatch, tmp_path):
+    """Origin X: the player UA is refused with HTTP 456, the browser UA
+    plays. The demo must respawn once and report success - the exact failure
+    that used to show rc=8 / 0 bytes in the FFmpeg tab."""
+    from app.services import stream_identity
+    stream_identity.reset()
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *Lavf53.32.100*)\n"
+        "    echo '[https @ 0x9] HTTP error 456 Server returned 4XX Client Error' >&2\n"
+        "    exit 8 ;;\n"
+        "  *) head -c 200000 /dev/zero ;;\n"
+        "esac\n")
+    fake.chmod(0o755)
+    _use_fake_ffmpeg(monkeypatch, str(fake))
+    try:
+        r = await fv.run_demo(f"ffmpeg -i {URL_PLACEHOLDER} -f mpegts pipe:1",
+                              mode="playlist", url=STALLED_URL)
+        assert r["ok"] is True, r["detail"]
+        assert r["bytes"] == 200000
+        # the winning identity is now shared with the real stream path
+        assert stream_identity.learned(STALLED_URL) == stream_identity.STB_UA
+    finally:
+        stream_identity.reset()
+
+
+# --------------------------------------------------------------------------
 # 3. the working case must be untouched
 # --------------------------------------------------------------------------
 

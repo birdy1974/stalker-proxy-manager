@@ -159,13 +159,16 @@ async def test_proxy_retries_a_stillborn_link_once(monkeypatch):
     monkeypatch.setattr("app.services.stream_manager.ZAP_RETRY_DELAY", 0.01)
     spawns = []
 
-    async def fake_spawn(cmd_template, url, title=None, pace=False):
+    async def fake_spawn(self, cmd_template, url, title=None, pace=False,
+                         user_agent=None):
         spawns.append(url)
         if len(spawns) == 1:
             return _FakeProc([], rc=1)          # EOF, never a byte
         return _FakeProc([b"x" * 188])         # first byte flows
 
-    monkeypatch.setattr(MANAGER, "_spawn", fake_spawn)
+    # class-level: an instance-level monkeypatch leaves a shadowing attribute
+    # behind on teardown that hides later class patches (see test_stream_ua_ladder)
+    monkeypatch.setattr(type(MANAGER), "_spawn", fake_spawn)
     _handle, gen = await MANAGER.open("live", pid, "zapbox")
     try:
         first = await gen.__anext__()

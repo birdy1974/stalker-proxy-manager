@@ -13,7 +13,8 @@ import re
 import time
 
 from ..config import FFMPEG_BIN, log
-from ..portal.client import MAG_UA, is_hls
+from ..portal.client import is_hls
+from . import stream_identity
 from .ffmpeg_templates import HLS_INPUT_OPTS
 
 _RE_DURATION = re.compile(
@@ -40,21 +41,29 @@ _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 300  # seconds — probing live streams is expensive
 
 
-def _probe_args(target: str, *, is_url: bool) -> list[str]:
-    """ffmpeg argv for one probe. Network streams get the MAG identity and the
-    per-input options of the real pipeline (same rules, so the probe reflects
-    what the stream path sees - a probe that cannot open an HLS playlist would
-    report "no metadata" for a channel that plays fine)."""
+def _probe_args(target: str, *, is_url: bool,
+                user_agent: str | None = stream_identity.PLAYER_UA) -> list[str]:
+    """ffmpeg argv for one probe. Network streams get the MAG media-player
+    identity and the per-input options of the real pipeline (same rules, so
+    the probe reflects what the stream path sees - a probe that cannot open an
+    HLS playlist would report "no metadata" for a channel that plays fine).
+
+    The default UA is the MAG box's embedded PLAYER identity
+    (Lavf53.32.100), not the portal browser identity: play/live.php origins
+    answer the browser UA with HTTP 456/403 on the media endpoint while the
+    player UA plays (see app/services/stream_identity.py). probe_media walks
+    the same short player->browser ladder the stream path does.
+    """
     args = [FFMPEG_BIN, "-hide_banner", "-nostdin"]
     if is_url:
         # generous read timeout but a hard wall-clock cap in probe_media
         args += ["-rw_timeout", "15000000", "-reconnect", "1"]
         args += ["-analyzeduration", "2500000", "-probesize", "2500000"]
-        # Impersonate the MAG box exactly like the real pipeline does
-        # (stream_manager._network_input_options): panels/CDNs refuse or stall
-        # the default Lavf user-agent, which used to make the probe time out
-        # even though the stream itself was fine.
-        args += ["-user_agent", MAG_UA]
+        # Present the same identity the real ffmpeg pipe presents. A user
+        # writing their own -user_agent into a template is unaffected there;
+        # the probe always gets an explicit value so a default "Lavf/61.x"
+        # can never be refused as an unknown scraper.
+        args += ["-user_agent", user_agent or stream_identity.PLAYER_UA]
         origin = target.split("://", 1)[-1].split("/", 1)[0]
         args += ["-referer", f"{target.split('://', 1)[0]}://{origin}/"]
         if is_hls(target):
@@ -118,23 +127,44 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
             except Exception:  # noqa: BLE001 - fall through to ffmpeg
                 pass
 
-    args = _probe_args(target, is_url=is_url)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+    # Network probes walk the same media-UA ladder as the stream path: an
+    # origin that 456/403s the first identity gets one browser-UA attempt
+    # before the probe reports "unreachable" for a perfectly playable link.
+    uas = stream_identity.ladder(target) if is_url else [None]
+    err = b""
+    proc = None
+    used_ua: str | None = None
+    binary_missing = False
+    for ua in uas:
+        args = _probe_args(target, is_url=is_url, user_agent=ua)
+        t0 = time.monotonic()
         try:
-            _, err = await asyncio.wait_for(proc.communicate(), timeout=PROBE_TIMEOUT)
-        except asyncio.TimeoutError:
+            proc = await asyncio.create_subprocess_exec(
+                *args, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE)
             try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-            return {"error": f"probe timed out (>{PROBE_TIMEOUT:.0f}s)"}
-    except FileNotFoundError:
+                _, err = await asyncio.wait_for(proc.communicate(),
+                                                timeout=PROBE_TIMEOUT)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                return {"error": f"probe timed out (>{PROBE_TIMEOUT:.0f}s)"}
+        except FileNotFoundError:
+            binary_missing = True
+            break
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+        elapsed = time.monotonic() - t0
+        if not is_url or stream_identity.http_open_error(
+                proc.returncode, err.decode("utf-8", "replace"),
+                elapsed) is None:
+            used_ua = ua
+            break
+        proc = None
+    if binary_missing:
         return {"error": "ffmpeg binary not found"}
-    except Exception as exc:  # noqa: BLE001
-        return {"error": str(exc)}
 
     text = err.decode("utf-8", errors="replace")
     # only the INPUT section describes the source; "Output #0, null" lines
@@ -174,6 +204,10 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
         out = {"error": "no stream info parsed — unreachable or unsupported input"}
         log.warning("probe: unparsed ffmpeg output probably; first lines: %s",
                     "\n".join(text.splitlines()[-3:]))
+    elif is_url and used_ua:
+        # A UA that produced real metadata is the one the stream path should
+        # open with too, so share the learning (next play skips the retry).
+        stream_identity.remember(target, used_ua)
     _CACHE[key] = (time.time(), out)
     return out
 
@@ -203,7 +237,10 @@ async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
     hit = _SUBS_CACHE.get(key)
     if hit and time.time() - hit[0] < _SUBS_CACHE_TTL:
         return hit[1]
-    args = _probe_args(target, is_url=is_url)
+    # Learned player identity for network URLs (the first-ever probe uses
+    # the faithful MAG player UA); local files don't announce anything.
+    _ua = stream_identity.learned(target) if is_url else None
+    args = _probe_args(target, is_url=is_url, user_agent=_ua)
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
@@ -307,7 +344,8 @@ async def media_codecs(target: str, *, is_url: bool) -> dict | None:
     hit = _CODECS_CACHE.get(key)
     if hit and time.time() - hit[0] < _SUBS_CACHE_TTL:
         return hit[1]
-    args = _probe_args(target, is_url=is_url)
+    _ua = stream_identity.learned(target) if is_url else None
+    args = _probe_args(target, is_url=is_url, user_agent=_ua)
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)

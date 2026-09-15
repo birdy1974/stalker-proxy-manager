@@ -16,13 +16,29 @@ from app.services import tmdb as tmdb_mod
 from app.services.probe import PROBE_TIMEOUT, _probe_args
 
 
-def test_probe_args_impersonate_the_mag_box_for_network_streams():
+def test_probe_args_impersonate_the_mag_player_for_network_streams():
+    """The probe of a media URL presents the MAG box's embedded PLAYER
+    identity (Lavf53.32.100), not the portal browser identity: play/live.php
+    origins answer the browser UA on the media endpoint with HTTP 456 while
+    the player UA plays. ffmpeg's own default 'Lavf/61.x' is still never
+    sent - a bare libav UA gets 403s of its own."""
+    from app.services.stream_identity import PLAYER_UA, STB_UA
+
     args = _probe_args("http://cdn.example.com/x/1.ts", is_url=True)
     assert "-user_agent" in args
-    assert "Lavf" not in " ".join(args)          # never the default Lavf UA
+    assert args[args.index("-user_agent") + 1] == PLAYER_UA
+    assert "Lavf/" not in " ".join(args)          # never ffmpeg's own default
+    assert STB_UA not in " ".join(args)           # not the portal browser UA
     assert args[args.index("-referer") + 1] == "http://cdn.example.com/"
     assert "-reconnect" in args and "-rw_timeout" in args
     assert args[0] == "ffmpeg"                    # replaced by FFMPEG_BIN at runtime
+
+
+def test_probe_args_accept_a_ladder_chosen_ua():
+    args = _probe_args("http://cdn.example.com/x/1.ts", is_url=True,
+                       user_agent="Mozilla/5.0 (QtEmbedded; U; Linux; C) X")
+    assert args[args.index("-user_agent") + 1] == \
+        "Mozilla/5.0 (QtEmbedded; U; Linux; C) X"
 
 
 def test_probe_args_stay_plain_for_local_files():

@@ -66,7 +66,9 @@ log = logging.getLogger("spm.portal")
 STB_PROFILE_ENABLED = os.environ.get("SPM_STB_PROFILE", "1").strip().lower() not in (
     "0", "off", "no", "false")
 
-MAG_UA = STB_UA   # probe.py / stream_manager.py import this name for ffmpeg
+#: Portal/API client identity. The media pipeline uses identity.PLAYER_UA for
+#: stream endpoints instead - see app/services/stream_identity.py.
+MAG_UA = STB_UA
 
 # ---------------------------------------------------------------------------
 # link helpers (see create_link)

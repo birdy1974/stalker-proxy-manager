@@ -52,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import httpx  # noqa: E402
 
-from app.portal.identity import STB_UA  # noqa: E402
+from app.portal.identity import PLAYER_UA, STB_UA  # noqa: E402
 from app.services.redirect_guard import (  # noqa: E402
     VALIDATE_TIMEOUT, _referer_of, link_is_alive,
 )
@@ -180,9 +180,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--read", type=int, default=0, metavar="N",
                         help="also fetch N bytes of a plain GET and classify them "
                              "(e.g. 8192 = ~43 TS packets)")
-    parser.add_argument("--ua", default=STB_UA,
-                        help="User-Agent to probe with (default: the STB identity the "
-                             "guard uses)")
+    parser.add_argument("--ua", default=PLAYER_UA,
+                        help="User-Agent for the raw GET probe (default: the MAG "
+                             "embedded player identity the guard tries first, "
+                             "Lavf53.32.100; the guard itself walks player -> STB "
+                             "browser UA automatically)")
+    parser.add_argument("--browser", action="store_const", const=STB_UA,
+                        dest="ua",
+                        help="probe with the STB portal-browser UA instead of "
+                             "the player UA (the guard's fallback rung)")
     parser.add_argument("--no-referer", action="store_true",
                         help="omit the origin-root Referer the guard sends")
     args = parser.parse_args(argv)

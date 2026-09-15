@@ -232,7 +232,7 @@ async def test_transcode_template_goes_through_ffmpeg_with_quoted_path(
     seen: list[str] = []
 
     async def _spawn_stub(self, cmd_template: str, url: str, title: str | None = None,
-                          pace: bool = False):
+                          pace: bool = False, user_agent: str | None = None):
         seen.append(url)
         return await asyncio.create_subprocess_exec(
             "sh", "-c", "printf MPEGTS",
@@ -282,7 +282,7 @@ async def test_ts_url_remuxes_local_mp4_instead_of_serving_the_file(
     seen: list[tuple[str, str]] = []
 
     async def _spawn_stub(self, cmd_template: str, url: str, title: str | None = None,
-                          pace: bool = False):
+                          pace: bool = False, user_agent: str | None = None):
         seen.append((cmd_template, url))
         return await asyncio.create_subprocess_exec(
             "sh", "-c", "printf MPEGTS",
