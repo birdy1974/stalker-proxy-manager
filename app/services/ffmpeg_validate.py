@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import re
 import shlex
+import signal
 import time
 
 from ..config import FFMPEG_BIN
@@ -23,6 +26,25 @@ _NETONLY = re.compile(
 MAX_STDERR = 256 * 1024
 DEMO_TIMEOUT_S = 20
 PLAYLIST_DEMO_TIMEOUT_S = 30
+# Grace period for a killed ffmpeg to be reaped before we stop waiting on it.
+# A demo must always answer the GUI, even if a child process refuses to die.
+REAP_GRACE_S = 3.0
+
+# A demo is a ~2 s diagnostic, not a stream: it must fail FAST and report why.
+# The stream path deliberately retries a flaky live link for minutes
+# (-reconnect_delay_max 5 with unlimited attempts, plus a 10 s -rw_timeout per
+# attempt). Inside a demo that same policy is what produces the useless
+# "timed out after 30s / bytes=0 / rc=-9" result: ffmpeg was still politely
+# reconnecting to a dead link when the harness killed it, so the operator sees
+# a killed process instead of the panel's actual error.
+#
+# These caps are therefore applied to the demo argv only (never to the real
+# stream path): a short connect attempt, a short read timeout and a tight
+# reconnect backoff, so ffmpeg gives up and prints a real diagnostic
+# (403 / 404 / Connection timed out) well before our own kill fires.
+DEMO_RW_TIMEOUT_US = 5_000_000        # 5 s without data on the input socket
+DEMO_CONNECT_TIMEOUT_US = 5_000_000   # 5 s to establish the TCP connection
+DEMO_RECONNECT_DELAY_MAX = 2          # cap the backoff (template often says 5)
 
 
 def syntax_check(command: str) -> dict:
@@ -48,6 +70,49 @@ def syntax_check(command: str) -> dict:
             "detail": f"{len(toks)} tokens, placeholder at input"}
 
 
+def _set_input_opt(toks: list[str], flag: str, value: str) -> list[str]:
+    """Force `flag value` in front of the LAST -i (an input option).
+
+    Overwrites the template's value when the flag is already there, so a
+    template carrying `-reconnect_delay_max 5` cannot out-wait the demo.
+    """
+    try:
+        i_idx = max(n for n, t in enumerate(toks) if t == "-i")
+    except ValueError:
+        return toks
+    for n, t in enumerate(toks):
+        if t == flag and n < i_idx and n + 1 < len(toks):
+            toks[n + 1] = value
+            return toks
+    toks[i_idx:i_idx] = [flag, value]
+    return toks
+
+
+def _bound_network_input(toks: list[str]) -> list[str]:
+    """Make a network demo fail fast with ffmpeg's OWN error message.
+
+    Only touches argv when the input is an http(s) URL - a file or lavfi input
+    has no reconnect/timeout semantics and ffmpeg rejects the options outright.
+    """
+    try:
+        i_idx = max(n for n, t in enumerate(toks) if t == "-i")
+    except ValueError:
+        return toks
+    target = toks[i_idx + 1] if i_idx + 1 < len(toks) else ""
+    if not target.lower().startswith(("http://", "https://")):
+        return toks
+    toks = _set_input_opt(toks, "-rw_timeout", str(DEMO_RW_TIMEOUT_US))
+    toks = _set_input_opt(toks, "-timeout", str(DEMO_CONNECT_TIMEOUT_US))
+    # Only bound reconnection if the template already asked for it. ffmpeg
+    # aborts with "Unrecognized option" on a flag its build does not know, and
+    # -reconnect_delay_max is the one retry control present in every build that
+    # supports -reconnect at all ("give up once the backoff exceeds this").
+    if any(t.startswith("-reconnect") for t in toks[:i_idx]):
+        toks = _set_input_opt(toks, "-reconnect_delay_max",
+                              str(DEMO_RECONNECT_DELAY_MAX))
+    return toks
+
+
 def _bound_demo(toks: list[str]) -> list[str]:
     """Cap a demo run at 2s and never write HLS files during a probe."""
     if "-t" not in toks:
@@ -68,7 +133,7 @@ def _bound_demo(toks: list[str]) -> list[str]:
     # happens to carry -loglevel error would hide the very output we want.
     if "-loglevel" not in toks and "-v" not in toks:
         toks[1:1] = ["-loglevel", "info"]
-    return toks
+    return _bound_network_input(toks)
 
 
 def _argv(command: str, url: str, *, lavfi: bool) -> list[str]:
@@ -91,6 +156,53 @@ def _playlist_argv(command: str, url: str) -> list[str]:
     if not args:
         return _argv(command, url, lavfi=False)
     return _bound_demo(list(args))
+
+
+def _timeout_hint(err: str, out_n: int) -> str:
+    """Explain a killed demo, because 'bytes=0 rc=-9' names no culprit.
+
+    rc=-9 is OUR SIGKILL, so the interesting evidence is what ffmpeg had
+    already printed on stderr. The checks are ordered most-specific first.
+    """
+    low = (err or "").lower()
+    if "no such device" in low or "failed to initialise vaapi" in low \
+            or "device creation failed" in low or "cannot open the drm device" in low:
+        return ("hardware encoder unavailable (VAAPI/QSV device missing) — "
+                "map /dev/dri into the container or test a copy/software template")
+    if "403 forbidden" in low:
+        return "the panel answered 403 Forbidden (MAC/token rejected)"
+    if "404 not found" in low:
+        return "the panel answered 404 Not Found (stale link — re-fetch the source)"
+    if "401 unauthorized" in low or "http error 4" in low:
+        return "the panel refused the request (HTTP 4xx)"
+    if "will reconnect" in low or "connection timed out" in low:
+        return "the source never delivered data (connect/read timed out)"
+    if "connection refused" in low:
+        return "connection refused by the source host"
+    if "immediate exit requested" in low:
+        return "ffmpeg was still shutting down"
+    if out_n == 0 and "stream mapping" in low:
+        return "ffmpeg opened the input but produced no output (encoder stalled)"
+    if out_n == 0:
+        return "ffmpeg never opened the input"
+    return ""
+
+
+async def _terminate(proc) -> None:
+    """Kill the demo's whole process group and never block on the reap.
+
+    `proc.kill()` alone signals the direct child only. A stalled ffmpeg spawned
+    via a wrapper leaves a grandchild holding the stdout pipe, and the
+    subsequent `await proc.wait()` then hangs indefinitely - which turned a
+    30 s demo timeout into a request that never returned. SIGKILL goes to the
+    group, and the reap itself is bounded.
+    """
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    with contextlib.suppress(asyncio.TimeoutError):
+        await asyncio.wait_for(asyncio.shield(proc.wait()), REAP_GRACE_S)
 
 
 def _result(*, ok: bool, mode: str, detail: str, args: list[str] | None = None,
@@ -129,9 +241,15 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
     source = source_label or ("lavfi testsrc2" if lavfi else src)
     started = time.perf_counter()
     try:
+        # start_new_session: ffmpeg gets its own process group, so a timeout
+        # can kill the whole tree. Without it a wrapper script's child (or an
+        # ffmpeg that forked) survives, keeps the stdout pipe open and makes
+        # the reaping `proc.wait()` below block forever - the demo then never
+        # answers the GUI at all.
         proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            start_new_session=True)
     except FileNotFoundError:
         return _result(ok=False, mode=mode, detail=f"ffmpeg not found: {args[0]}",
                        args=args, source=source)
@@ -162,15 +280,16 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
     try:
         await asyncio.wait_for(asyncio.gather(_stdout(), _stderr(), proc.wait()), timeout)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        await proc.wait()
+        await _terminate(proc)
+        err_text = err_buf.decode(errors="replace")
+        detail = f"timed out after {timeout}s"
+        hint = _timeout_hint(err_text, out_n)
+        if hint:
+            detail = f"{detail} — {hint}"
         return _result(
-            ok=False, mode=mode, detail=f"timed out after {timeout}s",
+            ok=False, mode=mode, detail=detail,
             args=args, out_n=out_n, rc=proc.returncode,
-            err=err_buf.decode(errors="replace"),
+            err=err_text,
             ms=int((time.perf_counter() - started) * 1000),
             source=source)
 
