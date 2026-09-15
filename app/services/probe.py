@@ -137,6 +137,7 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
     binary_missing = False
     for ua in uas:
         args = _probe_args(target, is_url=is_url, user_agent=ua)
+        t0 = time.monotonic()
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdout=asyncio.subprocess.DEVNULL,
@@ -155,8 +156,10 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
             break
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
+        elapsed = time.monotonic() - t0
         if not is_url or stream_identity.http_open_error(
-                proc.returncode, err.decode("utf-8", "replace")) is None:
+                proc.returncode, err.decode("utf-8", "replace"),
+                elapsed) is None:
             used_ua = ua
             break
         proc = None

@@ -1151,6 +1151,7 @@ class StreamManager:
             choices = stream_identity.ladder(url)
         last: dict | None = None
         for rung, ua in enumerate(choices):
+            t0 = time.monotonic()
             proc = await self._spawn(command, url, title, pace=pace,
                                      user_agent=ua)
             if proc is None:
@@ -1171,8 +1172,22 @@ class StreamManager:
                 except Exception:  # noqa: BLE001
                     pass
             tail = self._stderr_tail(proc)
+            elapsed = time.monotonic() - t0
             last = {"rc": proc.returncode, "tail": tail, "stalled": stalled}
-            status = stream_identity.http_open_error(last["rc"], tail)
+            status = stream_identity.http_open_error(last["rc"], tail, elapsed)
+            if status is None and stalled is False and not template_owns:
+                # Explain why an apparently identity-shaped 4xx did NOT spend
+                # the other-UA rung: it arrived too slowly (panel connection
+                # slot check, not a WAF refusal) - the MAC fallback is the
+                # useful next step.
+                bare = stream_identity.http_open_error(last["rc"], tail)
+                if bare is not None and elapsed > stream_identity.FAST_REFUSAL_S:
+                    await db_log(
+                        "INFO", "stream",
+                        f"[{title}] origin answered HTTP {bare} after "
+                        f"{elapsed:.1f}s - too slow for an identity refusal "
+                        f"(usually: MAC connection slot still held); moving "
+                        f"to the next source/MAC instead of retrying the UA")
             if status is not None and rung + 1 < len(choices):
                 nxt = choices[rung + 1]
                 next_label = ("portal browser"

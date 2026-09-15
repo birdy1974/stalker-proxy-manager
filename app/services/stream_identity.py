@@ -45,7 +45,7 @@ from ..portal.identity import PLAYER_UA, STB_UA
 
 __all__ = ["PLAYER_UA", "STB_UA", "origin_of", "learned", "remember",
            "ladder", "reset", "http_open_error", "LADDER_ENABLED",
-           "UA_POLICY_4XX"]
+           "FAST_REFUSAL_S", "UA_POLICY_4XX"]
 
 #: HTTP client errors that can mean "I do not like the way this client looks"
 #: at an origin. ffmpeg's own HTTP layer only auto-retries 400/401/403/404;
@@ -55,6 +55,16 @@ __all__ = ["PLAYER_UA", "STB_UA", "origin_of", "learned", "remember",
 UA_POLICY_4XX = frozenset({401, 403, 404, 429, 456})
 
 LADDER_ENABLED = os.environ.get("SPM_STREAM_UA_LADDER", "1") == "1"
+
+#: A 4xx only counts as an *identity* answer when it comes back fast. A WAF
+#: that refuses the client shape answers in tens of milliseconds; a Stalker
+#: backend that returns 456 because the MAC's single connection slot is still
+#: held (a zap overlap or a playlist demo that just used the MAC) first works
+#: through its connection table - measured ~6.5 s on a real panel, while a
+#: healthy answer reaches first bytes in ~2 s. Retrying the slow case with
+#: the other UA cannot help (the slot is UA-independent) and would only add
+#: those seconds before the MAC/source fallback. Env-overridable.
+FAST_REFUSAL_S = float(os.environ.get("SPM_UA_LADDER_FAST_FAIL_S", "5"))
 
 #: origin host[:port] -> the UA that produced bytes there
 _origin_ua: dict[str, str] = {}
@@ -127,7 +137,8 @@ _RE_HTTP_STATUS = re.compile(r"HTTP error\s*(\d{3})")
 _RE_4XX_WRAPPER = re.compile(r"returned\s+4XX\s+Client\s+Error", re.I)
 
 
-def http_open_error(rc: int | None, stderr_tail: str) -> int | None:
+def http_open_error(rc: int | None, stderr_tail: str,
+                    elapsed: float | None = None) -> int | None:
     """The HTTP 4xx status ffmpeg died of while opening the INPUT, or None.
 
     None covers everything that is not an identity-policy answer: transport
@@ -135,6 +146,11 @@ def http_open_error(rc: int | None, stderr_tail: str) -> int | None:
     errors at output init, and any 2xx-then-EOF death. Only a clear 4xx from
     the HTTP layer - the documented 456 and the statuses in UA_POLICY_4XX -
     justifies spending the one ladder retry.
+
+    ``elapsed`` is the spawn-to-death time in seconds. When given, a refusal
+    that took longer than ``FAST_REFUSAL_S`` is treated as a SLOW, non-
+    identity answer (panel connection-slot/account check - see that constant)
+    and returns None, so the ladder does not delay the MAC/source fallback.
     """
     text = str(stderr_tail or "")
     m = _RE_HTTP_STATUS.search(text)
@@ -143,8 +159,11 @@ def http_open_error(rc: int | None, stderr_tail: str) -> int | None:
         # ffmpeg 7 wording for an unrecognised 4xx (456/429/418/...): the
         # numeric line may be absent in some builds, so recognise the wrapper.
         if rc in (1, 8) and _RE_4XX_WRAPPER.search(text):
-            return 456
+            status = 456
+        else:
+            return None
+    if not (400 <= status < 500 and status in UA_POLICY_4XX):
         return None
-    if 400 <= status < 500 and status in UA_POLICY_4XX:
-        return status
-    return None
+    if elapsed is not None and elapsed > FAST_REFUSAL_S:
+        return None
+    return status

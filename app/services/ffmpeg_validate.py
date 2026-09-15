@@ -333,7 +333,8 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
                 stream_identity.remember(src, ua)
             return res
         if ua is not None and idx + 1 < len(attempts) and stream_identity.http_open_error(
-                res.get("rc"), res.get("stderr", "")) is not None:
+                res.get("rc"), res.get("stderr", ""),
+                (res.get("ms") or 0) / 1000.0) is not None:
             # Origin refused this identity on the media endpoint: show the
             # ladder decision in the very tab the operator is watching.
             res["detail"] = (f"{res['detail']} - origin rejected this "

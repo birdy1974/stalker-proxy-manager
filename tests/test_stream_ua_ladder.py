@@ -76,6 +76,19 @@ def test_http_open_error_ignores_non_identity_failures():
     assert http_open_error(None, "") is None
 
 
+def test_http_open_error_distinguishes_fast_waf_from_slow_slot_refusal():
+    """Real panel trace (backup.xp1.tv): a 456 from the backend's connection
+    table arrived after ~6.5 s and was UA-independent (the second MAC played
+    the same browser-UA request in ~2 s); a WAF/client-shape refusal answers
+    in milliseconds. The slow answer must not spend the UA retry."""
+    err = "[http @ x] HTTP error 456"
+    assert http_open_error(8, err, elapsed=0.4) == 456      # WAF: fast refusal
+    assert http_open_error(8, err, elapsed=6.5) is None     # slot: too slow
+    assert http_open_error(8, err, elapsed=None) == 456     # no timing: trust it
+    # boundary uses the configurable constant
+    assert stream_identity.FAST_REFUSAL_S == 5.0
+
+
 def test_ladder_order_and_disable_switch(monkeypatch):
     assert ladder("http://cdn/live.php?t=1") == [PLAYER_UA, STB_UA]
     monkeypatch.setattr(stream_identity, "LADDER_ENABLED", False)
@@ -249,6 +262,34 @@ async def test_opener_silent_stall_does_not_spend_the_browser_retry(monkeypatch)
         _TPL_COPY, _URL, title="Ch", pace=False)
     assert proc is None and fail is not None and fail["stalled"] is True
     assert calls == [(_URL, PLAYER_UA)]  # a timeout is not an identity answer
+
+
+async def test_opener_slow_456_skips_the_ua_rung_and_goes_to_mac_fallback(monkeypatch):
+    """Panel connection-slot refusal: the 456 arrives after the fast-refusal
+    window (real trace: 6.5 s). Swapping the UA cannot free a slot, so the
+    opener must NOT spend the browser rung - it hands back the failure and
+    the pump walks the next MAC/source immediately."""
+    monkeypatch.setattr(stream_identity, "FAST_REFUSAL_S", 0.0)
+    calls = _install_spawn(
+        monkeypatch, lambda ua: _FakeProc([], rc=8, tail=_456))
+    proc, first, fail = await MANAGER._open_with_identity(
+        _TPL_COPY, _URL, title="Ch", pace=False)
+    assert proc is None and fail is not None and fail["rc"] == 8
+    assert calls == [(_URL, PLAYER_UA)]   # one attempt, straight to MAC fallback
+
+
+async def test_opener_fast_456_walks_player_to_browser_even_with_tight_window(monkeypatch):
+    """Sanity counterpart of the slow case: with the normal window a WAF that
+    answers a 456 immediately (the fakes answer in ~0 ms) still walks."""
+    monkeypatch.setattr(stream_identity, "FAST_REFUSAL_S", 5.0)
+    calls = _install_spawn(
+        monkeypatch,
+        lambda ua: _FakeProc([], rc=8, tail=_456) if ua == PLAYER_UA
+        else _FakeProc([_TS], rc=0))
+    proc, first, fail = await MANAGER._open_with_identity(
+        _TPL_COPY, _URL, title="Ch", pace=False)
+    assert first == _TS and fail is None
+    assert calls == [(_URL, PLAYER_UA), (_URL, STB_UA)]
 
 
 async def test_opener_local_file_skips_the_ladder(monkeypatch):
