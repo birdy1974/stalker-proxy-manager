@@ -170,7 +170,7 @@ async def test_preview_endpoint_streams_on_a_fresh_install(monkeypatch):
 
     seen = {}
 
-    async def _spawn_stub(self, cmd_template, url, title=None, pace=False):
+    async def _spawn_stub(self, cmd_template, url, title=None, pace=False, user_agent=None):
         seen["cmd"] = cmd_template
         return await asyncio.create_subprocess_exec(
             "sh", "-c", "printf MPEGTS",

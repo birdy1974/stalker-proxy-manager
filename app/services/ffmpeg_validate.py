@@ -11,6 +11,7 @@ import signal
 import time
 
 from ..config import FFMPEG_BIN
+from . import stream_identity
 from .ffmpeg_templates import REDIRECT_COMMAND, URL_PLACEHOLDER
 
 # 10-second H.264 360p clip (CC-BY Big Buck Bunny) — small enough to probe
@@ -149,10 +150,10 @@ def _argv(command: str, url: str, *, lavfi: bool) -> list[str]:
     return _bound_demo(shlex.split(cmd))
 
 
-def _playlist_argv(command: str, url: str) -> list[str]:
+def _playlist_argv(command: str, url: str, user_agent: str | None = None) -> list[str]:
     """Build argv the same way the stream path does (UA / referer / HLS opts)."""
     from .stream_manager import StreamManager
-    args = StreamManager._ffmpeg_argv(command, url)
+    args = StreamManager._ffmpeg_argv(command, url, user_agent=user_agent)
     if not args:
         return _argv(command, url, lavfi=False)
     return _bound_demo(list(args))
@@ -239,74 +240,106 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
         return _result(ok=False, mode=mode, detail=str(exc), source=source_label or src)
 
     source = source_label or ("lavfi testsrc2" if lavfi else src)
-    started = time.perf_counter()
-    try:
-        # start_new_session: ffmpeg gets its own process group, so a timeout
-        # can kill the whole tree. Without it a wrapper script's child (or an
-        # ffmpeg that forked) survives, keeps the stdout pipe open and makes
-        # the reaping `proc.wait()` below block forever - the demo then never
-        # answers the GUI at all.
-        proc = await asyncio.create_subprocess_exec(
-            *args, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True)
-    except FileNotFoundError:
-        return _result(ok=False, mode=mode, detail=f"ffmpeg not found: {args[0]}",
-                       args=args, source=source)
 
-    out_n = 0
-    err_buf = bytearray()
-
-    async def _stdout() -> None:
-        nonlocal out_n
-        assert proc.stdout
-        while True:
-            chunk = await proc.stdout.read(64 * 1024)
-            if not chunk:
-                return
-            out_n += len(chunk)
-
-    async def _stderr() -> None:
-        assert proc.stderr
-        while True:
-            chunk = await proc.stderr.read(4096)
-            if not chunk:
-                return
-            err_buf.extend(chunk)
-            if len(err_buf) > MAX_STDERR:
-                del err_buf[:len(err_buf) - MAX_STDERR]
-
-    timeout = PLAYLIST_DEMO_TIMEOUT_S if mode == "playlist" else DEMO_TIMEOUT_S
-    try:
-        await asyncio.wait_for(asyncio.gather(_stdout(), _stderr(), proc.wait()), timeout)
-    except asyncio.TimeoutError:
-        await _terminate(proc)
-        err_text = err_buf.decode(errors="replace")
-        detail = f"timed out after {timeout}s"
-        hint = _timeout_hint(err_text, out_n)
-        if hint:
-            detail = f"{detail} — {hint}"
-        return _result(
-            ok=False, mode=mode, detail=detail,
-            args=args, out_n=out_n, rc=proc.returncode,
-            err=err_text,
-            ms=int((time.perf_counter() - started) * 1000),
-            source=source)
-
-    rc = proc.returncode
-    err = err_buf.decode(errors="replace")
-    ms = int((time.perf_counter() - started) * 1000)
-    ok = rc == 0 and out_n > 0
-    if rc == 0 and out_n == 0:
-        detail = "ffmpeg exited 0 but produced no output bytes"
-        ok = False
-    elif rc not in (0, None) and out_n == 0:
-        detail = f"ffmpeg exited rc={rc} with no output"
-    elif rc not in (0, None):
-        # Some builds exit 255 after -t even when bytes flowed.
-        ok = out_n > 8000
-        detail = f"ffmpeg rc={rc}, {out_n} bytes in {ms} ms"
+    # Playlist demos hit a real resolved media URL, so they walk the same
+    # media-UA ladder as the stream path: panels that 456/403 the first
+    # identity get one retry with the other before the demo reports failure.
+    # A template that sets its own -user_agent opts out, exactly as in the
+    # pump. Every other mode is a single local attempt.
+    if mode == "playlist" and "-user_agent" not in (command or ""):
+        attempts = [(_playlist_argv(command, src, ua), ua)
+                    for ua in stream_identity.ladder(src)]
     else:
-        detail = f"{out_n} bytes in {ms} ms"
-    return _result(ok=ok, mode=mode, detail=detail, args=args, out_n=out_n,
-                   rc=rc, err=err, ms=ms, source=source)
+        attempts = [(args, None)]
+
+    async def _one(argv: list[str]) -> dict:
+        started = time.perf_counter()
+        try:
+            # start_new_session: ffmpeg gets its own process group, so a timeout
+            # can kill the whole tree. Without it a wrapper script's child (or an
+            # ffmpeg that forked) survives, keeps the stdout pipe open and makes
+            # the reaping `proc.wait()` below block forever - the demo then never
+            # answers the GUI at all.
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                start_new_session=True)
+        except FileNotFoundError:
+            return _result(ok=False, mode=mode, detail=f"ffmpeg not found: {argv[0]}",
+                           args=argv, source=source)
+
+        out_n = 0
+        err_buf = bytearray()
+
+        async def _stdout() -> None:
+            nonlocal out_n
+            assert proc.stdout
+            while True:
+                chunk = await proc.stdout.read(64 * 1024)
+                if not chunk:
+                    return
+                out_n += len(chunk)
+
+        async def _stderr() -> None:
+            assert proc.stderr
+            while True:
+                chunk = await proc.stderr.read(4096)
+                if not chunk:
+                    return
+                err_buf.extend(chunk)
+                if len(err_buf) > MAX_STDERR:
+                    del err_buf[:len(err_buf) - MAX_STDERR]
+
+        timeout = PLAYLIST_DEMO_TIMEOUT_S if mode == "playlist" else DEMO_TIMEOUT_S
+        try:
+            await asyncio.wait_for(asyncio.gather(_stdout(), _stderr(), proc.wait()), timeout)
+        except asyncio.TimeoutError:
+            await _terminate(proc)
+            err_text = err_buf.decode(errors="replace")
+            detail = f"timed out after {timeout}s"
+            hint = _timeout_hint(err_text, out_n)
+            if hint:
+                detail = f"{detail} — {hint}"
+            return _result(
+                ok=False, mode=mode, detail=detail,
+                args=argv, out_n=out_n, rc=proc.returncode,
+                err=err_text,
+                ms=int((time.perf_counter() - started) * 1000),
+                source=source)
+
+        rc = proc.returncode
+        err = err_buf.decode(errors="replace")
+        ms = int((time.perf_counter() - started) * 1000)
+        ok = rc == 0 and out_n > 0
+        if rc == 0 and out_n == 0:
+            detail = "ffmpeg exited 0 but produced no output bytes"
+            ok = False
+        elif rc not in (0, None) and out_n == 0:
+            detail = f"ffmpeg exited rc={rc} with no output"
+        elif rc not in (0, None):
+            # Some builds exit 255 after -t even when bytes flowed.
+            ok = out_n > 8000
+            detail = f"ffmpeg rc={rc}, {out_n} bytes in {ms} ms"
+        else:
+            detail = f"{out_n} bytes in {ms} ms"
+        return _result(ok=ok, mode=mode, detail=detail, args=argv, out_n=out_n,
+                       rc=rc, err=err, ms=ms, source=source)
+
+    last: dict | None = None
+    for idx, (argv, ua) in enumerate(attempts):
+        res = await _one(argv)
+        if res.get("ok"):
+            if ua is not None:
+                stream_identity.remember(src, ua)
+            return res
+        if ua is not None and idx + 1 < len(attempts) and stream_identity.http_open_error(
+                res.get("rc"), res.get("stderr", "")) is not None:
+            # Origin refused this identity on the media endpoint: show the
+            # ladder decision in the very tab the operator is watching.
+            res["detail"] = (f"{res['detail']} - origin rejected this "
+                             f"user-agent; retrying once with the other one")
+            last = res
+            continue
+        return res
+    return last if last is not None else {"ok": False, "mode": mode,
+                                          "detail": "no attempt ran"}

@@ -596,19 +596,39 @@ async def test_the_identity_knobs_are_driveable_through_the_control_endpoint(mon
     assert st["counters"]["profile_calls"] == 1, "refused once, not retried on 404"
 
 
-def test_the_announced_user_agent_is_one_value_for_the_whole_pipeline():
-    """Portal calls, stream probes and ffmpeg's -user_agent must agree.
+def test_the_announced_user_agents_split_between_portal_and_player():
+    """A real MAG box announces TWO identities and the pipeline must match
+    that split:
 
-    Three literals that start identical drift the first time someone changes one
-    to satisfy a panel - and then a probe reports success for a stream path that
-    is still 403ing, which is the worst kind of green light.
+      * portal.php API calls (handshake, lists, create_link, resolver) carry
+        the portal BROWSER UA (STB_UA, the QtEmbedded WebKit string);
+      * the resolved media URL is fetched by the box's embedded libav player,
+        which announces Lavf53.32.100 (PLAYER_UA). play/live.php origins 456
+        the browser UA on the media endpoint, which is exactly the
+        "redirect/direct plays but every ffmpeg template fails" case.
+
+    What must never drift: the portal side one-literal identity, and the
+    media side default that probe + argv share. The media path may
+    additionally retry once with the browser UA (stream_identity ladder);
+    that is tested in test_stream_ua_ladder.py.
     """
-    from app.portal import resolver
-    from app.services import probe, stream_manager
+    from app.portal import identity, resolver
+    from app.services import probe, stream_identity, stream_manager
 
-    assert client_mod.MAG_UA is STB_UA
-    assert resolver.MAG_UA is STB_UA
-    assert probe.MAG_UA is STB_UA and stream_manager.MAG_UA is STB_UA
+    # portal/API side: one browser value everywhere
+    assert client_mod.MAG_UA is identity.STB_UA
+    assert resolver.MAG_UA is identity.STB_UA
+    # media side: the faithful embedded player identity
+    assert stream_identity.PLAYER_UA == "Lavf53.32.100"
+    assert identity.PLAYER_UA is stream_identity.PLAYER_UA
+
+    argv = stream_manager.StreamManager._ffmpeg_argv(
+        "ffmpeg -i <url> -c copy -f mpegts pipe:1", "http://cdn/live.ts")
+    assert argv[argv.index("-user_agent") + 1] == stream_identity.PLAYER_UA
+    assert identity.STB_UA not in argv
+
+    pargs = probe._probe_args("http://cdn/live.ts", is_url=True)
+    assert pargs[pargs.index("-user_agent") + 1] == stream_identity.PLAYER_UA
 
 
 # =========================================================================== #

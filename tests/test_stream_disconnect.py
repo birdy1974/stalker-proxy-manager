@@ -88,7 +88,7 @@ class _FakeStalkerClient:
 # `await proc.stdout.read(CHUNK)`, which is where a real disconnect catches it
 # (a generator suspended at `yield` instead would not reproduce the bug).
 async def _spawn_stub(self, cmd_template: str, url: str, title: str | None = None,
-                      pace: bool = False):
+                      pace: bool = False, user_agent: str | None = None):
     return await asyncio.create_subprocess_exec(
         "sh", "-c", "while :; do head -c 65536 /dev/zero | tr '\\0' 'A'; sleep 0.15; done",
         stdin=asyncio.subprocess.DEVNULL,

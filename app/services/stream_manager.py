@@ -44,8 +44,9 @@ from ..models import (
 )
 from ..portal.account import mac_is_usable
 from ..portal.pool import POOL, PortalSession
-from ..portal.client import MAG_UA, PortalError, is_hls
+from ..portal.client import PortalError, is_hls
 from ..portal.links import plan_adopted, plan_for
+from . import stream_identity
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
                                HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
@@ -531,7 +532,8 @@ class StreamManager:
 
     # --------------------------------------------------------- ffmpeg spawn
     @staticmethod
-    def _network_input_options(cmd_text: str, url: str) -> str:
+    def _network_input_options(cmd_text: str, url: str,
+                               user_agent: str | None = None) -> str:
         """
         Give ffmpeg the identity of the STB it is impersonating, and the input
         options the resolved link itself requires.
@@ -539,7 +541,13 @@ class StreamManager:
         Identity: ffmpeg announces itself as "Lavf/61.x" and sends no Referer;
         plenty of Stalker panels - and the CDNs in front of them - answer that
         with 403 or 405 ("Method Not Allowed") on an otherwise perfectly valid
-        link.
+        link. The default is the UA of the MAG box's embedded media *player*
+        (Lavf53.32.100, see app/services/stream_identity.py): injecting the
+        portal BROWSER UA here makes play/live.php-style origins answer the
+        media endpoint with HTTP 456 ("unrecoverable") and zero bytes, which
+        reads as "redirect/direct works but every ffmpeg template fails". The
+        pump walks the player->browser UA ladder (stream_identity) and passes
+        the value to try; every other caller gets the faithful player UA.
 
         Per-input options: an HLS playlist additionally needs its segment
         protocols whitelisted or ffmpeg refuses to open it at all (see
@@ -551,7 +559,7 @@ class StreamManager:
             return cmd_text
         add: list[str] = []
         if "-user_agent" not in cmd_text:
-            add.append(f'-user_agent "{MAG_UA}"')
+            add.append(f'-user_agent "{user_agent or stream_identity.PLAYER_UA}"')
         if "-referer" not in cmd_text and "-headers" not in cmd_text:
             origin = url.split("://", 1)[-1].split("/", 1)[0]
             add.append(f'-referer "{url.split("://", 1)[0]}://{origin}/"')
@@ -697,7 +705,7 @@ class StreamManager:
 
     @staticmethod
     def _ffmpeg_argv(cmd_template: str, url: str, title: str | None = None,
-                     pace: bool = False) -> list[str] | None:
+                     pace: bool = False, user_agent: str | None = None) -> list[str] | None:
         """Render a template + input into an argv list, or None if unusable.
 
         Local paths are quoted so `shlex.split` keeps spaces/quotes as one
@@ -728,7 +736,8 @@ class StreamManager:
         is_net = url.lower().startswith(_NET_SCHEMES)
         insert = url if is_net else shlex.quote(url)
         cmd_text = StreamManager._network_input_options(
-            cmd_template.replace(URL_PLACEHOLDER, insert), url)
+            cmd_template.replace(URL_PLACEHOLDER, insert), url,
+            user_agent=user_agent)
         if not is_net:
             cmd_text = _NETONLY_OPTS.sub(" ", cmd_text)
         if cmd_text.startswith("ffmpeg"):
@@ -1113,8 +1122,72 @@ class StreamManager:
         out[at:at] = ins
         return out
 
+    async def _open_with_identity(self, command: str, url: str, *,
+                                  title: str, pace: bool
+                                  ) -> tuple[object | None, bytes, dict | None]:
+        """Spawn ffmpeg for a network URL, walking the media-UA ladder.
+
+        Returns ``(proc, first_chunk, None)`` once an identity produced bytes,
+        or ``(None, b"", fail)`` when nothing did, where ``fail`` is
+        ``{"rc", "tail", "stalled"}`` for the caller's existing warning, or
+        None when ffmpeg itself could not be spawned (bad template/binary -
+        the caller already logged it).
+
+        A template that pins its own ``-user_agent`` opts out of the ladder:
+        the operator's explicit choice wins. Otherwise the origin is offered
+        first its learned UA, then the MAG player UA, then - exactly once, on
+        a pre-first-byte HTTP 4xx - the portal browser UA. The identity that
+        produces bytes is remembered per origin host (stream_identity), so
+        the next play costs one spawn again. A silent stall/timeout is NOT an
+        identity answer and never spends the browser-UA retry.
+        """
+        template_owns = "-user_agent" in (command or "")
+        is_net = url.lower().startswith(_NET_SCHEMES)
+        # Local files have no media endpoint to negotiate identity with: one
+        # attempt, no respawn, nothing learned.
+        if template_owns or not is_net:
+            choices: list[str | None] = [None]
+        else:
+            choices = stream_identity.ladder(url)
+        last: dict | None = None
+        for rung, ua in enumerate(choices):
+            proc = await self._spawn(command, url, title, pace=pace,
+                                     user_agent=ua)
+            if proc is None:
+                return None, b"", None
+            first = await self._first_bytes(proc)
+            if first:
+                if ua:
+                    stream_identity.remember(url, ua)
+                return proc, first, None
+            stalled = proc.returncode is None
+            await self._kill_quiet(proc)
+            # The tail now drives the retry decision, so wait for the stderr
+            # reader to finish (it ends on process exit) before looking at it.
+            drain = getattr(proc, "spm_stderr_task", None)
+            if drain is not None:
+                try:
+                    await asyncio.wait_for(asyncio.shield(drain), timeout=1.0)
+                except Exception:  # noqa: BLE001
+                    pass
+            tail = self._stderr_tail(proc)
+            last = {"rc": proc.returncode, "tail": tail, "stalled": stalled}
+            status = stream_identity.http_open_error(last["rc"], tail)
+            if status is not None and rung + 1 < len(choices):
+                nxt = choices[rung + 1]
+                next_label = ("portal browser"
+                              if nxt == stream_identity.STB_UA else "media player")
+                await db_log(
+                    "INFO", "stream",
+                    f"[{title}] origin answered HTTP {status} to ffmpeg's "
+                    f"media request and sent 0 bytes - retrying once with the "
+                    f"{next_label} user-agent")
+                continue
+            return None, b"", last
+        return None, b"", last
+
     async def _spawn(self, cmd_template: str, url: str, title: str | None = None,
-                     pace: bool = False) -> asyncio.subprocess.Process | None:
+                     pace: bool = False, user_agent: str | None = None) -> asyncio.subprocess.Process | None:
         if (cmd_template or "").strip() == REDIRECT_COMMAND:
             await db_log("ERROR", "stream",
                          "cannot spawn the redirect template as ffmpeg "
@@ -1123,7 +1196,7 @@ class StreamManager:
         if "<out_dir>" in (cmd_template or ""):
             await db_log("ERROR", "stream", "template uses HLS file output; use mpegts for live proxying")
             return None
-        args = self._ffmpeg_argv(cmd_template, url, title, pace)
+        args = self._ffmpeg_argv(cmd_template, url, title, pace, user_agent)
         if not args:
             await db_log("ERROR", "stream", "unparseable ffmpeg template")
             return None
@@ -1136,7 +1209,10 @@ class StreamManager:
                 *args, stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
-            asyncio.get_running_loop().create_task(self._drain_stderr(proc))
+            # parked on the process so a failed identity-ladder rung can wait
+            # for ffmpeg's final stderr (the HTTP 4xx line drives the retry)
+            proc.spm_stderr_task = asyncio.get_running_loop().create_task(
+                self._drain_stderr(proc))
             return proc
         except FileNotFoundError:
             await db_log("ERROR", "stream", f"ffmpeg binary not found: {args[0]}")
@@ -1899,9 +1975,28 @@ class StreamManager:
                         # VOD/episode links are FILES (mkv/mp4 over the CDN): pace
                         # them to real time like local files, or the player hits
                         # EOF early. Live is paced by its own encoder - never -re.
-                        proc = await self._spawn(h.command, url, h.item_name,
-                                                 pace=(kind != "live"))
+                        # The opener walks the media-UA ladder (player identity
+                        # first, one browser-UA retry on an HTTP 4xx open error):
+                        # play/live.php origins answer the portal browser UA with
+                        # HTTP 456/403 and zero bytes while a player-shaped request
+                        # plays the very same play_token - see stream_identity.
+                        proc, first, open_fail = await self._open_with_identity(
+                            h.command, url, title=h.item_name,
+                            pace=(kind != "live"))
                         if proc is None:
+                            if open_fail is not None:
+                                who = portal.name + ("/xtream" if adopted
+                                                     else f"/{mac_row.mac}")
+                                if open_fail["stalled"]:
+                                    await db_log("WARNING", "stream",
+                                                 f"[{h.item_name}] no data within {STREAM_START_TIMEOUT}s from "
+                                                 f"{who} -> fallback")
+                                else:
+                                    # ffmpeg is gone and will never send a byte: say so
+                                    # (the [ffmpeg] log line has the stderr tail)
+                                    await db_log("WARNING", "stream",
+                                                 f"[{h.item_name}] ffmpeg exited rc={open_fail['rc']} before sending "
+                                                 f"data ({who}) -> fallback")
                             if locked is not None:
                                 self.mac_locks.pop(locked, None)
                             self.route_health.failed(src)
@@ -1914,25 +2009,6 @@ class StreamManager:
                         if not registered:
                             await self._register(h)
                             registered = True
-                        first = await self._first_bytes(proc)
-                        if not first:
-                            if proc.returncode is None:
-                                await db_log("WARNING", "stream",
-                                             f"[{h.item_name}] no data within {STREAM_START_TIMEOUT}s from "
-                                             f"{portal.name}/{mac_row.mac} -> fallback")
-                            else:
-                                # ffmpeg is gone and will never send a byte: say so
-                                # (the [ffmpeg] log line has the stderr tail)
-                                await db_log("WARNING", "stream",
-                                             f"[{h.item_name}] ffmpeg exited rc={proc.returncode} before sending "
-                                             f"data ({portal.name}/{mac_row.mac}) -> fallback")
-                            await self._kill_quiet(proc)
-                            if locked is not None:
-                                self.mac_locks.pop(locked, None)
-                            self.route_health.failed(src)
-                            if adopted:
-                                break
-                            continue
                         self.route_health.succeeded(h.route_key, src, mac_row)
                         await db_log("INFO", "stream",
                                      f"[{h.item_name}] playing via {portal.name}/"

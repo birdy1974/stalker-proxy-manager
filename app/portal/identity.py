@@ -82,9 +82,34 @@ STB_LANG = os.environ.get("SPM_STB_LANG", "en")
 #: probe that announces something else than the real path reports a result nobody
 #: will ever see. Overridable - some panels pin an older `stbapp ver:` string,
 #: and "the panel wants a different lie" is a supported configuration, not a bug.
+#: The UA the MAG's portal BROWSER announces: portal API calls (handshake,
+#: get_profile, ordered lists, create_link, the resolver, the redirect
+#: liveness probe) all take this value. Overridable - some panels pin an
+#: older `stbapp ver:` string, and "the panel wants a different lie" is a
+#: supported configuration, not a bug.
 STB_UA = os.environ.get("SPM_STB_UA") or (
     "Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 "
     "(KHTML, like Gecko) MAG200 stbapp ver: 4 rev: 2721 Safari/533.3")
+
+#: The UA a MAG's *embedded media player* announces while fetching the
+#: resolved stream URL (STB_UA is the portal browser's identity).
+#:
+#: A real MAG box contains two HTTP clients: the stbapp WebKit browser that
+#: talks to portal.php with the Mozilla/5.0 (QtEmbedded...) AppleWebKit UA,
+#: and the old libav/ffmpeg build the player hands play/live.php URLs to -
+#: which identifies itself as exactly this string. Ministra's own storage
+#: docs call it "the user agent of mag250" (stalker-middleware group, 2014),
+#: and modern independent Stalker clients re-derived the same split in 2026
+#: (StreamVault 1.0.15: "Lavf53.32.100 as the player User-Agent").
+#:
+#: Why it matters: play/live.php-style origins and the anti-proxy WAFs in
+#: front of them answer the *browser* UA on the media endpoint with HTTP 456
+#: ("unrecoverable", also seen as 403) while the same play_token plays for a
+#: player-shaped UA - the observed "redirect/direct plays, every
+#: ffmpeg-template channel fails" failure. Other panels do the reverse and
+#: refuse a bare libav UA, which is why the media path walks a short ladder
+#: instead of hardcoding either value - see app/services/stream_identity.py.
+PLAYER_UA = os.environ.get("SPM_PLAYER_UA") or "Lavf53.32.100"
 
 _MODELS = {"MAG200": "200", "MAG245": "245", "MAG250": "250", "MAG255": "255",
            "MAG322": "322", "MAG349": "349"}
