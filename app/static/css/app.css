@@ -36,6 +36,8 @@ body { background: var(--spm-bg); }
 .table-spm .filters input, .table-spm .filters select { font-size: .75rem; padding: .1rem .3rem; height: 26px; }
 
 .row-drag { cursor: grab; color: #9ca3af; }
+/* the grip of a row that cannot be dragged (a locked channel number) */
+.row-drag.row-locked { cursor: not-allowed; color: #d97706; }
 tr.dragging, div.dragging { opacity: .4; }
 
 .badge-status { font-weight: 500; min-width: 72px; }

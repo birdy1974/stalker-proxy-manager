@@ -212,3 +212,89 @@ def test_bounded_argv_is_still_shell_quotable():
     """The GUI echoes argv_text; it must stay a valid, re-runnable command."""
     args = fv._argv(F1TV_CMD, STALLED_URL, lavfi=False)
     assert shlex.split(" ".join(shlex.quote(a) for a in args)) == args
+
+
+# -------------------------------------------------------------------------- #
+# 2c. HTTP 456: the panel's non-standard "unrecoverable" answer
+#
+# Reported symptom (live #117 F1TV): the demo died in 294 ms with
+#     [http @ …] HTTP error 456
+#     Error opening input: Server returned 4XX Client Error, but not one
+#     of 40{0,1,3,4}
+# and the GUI showed only "ffmpeg exited rc=8 with no output". The 456 line
+# IS the diagnosis; the hint must be attached to the fast failure, not only
+# to the timeout path.
+# -------------------------------------------------------------------------- #
+
+def test_timeout_hint_explains_a_456():
+    err = ("[http @ 0x563bbb4f4680] HTTP error 456 \n"
+           "[in#0 @ 0x563bbb4d3b80] Error opening input: Server returned 4XX "
+           "Client Error, but not one of 40{0,1,3,4}\n"
+           "Error opening input file "
+           "http://backup.xp1.tv:80/play/live.php?mac=00:1A:79:44:EE:FA&"
+           "stream=127256&extension=ts&play_token=***")
+    hint = fv._timeout_hint(err, 0)
+    assert "456" in hint
+    assert "connection slot" in hint
+    assert "anti-proxy" in hint
+
+
+def test_timeout_hint_still_distinguishes_403_and_404():
+    assert "403" in fv._timeout_hint("[http @ 0x1] HTTP error 403 Forbidden", 0)
+    assert "404" in fv._timeout_hint("[http @ 0x1] HTTP error 404 Not Found", 0)
+    # and a 456 is never swallowed by the generic 4xx line
+    assert "403 forbidden" not in fv._timeout_hint(
+        "[http @ 0x1] HTTP error 456", 0).lower()
+
+
+async def test_fast_refusal_detail_carries_the_456_hint(monkeypatch, tmp_path):
+    """rc=8 with zero bytes used to report nothing beyond the rc; the stderr
+    (HTTP 456) is what tells the operator WHY."""
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "echo '[http @ 0x9] HTTP error 456' >&2\n"
+        "echo 'Error opening input: Server returned 4XX Client Error, "
+        "but not one of 40{0,1,3,4}' >&2\n"
+        "exit 8\n")
+    fake.chmod(0o755)
+    _use_fake_ffmpeg(monkeypatch, str(fake))
+    r = await fv.run_demo(f"ffmpeg -i {URL_PLACEHOLDER} -f mpegts pipe:1",
+                          mode="url", url=STALLED_URL)
+    assert r["ok"] is False
+    assert r["rc"] == 8
+    assert "rc=8" in r["detail"]
+    assert "456" in r["detail"]
+    assert "connection slot" in r["detail"]
+
+
+async def test_playlist_demo_does_not_spend_the_browser_rung_when_bytes_flew(
+        monkeypatch, tmp_path):
+    """A 456 AFTER output started is the panel cutting a live connection
+    mid-stream (slot pressure), not an identity refusal. Respawning with the
+    other UA would replace the real diagnosis ('rc=8, 5000 bytes') with a
+    clean second 456 - so the browser rung must stay unspent and the first
+    attempt's argv is what the operator sees."""
+    from app.services import stream_identity
+    stream_identity.reset()
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "head -c 5000 /dev/zero\n"
+        "echo '[http @ 0x9] HTTP error 456' >&2\n"
+        "exit 8\n")
+    fake.chmod(0o755)
+    _use_fake_ffmpeg(monkeypatch, str(fake))
+    try:
+        r = await fv.run_demo(f"ffmpeg -i {URL_PLACEHOLDER} -f mpegts pipe:1",
+                              mode="playlist", url=STALLED_URL)
+    finally:
+        stream_identity.reset()
+    assert r["ok"] is False
+    assert r["bytes"] == 5000
+    argv_text = " ".join(r["argv"])
+    # the FIRST rung (the player identity) is what ran last
+    assert stream_identity.PLAYER_UA in argv_text
+    assert stream_identity.STB_UA not in argv_text
+    # and no identity was "remembered" for this origin
+    assert stream_identity.learned(STALLED_URL) is None

@@ -174,6 +174,18 @@ def _timeout_hint(err: str, out_n: int) -> str:
         return "the panel answered 403 Forbidden (MAC/token rejected)"
     if "404 not found" in low:
         return "the panel answered 404 Not Found (stale link — re-fetch the source)"
+    # The non-standard 456 is its own diagnosis (see stream_identity): it is
+    # the Stalker/WAF "unrecoverable" answer, and the two causes are very
+    # different to fix. ffmpeg 7 prints it as "HTTP error 456" and/or the
+    # wrapper "Server returned 4XX Client Error, but not one of 40{0,1,3,4}".
+    if "http error 456" in low or "returned 4xx client error" in low:
+        return ("HTTP 456 is the panel's non-standard 'unrecoverable' answer "
+                "on the media endpoint, not a template error: either the MAC's "
+                "single connection slot was still held (a stream running on "
+                "that MAC — stop the channel on the box and re-run), or the "
+                "origin's anti-proxy layer refuses this server's requests "
+                "(taste the token with dev/probe-link.py --read 8192, or try "
+                "SPM_PLAYER_UA=… / SPM_STREAM_UA_LADDER=0)")
     if "401 unauthorized" in low or "http error 4" in low:
         return "the panel refused the request (HTTP 4xx)"
     if "will reconnect" in low or "connection timed out" in low:
@@ -316,6 +328,13 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
             ok = False
         elif rc not in (0, None) and out_n == 0:
             detail = f"ffmpeg exited rc={rc} with no output"
+            # A fast death (rc=8 on a refused input) is where ffmpeg's stderr
+            # carries the whole diagnosis (456/403/404); a bare rc used to be
+            # all the GUI saw, so the hint is attached here, not only on the
+            # timeout path.
+            hint = _timeout_hint(err, out_n)
+            if hint:
+                detail = f"{detail} — {hint}"
         elif rc not in (0, None):
             # Some builds exit 255 after -t even when bytes flowed.
             ok = out_n > 8000
@@ -332,9 +351,16 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
             if ua is not None:
                 stream_identity.remember(src, ua)
             return res
-        if ua is not None and idx + 1 < len(attempts) and stream_identity.http_open_error(
-                res.get("rc"), res.get("stderr", ""),
-                (res.get("ms") or 0) / 1000.0) is not None:
+        # `bytes == 0` matters: an identity refusal can only happen while
+        # opening the input, which never produces output bytes. A 4xx that
+        # appears AFTER bytes flowed is the panel cutting a live connection
+        # mid-stream (slot pressure, token rotation) - respawning with the
+        # other identity would replace that real diagnosis with a clean
+        # second 456, which is what a mid-stream death does not deserve.
+        if (ua is not None and idx + 1 < len(attempts) and res.get("bytes") == 0
+                and stream_identity.http_open_error(
+                    res.get("rc"), res.get("stderr", ""),
+                    (res.get("ms") or 0) / 1000.0) is not None):
             # Origin refused this identity on the media endpoint: show the
             # ladder decision in the very tab the operator is watching.
             res["detail"] = (f"{res['detail']} - origin rejected this "

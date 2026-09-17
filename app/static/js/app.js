@@ -282,7 +282,7 @@ class DataTable {
     for (const row of this.items) {
       const tr = el("tr", { "data-id": row.id });
       if (o.onRowClick) { tr.style.cursor = "pointer"; tr.addEventListener("click", (e) => { if (!e.target.closest("button,input,select,a")) o.onRowClick(row); }); }
-      if (o.dnd) { tr.draggable = true; this._bindDnd(tr, row); }
+      if (o.dnd) this._bindDnd(tr, row, !o.dnd.isLocked?.(row));
       if (o.selectable) {
         const cb = el("input", { type: "checkbox", class: "form-check-input" });
         cb.checked = this.selected.has(row.id);
@@ -302,10 +302,20 @@ class DataTable {
       this.tbody.append(tr);
     }
   }
-  _bindDnd(tr, row) {
-    const g = el("td", {}, el("i", { class: "bi bi-grip-vertical row-drag" }));
+  _bindDnd(tr, row, canDrag = true) {
+    const grip = el("i", { class: "bi bi-grip-vertical row-drag" });
+    if (!canDrag) {
+      // a locked row (a channel whose number is frozen) cannot itself be
+      // dragged - it still accepts drops, so others move around it
+      grip.className = "bi bi-lock-fill row-drag row-locked";
+      grip.title = "channel number locked - drag another row to move it around this one";
+    }
+    const g = el("td", {}, grip);
     tr.insertBefore(g, tr.children[1] || null);
-    tr.addEventListener("dragstart", (e) => { this._dragRow = row; tr.classList.add("dragging"); });
+    if (canDrag) {
+      tr.draggable = true;
+      tr.addEventListener("dragstart", (e) => { this._dragRow = row; tr.classList.add("dragging"); });
+    }
     tr.addEventListener("dragend", () => { tr.classList.remove("dragging"); $$("tr", this.tbody).forEach(x => x.classList.remove("drop-highlight")); });
     tr.addEventListener("dragover", (e) => { e.preventDefault(); tr.classList.add("drop-highlight"); });
     tr.addEventListener("dragleave", () => tr.classList.remove("drop-highlight"));

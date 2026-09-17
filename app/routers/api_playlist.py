@@ -27,8 +27,27 @@ from ..models import (
 from ..security import require_admin
 from ..services import item_info
 from ..services.db_logging import db_log
-from ..services.playlist_sync import ADD_KINDS, add_sources
+from ..services.playlist_sync import (
+    ADD_KINDS, add_sources, move_live_to_rank, renumber_live_numbers,
+)
 from ..services.titles import best_title
+
+
+async def _live_number_sync(db, r: LivePlaylist, payload: dict) -> None:
+    """Channel number <-> final playlist order, kept two ways.
+
+    Setting the number in the payload moves the channel to that position in
+    the final playlist (others push down); afterwards the numbers of ALL
+    enabled channels are re-derived from their positions, so a move-by-number
+    or an enable/disable can never leave number and order telling different
+    stories. (A reorder goes through /live/order, which renumbers itself.)
+    """
+    if r.enabled and payload.get("number") is not None:
+        try:
+            await move_live_to_rank(db, r.id, int(payload["number"]))
+        except (TypeError, ValueError):
+            pass
+    await renumber_live_numbers(db)
 
 router = APIRouter(prefix="/api/playlist", tags=["playlist"], dependencies=[Depends(require_admin)])
 
@@ -163,6 +182,7 @@ async def live_list(db=Depends(get_db), q: str = "", group: str = "", portal_id:
         chain = chains.get(r.id, [])
         items.append({"id": r.id, "custom_name": r.custom_name, "group_name": r.group_name,
                       "epg_id": r.epg_id, "logo": r.logo, "number": r.number,
+                      "lock_number": bool(r.lock_number),
                       "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""),
                       "enabled": r.enabled, "order": r.order, "chain": chain})
@@ -172,9 +192,9 @@ async def live_list(db=Depends(get_db), q: str = "", group: str = "", portal_id:
 
 def _apply_live_payload(r: LivePlaylist, payload: dict):
     for f in ("custom_name", "group_name", "epg_id", "logo", "number",
-              "ffmpeg_template_id", "enabled"):
+              "ffmpeg_template_id", "enabled", "lock_number"):
         if f in payload:
-            setattr(r, f, payload[f])
+            setattr(r, f, bool(payload[f]) if f == "lock_number" else payload[f])
 
 
 @router.post("/live")
@@ -189,6 +209,14 @@ async def live_create(payload: dict, db=Depends(get_db)):
     await db.flush()
     for i, sid in enumerate(payload.get("source_ids", []), 1):
         db.add(LivePlaylistSource(live_playlist_id=r.id, live_source_id=int(sid), priority=i))
+    if r.lock_number:
+        # place the channel first (with the number from this save, when given),
+        # let the renumber give it its number, then freeze it
+        r.lock_number = False
+        await _live_number_sync(db, r, payload)
+        r.lock_number = True
+    else:
+        await _live_number_sync(db, r, payload)
     await db.commit()
     await db_log("INFO", "playlist", f"custom channel '{name}' created "
                                      f"({len(payload.get('source_ids', []))} fallback sources)")
@@ -200,6 +228,9 @@ async def live_update(pid: int, payload: dict, db=Depends(get_db)):
     r = await db.get(LivePlaylist, pid)
     if not r:
         raise HTTPException(404, "not found")
+    was_enabled = r.enabled
+    was_locked = r.lock_number
+    prev_number = r.number
     _apply_live_payload(r, payload)
     if "source_ids" in payload:
         # explicit select: lazy r.sources would trigger sync IO -> 500 (async session)
@@ -215,6 +246,30 @@ async def live_update(pid: int, payload: dict, db=Depends(get_db)):
                 existing[sid].priority = i
             else:
                 db.add(LivePlaylistSource(live_playlist_id=r.id, live_source_id=sid, priority=i))
+    if was_locked and not r.lock_number:
+        # this save UNLOCKS: the frozen number may no longer match the
+        # channel's position, so it flows back with the renumber
+        await renumber_live_numbers(db)
+    elif not was_locked and r.lock_number:
+        # this save LOCKS the channel (possibly together with a new number):
+        # place it like any other channel, then freeze the number it ends up
+        # with - a number requested in the same save is honoured this way
+        r.lock_number = False
+        await _live_number_sync(db, r, payload)
+        r.lock_number = True
+    else:
+        if r.lock_number:
+            # a locked channel keeps its number, whatever the payload says
+            r.number = prev_number
+            if r.number is None and r.enabled:
+                # legacy lock without a number: give it its position number
+                r.lock_number = False
+                await renumber_live_numbers(db)
+                r.lock_number = True
+        if "number" in payload or (was_enabled != r.enabled):
+            # locked target: move_live_to_rank is a no-op for it, but the
+            # renumber still re-flows the other channels around its number
+            await _live_number_sync(db, r, payload)
     await db.commit()
     return {"ok": True}
 
@@ -225,23 +280,29 @@ async def live_delete(pid: int, db=Depends(get_db)):
     if not r:
         raise HTTPException(404, "not found")
     await db.delete(r)
+    # the channel leaves the final playlist, so the numbers of the ones below
+    # it shift up
+    await renumber_live_numbers(db)
     await db.commit()
     return {"ok": True}
 
 
-async def _set_order(db, model, payload: dict) -> dict:
+async def _set_order(db, model, payload: dict, *, renumber: bool = False) -> dict:
     """Drag&drop result: [{id, order}, ...] (only valid when sorted by order)."""
     for row in payload.get("items", []):
         r = await db.get(model, int(row["id"]))
         if r:
             r.order = int(row["order"])
+    if renumber:
+        # the final playlist moved, so the channel numbers follow it
+        await renumber_live_numbers(db)
     await db.commit()
     return {"ok": True}
 
 
 @router.post("/live/order")
 async def live_order(payload: dict, db=Depends(get_db)):
-    return await _set_order(db, LivePlaylist, payload)
+    return await _set_order(db, LivePlaylist, payload, renumber=True)
 
 
 @router.post("/vod/order")
@@ -267,6 +328,9 @@ async def live_bulk(payload: dict, db=Depends(get_db)):
     if payload.get("delete"):                     # "remove from playlist" in bulk
         for r in rows:
             await db.delete(r)
+        # the final playlist shrank: the numbers of the remaining channels
+        # shift up
+        await renumber_live_numbers(db)
         await db.commit()
         return {"ok": True, "count": len(rows), "deleted": len(rows)}
     for r in rows:
@@ -276,6 +340,9 @@ async def live_bulk(payload: dict, db=Depends(get_db)):
             r.ffmpeg_template_id = payload["ffmpeg_template_id"] or None
         if "enabled" in payload:
             r.enabled = bool(payload["enabled"])
+    if "enabled" in payload:
+        # channels entered/left the final playlist: re-derive the numbers
+        await renumber_live_numbers(db)
     await db.commit()
     return {"ok": True, "count": len(rows)}
 

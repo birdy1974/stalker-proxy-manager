@@ -65,12 +65,24 @@
     <div class="card mt-3">
       <div class="card-header"><i class="bi bi-download"></i> Backup / restore</div>
       <div class="card-body">
-        <div class="d-flex flex-wrap gap-2 mb-3">
+        <div class="d-flex flex-wrap gap-2 mb-1">
           <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=all"><i class="bi bi-download"></i> Full backup (all)</a>
           <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=portals">Portals</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=sources">Sources (live / vod / series / local)</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=playlists">Playlists (live / vod / series / local)</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=areas">Areas</a>
+          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=enigma2">Enigma2</a>
           <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=ffmpeg">FFmpeg</a>
           <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=users">Users</a>
           <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=settings">Settings</a>
+        </div>
+        <div class="small text-muted mb-2">
+          Sources and playlists carry your curation - enabled flags, custom names, logos,
+          epg ids, FFmpeg-template picks and fallback priorities - as name references, so a
+          backup restores onto another install. Importing them <b>restores</b>: existing rows
+          are updated to the backup's values, missing rows are added, nothing is deleted.
+          (The local-file backup covers the catalog rows; the media files themselves live
+          on disk.)
         </div>
         <label class="muted-label">Import (merge; duplicates are skipped)</label>
         <input class="form-control form-control-sm" type="file" id="import-file" accept="application/json">
@@ -182,7 +194,14 @@ $("#import-file").addEventListener("change", async (e) => {
   try {
     const data = JSON.parse(await f.text());
     const r = await api("/api/import", { method: "POST", body: { mode: "merge", data } });
-    $("#import-result").innerHTML = `<span class="text-success">imported ${r.imported}, skipped ${r.skipped.length}</span>`;
+    const parts = [`imported ${r.imported}`];
+    if (r.updated) parts.push(`updated ${r.updated}`);
+    $("#import-result").innerHTML =
+      `<span class="text-success">${parts.join(", ")}</span>` +
+      (r.skipped.length
+        ? `<span class="text-muted">, skipped ${r.skipped.length} ` +
+          `<span class="text-decoration-underline" title="${esc(r.skipped.join("\n"))}">details</span></span>`
+        : "");
   } catch (err) { $("#import-result").textContent = "invalid file: " + err.message; }
   e.target.value = "";
 });

@@ -394,6 +394,11 @@ class LivePlaylist(Base):
     ffmpeg_template_id: Mapped[int | None] = mapped_column(ForeignKey("ffmpeg_templates.id", ondelete="SET NULL"))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     order: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    #: the channel number is this channel's position in the final playlist,
+    #: re-derived on every reorder/delete/toggle - EXCEPT while locked: a
+    #: locked channel keeps its number no matter what the rest of the list
+    #: does, and the other channels renumber around it (skipping its number).
+    lock_number: Mapped[bool] = mapped_column(Boolean, default=False)
 
     sources: Mapped[list["LivePlaylistSource"]] = relationship(
         back_populates="item", cascade="all, delete-orphan", order_by="LivePlaylistSource.priority"

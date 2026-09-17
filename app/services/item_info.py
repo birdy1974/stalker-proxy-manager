@@ -17,6 +17,7 @@ from ..models import (
     SeriePlaylistSeason, SerieSeason, SerieSource, VodPlaylist,
     VodPlaylistSource, VodSource,
 )
+from ..portal.account import mac_is_usable
 from ..portal.client import apply_mac_placeholder, extract_url
 from ..portal.links import link_policy
 from ..portal.pool import POOL, PortalSession
@@ -37,19 +38,74 @@ def cmd_to_url(cmd: str) -> str | None:
     return extract_url(cmd) or None
 
 
-async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None) -> str | None:
+def choose_mac(portal, macs, *, avoid_busy: bool):
+    """Which MAC to resolve the URL through: the first one, or the first one
+    the stream path would actually use.
+
+    The stream path's candidate walk (`_pick_macs`) never opens a MAC the portal
+    says is unusable (banned/expired); with `avoid_busy` (the FFmpeg-tab demo)
+    a MAC that is streaming right now is skipped as well. A MAC holding an
+    ffmpeg pipe or another user's redirect lease holds the panel's single
+    connection slot, and a second concurrent media link on it is what the panel
+    answers with HTTP 456 - a demo run beside a playing box used to end as a
+    mysterious `rc=8, no bytes` on the FFmpeg tab. Getting no free MAC is an
+    error with the occupancy spelled out, not a fallback onto the busy MAC.
+    """
+    if not avoid_busy:
+        return macs[0] if macs else None
+    if not macs:
+        # A portal with no MACs at all is not "every MAC is busy" - the
+        # caller falls through to the raw stored cmd, as before.
+        return None
+    from .stream_manager import MANAGER     # lazy: stream_manager imports this module
+    notes = []
+    for m in macs:
+        if not mac_is_usable(getattr(m, "status", None)):
+            notes.append(f"{m.mac} (portal says {getattr(m, 'status', 'unknown')})")
+            continue
+        if MANAGER.is_mac_busy(m.id):
+            info = MANAGER.mac_occupancy(m.id) or {}
+            holder = info.get("holder") or "another stream"
+            item = info.get("item") or "?"
+            if info.get("reason") == "pipe":
+                state = "streaming via ffmpeg"
+            else:
+                state = f"redirect lease {info.get('remaining_s', 0):.0f}s left"
+            notes.append(f"{m.mac} ({state}; {holder}: {item})")
+            continue
+        return m
+    detail = "; ".join(notes) or "the portal has no MACs"
+    raise ValueError(
+        f"no free MAC on '{portal.name}' - {detail}. A MAC that is already "
+        "streaming holds the panel's single connection slot, and a second "
+        "concurrent media link on it is answered HTTP 456 (ffmpeg rc=8, no "
+        "bytes). Stop the channel on the box (or wait for the lease to "
+        "expire) and run the demo again.")
+
+
+async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None,
+                       avoid_busy: bool = False, used: dict | None = None) -> str | None:
     """The URL this item would really be played with - same rules as the stream path.
 
     `src` is the source row the popup is showing. Passing it matters: its stored
     link flags are what decide whether the portal has to be asked at all (R2), so
     without it the popup asks on every open and can report a URL the player never
     sees. A caller without a row gets today's behaviour (unknown flags = ask).
+
+    `avoid_busy` (the FFmpeg-tab demo sets it) resolves through a MAC that is
+    not streaming right now, or raises with the occupancy spelled out - see
+    `choose_mac`. `used` is an optional dict the caller fills for display
+    (`mac` / `portal` of the MAC the URL was resolved through).
     """
     portal = await db.get(Portal, portal_id) if portal_id else None
     if portal and portal.enabled and portal.resolved_url:
-        mac = (await db.execute(select(MacAddress).where(
-            MacAddress.portal_id == portal.id).order_by(MacAddress.order))).scalars().first()
+        macs = (await db.execute(select(MacAddress).where(
+            MacAddress.portal_id == portal.id).order_by(MacAddress.order))).scalars().all()
+        mac = choose_mac(portal, macs, avoid_busy=avoid_busy)
         if mac:
+            if used is not None:
+                used["mac"] = mac.mac
+                used["portal"] = portal.name
             flags = getattr(src, "link_flags", None) if src is not None else None
             force = bool(getattr(mac, "force_ch_link_check", False))
             # Classic-Stalker episode: cmd addresses the SEASON; only create_link
@@ -168,10 +224,15 @@ async def playlist_primary_input(db, kind: str, pid: int):
     return None, None, True, None
 
 
-async def resolve_playlist_input(db, kind: str, pid: int) -> dict:
+async def resolve_playlist_input(db, kind: str, pid: int,
+                                 *, avoid_busy: bool = False) -> dict:
     """Playable URL/path + labels for one enabled playlist item.
 
     Raises ValueError with a GUI-safe message when the item cannot be tested.
+
+    `avoid_busy=True` (the FFmpeg-tab demo) resolves through a MAC that is not
+    streaming right now, and names the MAC the URL was resolved through
+    (`mac` / `portal`) so the demo result says where it pointed.
     """
     if kind not in PLAYLIST_KINDS:
         raise ValueError("kind must be live|vod|series|local")
@@ -188,10 +249,13 @@ async def resolve_playlist_input(db, kind: str, pid: int) -> dict:
     if not cmd:
         raise ValueError(f"no usable source stream on '{name}'")
     if is_url:
-        url = await playable_url(db, cmd, portal_id, kind, src=src)
+        used: dict = {}
+        url = await playable_url(db, cmd, portal_id, kind, src=src,
+                                 avoid_busy=avoid_busy, used=used)
         if not url:
             raise ValueError(f"could not resolve a playable URL for '{name}'")
         return {"kind": kind, "id": pid, "name": name, "url": url, "is_url": True,
-                "source": src_name, "cmd": cmd}
+                "source": src_name, "cmd": cmd, "mac": used.get("mac", ""),
+                "portal": used.get("portal", "")}
     return {"kind": kind, "id": pid, "name": name, "url": cmd, "is_url": False,
-            "source": src_name, "cmd": cmd}
+            "source": src_name, "cmd": cmd, "mac": "", "portal": ""}
