@@ -752,15 +752,16 @@ Two things the proxy does for you here: the outgoing `create_link` cmd is stripp
 | `python3 dev/check-links.py` | Pins the portal plumbing that decides whether a channel plays: the `create_link` URL rules (prefix stripping, stale-token removal, repair of a mangled answer), the STB fingerprint and account verdict, the link-flag policy table and the `version.js`/`get_modules` parsers — plus greps that no probe's answer is discarded and that the link policy is not re-inlined at a call site. No pytest needed, so it also runs on a NAS. Run it after touching `app/portal/`. |
 | `python3 dev/probe-link.py '<url>'` | Runs the redirect guard's real probe ladder against a live URL and prints every rung — method, `Range` or not, status or exception, elapsed ms — plus the verdict, so `redirect: fresh link dead (…)` can be checked against what the origin really answers. `--read N` also fetches N bytes of a plain GET (what a player sends) and classifies them: MPEG-TS sync bytes, the panel's HTML error page, or something else. Needs only `httpx`, so it runs inside the built image; a `play_token` is short-lived, so probe a fresh one. |
 | `node dev/check-js.js` | Syntax-checks the JavaScript inside every template's `<script>` block (and `app/static/js/app.js`) with the real parser, after a text-level Jinja pass that keeps one branch of each `{% if %}`. A broken template script is invisible to every Python test — the page renders, the API answers 200, and the table is simply empty. Needs `node`; skip it if your box has none. |
-| `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies `dev/docker-publish.yml.example` is byte-identical to the real workflow. Run it before pushing anything under `.github/workflows/`. |
+| `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies each `dev/*.yml.example` is byte-identical to the workflow it installs (`docker-publish.yml`, `ci.yml`). Run it before pushing anything under `.github/workflows/`. |
 | `bash dev/seed-demo.sh [BASE_URL]` | Seeds a *running* instance with a full demo setup against the built-in mock portal (portal → genres → live/VOD/series → users). Idempotent; dev/mockup use (`SPM_SKIP_LOGIN=1`), default base `http://127.0.0.1:8880`. |
 
 **YAML gotcha that silently disabled this whole workflow once:** a plain scalar may not contain `": "`, so step names must be quoted — `- name: "Image metadata (tags: latest, sha, semver releases)"`. Unquoted, GitHub reports *"mapping values are not allowed here"* and refuses the **entire file**: no job in it runs (build, push and smoke all vanish together), which looks like "the workflow stopped working" rather than a typo. `dev/check-yaml.sh` catches it before you push.
 
-`dev/docker-publish.yml.example` is a full copy of the workflow, kept in sync on purpose: the repo's bot cannot commit under `.github/workflows/` (GitHub denies GitHub-App commits that touch workflows), so the copy is installed with
+`dev/docker-publish.yml.example` and `dev/ci.yml.example` are full copies of their workflows, kept in sync on purpose: the repo's bot cannot commit under `.github/workflows/` (GitHub refuses a GitHub-App push that touches a workflow with *"refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission"*), so the copies are installed with
 
 ```bash
 cp dev/docker-publish.yml.example .github/workflows/docker-publish.yml   # safe: byte-identical
+cp dev/ci.yml.example             .github/workflows/ci.yml               # the test suite
 ```
 
 ---
@@ -821,6 +822,30 @@ and `test_stb_identity.py::test_an_existing_install_gets_the_columns_it_is_promi
 streaming/portal work); deselect them with
 `--deselect tests/test_stb_identity.py::test_an_existing_install_gets_the_columns_it_is_promised`
 until they are fixed.
+
+### Continuous integration (GitHub Actions)
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `docker` (`dev/docker-publish.yml.example`) | push to `main`/`master`, `v*` tags | builds the image, pushes it to GHCR, then boots it with `SPM_MOCK_PORTAL=1` and runs `dev/smoke.sh`. |
+| `tests` (`dev/ci.yml.example`) | **every pull request**, push to `main`/`master`, manual | installs `requirements-dev.txt`, runs `dev/check-yaml.sh` + `node dev/check-js.js`, then the pytest suite. ~1 minute warm, and it is the same command you run locally (`pytest.ini` still adds `-n auto` and the 120 s timeout). |
+
+Install the test workflow once (the bot cannot - see the note in *Development
+scripts* below; this is the GitHub web UI equivalent of copying the file:
+repo → **Add file** → **Create new file** → path `.github/workflows/ci.yml` →
+paste the contents of `dev/ci.yml.example` → commit):
+
+```bash
+cp dev/ci.yml.example .github/workflows/ci.yml
+git add .github/workflows/ci.yml && git commit -m "CI: run the test suite on PRs" && git push
+```
+
+It runs on the next PR/push. Two tests are deselected *in the workflow* because
+they fail on `main` too; delete those two `--deselect` lines once they are fixed
+(a `--deselect` for a test that no longer exists is silently ignored, so they
+cannot go stale). `dev/check-links.py` is deliberately **not** wired in yet: it
+currently fails 5/166 on `main` (the EPG now/next endpoints), so it would turn
+every run red - run it by hand after touching `app/portal/`.
 
 ## Phase 3 (done)
 

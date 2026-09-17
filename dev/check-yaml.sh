@@ -8,8 +8,9 @@
 # Why this script exists. Two smoke-job regressions were caused by the test's
 # *harness*, not the app, and the second one by a copy-paste template:
 # dev/docker-publish.yml.example is what you (or a bot without the
-# `workflows` permission) install over .github/workflows/docker-publish.yml.
-# It had silently drifted from the real workflow AND contained invalid YAML:
+# `workflows` permission) install over .github/workflows/docker-publish.yml
+# (and dev/ci.yml.example over .github/workflows/ci.yml - same reason, same
+# trap). It had silently drifted from the real workflow AND contained invalid YAML:
 #
 #     - name: Image metadata (tags: latest, sha, semver releases)   # INVALID
 #     - name: "Image metadata (tags: latest, sha, semver releases)" # ok
@@ -21,8 +22,8 @@
 # contains a colon+space.
 #
 # So this script does two things: (1) parse every workflow/template it finds,
-# (2) verify dev/docker-publish.yml.example is byte-identical to
-# .github/workflows/docker-publish.yml (the template must be copyable as-is).
+# (2) verify every dev/*.yml.example is byte-identical to the workflow it
+# installs (the templates must be copyable as-is).
 #
 # Parser choice: PyYAML (python3 on a runner, or .venv / $SPM_PYTHON locally) ->
 # ruby -> node/js-yaml. If no parser is available it says so and exits 0: a
@@ -87,21 +88,34 @@ for f in "${files[@]}"; do
     fi
 done
 
-# --- template drift: the example must be a faithful copy of the workflow -----
-wf="$root/.github/workflows/docker-publish.yml"
-ex="$root/dev/docker-publish.yml.example"
-if [ -f "$wf" ] && [ -f "$ex" ]; then
-    echo "== yaml: template in sync"
-    if cmp -s "$wf" "$ex"; then
-        echo "   OK   dev/docker-publish.yml.example == .github/workflows/docker-publish.yml"
-    else
-        echo "   FAIL dev/docker-publish.yml.example differs from the real workflow;" >&2
-        echo "        'cp dev/docker-publish.yml.example ...' would install a stale file." >&2
-        diff -u "$wf" "$ex" | sed 's/^/          /' >&2 || true
-        echo "        fix: cp .github/workflows/docker-publish.yml dev/docker-publish.yml.example" >&2
-        fail=1
+# --- template drift: every example must be a faithful copy of its workflow ---
+# name=<workflow file under .github/workflows>  example=<copy to install>
+# `local` marks an example that has no workflow installed yet: the bot cannot
+# create one, so the file is only checked for YAML validity here.
+for pair in "docker-publish.yml:dev/docker-publish.yml.example" \
+            "ci.yml:dev/ci.yml.example:local"; do
+    wf_name="${pair%%:*}"; rest="${pair#*:}"
+    ex_name="${rest%%:*}"; mode="${rest#*:}"
+    wf="$root/.github/workflows/$wf_name"
+    ex="$root/$ex_name"
+    [ -f "$ex" ] || continue
+    if [ -f "$wf" ]; then
+        echo "== yaml: template in sync ($wf_name)"
+        if cmp -s "$wf" "$ex"; then
+            echo "   OK   $ex_name == .github/workflows/$wf_name"
+        else
+            echo "   FAIL $ex_name differs from .github/workflows/$wf_name;" >&2
+            echo "        'cp $ex_name ...' would install a stale file." >&2
+            diff -u "$wf" "$ex" | sed 's/^/          /' >&2 || true
+            echo "        fix: cp .github/workflows/$wf_name $ex_name" >&2
+            fail=1
+        fi
+    elif [ "$mode" = "local" ]; then
+        echo "== yaml: template not installed yet"
+        echo "   NOTE $ex_name has no .github/workflows/$wf_name counterpart;"
+        echo "        install it with: cp $ex_name .github/workflows/$wf_name"
     fi
-fi
+done
 
 if [ "$fail" -eq 0 ]; then
     echo
