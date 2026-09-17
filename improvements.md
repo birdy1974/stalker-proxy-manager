@@ -21,6 +21,9 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-17 (ffmpeg filters)
+- selectable extra video filters for fault-finding (Enigma2 audio-plays-but-black-picture): new template field "Video filter" (None + 16 presets: 5x VAAPI deinterlace, 2x QSV deinterlace, 4x software yadif/bwdif incl. bob, GPU round-trip no-op test, 8-bit 4:2:0 force, 2x field-flag force, null sanity check). Spliced first into -vf with per-decode-path snippets, full build/parse round-trip, mismatch/CPU/bob warnings, tooltips + Demo-button workflow. All stored commands byte-identical (default None). Suite: 772 passed, same 2 pre-existing failures as main.
+
 2026-09-17 (CI)
 - the suite only runs when I run it by hand - can GitHub run it on every change?
   -> new `dev/ci.yml.example`, installed with `cp dev/ci.yml.example .github/workflows/ci.yml` (the repo's bot is not allowed to create workflow files: GitHub refuses the push). The `tests` workflow runs on every pull request, on pushes to main and on demand: installs requirements-dev.txt, runs dev/check-yaml.sh and dev/check-js.js, then pytest - the same 716 passed / 5 skipped as locally, `-n auto` and the 120 s timeout come from pytest.ini. dev/check-yaml.sh now verifies BOTH examples stay byte-identical to their installed workflow and prints the install hint while ci.yml is missing.

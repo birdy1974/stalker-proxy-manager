@@ -68,6 +68,27 @@
                 <select class="form-select form-select-sm ff-field" id="f-profile"><option>high</option><option>main</option><option>baseline</option></select></div>
               <div class="col-3"><label class="muted-label">Level</label>
                 <select class="form-select form-select-sm ff-field" id="f-level"><option>4.1</option><option>4.0</option><option>3.1</option><option>5.1</option></select></div>
+              <div class="col-6"><label class="muted-label" title="Extra video filter, spliced FIRST into -vf (before scale/fps): each preset isolates one suspect when the picture misbehaves - interlaced source, 10-bit pixels, wrong field flags, broken surface handling. VAAPI/QSV presets stay on the GPU; (CPU) presets download frames, filter on the CPU and re-upload (diagnostic, expect CPU load). Bob presets output one frame per field (25i becomes 50p), so pair them with FPS 50 or src - with FPS 25 the fps filter halves it straight back. A preset that does not fit the Hardware/decoder choice is left out of the command and flagged beside it.">Video filter</label>
+                <select class="form-select form-select-sm ff-field" id="f-vf_preset">
+                  <option value="none" selected>None (default, current behaviour)</option>
+                  <option value="deint-vaapi-frame">Deinterlace (VAAPI, frame rate kept)</option>
+                  <option value="deint-vaapi-auto">Deinterlace (VAAPI, interlaced frames only)</option>
+                  <option value="deint-vaapi-field">Deinterlace bob (VAAPI, double frame rate)</option>
+                  <option value="deint-vaapi-bob">Deinterlace bob, pinned algorithm (VAAPI mode=bob)</option>
+                  <option value="deint-vaapi-motion">Deinterlace motion-adaptive (VAAPI)</option>
+                  <option value="deint-qsv-advanced">Deinterlace advanced (QSV)</option>
+                  <option value="deint-qsv-bob">Deinterlace bob (QSV)</option>
+                  <option value="yadif-frame">Deinterlace yadif (CPU, frame rate kept)</option>
+                  <option value="yadif-bob">Deinterlace yadif bob (CPU, double frame rate)</option>
+                  <option value="bwdif-frame">Deinterlace bwdif (CPU, frame rate kept)</option>
+                  <option value="bwdif-bob">Deinterlace bwdif bob (CPU, double frame rate)</option>
+                  <option value="hw-roundtrip">GPU download/upload round-trip (no-op test)</option>
+                  <option value="pixfmt-420p">Force 8-bit 4:2:0 (10-bit/HDR sources)</option>
+                  <option value="setfield-prog">Force progressive flag</option>
+                  <option value="setfield-tff">Force top-field-first flag</option>
+                  <option value="null">Null (filter-graph sanity check)</option>
+                </select></div>
+              <div class="col-6 small text-muted">Fault-finding bank: start with the VAAPI deinterlacer for interlaced live TV, then narrow it down with the Demo buttons. Bob wants FPS 50; (CPU) presets load the CPU.</div>
               <div class="col-4 d-flex align-items-end"><div class="form-check form-switch">
                 <input class="form-check-input ff-field" type="checkbox" id="f-low_power"><label class="form-check-label small">VAAPI low-power (LP encoder)</label></div></div>
               <div class="col-3"><label class="muted-label">VAAPI rate control</label>
@@ -136,7 +157,7 @@
 const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","video_codec","video_bitrate",
   "maxrate","bufsize","fps","gop","profile","level","low_power","rc_mode","global_quality","async_depth",
   "audio_codec","audio_bitrate","audio_channels",
-  "audio_rate","output_format","subs","extra_input","extra_output"];
+  "audio_rate","output_format","subs","vf_preset","extra_input","extra_output"];
 let current = null, templates = [];
 const isRedirectTpl = (t) => (t.command || "").trim() === "@redirect";
 
