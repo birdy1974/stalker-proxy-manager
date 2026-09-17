@@ -125,9 +125,11 @@ async def _reset_portal_pool():
     await POOL.close_all()
     POOL.hits = POOL.misses = 0
     MANAGER.redirect_leases.clear()
+    MANAGER.lease_meta.clear()          # who held the lease, not just until when
     MANAGER.route_health = _RouteHealth()
     yield
     await POOL.close_all()
     POOL.hits = POOL.misses = 0
     MANAGER.redirect_leases.clear()
+    MANAGER.lease_meta.clear()
     MANAGER.route_health = _RouteHealth()

@@ -246,6 +246,19 @@ class StreamHandle:
     proc: asyncio.subprocess.Process | None = None
     dead: bool = False
     route_key: tuple | None = None
+    #: Seconds the fallback engine may spend looking for a first byte (see
+    #: STREAM_START_BUDGET). The output guard waits at least this long + slack,
+    #: so the engine is never cut off mid-chain by a fixed 25s timer.
+    start_budget: float = 0.0
+    #: One line per candidate MAC/source that did not produce data, oldest
+    #: first. This is what turns "[Npo 1] produced no data within 25s" into a
+    #: report that names the MACs and the reason each one failed.
+    attempts: list[str] = field(default_factory=list)
+    #: Set when the engine stops early (budget spent) - merged into the 502.
+    fail_note: str = ""
+    #: Set when a redirect lease held by a *different* play of the same user was
+    #: taken over (a zap), so the log can say why the "busy" MAC was used.
+    took_over_lease: bool = False
 
     def public(self) -> dict:
         return {"id": self.id, "kind": self.kind, "item_name": self.item_name,
@@ -253,6 +266,19 @@ class StreamHandle:
                 "mac": self.mac, "template_name": self.template_name,
                 "started": self.started, "bytes_sent": self.bytes_sent,
                 "url": self.url, "pid": self.proc.pid if self.proc else None}
+
+    def note_attempt(self, text: str) -> None:
+        """Remember one candidate outcome (bounded, oldest dropped)."""
+        if not text:
+            return
+        self.attempts.append(str(text))
+        del self.attempts[:-ATTEMPT_TRACE]
+
+    @property
+    def trace(self) -> str:
+        """The attempt trace as one log-friendly line, '' when nothing failed."""
+        return "; ".join(self.attempts)
+
 
 
 # How long a handle may sit in the registry with its ffmpeg process gone and no
@@ -280,6 +306,25 @@ REDIRECT_LEASE_S = float(os.environ.get("SPM_REDIRECT_LEASE_S", "180.0"))
 ZAP_RETRY = os.environ.get("SPM_ZAP_RETRY", "1") == "1"
 ZAP_RETRY_DELAY = float(os.environ.get("SPM_ZAP_RETRY_DELAY", "2.5"))
 
+#: How long the fallback engine may keep walking MACs and sources before it
+#: gives up and lets the caller answer 502.
+#:
+#: Without a cap the chain time is `candidates x STREAM_START_TIMEOUT x passes`
+#: - which for two MACs and the zap retry is 50s, for three 74s - and the output
+#: guard (SPM_FIRST_CHUNK_TIMEOUT, 25s) fired long before the engine was done.
+#: The player then got a 502 while the engine was still working: the retry pass
+#: never ran at all. The guard is a backstop now, this is the real budget.
+#: 0 = no cap (the old, unbounded behaviour).
+STREAM_START_BUDGET = float(os.environ.get("SPM_STREAM_START_BUDGET", "75"))
+#: Slack added to the engine's budget before the output guard calls the pipe
+#: dead. Portal handshakes, create_link round trips and killing a stalled ffmpeg
+#: all happen outside the STREAM_START_TIMEOUT windows.
+START_BUDGET_SLACK = float(os.environ.get("SPM_START_BUDGET_SLACK", "10"))
+#: How many per-candidate outcomes to keep on the handle for the final "no data"
+#: report. Enough to name every MAC of a normal portal, bounded so a 40-source
+#: chain cannot fill the log with one message.
+ATTEMPT_TRACE = 6
+
 
 class StreamManager:
     def __init__(self) -> None:
@@ -288,12 +333,37 @@ class StreamManager:
         # Soft occupancy for redirect/direct plays: mac_id -> monotonic expiry.
         # See REDIRECT_LEASE_S. Expired entries are dropped lazily on read.
         self.redirect_leases: dict[int, float] = {}
+        # Who took the lease (mac_id -> {holder, item, kind, ref, at, seconds}).
+        # Needed because a lease is time-bounded, not exact: a quick zap by the
+        # *same* user must not be blocked by the channel it just left, while a
+        # different user's MAC stays off-limits.
+        self.lease_meta: dict[int, dict] = {}
         self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
         self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
         self.route_health = _RouteHealth()
 
     # ------------------------------------------------------------- occupancy
-    def is_mac_busy(self, mac_id: int | None) -> bool:
+    def _expire_lease(self, mac_id: int | None) -> None:
+        """Drop an expired lease (and its holder record) if it is past its time."""
+        if mac_id is None:
+            return
+        exp = self.redirect_leases.get(mac_id)
+        if exp is not None and exp <= time.monotonic():
+            self.redirect_leases.pop(mac_id, None)
+            self.lease_meta.pop(mac_id, None)
+
+    def lease_holder(self, mac_id: int | None) -> str | None:
+        """Which user the current redirect lease belongs to (None when free).
+
+        An anonymous lease (a caller that did not say who it is playing for -
+        the admin GUI's quick play, the test doubles) has no holder, so nothing
+        may take it over.
+        """
+        self._expire_lease(mac_id)
+        meta = self.lease_meta.get(mac_id or -1) or {}
+        return str(meta.get("holder") or "") or None
+
+    def is_mac_busy(self, mac_id: int | None, requester: str | None = None) -> bool:
         """True when a MAC must not be re-handshaked or handed to another play.
 
         Two independent signals:
@@ -302,24 +372,43 @@ class StreamManager:
           * ``redirect_leases`` — we just 302'd a player to the panel CDN with
             this MAC's create_link token. We no longer see the socket, so the
             lease is time-bounded rather than exact.
+
+        ``requester`` is the user asking *now*. A lease the same user took is
+        not "someone else's stream": it is the channel that box just zapped
+        away from, and holding it against the zap sends the request to a worse
+        MAC for no reason (the panel, not this lease, is the authority on
+        whether the slot is really free). So the same user may take it over -
+        a *different* user never can. Hard ``mac_locks`` (a live ffmpeg pipe)
+        are never taken over; those are real concurrent streams.
         """
         if mac_id is None:
             return False
         if mac_id in self.mac_locks:
             return True
-        exp = self.redirect_leases.get(mac_id)
-        if exp is None:
+        self._expire_lease(mac_id)
+        if mac_id not in self.redirect_leases:
             return False
-        if exp <= time.monotonic():
-            self.redirect_leases.pop(mac_id, None)
-            return False
-        return True
+        holder = (self.lease_meta.get(mac_id) or {}).get("holder")
+        return not (requester and holder and holder == requester)
 
-    def lease_mac(self, mac_id: int | None, *, seconds: float = REDIRECT_LEASE_S) -> None:
+    def lease_mac(self, mac_id: int | None, *, seconds: float = REDIRECT_LEASE_S,
+                  holder: str | None = None, item: str = "", kind: str = "",
+                  ref: int | None = None) -> None:
         """Mark a MAC busy for a short window after a redirect/direct resolve."""
         if mac_id is None:
             return
-        self.redirect_leases[mac_id] = time.monotonic() + max(1.0, float(seconds))
+        window = max(1.0, float(seconds))
+        self.redirect_leases[mac_id] = time.monotonic() + window
+        self.lease_meta[mac_id] = {"holder": holder or None, "item": item or "",
+                                   "kind": kind or "", "ref": ref,
+                                   "seconds": round(window, 1),
+                                   "at": time.time()}
+
+    def lease_remaining(self, mac_id: int | None) -> float:
+        """Seconds left on a redirect lease (0.0 when free)."""
+        self._expire_lease(mac_id)
+        exp = self.redirect_leases.get(mac_id)
+        return max(0.0, exp - time.monotonic()) if exp is not None else 0.0
 
     def release_mac(self, mac_id: int | None) -> None:
         """Drop every occupancy record for one MAC (delete/edit cleanup)."""
@@ -327,6 +416,7 @@ class StreamManager:
             return
         self.mac_locks.pop(mac_id, None)
         self.redirect_leases.pop(mac_id, None)
+        self.lease_meta.pop(mac_id, None)
 
     def release_macs(self, mac_ids) -> None:
         for mid in mac_ids or ():
@@ -334,11 +424,48 @@ class StreamManager:
 
     def busy_mac_ids(self) -> set[int]:
         """mac_ids currently locked by ffmpeg or holding a live redirect lease."""
-        now = time.monotonic()
-        expired = [mid for mid, exp in self.redirect_leases.items() if exp <= now]
-        for mid in expired:
-            self.redirect_leases.pop(mid, None)
+        for mid in list(self.redirect_leases):
+            self._expire_lease(mid)
         return set(self.mac_locks) | set(self.redirect_leases)
+
+    def mac_occupancy(self, mac_id: int | None) -> dict | None:
+        """Why a MAC is (not) usable right now, for the GUI and the logs.
+
+        Deliberately side-effect free: it neither creates nor extends anything,
+        so asking the question can never keep a lease alive. Expired leases are
+        reported as free, and the caller is told which kind of busy this is -
+
+          ``pipe``  an ffmpeg pipe we own (a real stream, right now)
+          ``lease`` a post-302 redirect lease: the player is on the panel's CDN,
+                     so this is "probably still watching", with N seconds left
+        """
+        if mac_id is None:
+            return None
+        holder = self.lease_holder(mac_id)
+        stream_id = self.mac_locks.get(mac_id)
+        if stream_id:
+            h = self.streams.get(stream_id)
+            return {"busy": True, "reason": "pipe", "stream_id": stream_id,
+                    "holder": (h.user_name if h else None),
+                    "item": (h.item_name if h else ""),
+                    "remaining_s": 0.0}
+        remaining = self.lease_remaining(mac_id)
+        if remaining <= 0:
+            return {"busy": False, "reason": "free", "remaining_s": 0.0}
+        meta = self.lease_meta.get(mac_id) or {}
+        return {"busy": True, "reason": "lease", "remaining_s": round(remaining, 1),
+                "holder": holder, "item": meta.get("item") or "",
+                "kind": meta.get("kind") or "", "ref": meta.get("ref"),
+                "seconds": meta.get("seconds")}
+
+    def occupancy_map(self) -> dict[int, dict]:
+        """Every MAC with something to say right now (busy ones only)."""
+        out: dict[int, dict] = {}
+        for mid in self.busy_mac_ids():
+            info = self.mac_occupancy(mid)
+            if info and info.get("busy"):
+                out[int(mid)] = info
+        return out
 
     def busy_mac_addresses(self) -> set[str]:
         """Uppercased MAC strings currently occupied (for health-skip lookups).
@@ -1580,6 +1707,42 @@ class StreamManager:
 
     # ---------------------------------------------------------- link (R2)
     @staticmethod
+    def start_budget(chain: list, *, kind: str = "live") -> float:
+        """How long the engine may look for a first byte before it gives up.
+
+        The chain time is `passes x candidates x STREAM_START_TIMEOUT` plus one
+        ZAP_RETRY_DELAY per extra pass. Capped by SPM_STREAM_START_BUDGET so a
+        playlist with six sources cannot hang a player for four minutes; the
+        output guard adds START_BUDGET_SLACK on top, which is what makes the
+        guard a backstop instead of a race.
+        """
+        if kind == "local" or not chain:
+            # Local files never walk MACs: one spawn, one start window.
+            return STREAM_START_TIMEOUT if chain else 0.0
+        candidates = sum(max(1, len(macs)) for _s, _p, macs in chain)
+        passes = 2 if (ZAP_RETRY and chain) else 1
+        raw = passes * candidates * STREAM_START_TIMEOUT + (passes - 1) * ZAP_RETRY_DELAY
+        return min(raw, STREAM_START_BUDGET) if STREAM_START_BUDGET > 0 else raw
+
+    def _occupied_note(self, mac_row) -> str:
+        """One MAC's occupancy as a phrase for a log line ('' when free)."""
+        info = self.mac_occupancy(getattr(mac_row, "id", None))
+        if not info or not info.get("busy"):
+            return ""
+        mac = getattr(mac_row, "mac", "?")
+        if info.get("reason") == "pipe":
+            who = info.get("holder") or "?"
+            return f"{mac} streaming via ffmpeg ({who})"
+        who = info.get("holder") or "unknown user"
+        item = info.get("item") or "?"
+        return (f"{mac} redirect lease {info.get('remaining_s', 0):.0f}s left "
+                f"({who}, {item})")
+
+    def occupancy_for_stats(self) -> dict:
+        """Redirect leases and ffmpeg pipes as plain MAC ids, for the GUI."""
+        return {str(mid): info for mid, info in self.occupancy_map().items()}
+
+    @staticmethod
     def _macs_for(portal, src, macs):
         """The MAC rows a chain step may walk, or the one thing that replaces them.
 
@@ -1612,7 +1775,8 @@ class StreamManager:
                         allow_direct=bool(getattr(portal, "direct_links", True)))
 
     # ------------------------------------------------------------ the pump
-    async def resolve(self, kind: str, ref_id: int) -> tuple[str | None, str]:
+    async def resolve(self, kind: str, ref_id: int,
+                      requester: str | None = None) -> tuple[str | None, str]:
         """
         Resolve a playable portal URL WITHOUT starting ffmpeg.
 
@@ -1658,11 +1822,21 @@ class StreamManager:
                     # ffmpeg lock OR a recent redirect lease — both mean "leave this
                     # MAC alone". Redirects never enter mac_locks (we no longer hold
                     # the socket after the 302), so the lease is the only signal.
-                    if mac_row is not None and self.is_mac_busy(mac_row.id):
+                    # The same user's own lease is exempt: that is the channel this
+                    # box just zapped away from (see is_mac_busy), not another
+                    # viewer, and skipping it sends the zap to a worse MAC.
+                    if mac_row is not None and self.is_mac_busy(mac_row.id,
+                                                                requester=requester):
                         await db_log("INFO", "stream",
                                      f"[{item_name}] redirect: mac {mac_row.mac} busy "
                                      "(ffmpeg pipe or redirect lease) -> skip")
                         continue
+                    if mac_row is not None and self.lease_holder(mac_row.id) == requester \
+                            and requester:
+                        await db_log("INFO", "stream",
+                                     f"[{item_name}] redirect: taking over the redirect "
+                                     f"lease on {mac_row.mac} held by {requester} "
+                                     "(the channel this zap left)")
                     # Decided first, before any portal session exists: the point of
                     # R2 is that a channel the panel described as permanent costs the
                     # player one redirect and us *nothing* - no handshake reuse, no
@@ -1685,7 +1859,8 @@ class StreamManager:
                         note_handed_out(route_key, _src, mac_row)
                         # <<< redirect-guard
                         if mac_row is not None:
-                            self.lease_mac(mac_row.id)
+                            self.lease_mac(mac_row.id, holder=requester,
+                                           item=item_name, kind=kind, ref=ref_id)
                         self.route_health.succeeded(route_key, _src, mac_row)
                         return plan.direct_url, item_name
                     client = await POOL.get(PortalSession.from_rows(portal, mac_row))
@@ -1749,7 +1924,8 @@ class StreamManager:
                                      f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
                                      f"(no ffmpeg)")
                         if mac_row is not None:
-                            self.lease_mac(mac_row.id)
+                            self.lease_mac(mac_row.id, holder=requester,
+                                           item=item_name, kind=kind, ref=ref_id)
                         self.route_health.succeeded(route_key, _src, mac_row)
                         return url, item_name
         await db_log("ERROR", "stream",
@@ -1802,6 +1978,11 @@ class StreamManager:
         handle = StreamHandle(id=uuid.uuid4().hex, kind=kind, item_name=item_name,
                               user_name=user_name, template_name=tpl_name, command=command,
                               route_key=(kind, ref_id))
+        # The engine's own start budget - what the output guard waits for before
+        # it declares the pipe dead (see STREAM_START_BUDGET). A fixed guard
+        # shorter than the chain it guards turns "walking the fallbacks" into a
+        # 502 while the engine is still working.
+        handle.start_budget = self.start_budget(chain, kind=kind)
         # Pre-check: empty chain or EVERY mac currently occupied -> fail fast
         # with 404 instead of hanging a client with a 200 + empty body.
         if kind == "local":
@@ -1810,11 +1991,17 @@ class StreamManager:
                              f"[{item_name}] local file missing on disk -> 404")
                 handle.dead = True
         else:
-            free = any(not self.is_mac_busy(m.id) for (_s, _p, macs) in chain for m in macs)
+            # `requester=user_name`: a lease this same user took is the channel
+            # the box just left, not somebody else's stream (see is_mac_busy).
+            free = any(not self.is_mac_busy(m.id, requester=user_name)
+                       for (_s, _p, macs) in chain for m in macs)
             if not chain or not free:
                 if chain and not free:
+                    busy = "; ".join(self._occupied_note(m) for (_s, _p, macs) in chain
+                                     for m in macs)
                     await db_log("WARNING", "stream",
-                                 f"[{item_name}] all MACs occupied -> 404 (try again later)")
+                                 f"[{item_name}] all MACs occupied -> 404 (try again later)"
+                                 + (f" | {busy}" if busy else ""))
                 if not chain:
                     await db_log("ERROR", "stream",
                                  f"[{item_name}] no usable sources (empty fallback chain / portal disabled / no MAC)")
@@ -1845,6 +2032,9 @@ class StreamManager:
                 first = await self._first_bytes(proc)
                 if not first:
                     stalled = proc.returncode is None
+                    h.note_attempt("local file: "
+                                   + (f"silent {STREAM_START_TIMEOUT:.0f}s" if stalled
+                                      else f"ffmpeg rc={proc.returncode}"))
                     if stalled:
                         # ffmpeg is still running, just silent: slow storage
                         # (disk spin-up, network mount) or a file its demuxer
@@ -1890,8 +2080,29 @@ class StreamManager:
                              f"{configured_count - len(chain)} cooling source(s)")
             yielded_any = False
             attempts = 2 if (ZAP_RETRY and chain) else 1
+            # The engine's own deadline: STREAM_START_TIMEOUT per candidate is
+            # only honest while the whole walk fits in one budget. Past it the
+            # request answers "no data" promptly and the output guard turns that
+            # into a 502 that names what was tried - better than a player
+            # hanging on a chain that has four more silent MACs to go.
+            deadline = (time.monotonic() + h.start_budget) if h.start_budget > 0 else None
+
+            def _budget_spent() -> bool:
+                return bool(deadline and time.monotonic() >= deadline)
+
+            async def _give_up() -> None:
+                h.fail_note = (f"start budget of {h.start_budget:g}s spent after "
+                               f"{len(h.attempts)} attempt(s)")
+                await db_log("WARNING", "stream",
+                             f"[{h.item_name}] {h.fail_note}"
+                             + (f" - {h.trace}" if h.trace else "")
+                             + " -> giving the player an answer instead of a hang")
+
             for pass_no in range(attempts):
                 if pass_no == 1:
+                    if _budget_spent():
+                        await _give_up()
+                        return
                     await db_log("INFO", "stream",
                                  f"[{h.item_name}] first pass produced no data "
                                  f"-> retrying once in {ZAP_RETRY_DELAY:.1f}s (zap overlap?)")
@@ -1904,6 +2115,9 @@ class StreamManager:
                     for mac_row in candidates:
                         if h.dead:
                             return
+                        if _budget_spent():
+                            await _give_up()
+                            return
                         # Decided before the portal is touched, for the same reason the
                         # redirect path decides first: for a source the user adopted onto
                         # the panel's Xtream side (R7) there is no MAC to spend and no
@@ -1911,11 +2125,25 @@ class StreamManager:
                         # would put the portal back in the loop we removed.
                         plan = self._plan(src, mac_row, portal, ffmpeg=True)
                         adopted = plan.adopted
-                        if not adopted and self.is_mac_busy(mac_row.id):
+                        # `requester=h.user_name`: this user's own post-302 lease is
+                        # the channel the box just zapped away from, not another
+                        # viewer - taking it back is what keeps a single-MAC zap on
+                        # the MAC that actually works instead of a worse one.
+                        if not adopted and self.is_mac_busy(mac_row.id,
+                                                            requester=h.user_name):
+                            h.note_attempt(f"{mac_row.mac}: busy "
+                                           f"({self._occupied_note(mac_row) or 'unknown'})")
                             await db_log("INFO", "stream",
                                          f"[{h.item_name}] mac {mac_row.mac} busy -> skip "
                                          f"(fallback step {idx}/{len(chain)})")
                             continue
+                        if not adopted and self.lease_holder(mac_row.id) == h.user_name \
+                                and h.user_name:
+                            h.took_over_lease = True
+                            await db_log("INFO", "stream",
+                                         f"[{h.item_name}] taking over the redirect lease "
+                                         f"on {mac_row.mac} held by {h.user_name} "
+                                         "(the channel this zap left)")
                         await db_log("INFO", "stream",
                                      f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
                                      + (f"portal '{portal.name}' - {plan.policy.reason}" if adopted
@@ -1951,6 +2179,7 @@ class StreamManager:
                                 # chain: `limit` is "this MAC is busy over there", so
                                 # the next MAC is the right move, while `nothing_to_play`
                                 # is "this source is dead", so hopping MACs is pointless.
+                                h.note_attempt(f"{portal.name}/{mac_row.mac}: {exc.code or exc}")
                                 await db_log("WARNING", "stream",
                                              f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
                                              f"{exc.detail()}"
@@ -1960,6 +2189,8 @@ class StreamManager:
                                 self.route_health.failed(src)
                                 break  # source-specific failure: another MAC cannot repair it
                             except Exception as exc:  # noqa: BLE001
+                                h.note_attempt(f"{portal.name}/{mac_row.mac}: "
+                                               f"{type(exc).__name__}")
                                 await db_log("WARNING", "stream",
                                              f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
                                              f"unexpected {type(exc).__name__}: {exc} -> next")
@@ -1970,6 +2201,7 @@ class StreamManager:
                             # An Xtream URL that will not open is not a MAC problem:
                             # the next MAC would be handed exactly the same URL, so
                             # move on to the next source instead of walking the list.
+                            h.note_attempt(f"{portal.name}/{mac_row.mac}: no URL")
                             if adopted:
                                 break
                             continue
@@ -2002,16 +2234,26 @@ class StreamManager:
                             if open_fail is not None:
                                 who = portal.name + ("/xtream" if adopted
                                                      else f"/{mac_row.mac}")
+                                # The stderr tail is the *only* evidence for a silent
+                                # stall (rc == -9 because we killed it, which is
+                                # deliberately not logged on its own): without it the
+                                # log says "no data within 12s" and leaves the real
+                                # reason - VAAPI init, a 4xx on the media request, a
+                                # panel slot check - to guesswork.
+                                tail = (open_fail.get("tail") or "").strip()
+                                words = f" | ffmpeg's last words: {tail[:400]}" if tail else ""
                                 if open_fail["stalled"]:
+                                    h.note_attempt(f"{who}: silent {STREAM_START_TIMEOUT:.0f}s")
                                     await db_log("WARNING", "stream",
-                                                 f"[{h.item_name}] no data within {STREAM_START_TIMEOUT}s from "
-                                                 f"{who} -> fallback")
+                                                 f"[{h.item_name}] no data within {STREAM_START_TIMEOUT:.0f}s from "
+                                                 f"{who} -> fallback{words}")
                                 else:
                                     # ffmpeg is gone and will never send a byte: say so
                                     # (the [ffmpeg] log line has the stderr tail)
+                                    h.note_attempt(f"{who}: ffmpeg rc={open_fail['rc']}")
                                     await db_log("WARNING", "stream",
                                                  f"[{h.item_name}] ffmpeg exited rc={open_fail['rc']} before sending "
-                                                 f"data ({who}) -> fallback")
+                                                 f"data ({who}) -> fallback{words}")
                             if locked is not None:
                                 self.mac_locks.pop(locked, None)
                             self.route_health.failed(src)
@@ -2044,7 +2286,12 @@ class StreamManager:
                     # next portal in chain
                 if yielded_any:
                     break
-            await db_log("ERROR", "stream", f"[{h.item_name}] all fallbacks exhausted")
+            if not h.fail_note:
+                h.fail_note = (f"{len(h.attempts)} attempt(s) without data"
+                               if h.attempts else "no candidate source could be tried")
+            await db_log("ERROR", "stream",
+                         f"[{h.item_name}] all fallbacks exhausted - {h.fail_note}"
+                         + (f" | {h.trace}" if h.trace else ""))
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001

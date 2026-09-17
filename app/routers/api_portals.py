@@ -28,6 +28,7 @@ from ..security import require_admin
 from ..services import xtream_bridge
 from ..services.db_logging import db_log
 from ..services.fetch_jobs import cancel as cancel_job, list_jobs, submit
+from ..services.stream_manager import MANAGER
 
 router = APIRouter(prefix="/api/portals", tags=["portals"], dependencies=[Depends(require_admin)])
 
@@ -117,6 +118,14 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
                       "sn": m.sn or "", "device_id": m.device_id or "",
                       "fail_count": m.fail_count,
                       "last_checked": m.last_checked.isoformat() if m.last_checked else None,
+                      # Runtime occupancy: "this proxy is using the MAC right
+                      # now" (ffmpeg pipe) or "the player was handed to the CDN
+                      # N seconds ago" (redirect lease). Free means only that
+                      # *we* hold nothing - the panel is the authority on the
+                      # MAC's single connection slot (see the MAC probe).
+                      "runtime": MANAGER.mac_occupancy(m.id) or {"busy": False,
+                                                                 "reason": "free",
+                                                                 "remaining_s": 0.0},
                       "genre_counts": {"live": m.genre_count_live,
                                        "vod": m.genre_count_vod,
                                        "series": m.genre_count_series},
@@ -579,6 +588,40 @@ async def mac_health_refresh(payload: dict | None = None):
         return await mac_health.refresh_portal_macs(int(pid), skip_busy=skip_busy)
     only_multi = bool(body.get("only_multi", True))
     return await mac_health.refresh_all_macs(only_multi=only_multi, skip_busy=skip_busy)
+
+
+@router.post("/{pid}/macs/{mid}/probe")
+async def probe_portal_mac(pid: int, mid: int, payload: dict | None = None):
+    """Ask the PANEL whether one MAC can stream right now.
+
+    This is the "is the MAC in use by somebody else?" test the Portals table
+    cannot answer from local state: handshake + `create_link` for a real channel
+    + read the first bytes. The refusal codes are the answer -
+
+      * `limit` / `account_is_in_use` -> another device (or a slot the panel has
+        not timed out) is on that MAC;
+      * `access_denied` / token codes -> the MAC itself is unusable;
+      * a link that sends no data -> the slot is held mid-flight;
+      * bytes -> the MAC is free and working.
+
+    Body (all optional): `ref_id` picks which live playlist item to ask about
+    (default: any enabled live source of the portal), `timeout` seconds to wait
+    for the first bytes, `force` to probe even while this proxy is using it.
+    """
+    from ..services import mac_probe
+    body = payload or {}
+    return await mac_probe.probe_mac(
+        pid, mid, ref_id=body.get("ref_id") or None,
+        timeout=float(body.get("timeout") or mac_probe.READ_TIMEOUT),
+        force=bool(body.get("force")))
+
+
+@router.post("/{pid}/macs/probe")
+async def probe_all_portal_macs(pid: int, payload: dict | None = None):
+    """Probe every MAC of one portal (sequential; see probe_portal_mac)."""
+    from ..services import mac_probe
+    body = payload or {}
+    return await mac_probe.probe_portal(pid, only_free=bool(body.get("only_free")))
 
 
 @router.post("/{pid}/compare-genres")

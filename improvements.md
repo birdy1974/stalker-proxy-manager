@@ -21,6 +21,14 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-17
+- can we see/test if a MAC is still available and not already used by another user before connecting to that portal/MAC?
+  -> Portals: per-MAC runtime badge (free here / streaming · user / leased Ns) + per-MAC "Test" button (asks the PANEL: available / in-use / unusable / no-data), API: POST /api/portals/{id}/macs/{mac}/probe and /macs/probe for a whole portal.
+- how does zapping work: is the portal connection rebuilt per channel, or reused with a different stream? Is the old stream still holding the MAC?
+  -> per play: new create_link (new play_token) on the pooled session; a 302 play leaves a 180s lease. Same user's zap now TAKES OVER its own lease (the channel it just left) instead of skipping that MAC; another user's MAC is still skipped. ffmpeg pipes are never taken over.
+- the NPO1 failure (mac 6D busy -> skip, then 502 "produced no data within 25s"):
+  -> two fixes: (1) the redirect lease of the same user no longer blocks the zap, so the working MAC is used; (2) the first-chunk guard follows the fallback engine's budget (SPM_STREAM_START_BUDGET, default 75s) instead of a fixed 25s, and the 502/log now list every MAC tried and why (plus ffmpeg's last stderr words on a silent stall).
+
 2026-09-13
 - check output stream or ffmpeg template to enigma2 box as the stream is not working on my enigma2 box
 - on dashboard change positions of "Background jobs" and "Messages" with each other

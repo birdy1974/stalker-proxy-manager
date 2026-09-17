@@ -39,6 +39,40 @@ function statusBadge(m) {
   const why = esc(m.last_error || "");
   return `<span class="badge badge-status ${cls}" ${why ? `title="${why}"` : ""}>${m.online ? "online" : m.status}</span>`;
 }
+function runtimeBadge(m) {
+  // What THIS proxy is doing with the MAC right now - not what the panel thinks.
+  // "free" here still means "we hold nothing": the panel is the authority on its
+  // single connection slot, which is what the Test button below asks it.
+  const rt = m.runtime || {};
+  if (!rt.busy) return `<span class="badge text-bg-light" title="this proxy holds nothing on this MAC - use the test button to ask the panel">free here</span>`;
+  if (rt.reason === "pipe") {
+    return `<span class="badge text-bg-success" title="this proxy is streaming through this MAC right now (ffmpeg): ${esc(rt.item || "")}">streaming${rt.holder ? " · " + esc(rt.holder) : ""}</span>`;
+  }
+  const secs = Math.round(rt.remaining_s || 0);
+  return `<span class="badge text-bg-warning" title="redirect lease: the player was sent to the panel CDN and we cannot see when it stopped. Used by ${esc(rt.holder || "unknown")} for ${esc(rt.item || "?")}">leased ${secs}s</span>`;
+}
+function probeMac(pid, mid, mac) {
+  // The one question local state cannot answer: does the PANEL still have this
+  // MAC's connection slot in use? Costs a create_link and a few seconds of the
+  // slot, so it is a button and never automatic.
+  toast(`testing ${mac} against the panel…`);
+  api(`/api/portals/${pid}/macs/${mid}/probe`, { method: "POST", body: {} }).then(r => {
+    const okish = r.available;
+    const body = document.createElement("div");
+    body.innerHTML = `
+      <div class="mb-2"><span class="mono">${esc(mac)}</span>
+        <span class="badge ${okish ? "text-bg-success" : "text-bg-danger"}">${okish ? "available" : esc(r.reason || "not available")}</span>
+        <span class="text-muted small">${esc(r.portal || "")}${r.source ? " · " + esc(r.source) : ""}</span></div>
+      <div>${esc(r.detail || "")}</div>
+      ${r.media ? `<div class="small text-muted mt-2">HTTP ${esc(String(r.media.status ?? "-"))} · ${esc(String(r.media.bytes))} bytes · ${esc(String(r.media.elapsed_s))}s · ${esc(r.media.ua || "")}</div>` : ""}
+      ${r.elapsed_s ? `<div class="small text-muted mt-1">test took ${esc(String(r.elapsed_s))}s</div>` : ""}`;
+    openModal({ title: okish ? "MAC is available" : "MAC is not available", body, size: "md",
+                footer: el("div", {}) });
+    toast(okish ? `${mac}: available` : `${mac}: ${r.reason || "not available"}`,
+          okish ? "ok" : "warn");
+    table.reload();
+  }).catch(e => toast(`${mac}: probe failed - ${e.message}`, "error"));
+}
 function pinIdentity(pid, mid, mac, sn, deviceId) {
   // Derived-from-MAC is the default and the right answer for almost every panel;
   // this exists for the box whose real serial the portal has already enrolled.
@@ -156,12 +190,14 @@ function makeTable() {
               ? `<span class="badge text-bg-light" title="${compared}">Genres L ${gc.live ?? '?'} · V ${gc.vod ?? '?'} · S ${gc.series ?? '?'}</span>`
               : `<span class="small text-muted" title="Run Compare genres across MACs">genres not compared</span>`;
             return `<div class="d-flex flex-wrap align-items-center gap-2 mb-1">
-              <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)}
+              <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)} ${runtimeBadge(m)}
               <span class="small text-muted" title="expire date from the panel">${esc(m.expire_date || "")}</span>
               ${genreCounts}
               <span class="small text-muted">${checked}</span>
               <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="STB identity this portal is told (serial, device id) - pin the values your box really sends"
                 onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
+              <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="Test this MAC against the panel: is it available, or is somebody else already streaming on it? (costs one portal request and a few seconds of a connection slot)"
+                onclick="probeMac(${r.id}, ${m.id}, '${m.mac}')"><i class="bi bi-broadcast-pin"></i></button>
               <button class="btn btn-xs btn-outline-danger py-0 px-1" title="delete mac"
                 onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
             </div>`;
