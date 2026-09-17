@@ -796,8 +796,31 @@ a real subprocess for the ffmpeg binary and keep the rest of the pipeline real):
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest          # or: python -m pytest -v tests/test_stream_disconnect.py
+python -m pytest          # 700+ tests in ~29 s on two cores (was ~103 s)
+python -m pytest tests/test_stream_disconnect.py -v      # one file, one worker
 ```
+
+(the last two lines of `requirements-dev.txt` pull in pytest-xdist and
+pytest-timeout; `pytest.ini` configures both, so re-run that pip install in an
+older venv or the run stops with "unrecognized arguments: -n")
+
+What keeps it fast (and what to reach for when a run misbehaves):
+
+| Knob | Why |
+|---|---|
+| `tests/conftest.py` builds each test's empty database by **deleting rows** instead of dropping and re-creating 31 tables: ~6 ms against ~58 ms per test, ~40 s of the suite. The schema is rebuilt only when a test actually changed it (the migration tests do), detected by fingerprinting `sqlite_master`. |
+| `-n auto` (pytest-xdist, the default via `addopts`) spreads the tests over the available cores; each worker gets its own temp database, so they cannot collide. On a 2-core container that measured ~19 s with `-n 3` against ~29 s serial and ~30 s with `-n auto` - the bag of tests is uneven, so more workers are not automatically better. `-n 0` runs in-process (needed for `--pdb`). |
+| `timeout = 120` (pytest-timeout) turns a deadlock into a *failed test* instead of a run that never ends. It is a safety net — the slowest test is under 1.5 s, so anything near the limit is a hang, not slow work. `--timeout=30` for a stricter run, `--timeout=0` to switch it off. |
+| `app/database.py::run_uncancelled` hands back a cancellation that `asyncio.wait_for` swallowed when the shielded work finished in the same loop turn. Without that, the log writer parked forever (state CANCELLING, no exception anywhere) and the teardown that waits for it - `asyncio.Runner.close()` under xdist, uvicorn's shutdown in production - waited forever too. |
+| Long `sleep`s in tests were shortened to the smallest value that still proves the same thing (a demo timeout is asserted at 0.5 s, a simulated portal page latency at 20 ms, a "silent ffmpeg" stub `exec`s its `sleep` so no orphan child holds the pipes and burns a 3 s reap wait). |
+| `python -m pytest -q --durations=10` when you want to know where the time went; `-x --timeout=30` for a quick feedback loop while editing one module. |
+
+Two failures on a clean checkout - `test_local_playback.py::test_ffmpeg_argv_injects_annexb_when_copying_to_mpegts`
+and `test_stb_identity.py::test_an_existing_install_gets_the_columns_it_is_promised`
+- are **pre-existing** (they fail on `main` too, and are unrelated to the
+streaming/portal work); deselect them with
+`--deselect tests/test_stb_identity.py::test_an_existing_install_gets_the_columns_it_is_promised`
+until they are fixed.
 
 ## Phase 3 (done)
 
