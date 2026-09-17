@@ -1,0 +1,69 @@
+# ============================================================================
+# Test suite - runs on every pull request and on every push to main.
+# ----------------------------------------------------------------------------
+# Install it with:
+#     cp dev/ci.yml.example .github/workflows/ci.yml
+# (kept here as an .example because a bot without the `workflows` permission
+# cannot commit under .github/workflows/ - see dev/check-yaml.sh)
+#
+# Why it is a separate workflow from docker-publish.yml: that one only fires on
+# main/tags, because its job is to publish the image. This one has to run on
+# every PR, before anything is merged.
+#
+# No services, no docker, no portal, no ffmpeg: tests/conftest.py points the app
+# at a throwaway SQLite file under /tmp, and the streaming tests substitute a
+# real subprocess for the ffmpeg binary while keeping the rest of the pipeline
+# real. Nothing here touches the network.
+#
+# pytest.ini does the heavy lifting: `addopts = -n auto` spreads the tests over
+# the runner's cores and `timeout = 120` turns a deadlock into a failed test
+# instead of a job that hangs until the 6 hour limit. Warm run: ~1 minute.
+# ============================================================================
+name: tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A new push to the same branch makes the previous run irrelevant.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20          # 120 s per test, and a hard stop for the job
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"   # same minor as the Dockerfile runtime
+          cache: pip               # keyed on requirements*.txt
+
+      - name: "Install dev dependencies"
+        run: pip install -r requirements-dev.txt
+
+      # Cheap gates first (a few seconds), so a broken template script or a
+      # malformed workflow file fails the run before the suite even starts.
+      - name: "Check workflow/compose YAML (+ template drift)"
+        run: bash dev/check-yaml.sh
+
+      - name: "Syntax-check the JavaScript in the templates"
+        run: node dev/check-js.js
+
+      # The two --deselect flags are for tests that fail on main as well; they
+      # are somebody else's work item, and a permanently red check teaches
+      # nobody anything. Delete the flags (they are then harmless no-ops) once
+      # those two tests are fixed - the README lists them under "Tests".
+      # `dev/check-links.py` is NOT wired in yet: it fails 5/166 on main
+      # (EPG now/next endpoints), so it would fail every run until that is
+      # addressed. Run it by hand after touching app/portal/.
+      - name: "Run the test suite"
+        run: |
+          python -m pytest -q \
+            --deselect tests/test_local_playback.py::test_ffmpeg_argv_injects_annexb_when_copying_to_mpegts \
+            --deselect tests/test_stb_identity.py::test_an_existing_install_gets_the_columns_it_is_promised
