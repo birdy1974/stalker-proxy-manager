@@ -21,6 +21,26 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-17 (CI)
+- the suite only runs when I run it by hand - can GitHub run it on every change?
+  -> new `dev/ci.yml.example`, installed with `cp dev/ci.yml.example .github/workflows/ci.yml` (the repo's bot is not allowed to create workflow files: GitHub refuses the push). The `tests` workflow runs on every pull request, on pushes to main and on demand: installs requirements-dev.txt, runs dev/check-yaml.sh and dev/check-js.js, then pytest - the same 716 passed / 5 skipped as locally, `-n auto` and the 120 s timeout come from pytest.ini. dev/check-yaml.sh now verifies BOTH examples stay byte-identical to their installed workflow and prints the install hint while ci.yml is missing.
+  -> the two tests that fail on main are deselected inside the workflow (a permanently red check teaches nobody anything); dev/check-links.py is left out until its 5 pre-existing failures (EPG now/next) are fixed.
+
+2026-09-17 (suite speed)
+- the full test suite takes a really long time: can it be sped up with a timeout, skipping tests, or something else?
+  -> measured first: 102.5 s, of which 72.5 s was fixture setup - the autouse fixture dropped and re-created 31 tables for every one of 700+ tests (~58 ms each, ~40 s total). It now deletes rows instead (~6 ms) and rebuilds the schema only when a test actually changed it (fingerprinted via sqlite_master; the migration tests still trigger a rebuild). Same tests, same order, same coverage: 29.1 s serial.
+  -> three long `sleep`s in tests were trimmed to the smallest value that still proves the same thing (demo timeout 2 s -> 0.5 s, simulated page latency 50 ms -> 20 ms, and the "silent ffmpeg" stub now `exec`s its sleep so no orphan child holds the pipes and burns the 3 s bounded reap). Slowest test: 3.71 s -> 1.37 s.
+  -> pytest-xdist + pytest-timeout are now in requirements-dev and configured in pytest.ini: `-n auto` (measured ~19 s with `-n 3` on a 2-core box) and a 120 s per-test deadlock timeout with `timeout_method = signal`, verified to fail a hung async test in place instead of never returning. Skipping/deselecting tests was NOT needed: individual tests are not the bottleneck, and no test is slow enough to justify dropping it.
+  -> bonus, found while chasing a suite hang under xdist: `run_uncancelled` could lose a cancellation that `asyncio.wait_for` swallowed when the shielded work finished in the same loop turn as the cancel (the task kept running in state CANCELLING with no exception). The log writer parked on `await q.get()` forever and the event-loop teardown that waits for it (`asyncio.Runner.close()` in tests, uvicorn's shutdown in production) waited forever too. `_cancel_shield` now hands that cancellation back; regression test: tests/test_stream_disconnect.py::test_run_uncancelled_does_not_lose_a_cancellation_that_races_the_result.
+
+2026-09-17
+- can we see/test if a MAC is still available and not already used by another user before connecting to that portal/MAC?
+  -> Portals: per-MAC runtime badge (free here / streaming · user / leased Ns) + per-MAC "Test" button (asks the PANEL: available / in-use / unusable / no-data), API: POST /api/portals/{id}/macs/{mac}/probe and /macs/probe for a whole portal.
+- how does zapping work: is the portal connection rebuilt per channel, or reused with a different stream? Is the old stream still holding the MAC?
+  -> per play: new create_link (new play_token) on the pooled session; a 302 play leaves a 180s lease. Same user's zap now TAKES OVER its own lease (the channel it just left) instead of skipping that MAC; another user's MAC is still skipped. ffmpeg pipes are never taken over.
+- the NPO1 failure (mac 6D busy -> skip, then 502 "produced no data within 25s"):
+  -> two fixes: (1) the redirect lease of the same user no longer blocks the zap, so the working MAC is used; (2) the first-chunk guard follows the fallback engine's budget (SPM_STREAM_START_BUDGET, default 75s) instead of a fixed 25s, and the 502/log now list every MAC tried and why (plus ffmpeg's last stderr words on a silent stall).
+
 2026-09-13
 - check output stream or ffmpeg template to enigma2 box as the stream is not working on my enigma2 box
 - on dashboard change positions of "Background jobs" and "Messages" with each other

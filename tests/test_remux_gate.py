@@ -308,8 +308,13 @@ async def test_local_pump_logs_ffmpeg_tail_after_a_silent_stall(monkeypatch):
         logged.append((level, component, message))
 
     async def _spawn_stub(self, cmd_template, url, title=None, pace=False, user_agent=None):
+        # `exec` so the sleeping process IS the direct child: without it the
+        # orphaned grandchild keeps the stdout/stderr pipes open, and
+        # `_kill_quiet`'s bounded `await proc.wait()` burns its full 3 s wait
+        # every run (asyncio only completes a subprocess transport once every
+        # pipe is closed). Same behaviour under test, 3 s less per suite run.
         proc = await asyncio.create_subprocess_exec(
-            "sh", "-c", "echo boom-error >&2; sleep 30",
+            "sh", "-c", "echo boom-error >&2; exec sleep 30",
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE)

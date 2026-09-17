@@ -109,7 +109,9 @@ async def test_timeout_returns_even_when_child_outlives_the_kill(monkeypatch, tm
     fake.write_text("#!/bin/sh\necho 'ffmpeg version fake' >&2\nsleep 120 &\nsleep 120\n")
     fake.chmod(0o755)
     _use_fake_ffmpeg(monkeypatch, str(fake))
-    monkeypatch.setattr(fv, "PLAYLIST_DEMO_TIMEOUT_S", 2)
+    # 0.5 s proves the same thing as 2 s (the stub outlives the kill) and
+    # keeps two of the slowest tests in the suite cheap
+    monkeypatch.setattr(fv, "PLAYLIST_DEMO_TIMEOUT_S", 0.5)
 
     started = time.perf_counter()
     r = await asyncio.wait_for(
@@ -133,14 +135,16 @@ async def test_timeout_detail_explains_a_dead_source(monkeypatch, tmp_path):
         "sleep 120\n")
     fake.chmod(0o755)
     _use_fake_ffmpeg(monkeypatch, str(fake))
-    monkeypatch.setattr(fv, "PLAYLIST_DEMO_TIMEOUT_S", 2)
+    # 0.5 s proves the same thing as 2 s (the stub outlives the kill) and
+    # keeps two of the slowest tests in the suite cheap
+    monkeypatch.setattr(fv, "PLAYLIST_DEMO_TIMEOUT_S", 0.5)
 
     r = await asyncio.wait_for(
         fv.run_demo(f"ffmpeg -i {URL_PLACEHOLDER} -f mpegts pipe:1",
                     mode="playlist", url=STALLED_URL), timeout=30)
     assert r["ok"] is False
     assert "never delivered data" in r["detail"]
-    assert "timed out after 2s" in r["detail"]
+    assert "timed out after 0.5s" in r["detail"]
 
 
 def test_timeout_hint_flags_a_missing_hardware_encoder():

@@ -37,7 +37,7 @@ from ..services.playlist_gen import (
     xtream_live, xtream_series, xtream_series_info, xtream_vod,
 )
 from ..services.local_files import media_type_for
-from ..services.stream_manager import MANAGER
+from ..services.stream_manager import MANAGER, START_BUDGET_SLACK
 from sqlalchemy import select
 
 router = APIRouter(tags=["output"])
@@ -147,6 +147,13 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
 # browser turns into "player popup, black screen, no error anywhere" and what a
 # set-top box turns into a silent hang. We can only change the status code
 # before the first byte goes out, so peek at the first chunk and fail loudly.
+#
+# This is a BACKSTOP, not the engine's working budget. The fallback chain takes
+# `candidates x SPM_STREAM_START_TIMEOUT x passes` (two MACs + the zap retry =
+# 50s), so a fixed 25s guard used to fire while the pump was still walking - the
+# log said "produced no data within 25s -> 502" and the retry pass never ran.
+# `_guarded` therefore waits for `handle.start_budget + START_BUDGET_SLACK`
+# whenever it is given a handle, and the engine stops itself at its own budget.
 FIRST_CHUNK_TIMEOUT = float(os.environ.get("SPM_FIRST_CHUNK_TIMEOUT", "25"))
 # Headers for every infinite stream: X-Accel-Buffering tells reverse proxies
 # (nginx and everything speaking its conventions) not to buffer the response -
@@ -161,14 +168,37 @@ STREAM_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no",
 MAXCONN_RETRY_DELAY = float(os.environ.get("SPM_MAXCONN_RETRY_DELAY", "1.2"))
 
 
-async def _guarded(gen, label: str, item_name: str = ""):
+def _guard_wait(handle=None) -> float:
+    """Seconds the first-chunk guard waits, before calling the pipe dead.
+
+    `FIRST_CHUNK_TIMEOUT` is the floor (a preview, a local file, an engine that
+    reported no budget). A stream open hands us the engine's own budget, and the
+    guard must not fire earlier than the engine's own deadline plus slack -
+    otherwise "walking the fallbacks" reads as "produced no data" and the retry
+    pass never runs. See stream_manager.STREAM_START_BUDGET.
+    """
+    wait = FIRST_CHUNK_TIMEOUT
+    if handle is not None:
+        wait = max(wait, float(getattr(handle, "start_budget", 0.0) or 0.0)
+                   + START_BUDGET_SLACK)
+    return wait
+
+
+async def _guarded(gen, label: str, item_name: str = "", handle=None):
     """
     Yield `gen` unchanged, but only after proving it produces at least one
     chunk. Raises HTTPException(502) instead of streaming nothing.
+
+    With a `handle` (a real stream open) the wait follows the engine's own start
+    budget - how long the fallback chain may legitimately spend looking for a
+    first byte - plus slack for the portal round trips in between. The 502 then
+    names the MACs/sources that were tried and why each one failed, instead of
+    blaming a timeout the engine had not even reached yet.
     """
+    wait = _guard_wait(handle)
     first = None
     try:
-        async with asyncio.timeout(FIRST_CHUNK_TIMEOUT):
+        async with asyncio.timeout(wait):
             async for chunk in gen:
                 if chunk:
                     first = chunk
@@ -179,12 +209,20 @@ async def _guarded(gen, label: str, item_name: str = ""):
         raise HTTPException(502, f"{label}: the stream pipe failed: "
                                  f"{type(exc).__name__}: {exc}")
     if first is None:
+        detail = ""
+        if handle is not None:
+            note = getattr(handle, "fail_note", "") or ""
+            trace = getattr(handle, "trace", "") or ""
+            detail = " | ".join(part for part in (note, trace) if part)
         await db_log("ERROR", "output",
                      f"[{item_name or label}] produced no data within "
-                     f"{FIRST_CHUNK_TIMEOUT:.0f}s -> 502 (not a silent 200)")
+                     f"{wait:.0f}s -> 502 (not a silent 200)"
+                     + (f" - {detail}" if detail else ""))
         raise HTTPException(502, f"{label}: the source produced no data "
                                  f"(ffmpeg missing, template failed, or the panel "
-                                 f"returned an empty stream). Check Logs → stream.")
+                                 f"returned an empty stream)."
+                                 + (f" {detail}" if detail else "")
+                                 + " Check Logs → stream.")
 
     async def body():
         yield first
@@ -259,7 +297,8 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
             kind, ref_id, mode, user.name if user else None):
         from fastapi.responses import RedirectResponse
         resolve_started = time.perf_counter()
-        url, item_name = await MANAGER.resolve(kind, ref_id)
+        url, item_name = await MANAGER.resolve(kind, ref_id,
+                                               requester=user.name if user else None)
         resolve_ms = (time.perf_counter() - resolve_started) * 1000
         if url:
             total_ms = (time.perf_counter() - started) * 1000
@@ -283,7 +322,7 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     # a strong reference, so the task cannot be garbage-collected mid-flight.
     MANAGER.watch(request, handle)
     first_started = time.perf_counter()
-    body = await _guarded(gen, label, handle.item_name)
+    body = await _guarded(gen, label, handle.item_name, handle=handle)
     first_ms = (time.perf_counter() - first_started) * 1000
     total_ms = (time.perf_counter() - started) * 1000
     await db_log("INFO", "output",

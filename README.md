@@ -47,6 +47,13 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here �
 | `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
 | `SPM_PORTAL_WARM_INTERVAL` | `600` | seconds between background pre-authentication passes for resolved portal/MAC sessions |
 | `SPM_ROUTE_AFFINITY_TTL` | `1800` | seconds to prefer the source/MAC that most recently produced stream bytes |
+| `SPM_STREAM_START_BUDGET` | `75` | seconds the fallback engine may spend looking for a first byte before it gives up (0 = no cap). Covers `candidates × SPM_STREAM_START_TIMEOUT × passes`; the output guard waits for this budget plus `SPM_START_BUDGET_SLACK` before answering 502, so the engine is never cut off mid-chain |
+| `SPM_START_BUDGET_SLACK` | `10` | seconds added to the engine's budget before the first-chunk guard declares the pipe dead (portal round trips and killing a stalled ffmpeg happen outside the start windows) |
+| `SPM_MAC_PROBE_READ_TIMEOUT` | `10` | seconds the *Test* button / `POST /api/portals/{id}/macs/{mac}/probe` waits for the panel's link to deliver its first bytes |
+| `SPM_STREAM_START_TIMEOUT` | `12` | seconds one MAC/source attempt may stay silent before the chain moves on |
+| `SPM_FIRST_CHUNK_TIMEOUT` | `25` | floor for the first-chunk guard (the `produced no data -> 502` line). A real stream open extends it to the engine's budget + `SPM_START_BUDGET_SLACK` |
+| `SPM_REDIRECT_LEASE_S` | `180` | how long a MAC stays "probably still watching" after a 302 (the player is on the panel's CDN and we cannot see it stop) |
+| `SPM_ZAP_RETRY` / `SPM_ZAP_RETRY_DELAY` | `1` / `2.5` | one delayed second pass for a zap whose panel slot is still held |
 | `SPM_SOURCE_BREAKER_FAILURES` / `SPM_SOURCE_BREAKER_COOLDOWN` | `2` / `45` | source-specific failures before temporarily skipping it, and seconds before a half-open retry |
 | `SPM_MEDIA_CMD_REPAIR` | `1` | `0` stops the `/media/<id>` → `/media/file_<id>` retry — for a panel that rate-limits every extra request (see *Fallback engine semantics*) |
 | `SPM_REDIRECT_VALIDATE` | `1` | redirect mode only: `0` hands the 302 out **unprobed**. The validator probes each candidate link (HEAD → ranged GET → plain GET) and skips a link it *proved* dead; set `0` to compare behaviour when a channel only fails in redirect mode |
@@ -143,6 +150,18 @@ and, when the ids do not match:
 1. **Portals** – add each Stalker portal base URL and its MAC addresses (optionally per-MAC password). *Check Portal* resolves the real endpoint (`/c/`, `/client/`, `/portal.php`, …) and verifies each MAC online (busy-ness and subscription expiry included); the per-MAC result now carries **why** a failure happened (`code` + the panel's own wording), not just "failed". Two per-portal network switches live in the same editor: **HTTP proxy** and **Allow broken TLS** (certificate verification is ON for every portal unless that box is ticked — a `TLS unverified` badge then marks the portal in the list, because it is a deliberate exception, not a setting to forget). *Delete* offers a replacement-dialog cleanup for playlists that reference it.
 
    **Multi-MAC health.** Portals with two or more MACs get a background sweep (Settings → *Multi-MAC status refresh*, default every 60 min; `0` pauses it) that handshakes every MAC and refreshes `status` / `online` / `expire_date` / `last_checked` — the same work *Check Portal* does, kept honest overnight. MACs currently occupied are skipped so a viewer is never kicked: that covers both ffmpeg-proxied plays (hard `mac_locks`) and redirect/direct plays (a soft lease after the 302, because once the player is sent to the panel CDN we no longer hold the socket). The Portals toolbar *Refresh MAC health* button runs the same sweep on demand. On a multi-MAC portal, **Compare genres across MACs** first lets the operator select which online accounts to contact, then renders Live/VOD/Series genre-by-MAC matrices with text, difference, coverage, MAC and package filters. Exact matching signatures are grouped as packages; selected or visible stored genres can be enabled/disabled in bulk. Successful Live/VOD/Series genre counts and the comparison time are persisted per MAC and shown directly on the portal list (`Genres L … · V … · S …`); failed content-kind requests retain their previous count instead of being recorded as zero. The comparison **upserts the selected MACs' union into the portal's genre tables** (existing `enabled` flags are kept; brand-new genres land disabled). Useful when a "secondary" MAC is actually a different package from a shared-login reseller. Removing a MAC or deleting a portal also drops its runtime leftovers (mac locks, redirect leases, pooled Stalker sessions) — DB cascades already wipe the durable rows.
+
+   **Is a MAC available right now?** Two answers, and the GUI shows both. *Our* view is the badge next to each MAC: `free here` (this proxy holds nothing), `streaming · user` (an ffmpeg pipe is on it right now) or `leased 143s` (the player was 302'd to the panel CDN and we cannot see it stop — the badge tooltip names the user and the channel). The other answer belongs to the panel, which has no "who uses this MAC" call: the only moment it tells you is when you ask it for a link, and then only as a refusal code. The **Test** (broadcast) button per MAC does exactly that — handshake, `create_link` for one channel, then read the first bytes:
+
+   | Result | What it means |
+   |---|---|
+   | `available` + bytes | the panel built a link **and** streamed it: nobody else holds this MAC |
+   | `in-use` (`limit` / `account is in use`) | another device is watching on that MAC, or the panel has not timed out its last stream yet |
+   | `unusable` (`access_denied`, token codes) | the MAC itself is refused — fix it in Portals, retrying will not help |
+   | `no-data` | the link was built but sent nothing: the slot is held mid-flight (a zap, another device, a panel timeout pending) |
+   | `busy-ours` | this proxy is using the MAC — answered from local state without touching the panel |
+
+   The test costs one portal request and a few seconds of that MAC's connection slot, which is why it is a button and never automatic; `POST /api/portals/{id}/macs/probe` runs it for every MAC of a portal (sequential on purpose — a panel that rate-limits dislikes four concurrent slot tests).
 2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season. In the **Edit portal** popup this is a two-step flow: *Fetch genres* loads the live/VOD/series genre lists (all disabled by default — including the synthetic *(All VOD)* / *(All series)* a portal without categories gets), you tick the genres you want (the filter box narrows the list as you type), and **Save** then fetches the items of exactly those enabled genres.
 3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels. Clicking a **VOD** or **Series** row (or its ⓘ button) opens the same detail popup as Input Sources — stored portal metadata, a lazy **stream probe** (codec/resolution/bitrate) and **TMDB** enrichment. The ▶ *test stream* buttons (here and in Input Sources) open the preview player, which closes via its header **×** or the **Stop & Close** button.
 4. **Users** – each user gets `username/password` and can receive **M3U** and/or **Xtream** URLs (copy-buttons in the GUI). Per-user active-connection caps enforced.
@@ -415,7 +434,9 @@ At boot the app performs a **hardware sanity check**: if the default template ne
 
 - Every MAC streams **at most one channel at a time** (typical Stalker limit); occupancy is tracked centrally, busy MACs are skipped instantly.
 - Per play request the ordered chain is walked (source priority → MAC order); a `global setting` decides whether *all MACs of a portal are tried before moving to the next portal*.
-- No data within 12 s (configurable) or an ffmpeg exit → next step; when the chain exhausts, the client gets a clean end-of-stream and the GUI log shows every step. An ffmpeg that dies *before* the first byte (bad URL, 405, missing GPU) is detected immediately — the log then says `ffmpeg exited rc=8 before sending data` instead of a misleading "no data within 12s", so you do not wait 12 s per dead source.
+- **A redirect lease belongs to the user who took it.** A 302 play cannot see the player stop, so the MAC stays marked busy for `SPM_REDIRECT_LEASE_S` (default 180 s). That guess must not be held against the *same* user: Enigma2 zaps fast, and skipping "the channel this box just left" sent the next channel to a worse MAC (the `mac … busy -> skip` of the reported log). The same user now takes the lease over — logged as `taking over the redirect lease … (the channel this zap left)` — while a *different* user's MAC stays off-limits and an ffmpeg pipe (a real concurrent stream) is never taken over by anyone.
+- No data within 12 s (configurable) or an ffmpeg exit → next step; when the chain exhausts, the client gets a clean end-of-stream and the GUI log shows every step. An ffmpeg that dies *before* the first byte (bad URL, 405, missing GPU) is detected immediately — the log then says `ffmpeg exited rc=8 before sending data`, and a *silent* stall now carries ffmpeg's own stderr tail (`| ffmpeg's last words: …`: VAAPI init, a 4xx on the media request, a panel slot check) instead of leaving the reason to guesswork.
+- **The chain has a budget, and the 502 follows it.** `SPM_STREAM_START_BUDGET` (default 75 s) caps the whole walk; the first-chunk guard waits for that budget plus slack, so the engine is never cut off while it is still working. `candidates × 12 s × passes` is 50 s for a two-MAC chain (74 s for three) — the old fixed 25 s guard fired mid-chain, which is how a request ended in `produced no data within 25s -> 502` *and* never ran the zap retry. When the budget *is* spent, the log and the 502 name what was tried: `produced no data within 75s - start budget of 75s spent after 4 attempt(s) | nexus/00:1A:79:00:20:6D: silent 12s; …`.
 - **Link repair:** some panels rebuild the `create_link` answer instead of echoing it and lose parameters on the way (`&stream=392166` → `&stream=`). The request is stripped of its stale `play_token` before asking, and the answer is repaired against the request (missing/blanked parameters restored, the fresh token always wins). See `dev/check-links.py`.
 - **A `create_link` answer is read in every shape.** A panel that has to choose a storage — or that inserts an advertisement — answers with a *list* of candidates instead of one object. The first entry the panel did not label an ad is the stream, the `storage_id` it came with is kept for the log, and a list of nothing but ads is reported as "no link" *with that sentence in the error* — not as a dead channel and not by playing the advertisement. A reader that only knew the object shape reports every item such a panel serves as `no_url`, which is the failure that looks least like what it is.
 - **Two cmd forms of one VOD file.** Some panels list a movie as `/media/1234.mpg` and answer `create_link` only for `/media/file_<id>.mpg`, where the id is what `get_ordered_list&movie_id=` reports — and they refuse the catalogue form with `nothing_to_play`, byte-for-byte what a dead item looks like. Only a refusal that *can* mean "wrong form" (`no_url`, `nothing_to_play`, `link_fault`) triggers the retry: the file id is resolved, the cmd rewritten, the request repeated once, and the form that worked is remembered on the source row (`media_cmd`), so the next play asks with it directly instead of paying for a refusal and a resolution again. A re-fetch never wipes it, the catalogue `cmd` stays the panel's truth, and it is the fallback when a learned form goes stale (a re-ingested movie gets a new file id) — the row then learns the new one. `SPM_MEDIA_CMD_REPAIR=0` switches the retry off; an absolute URL is never rewritten, because that is a link and not a storage reference.
@@ -700,7 +721,7 @@ docker logs stalker-proxy-manager 2>&1 \
 | `[stream] ffmpeg exited rc=8 before sending data` | ffmpeg could not open the source at all (dead link, 403/405, template needs a GPU that is not mapped) | read the `[ffmpeg]` line just above it — it carries ffmpeg's stderr tail |
 | `[ffmpeg] … HTTP error 456` / `Server returned 4XX Client Error, but not one of 40{0,1,3,4}` then `[stream] … origin answered HTTP 456 to ffmpeg's media request … retrying once with the portal browser user-agent` | the origin's anti-proxy layer refuses the MAG *player* identity on the media endpoint (a 456 is its non-standard "unrecoverable" answer) — direct/redirect channels still play, because they are fetched by the end player and never hit ffmpeg | the second rung is automatic; if the channel then plays, nothing to do (the winner is remembered per origin). If both rungs fail, taste the fresh token with `dev/probe-link.py`, then `--browser`; a panel that pins another firmware build can be matched with `SPM_PLAYER_UA`, and a panel that only likes the browser UA gets legacy behaviour with `SPM_STREAM_UA_LADDER=0` |
 | `[ffmpeg] … HTTP error 456` followed by `origin answered HTTP 456 after 6.5s - too slow for an identity refusal (usually: MAC connection slot still held)` | **not** a UA problem: the panel backend checked the MAC's single connection slot and refused because it is still held (the ~5–7 s deliberation is the tell; a WAF refuses in milliseconds). Common triggers: an FFmpeg-tab *playlist demo* ran on the same MAC a minute ago, or a rapid zap | automatic MAC/source fallback handles it; wait a moment and replay (the panel times slots out) — the UA ladder is deliberately *skipped* so it does not add ~6 s per dead attempt. If it happens constantly, add/online more MACs for that portal |
-| `[stream] no data within 12s from portal/mac` | the portal accepted the request but sends nothing (MAC busy *on the panel*, expired account, IP/geo block) | *Check Portal* in the GUI; try another MAC of the same portal |
+| `[stream] no data within 12s from portal/mac \| ffmpeg's last words: …` | the portal accepted the request but sends nothing (MAC busy *on the panel*, expired account, IP/geo block) — ffmpeg's stderr tail now follows the same line, because "no data" alone is not a diagnosis | the per-MAC **Test** button in Portals answers "is this MAC in use?" against the panel; *Check Portal* for the account verdict; try another MAC of the same portal |
 | `[stream] … portal said limit - connection limit for this MAC (panel says it is already streaming)` | the panel is right: that MAC already has a stream open (often a previous player that has not been timed out yet) | the chain moves to the next MAC on its own; if every MAC says `limit`, the panel's quota is the real limit |
 | `[stream] … portal said nothing_to_play` / `link_fault` | the source is dead or the CDN is unhappy — retrying with another MAC cannot help | *Fetch Sources* for that channel, or drop it from the chain |
 | `[stream] ffmpeg exited rc=1 before sending data` **only on VOD/series/local, live plays fine** | a template (usually one stored before the `-sn` fix) still maps subtitle streams: an SRT/ASS/PGS track in the movie aborts ffmpeg at output init before the first byte | re-save the template (fields side re-renders it with `-sn`), or let the spawn-time net handle it — a restart on this build fixes it without any action |
@@ -708,6 +729,7 @@ docker logs stalker-proxy-manager 2>&1 \
 | `[portal] TLS error / unable to get local issuer certificate` | the panel has a self-signed or incomplete certificate chain | tick **Allow broken TLS** for that portal (keeps every *other* portal verified) or fix the chain; do not disable verification globally |
 | `[stream] [Ch] playing the stored link via portal/mac: the channel flags say nothing needs rebuilding…` | no `create_link` was asked, by design (see *Fallback engine semantics*) | if that channel is black, the panel lied about its links: tick **Play stored links when the panel allows** off for that portal, or re-fetch the sources |
 | `[fetch] series categories skipped: the panel says it has no sclub` | the portal's own `get_modules` answer gated the fetch | informational; if the panel *does* have series, press Resolve to re-read the answer |
+| `[output] … produced no data within 75s -> 502 … \| …: silent 12s; …` | the chain really was exhausted: every MAC/source the report names stayed silent for its whole start window. The number is the engine's budget (`SPM_STREAM_START_BUDGET` + slack), not a fixed timer, so nothing was cut off | read the listed attempts: `busy (…)` entries are MACs another viewer holds, `limit` is the panel's slot check, `silent` with a stderr tail is ffmpeg's own answer. Use the per-MAC **Test** button to see what the panel says about each account right now |
 | `[output] user … exceeded max_connections` | a previous stream of that user was still counted when the player reconnected | raise `max_connections` for that user; the slot frees as soon as the disconnect watchdog notices the client is gone (≤0.5 s) |
 | `[stream] … first pass … retrying once in 2.5s (zap overlap?)` | the box zapped while the panel still counted the old channel against the MAC's single slot (or our watchdog was still tearing the old pipe down) | informational — the open is retried once automatically; tune with `SPM_ZAP_RETRY_DELAY`, disable with `SPM_ZAP_RETRY=0` |
 | `create_link: panel answered a list of 2 candidate(s) plus 1 ad(s), storage 7` | the panel chose a storage and offered an advertisement with it; the first non-ad candidate was played | informational — this is the answer shape a dict-only reader reports as "no playable URL" |
@@ -715,7 +737,7 @@ docker logs stalker-proxy-manager 2>&1 \
 | `create_link returned no usable url … - the panel answered a list of 1 advertisement entry and no stream` | the panel offered an ad and nothing else | not a dead channel and not a parsing bug: that item is unplayable on this portal, so give the playlist row another source |
 | `[stream] [Ch] redirect: fresh link dead (portal/mac; HEAD 404) -> next candidate` | redirect mode probed the link before the 302 and the origin answered with proof it is gone (404/410, a 4xx/5xx on the GET rung, or nothing listening at all) | the trace in brackets says which rung proved it. If the channel plays anyway when you paste the URL in VLC, the origin is probe-shy rather than dead — run `dev/probe-link.py` on it and, until that is understood, `SPM_REDIRECT_VALIDATE=0` |
 | `[stream] [Ch] redirect: the origin at panel:80 is probe-shy (HEAD ReadError -> GET-no-range 200) - it refused the probe's request shape but answered a player-shaped one, so the link was handed out` | the validator had to climb its ladder before it could see the link is fine (here: the origin hangs up on `HEAD` *and* on a ranged `GET`, and answers a plain `GET`) | informational, logged once per origin and trace — this is the validator earning its keep instead of vetoing a working channel. A later `fresh link dead` from the same origin deserves a `dev/probe-link.py` run before you believe it |
-| `[stream] redirect: mac … busy (ffmpeg pipe or redirect lease) -> skip` | that MAC is streaming through ffmpeg or still holds a post-302 lease | zapping on a single MAC: lower `SPM_REDIRECT_LEASE_S` (default 180); otherwise give the portal another MAC |
+| `[stream] redirect: mac … busy (ffmpeg pipe or redirect lease) -> skip` | that MAC is streaming through ffmpeg (another viewer) or holds a post-302 lease owned by somebody else — the *same* user's lease is taken over automatically, logged as `taking over the redirect lease … (the channel this zap left)` | nothing to do for a same-user zap on this build; a *different* user's stream on the same MAC is real concurrency — give the portal another MAC (or lower `SPM_REDIRECT_LEASE_S`, default 180, if zapping is frequent) |
 
 Two things the proxy does for you here: the outgoing `create_link` cmd is stripped of its stale `play_token` (panels that receive their own token back tend to mangle the answer), and ffmpeg presents the MAG box's embedded **player** user-agent (`Lavf53.32.100`, never its own `Lavf/61.x`) plus a referer for `http(s)` inputs, because the bare modern-libav identity is refused by quite a few panels with a 403/405 — and if the origin instead answers the player UA with **HTTP 456** and zero bytes (the usual anti-proxy answer behind "ffmpeg templates don't play while direct/redirect channels do"), the stream is automatically reopened once with the portal browser UA and the winning identity is remembered for that origin.
 
@@ -730,15 +752,16 @@ Two things the proxy does for you here: the outgoing `create_link` cmd is stripp
 | `python3 dev/check-links.py` | Pins the portal plumbing that decides whether a channel plays: the `create_link` URL rules (prefix stripping, stale-token removal, repair of a mangled answer), the STB fingerprint and account verdict, the link-flag policy table and the `version.js`/`get_modules` parsers — plus greps that no probe's answer is discarded and that the link policy is not re-inlined at a call site. No pytest needed, so it also runs on a NAS. Run it after touching `app/portal/`. |
 | `python3 dev/probe-link.py '<url>'` | Runs the redirect guard's real probe ladder against a live URL and prints every rung — method, `Range` or not, status or exception, elapsed ms — plus the verdict, so `redirect: fresh link dead (…)` can be checked against what the origin really answers. `--read N` also fetches N bytes of a plain GET (what a player sends) and classifies them: MPEG-TS sync bytes, the panel's HTML error page, or something else. Needs only `httpx`, so it runs inside the built image; a `play_token` is short-lived, so probe a fresh one. |
 | `node dev/check-js.js` | Syntax-checks the JavaScript inside every template's `<script>` block (and `app/static/js/app.js`) with the real parser, after a text-level Jinja pass that keeps one branch of each `{% if %}`. A broken template script is invisible to every Python test — the page renders, the API answers 200, and the table is simply empty. Needs `node`; skip it if your box has none. |
-| `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies `dev/docker-publish.yml.example` is byte-identical to the real workflow. Run it before pushing anything under `.github/workflows/`. |
+| `bash dev/check-yaml.sh` | Parses every workflow file (and `docker-compose.yml`) and verifies each `dev/*.yml.example` is byte-identical to the workflow it installs (`docker-publish.yml`, `ci.yml`). Run it before pushing anything under `.github/workflows/`. |
 | `bash dev/seed-demo.sh [BASE_URL]` | Seeds a *running* instance with a full demo setup against the built-in mock portal (portal → genres → live/VOD/series → users). Idempotent; dev/mockup use (`SPM_SKIP_LOGIN=1`), default base `http://127.0.0.1:8880`. |
 
 **YAML gotcha that silently disabled this whole workflow once:** a plain scalar may not contain `": "`, so step names must be quoted — `- name: "Image metadata (tags: latest, sha, semver releases)"`. Unquoted, GitHub reports *"mapping values are not allowed here"* and refuses the **entire file**: no job in it runs (build, push and smoke all vanish together), which looks like "the workflow stopped working" rather than a typo. `dev/check-yaml.sh` catches it before you push.
 
-`dev/docker-publish.yml.example` is a full copy of the workflow, kept in sync on purpose: the repo's bot cannot commit under `.github/workflows/` (GitHub denies GitHub-App commits that touch workflows), so the copy is installed with
+`dev/docker-publish.yml.example` and `dev/ci.yml.example` are full copies of their workflows, kept in sync on purpose: the repo's bot cannot commit under `.github/workflows/` (GitHub refuses a GitHub-App push that touches a workflow with *"refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml` without `workflows` permission"*), so the copies are installed with
 
 ```bash
 cp dev/docker-publish.yml.example .github/workflows/docker-publish.yml   # safe: byte-identical
+cp dev/ci.yml.example             .github/workflows/ci.yml               # the test suite
 ```
 
 ---
@@ -774,8 +797,55 @@ a real subprocess for the ffmpeg binary and keep the rest of the pipeline real):
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest          # or: python -m pytest -v tests/test_stream_disconnect.py
+python -m pytest          # 700+ tests in ~29 s on two cores (was ~103 s)
+python -m pytest tests/test_stream_disconnect.py -v      # one file, one worker
 ```
+
+(the last two lines of `requirements-dev.txt` pull in pytest-xdist and
+pytest-timeout; `pytest.ini` configures both, so re-run that pip install in an
+older venv or the run stops with "unrecognized arguments: -n")
+
+What keeps it fast (and what to reach for when a run misbehaves):
+
+| Knob | Why |
+|---|---|
+| `tests/conftest.py` builds each test's empty database by **deleting rows** instead of dropping and re-creating 31 tables: ~6 ms against ~58 ms per test, ~40 s of the suite. The schema is rebuilt only when a test actually changed it (the migration tests do), detected by fingerprinting `sqlite_master`. |
+| `-n auto` (pytest-xdist, the default via `addopts`) spreads the tests over the available cores; each worker gets its own temp database, so they cannot collide. On a 2-core container that measured ~19 s with `-n 3` against ~29 s serial and ~30 s with `-n auto` - the bag of tests is uneven, so more workers are not automatically better. `-n 0` runs in-process (needed for `--pdb`). |
+| `timeout = 120` (pytest-timeout) turns a deadlock into a *failed test* instead of a run that never ends. It is a safety net — the slowest test is under 1.5 s, so anything near the limit is a hang, not slow work. `--timeout=30` for a stricter run, `--timeout=0` to switch it off. |
+| `app/database.py::run_uncancelled` hands back a cancellation that `asyncio.wait_for` swallowed when the shielded work finished in the same loop turn. Without that, the log writer parked forever (state CANCELLING, no exception anywhere) and the teardown that waits for it - `asyncio.Runner.close()` under xdist, uvicorn's shutdown in production - waited forever too. |
+| Long `sleep`s in tests were shortened to the smallest value that still proves the same thing (a demo timeout is asserted at 0.5 s, a simulated portal page latency at 20 ms, a "silent ffmpeg" stub `exec`s its `sleep` so no orphan child holds the pipes and burns a 3 s reap wait). |
+| `python -m pytest -q --durations=10` when you want to know where the time went; `-x --timeout=30` for a quick feedback loop while editing one module. |
+
+Two failures on a clean checkout - `test_local_playback.py::test_ffmpeg_argv_injects_annexb_when_copying_to_mpegts`
+and `test_stb_identity.py::test_an_existing_install_gets_the_columns_it_is_promised`
+- are **pre-existing** (they fail on `main` too, and are unrelated to the
+streaming/portal work); deselect them with
+`--deselect tests/test_stb_identity.py::test_an_existing_install_gets_the_columns_it_is_promised`
+until they are fixed.
+
+### Continuous integration (GitHub Actions)
+
+| Workflow | Trigger | What it does |
+|---|---|---|
+| `docker` (`dev/docker-publish.yml.example`) | push to `main`/`master`, `v*` tags | builds the image, pushes it to GHCR, then boots it with `SPM_MOCK_PORTAL=1` and runs `dev/smoke.sh`. |
+| `tests` (`dev/ci.yml.example`) | **every pull request**, push to `main`/`master`, manual | installs `requirements-dev.txt`, runs `dev/check-yaml.sh` + `node dev/check-js.js`, then the pytest suite. ~1 minute warm, and it is the same command you run locally (`pytest.ini` still adds `-n auto` and the 120 s timeout). |
+
+Install the test workflow once (the bot cannot - see the note in *Development
+scripts* below; this is the GitHub web UI equivalent of copying the file:
+repo → **Add file** → **Create new file** → path `.github/workflows/ci.yml` →
+paste the contents of `dev/ci.yml.example` → commit):
+
+```bash
+cp dev/ci.yml.example .github/workflows/ci.yml
+git add .github/workflows/ci.yml && git commit -m "CI: run the test suite on PRs" && git push
+```
+
+It runs on the next PR/push. Two tests are deselected *in the workflow* because
+they fail on `main` too; delete those two `--deselect` lines once they are fixed
+(a `--deselect` for a test that no longer exists is silently ignored, so they
+cannot go stale). `dev/check-links.py` is deliberately **not** wired in yet: it
+currently fails 5/166 on `main` (the EPG now/next endpoints), so it would turn
+every run red - run it by hand after touching `app/portal/`.
 
 ## Phase 3 (done)
 

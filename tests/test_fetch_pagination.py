@@ -26,7 +26,11 @@ from app.portal.client import Page
 from app.services.fetch_jobs import _paged_upsert
 
 PAGES = 24
-LATENCY = 0.05
+# Small on purpose: the assertions are about *ratios* (parallel beats serial,
+# in-flight stays within the limit), and a loaded suite does not become more
+# truthful by sleeping longer. 24 pages at 50 ms was 1.2 s of pure sleep per
+# test, twice over.
+LATENCY = 0.02
 
 
 class _Job:

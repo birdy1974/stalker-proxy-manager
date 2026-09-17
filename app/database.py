@@ -115,14 +115,31 @@ def _cancel_shield():
     *shielded* scope removes this task from the parent scope's task set; anyio
     restarts cancellation in the parent once we leave, so the CancelledError
     still propagates afterwards - just not while we are cleaning up.
+
+    "Afterwards" is not guaranteed, though. ``asyncio.wait_for`` returns the
+    RESULT of an awaitable that is already done rather than the cancellation it
+    just received, and anyio's ``CancelScope.__exit__`` returns True (swallow)
+    for a cancellation that counts as its own - so a ``Task.cancel()`` that
+    races the end of the shielded work can vanish. The task then keeps running
+    with the cancellation outstanding and no exception anywhere, and whatever
+    waits for it (uvicorn's shutdown, ``asyncio.Runner.close()`` in the test
+    suite) waits forever. That is a hang, not a slow test: compare the task's
+    count of cancellation requests across the block and hand the cancellation
+    back if it went up instead of being delivered.
     """
     try:
         from anyio import CancelScope
     except ImportError:                      # pragma: no cover - ships with FastAPI
         yield
         return
+    task = asyncio.current_task()
+    requested = task.cancelling() if task is not None else 0
     with CancelScope(shield=True):
         yield
+    if task is not None and task.cancelling() > requested:
+        # The work inside is finished, but the caller is still being torn down
+        # and has to unwind.
+        raise asyncio.CancelledError()
 
 
 async def run_uncancelled(coro: Coroutine[Any, Any, Any], *, timeout: float = 15.0,
@@ -138,21 +155,22 @@ async def run_uncancelled(coro: Coroutine[Any, Any, Any], *, timeout: float = 15
     killed - we only stop waiting for it.
     """
     task = spawn(coro)
-    with _cancel_shield():
-        try:
+    try:
+        with _cancel_shield():
             return await asyncio.wait_for(asyncio.shield(task), timeout)
-        except asyncio.TimeoutError:
-            log.warning("%s did not finish within %.0fs; leaving it running",
-                        what, timeout)
-            return None
-        except asyncio.CancelledError:
-            # We are being torn down. Do NOT swallow this - the request task has
-            # to unwind or uvicorn/anyio will wait for it forever. The work
-            # itself is detached and keeps running; just make sure its result is
-            # retrieved so asyncio does not log "Task exception was never
-            # retrieved" for a failure nobody will ever await.
-            task.add_done_callback(_consume_result)
-            raise
+    except asyncio.TimeoutError:
+        log.warning("%s did not finish within %.0fs; leaving it running",
+                    what, timeout)
+        return None
+    except asyncio.CancelledError:
+        # We are being torn down. Do NOT swallow this - the request task has
+        # to unwind or uvicorn/anyio will wait for it forever (the shield in
+        # `_cancel_shield` re-raises it here when it had to eat one). The work
+        # itself is detached and keeps running; just make sure its result is
+        # retrieved so asyncio does not log "Task exception was never
+        # retrieved" for a failure nobody will ever await.
+        task.add_done_callback(_consume_result)
+        raise
 
 
 class _DisconnectSafeSession(AsyncSession):

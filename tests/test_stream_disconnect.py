@@ -367,3 +367,46 @@ async def test_run_uncancelled_does_not_swallow_cancellation():
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+async def test_run_uncancelled_does_not_lose_a_cancellation_that_races_the_result():
+    """
+    The log writer used to park forever, and `asyncio.Runner.close()` (the test
+    suite's event-loop teardown) then waited for it forever: a hang, not a slow
+    test.
+
+    Cause: `asyncio.wait_for` has a documented soft spot - when the awaitable is
+    already done, it RETURNS its result instead of the cancellation, so a
+    `Task.cancel()` that lands in the same loop turn the shielded work finishes
+    disappears: the task keeps running with the cancellation outstanding, so it
+    is in state CANCELLING forever and no later cancel() is even attempted.
+    Whatever parks after such a call (the writer's `while True: await q.get()`)
+    never ends.
+
+    The work inside the shield still has to finish; the caller still has to
+    unwind.
+    """
+    finished = []
+
+    async def work(caller_task):
+        # Cancel the caller from the very turn this task completes, so the
+        # shielded future is already done when the cancellation is delivered.
+        asyncio.current_task().add_done_callback(lambda _t: caller_task.cancel())
+        await asyncio.sleep(0.02)
+        finished.append("cleaned up")
+        return "cleaned up"
+
+    parked = asyncio.Event()
+
+    async def caller():
+        await run_uncancelled(work(asyncio.current_task()), timeout=5)
+        parked.set()
+        await asyncio.sleep(30)            # where the log writer ended up
+
+    task = asyncio.create_task(caller())
+    done, _ = await asyncio.wait({task}, timeout=2.0)
+
+    assert task in done, "the cancellation was swallowed: the caller never unwound"
+    assert task.cancelled(), f"expected a cancelled task, got {task!r}"
+    assert not parked.is_set(), "run_uncancelled returned despite the cancellation"
+    assert finished == ["cleaned up"], "the shielded work must still finish"
