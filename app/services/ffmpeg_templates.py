@@ -83,6 +83,200 @@ OUTPUT_FORMATS = ("mpegts", "hls", "matroska")
 RC_MODES = ["AUTO", "CQP", "CBR", "VBR", "ICQ", "QVBR", "AVBR"]
 # VAAPI encoders that understand -low_power/-rc_mode/-async_depth.
 VAAPI_ENCODERS = ("h264_vaapi", "hevc_vaapi", "vp8_vaapi", "vp9_vaapi")
+# Selectable extra video filters (the `vf_preset` field): literal ffmpeg
+# snippets spliced FIRST into the -vf chain (before scale/fps/setsar), so a
+# deinterlacer sees full-size fields and a flag fix precedes any processing.
+# They exist for fault-finding (e.g. "audio plays, picture stays black" on an
+# Enigma2 box): each preset isolates one suspect - interlaced source, 10-bit
+# pixels, wrong field flags, broken surface handling - and the Demo buttons
+# run it against a real source in ~2 s. `none` renders nothing, so every
+# template stored before this field existed builds byte-identical commands.
+# A preset carries one snippet per decode path ("" = not applicable there and
+# rendered as nothing, with an option_warnings note - never a filter ffmpeg
+# would choke on). `cpu` pulls video frames through the CPU (download +
+# re-upload around a software filter): a diagnostic, not a daily driver.
+# `doubles` outputs one frame per FIELD (bob): 25i becomes 50p, so it wants
+# FPS 50 (or src) - with FPS 25 the fps filter halves it straight back.
+@dataclass(frozen=True)
+class VFPreset:
+    id: str
+    label: str      # dropdown text (mirrored in app/templates/ffmpeg.html)
+    hint: str       # one-line fault-finding guidance (GUI tooltip)
+    vaapi: str      # snippet when hw_accel=vaapi ("" = needs other decoding)
+    qsv: str        # snippet when hw_accel=qsv
+    sw: str         # snippet when hw_accel=none (software frames)
+    cpu: bool = False
+    doubles: bool = False
+
+
+VF_PRESETS: tuple[VFPreset, ...] = (
+    VFPreset("none",
+             "None (default, current behaviour)",
+             "no extra filter - the command is byte-identical to previous versions",
+             "", "", ""),
+    # --- VAAPI-native deinterlacers (stay on the GPU; the DS918+ path) ---
+    VFPreset("deint-vaapi-frame",
+             "Deinterlace (VAAPI, frame rate kept)",
+             "GPU deinterlace, 25i stays 25p - first choice for interlaced live TV",
+             "deinterlace_vaapi=rate=frame", "", ""),
+    VFPreset("deint-vaapi-auto",
+             "Deinterlace (VAAPI, interlaced frames only)",
+             "as above, but progressive frames pass through untouched (mixed content)",
+             "deinterlace_vaapi=rate=frame:auto=1", "", ""),
+    VFPreset("deint-vaapi-field",
+             "Deinterlace bob (VAAPI, double frame rate)",
+             "GPU bob: 25i becomes 50p - set FPS 50 (or src) to keep it",
+             "deinterlace_vaapi=rate=field", "", "", doubles=True),
+    VFPreset("deint-vaapi-bob",
+             "Deinterlace bob, pinned algorithm (VAAPI mode=bob)",
+             "as above but pins the bob algorithm instead of the driver default",
+             "deinterlace_vaapi=mode=bob:rate=field", "", "", doubles=True),
+    VFPreset("deint-vaapi-motion",
+             "Deinterlace motion-adaptive (VAAPI)",
+             "pins the motion-adaptive algorithm at frame rate (best single-rate quality on Intel)",
+             "deinterlace_vaapi=mode=motion_adaptive:rate=frame", "", ""),
+    # --- QSV deinterlacers (stay on the GPU) ---
+    VFPreset("deint-qsv-advanced",
+             "Deinterlace advanced (QSV)",
+             "GPU advanced (motion-adaptive) deinterlace for Quick Sync templates",
+             "", "vpp_qsv=deinterlace=2", ""),
+    VFPreset("deint-qsv-bob",
+             "Deinterlace bob (QSV)",
+             "GPU bob deinterlace for Quick Sync templates (double frame rate)",
+             "", "vpp_qsv=deinterlace=1", "", doubles=True),
+    # --- software deinterlacers (CPU round-trip on GPU templates) ---
+    VFPreset("yadif-frame",
+             "Deinterlace yadif (CPU, frame rate kept)",
+             "reference software deinterlacer; on GPU templates frames are downloaded and re-uploaded",
+             "hwdownload,format=yuv420p,yadif=mode=send_frame:parity=auto,hwupload",
+             "hwdownload,format=yuv420p,yadif=mode=send_frame:parity=auto,hwupload",
+             "yadif=mode=send_frame:parity=auto", cpu=True),
+    VFPreset("yadif-bob",
+             "Deinterlace yadif bob (CPU, double frame rate)",
+             "software bob: 25i becomes 50p - set FPS 50 (or src) to keep it",
+             "hwdownload,format=yuv420p,yadif=mode=send_field:parity=auto,hwupload",
+             "hwdownload,format=yuv420p,yadif=mode=send_field:parity=auto,hwupload",
+             "yadif=mode=send_field:parity=auto", cpu=True, doubles=True),
+    VFPreset("bwdif-frame",
+             "Deinterlace bwdif (CPU, frame rate kept)",
+             "higher-quality software deinterlacer (motion-weighted); CPU round-trip on GPU templates",
+             "hwdownload,format=yuv420p,bwdif=mode=send_frame:parity=auto,hwupload",
+             "hwdownload,format=yuv420p,bwdif=mode=send_frame:parity=auto,hwupload",
+             "bwdif=mode=send_frame:parity=auto", cpu=True),
+    VFPreset("bwdif-bob",
+             "Deinterlace bwdif bob (CPU, double frame rate)",
+             "software bob, motion-weighted: 25i becomes 50p - set FPS 50 (or src) to keep it",
+             "hwdownload,format=yuv420p,bwdif=mode=send_field:parity=auto,hwupload",
+             "hwdownload,format=yuv420p,bwdif=mode=send_field:parity=auto,hwupload",
+             "bwdif=mode=send_field:parity=auto", cpu=True, doubles=True),
+    # --- pipeline / signalling diagnostics ---
+    VFPreset("hw-roundtrip",
+             "GPU download/upload round-trip (no-op test)",
+             "frames go to the CPU and back unchanged: if THIS breaks the picture, surface handling is the fault",
+             "hwdownload,hwupload", "hwdownload,hwupload", "", cpu=True),
+    VFPreset("pixfmt-420p",
+             "Force 8-bit 4:2:0 (10-bit/HDR sources)",
+             "converts through 8-bit yuv420p: isolates 10-bit/odd-pixel-format rejections",
+             "hwdownload,format=yuv420p,hwupload",
+             "hwdownload,format=yuv420p,hwupload", "", cpu=True),
+    VFPreset("setfield-prog",
+             "Force progressive flag",
+             "marks frames progressive without touching pixels: isolates wrong interlace signalling",
+             "setfield=mode=prog", "setfield=mode=prog", "setfield=mode=prog"),
+    VFPreset("setfield-tff",
+             "Force top-field-first flag",
+             "marks frames top-field-first: pair with a deinterlacer when parity detection misfires",
+             "setfield=mode=tff", "setfield=mode=tff", "setfield=mode=tff"),
+    VFPreset("null",
+             "Null (filter-graph sanity check)",
+             "passes frames through untouched: if THIS breaks the picture, filter insertion itself is the fault",
+             "null", "null", "null"),
+)
+VF_PRESET_IDS = frozenset(p.id for p in VF_PRESETS)
+
+
+def vf_preset_by_id(preset_id: str) -> VFPreset | None:
+    for p in VF_PRESETS:
+        if p.id == preset_id:
+            return p
+    return None
+
+
+def vf_snippet(preset_id: str, hw_accel: str) -> str:
+    """Literal -vf snippet for (preset, decode path); "" when the id is unknown
+    or the preset does not apply there (the renderer then emits nothing and
+    option_warnings() says why)."""
+    p = vf_preset_by_id(preset_id)
+    if p is None:
+        return ""
+    if hw_accel == "vaapi":
+        return p.vaapi
+    if hw_accel == "qsv":
+        return p.qsv
+    return p.sw
+
+
+def vf_preset_needs(preset_id: str) -> str:
+    """Human-readable decode path a preset needs ("" = works everywhere)."""
+    p = vf_preset_by_id(preset_id)
+    if p is None or p.id == "none":
+        return ""
+    if p.vaapi and not p.qsv and not p.sw:
+        return "VAAPI decoding"
+    if p.qsv and not p.vaapi and not p.sw:
+        return "Quick Sync (QSV) decoding"
+    if (p.vaapi or p.qsv) and not p.sw:
+        return "GPU decoding (VAAPI or Quick Sync)"
+    return ""
+
+
+def _split_filter_chain(vf: str) -> list[str]:
+    """Split a -vf value on unescaped commas (filter arguments may escape theirs)."""
+    return [s for s in re.split(r"(?<!\\),", vf) if s]
+
+
+def _vf_preset_segments() -> list[tuple[tuple[str, ...], str]]:
+    """Every known snippet as (segments, preset id), longest first, so a wrapped
+    chain (hwdownload,...,yadif,...,hwupload) wins over its bare core."""
+    out: list[tuple[tuple[str, ...], str]] = []
+    for p in VF_PRESETS:
+        for snip in dict.fromkeys((p.vaapi, p.qsv, p.sw)):
+            if snip:
+                out.append((tuple(_split_filter_chain(snip)), p.id))
+    out.sort(key=lambda e: -len(e[0]))
+    return out
+
+
+_VF_PRESET_SEGMENTS = _vf_preset_segments()
+
+# -vf segments the renderer owns: scale (any spelling/args), fps, the SAR
+# normaliser and the software pixel-format pin. Anything else in a recognised
+# chain is either a known preset snippet or a foreign filter the next fields
+# pass will not reproduce (the parser warns about those).
+_OWNED_VF_NAMES = {"scale_vaapi", "scale_qsv", "scale", "fps", "setsar", "format"}
+
+
+def _match_vf_preset(vf: str) -> tuple[str | None, list[str]]:
+    """Find a known preset snippet inside a -vf chain.
+
+    Returns (preset id or None, unknown filter segments). Owned segments are
+    ignored; subtitles= is ignored here too (it has its own warning).
+    """
+    segs = _split_filter_chain(vf)
+    found: str | None = None
+    rest = segs
+    for wanted, pid in _VF_PRESET_SEGMENTS:
+        n = len(wanted)
+        for i in range(len(segs) - n + 1):
+            if tuple(segs[i:i + n]) == wanted:
+                found = pid
+                rest = segs[:i] + segs[i + n:]
+                break
+        if found is not None:
+            break
+    unknown = [s for s in rest
+               if s.split("=", 1)[0] not in _OWNED_VF_NAMES and "subtitles=" not in s]
+    return found, unknown
 # The shipped reference preset (kept as a built-in, but NOT the fallback
 # default - that role belongs to the redirect preset now).
 REFERENCE_PRESET_NAME = "VAAPI 720p ~1M (DS918+ reference)"
@@ -243,6 +437,7 @@ class FFmpegOptions:
     gop: str = "50"
     profile: str = "high"
     level: str = "4.1"
+    vf_preset: str = "none"            # extra video filter, first in -vf (see VF_PRESETS)
     low_power: bool = True           # h264_vaapi: use EncSliceLP (fixed-function)
     rc_mode: str = "CQP"             # VAAPI rate control: AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
     # QP for -rc_mode CQP (0-51, lower = better quality and more bits). Emitted
@@ -282,6 +477,10 @@ def coerce_options(base: dict | None) -> dict:
             # "mkv" is what people type; the muxer is called matroska
             fmt = "matroska" if fmt == "mkv" else fmt
             out[k] = fmt if fmt in OUTPUT_FORMATS else "mpegts"
+        elif k == "vf_preset":
+            # unknown ids are kept (the GUI shows them as custom values);
+            # build_command renders nothing for them and option_warnings says so
+            out[k] = str(v).strip().lower() or "none"
         else:
             out[k] = v if isinstance(v, str) else str(v)
     return out
@@ -329,6 +528,13 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     if transcode:
         size = target_size(opts.resolution, opts.aspect)
         filters: list[str] = []
+        # Selectable extra filter (fault-finding bank): spliced FIRST so a
+        # deinterlacer sees full-size fields and a flag fix precedes any
+        # processing. Unknown ids and decode-path mismatches render nothing
+        # (option_warnings says so) - never a filter ffmpeg would choke on.
+        extra = vf_snippet(opts.vf_preset, opts.hw_accel)
+        if extra:
+            filters.append(extra)
         if opts.hw_accel == "vaapi":
             if size:
                 filters.append(f"scale_vaapi=w={size[0]}:h={size[1]}:format=nv12")
@@ -505,6 +711,28 @@ def option_warnings(opts: FFmpegOptions) -> list[str]:
             and opts.audio_codec == "mp2":
         out.append("MP2 audio in Matroska plays on few set-top boxes; "
                    "AC3 or AAC is the safer choice")
+    vf = opts.vf_preset or "none"
+    if vf not in ("none", "") and vf not in VF_PRESET_IDS:
+        out.append(f"unknown video filter preset '{opts.vf_preset}' ignored "
+                   f"(pick a Video filter in the template editor)")
+    elif vf not in ("none", ""):
+        p = vf_preset_by_id(vf)
+        label = p.label if p else vf
+        if opts.video_codec == "copy":
+            out.append(f"video filter '{label}' needs re-encoded video and is "
+                       f"ignored for copy/passthrough")
+        elif not vf_snippet(vf, opts.hw_accel):
+            out.append(f"video filter '{label}' needs {vf_preset_needs(vf)}; "
+                       f"ignored on {opts.hw_accel or 'software'} decoding")
+        else:
+            if p.cpu and opts.hw_accel != "none":
+                out.append(f"video filter '{label}' pulls video frames through "
+                           f"the CPU (download + re-upload): expect CPU load - "
+                           f"a diagnostic, not a daily driver")
+            if p.doubles and (opts.fps or "") in ("24", "25", "30"):
+                out.append(f"video filter '{label}' outputs one frame per field "
+                           f"(25i becomes 50p) but FPS {opts.fps} halves it back; "
+                           f"use FPS 50 (or src) for full 50p")
     return out
 
 
@@ -626,6 +854,17 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
             fm = re.search(r"fps=(\d+)", vf)
             if fm:
                 opts.fps = fm.group(1)
+            preset, unknown_filters = _match_vf_preset(vf)
+            if preset is not None:
+                opts.vf_preset = preset
+            elif m is not None or "format" in vf:
+                # A recognised chain without a known extra filter honestly
+                # reads as none: unlike -rc_mode, the -vf text IS the whole
+                # filter state, so there is nothing for the base to keep (and
+                # deleting the filter from the command text resets the field).
+                opts.vf_preset = "none"
+            # else: a wholly foreign -vf (kept as-is below); the base value
+            # stands, because the text says nothing about our presets.
             if "subtitles=" in vf:
                 # burn-in was removed (software-only: libass needs CPU video
                 # frames). The filter is dropped from the rendered command and
@@ -636,6 +875,11 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
             elif m is None and "format" not in vf:
                 warnings.append(f"unrecognised video filter kept as-is: {vf}")
                 unhandled_out += ["-vf", vf]
+            else:
+                for u in unknown_filters:
+                    warnings.append(
+                        f"unrecognised video filter '{u}' is not a Video-filter "
+                        f"preset and will not survive the next fields pass")
             i += 2
             continue
         if t == "-map":

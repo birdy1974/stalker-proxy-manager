@@ -413,6 +413,7 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         # first, which is exactly how the subs column once knocked out the five
         # migrations above on databases that predate them.
         "subs": ("VARCHAR(6)", "'drop'"),
+        "vf_preset": ("VARCHAR(32)", "'none'"),
     },
     "local_files": {
         "duration_s": ("FLOAT", "NULL"),
