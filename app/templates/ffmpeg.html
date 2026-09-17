@@ -274,7 +274,7 @@ function showValidate(result, label) {
   const lines = [`${mark} ${label} — ${result.detail || (result.ok ? "ok" : "failed")}`];
   if (result.playlist) {
     const p = result.playlist;
-    lines.push(`playlist: ${p.kind} #${p.id}  ${p.name || ""}${p.source ? "  source=" + p.source : ""}`);
+    lines.push(`playlist: ${p.kind} #${p.id}  ${p.name || ""}${p.source ? "  source=" + p.source : ""}${p.mac ? "  mac=" + p.mac : ""}`);
     if (p.url) lines.push(`input: ${p.url}`);
   } else if (result.source) {
     lines.push(`source: ${result.source}`);

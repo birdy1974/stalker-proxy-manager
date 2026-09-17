@@ -185,7 +185,13 @@ async def demo(payload: dict, db=Depends(get_db)):
         except (TypeError, ValueError) as exc:
             raise HTTPException(400, "id must be an integer") from exc
         try:
-            resolved = await item_info.resolve_playlist_input(db, kind, pid)
+            # avoid_busy: the demo opens a media connection on the MAC it
+            # resolves through. Doing that on a MAC that is streaming right now
+            # is what the panel answers with HTTP 456 (single connection slot),
+            # so a demo run beside a playing box used to report a bare
+            # "rc=8 with no output". Resolve through a free MAC - or say so.
+            resolved = await item_info.resolve_playlist_input(db, kind, pid,
+                                                              avoid_busy=True)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         label = resolved["name"]
@@ -198,7 +204,9 @@ async def demo(payload: dict, db=Depends(get_db)):
         result["playlist"] = {"kind": kind, "id": resolved["id"],
                               "name": resolved["name"],
                               "source": resolved.get("source"),
-                              "url": resolved["url"]}
+                              "url": resolved["url"],
+                              "mac": resolved.get("mac") or "",
+                              "portal": resolved.get("portal") or ""}
         return result
     return await run_demo(
         command=command,

@@ -288,13 +288,22 @@ function liveBuilder() {
   bar.append(
     mBtn("Add custom channel", "btn-accent", () => editCustomChannel(null), "bi-plus-circle"),
     builderBar("live", () => liveTable, false),
-    el("a", { class: "btn btn-sm btn-outline-secondary", href: "/api/export?section=live_playlist" }, "⤓ Export"));
+    el("a", { class: "btn btn-sm btn-outline-secondary", href: "/api/export?section=playlists" }, "⤓ Export"));
   liveTable = new DataTable($("#pl-live"), {
     selectable: true, defaultSort: "order", extraHeader: bar,
     server: async (q) => await api("/api/playlist/live?" + q),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/live/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
       { key: "order", label: "Ord", sort: "order", width: "52px" },
+      { key: "lock", label: "Number", width: "92px",
+        title: r => r.lock_number
+          ? "Channel number LOCKED: it keeps this number through reordering, deletes and adds - unlock to let it renumber"
+          : "Lock this channel's number: it will keep this number no matter what the rest of the playlist does",
+        render: r => `<span class="d-inline-flex align-items-center gap-1">
+          <span class="mono small ${r.lock_number ? "text-accent fw-semibold" : "text-muted"}">${r.number ?? ""}</span>
+          <button type="button" class="btn btn-sm ${r.lock_number ? "btn-accent" : "btn-outline-secondary"} py-0"
+            title="${r.lock_number ? "Unlock the channel number" : "Lock the channel number"}"
+            onclick="event.stopPropagation();toggleLock(${r.id}, ${!r.lock_number})"><i class="bi ${r.lock_number ? "bi-lock-fill" : "bi-lock"}"></i></button></span>` },
       { key: "custom_name", class: "col-name", label: "Custom name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("live", r) },
       { key: "chain", label: "Source chain (1=primary, then fallbacks)", render: r => chainHtml(r.chain) },
@@ -306,11 +315,13 @@ function liveBuilder() {
         <button class="btn btn-sm btn-outline-secondary" onclick="editCustomChannel(${r.id})"><i class="bi bi-pencil"></i></button>
         <button class="btn btn-sm btn-outline-danger" onclick="delCustom(${r.id})"><i class="bi bi-trash"></i></button>` },
     ],
-    dnd: { onReorder: async (ids) => {
-      await api("/api/playlist/live/order", { method: "POST",
-        body: { items: ids.map((id, i) => ({ id, order: i + 1 })) } });
-      toast("order saved", "ok");
-    } },
+    dnd: {
+      isLocked: (r) => r.lock_number,   // locked channels cannot be dragged
+      onReorder: async (ids) => {
+        await api("/api/playlist/live/order", { method: "POST",
+          body: { items: ids.map((id, i) => ({ id, order: i + 1 })) } });
+        toast("order saved · channel numbers updated", "ok");
+      } },
     emptyText: "No custom channels yet. Click 'Add custom channel' (or 'Add from sources…' to turn a whole group of enabled channels into channels at once).",
   });
   PL_TABLES.live = liveTable;
@@ -318,6 +329,12 @@ function liveBuilder() {
 window.delCustom = (id) => confirmDialog({ title: "Delete custom channel", body: "Remove this channel from the final playlist?",
   okText: "Delete", okClass: "btn-danger",
   onOk: async () => { await api(`/api/playlist/live/${id}`, { method: "DELETE" }); liveTable.reload(); } });
+window.toggleLock = async (id, lock) => {
+  await api(`/api/playlist/live/${id}`, { method: "PUT", body: { lock_number: lock } });
+  toast(lock ? "channel number locked - it will keep it through reordering, deletes and adds"
+             : "channel number unlocked - it follows the playlist order again", "ok");
+  liveTable.reload();
+};
 
 /* ---------------- Add / edit custom channel modal ---------------- */
 async function editCustomChannel(id) {
@@ -336,8 +353,17 @@ async function editCustomChannel(id) {
         <input class="form-control form-control-sm mono" id="cc-epg" value="${esc(row?.epg_id || "")}"></div>
       <div class="col-md-3"><label class="muted-label">FFmpeg template (default)</label>
         <select class="form-select form-select-sm" id="cc-tpl">${tplOptions(row?.ffmpeg_template_id)}</select></div>
-      <div class="col-md-3"><label class="muted-label">Channel number (opt)</label>
-        <input class="form-control form-control-sm" id="cc-number" value="${row?.number ?? ""}"></div>
+      <div class="col-md-3">
+        <label class="muted-label"
+          title="Position in the final playlist: saving a new number moves the channel to that position; reordering the table (or deleting/toggling channels) updates the numbers to match.">Channel number (opt)</label>
+        <input class="form-control form-control-sm" id="cc-number" value="${row?.number ?? ""}"
+          ${row?.lock_number ? "disabled title=\"locked - untick 'lock number' to change\"" : ""}>
+        <div class="form-check mt-1 mb-0">
+          <input class="form-check-input" type="checkbox" id="cc-lock" ${row?.lock_number ? "checked" : ""}>
+          <label class="form-check-label small text-muted" for="cc-lock"
+            title="A locked channel keeps this number no matter what you reorder, delete, add or toggle: the other channels renumber around it (they skip this number).">lock number</label>
+        </div>
+      </div>
       <div class="col-md-6">
         <label class="muted-label">Logo URL</label>
         <div class="input-group input-group-sm">
@@ -422,6 +448,7 @@ async function editCustomChannel(id) {
         logo: $("#cc-logo", body).value.trim(),
         ffmpeg_template_id: +$("#cc-tpl", body).value || null,
         number: +$("#cc-number", body).value || null,
+        lock_number: $("#cc-lock", body).checked,
         source_ids: chain.map(c => c.id),
       };
       if (!payload.custom_name) return toast("name required", "warn");

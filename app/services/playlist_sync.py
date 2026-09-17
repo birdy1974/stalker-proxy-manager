@@ -53,6 +53,76 @@ async def _next_order(db, model, start: int) -> int:
     return (cur or 0) + start
 
 
+# --------------------------------------------------------------------- live numbers
+async def renumber_live_numbers(db) -> int:
+    """The channel number IS the channel's position in the final playlist:
+    for every enabled live channel, ``number`` = its 1-based rank in the
+    (order, id) sort that the M3U/EPG output uses - EXCEPT locked channels,
+    whose number is frozen. Locked numbers are skipped by everyone else, so
+    the list always shows distinct numbers. Every operation that changes the
+    list (reorder, move-by-number, delete, enable/disable) calls this.
+    Disabled channels keep whatever number they carry - they are not in the
+    final playlist and have no position. Returns the number of channels."""
+    rows = (await db.execute(select(LivePlaylist)
+             .where(LivePlaylist.enabled.is_(True))
+             .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
+    locked = {r.number for r in rows if r.lock_number and r.number is not None}
+    cursor = 1
+    for r in rows:
+        if r.lock_number:
+            continue                       # frozen: the others flow around it
+        while cursor in locked:
+            cursor += 1
+        if r.number != cursor:
+            r.number = cursor
+        cursor += 1
+    await db.flush()
+    return len(rows)
+
+
+async def move_live_to_rank(db, pid: int, rank: int) -> bool:
+    """Move a channel so its (re-derived) number becomes ``rank``.
+
+    Locked numbers are obstacles: the channel lands on the requested number
+    when it is free, otherwise on the closest FREE number >= it (a number
+    held by a locked channel can never be taken). A locked target cannot be
+    moved at all - its number is frozen. Returns False when the channel has
+    no position (disabled) or is locked."""
+    rows = (await db.execute(select(LivePlaylist)
+             .where(LivePlaylist.enabled.is_(True))
+             .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
+    target = next((r for r in rows if r.id == pid), None)
+    if target is None:
+        return False
+    if target.lock_number:
+        return False
+    locked = {r.number for r in rows
+              if r.lock_number and r.number is not None}
+    if rank in locked:
+        while rank in locked:
+            rank += 1
+    # an unlocked channel's number is its rank among the UNLOCKED channels in
+    # list order (locked ones hold their number without consuming a free one),
+    # so the target must land as the k-th unlocked channel, where k = the
+    # rank's position in the free numbers
+    k = rank - sum(1 for x in locked if x <= rank)
+    others = [r for r in rows if r.id != pid]
+    need = max(0, k - 1)                   # unlocked channels before the target
+    slot, seen = len(others), 0
+    for s, r in enumerate(others):
+        if seen == need:
+            slot = s
+            break
+        if not r.lock_number:
+            seen += 1
+    seq = others[:slot] + [target] + others[slot:]
+    for i, r in enumerate(seq, 1):
+        if r.order != i:
+            r.order = i
+    await db.flush()
+    return True
+
+
 # --------------------------------------------------------------------- vod
 async def _sync_vod(db, ids: list[int], enabled: bool) -> dict:
     srcs = (await db.execute(select(VodSource).where(VodSource.id.in_(ids)))).scalars().all()
@@ -196,7 +266,9 @@ async def _sync_live(db, ids: list[int], enabled: bool) -> dict:
         playlist = LivePlaylist(
             custom_name=name,
             group_name=(genre.name if genre else None) or "Live",
-            number=int(src.number) if str(src.number or "").isdigit() else None,
+            # number is left NULL here on purpose: the channel number is the
+            # channel's position in the final playlist, re-derived below - the
+            # panel's own channel number stays on the source row, not here.
             epg_id=src.epg_original, logo=src.logo_original,
             enabled=True, order=nxt,
         )
@@ -208,6 +280,8 @@ async def _sync_live(db, ids: list[int], enabled: bool) -> dict:
         priorities[playlist.id] = 1
         created += 1
         nxt += 1
+    if created:
+        await renumber_live_numbers(db)
     return {"created": created, "fallback": fallback,
             "enabled": 0, "disabled": 0}
 
@@ -266,9 +340,9 @@ async def _add_live(db, ids: list[int], group: str | None) -> dict:
         if src.id in existing:
             continue
         genre = await db.get(LiveGenre, src.live_genre_id) if src.live_genre_id else None
+        # number stays NULL: the position in the final playlist re-derives it
         row = LivePlaylist(custom_name=src.original_name,
                            group_name=group or (genre.name if genre else None) or "Live",
-                           number=int(src.number) if str(src.number or "").isdigit() else None,
                            epg_id=src.epg_original, logo=src.logo_original,
                            enabled=True, order=nxt)
         db.add(row)
@@ -276,6 +350,8 @@ async def _add_live(db, ids: list[int], group: str | None) -> dict:
         db.add(LivePlaylistSource(live_playlist_id=row.id, live_source_id=src.id, priority=1))
         added += 1
         nxt += 1
+    if added:
+        await renumber_live_numbers(db)
     return {"added": added, "existed": len(existing), "missing": max(0, len(ids) - len(srcs))}
 
 
@@ -419,7 +495,7 @@ async def assign_live_custom_name(db, source_id: int, custom_name: str) -> dict:
     pl = LivePlaylist(
         custom_name=name,
         group_name=(genre.name if genre else None) or "Live",
-        number=int(src.number) if str(src.number or "").isdigit() else None,
+        # number stays NULL: the position in the final playlist re-derives it
         epg_id=src.epg_original, logo=src.logo_original,
         enabled=True, order=nxt,
     )
@@ -427,6 +503,7 @@ async def assign_live_custom_name(db, source_id: int, custom_name: str) -> dict:
     await db.flush()
     db.add(LivePlaylistSource(live_playlist_id=pl.id, live_source_id=source_id, priority=1))
     await db.flush()
+    await renumber_live_numbers(db)
     return {"action": "created", "playlist_id": pl.id, "custom_name": pl.custom_name,
             "priority": 1, "is_primary": True}
 

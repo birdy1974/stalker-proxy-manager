@@ -436,6 +436,11 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
     "users": {
         "area_id": ("INTEGER", "NULL"),
     },
+    "live_playlist": {
+        # channel-number lock: a locked channel keeps its number through
+        # reordering / deletes / adds (the rest renumber around it)
+        "lock_number": ("BOOLEAN", "0"),
+    },
 }
 
 
