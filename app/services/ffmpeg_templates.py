@@ -361,6 +361,188 @@ def _tokens(raw: str | None) -> list[str]:
         return (raw or "").split()
 
 
+_STRUCTURED_OUTPUT_FLAGS = {
+    "-vf", "-map", "-c", "-codec", "-c:v", "-vcodec", "-c:a",
+    "-acodec", "-c:s", "-scodec", "-an", "-sn", "-dn", "-f",
+}
+
+
+def _safe_extra_tokens(raw: str | None, side: str) -> tuple[list[str], list[str]]:
+    """Return extra option tokens only when they have an option at the front.
+
+    ``extra_input``/``extra_output`` are escape hatches for flags the structured
+    editor does not know. They are *not* a second positional-argument list. A
+    stale two-way parse can leave the value of ``-vf`` or ``-map`` behind after
+    consuming the flag; blindly appending that value turns it into an output
+    filename (the exact ``scale_vaapi=...`` failure seen in production).
+
+    We keep valid arbitrary flag/value text, including half-typed values while
+    the editor is being used, but reject a list that starts with a bare value.
+    The caller reports the warning; the renderer fails safe by omitting it.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return [], []
+    try:
+        tokens = shlex.split(text)
+    except ValueError as exc:
+        return [], [f"{side} flags ignored: unbalanced quotes ({exc})"]
+    if not tokens:
+        return [], []
+    if not tokens[0].startswith("-"):
+        return [], [f"{side} flags ignored: first token {tokens[0]!r} is not an option"]
+    if side == "extra output":
+        owned = next((token for token in tokens if token in _STRUCTURED_OUTPUT_FLAGS), None)
+        if owned is not None:
+            return [], [f"extra output flags ignored: {owned} is owned by structured fields"]
+    # An option may consume one value; any later bare token is orphaned. This
+    # deliberately errs on the safe side for unknown/private FFmpeg flags: a
+    # command with an extra positional output is worse than an omitted custom
+    # flag, and the final argv validator remains the last line of defence.
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if not token.startswith("-"):
+            return [], [f"{side} flags ignored: orphan token {token!r}"]
+        if token in _NO_VALUE_FLAGS:
+            i += 1
+        elif i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+            i += 2
+        else:
+            i += 1
+    return tokens, []
+
+
+def extra_option_warnings(opts: FFmpegOptions) -> list[str]:
+    """Warnings for unsafe raw extra-option fields.
+
+    Kept separate from ``option_warnings`` so API callers can use the same
+    guard before saving a template and the field renderer can use it before
+    appending anything to a command.
+    """
+    out: list[str] = []
+    for raw, side in ((opts.extra_input, "extra input"),
+                      (opts.extra_output, "extra output")):
+        _tokens_out, warnings = _safe_extra_tokens(raw, side)
+        out.extend(warnings)
+    return out
+
+
+# Flags which are allowed to consume one following token as their value when
+# validating the final argv. Unknown flags use the same one-value convention,
+# which covers custom filters, metadata and private FFmpeg options without
+# pretending to understand every FFmpeg release.
+_NO_VALUE_FLAGS = {
+    "-an", "-dn", "-sn", "-re", "-y", "-n", "-nostdin", "-shortest",
+    "-copyts", "-start_at_zero", "-genpts", "-benchmark", "-hide_banner",
+}
+_REQUIRED_VALUE_FLAGS = {
+    "-i", "-rw_timeout", "-reconnect", "-reconnect_at_eof", "-reconnect_streamed",
+    "-reconnect_delay_max", "-fflags", "-err_detect", "-init_hw_device",
+    "-hwaccel", "-hwaccel_device", "-hwaccel_output_format", "-user_agent",
+    "-headers", "-referer", "-protocol_whitelist", "-allowed_extensions", "-timeout",
+    "-vf", "-map", "-c", "-codec", "-c:v", "-vcodec", "-c:a", "-acodec",
+    "-c:s", "-scodec", "-b:v", "-maxrate", "-bufsize", "-global_quality", "-q:v",
+    "-g", "-r", "-profile:v", "-level", "-b:a", "-ac", "-ar", "-low_power",
+    "-rc_mode", "-async_depth", "-f", "-preset", "-metadata", "-bsf:v",
+    "-bsf:v:0", "-mpegts_flags", "-flush_packets", "-max_interleave_delta",
+    "-hls_time", "-hls_list_size", "-hls_flags", "-live", "-t",
+}
+
+
+def argv_validation_errors(args: list[str]) -> list[str]:
+    """Find malformed option/value structure in an FFmpeg argv.
+
+    FFmpeg permits one final output target, normally ``pipe:1`` here. Before
+    that target every non-option token must be the value of the option directly
+    before it. The input side is checked too because runtime-added reconnect,
+    hardware and identity flags can be malformed independently. This catches
+    an orphaned filter/map value before a subprocess is launched, rather than
+    letting FFmpeg interpret it as a filename and return rc=234.
+    """
+    if not args:
+        return ["empty ffmpeg argv"]
+    try:
+        input_idx = max(i for i, token in enumerate(args) if token == "-i")
+    except ValueError:
+        return ["ffmpeg argv has no -i input"]
+    errors: list[str] = []
+    if input_idx + 1 >= len(args) or args[input_idx + 1].startswith("-"):
+        errors.append("-i has no input value")
+    if len(args) <= input_idx + 2:
+        errors.append("ffmpeg argv has no output target")
+        return errors
+
+    # Validate the input-option region too. Runtime-added reconnect, hardware
+    # and identity arguments live here; a missing value must not reach exec just
+    # because the output side happens to look well formed.
+    i = 1 if args[0] == "ffmpeg" or args[0].endswith("/ffmpeg") else 0
+    while i < input_idx:
+        token = args[i]
+        if not token.startswith("-"):
+            errors.append(f"bare input token {token!r} before -i")
+            i += 1
+            continue
+        if token in _NO_VALUE_FLAGS:
+            i += 1
+            continue
+        if token in _REQUIRED_VALUE_FLAGS \
+                and (i + 1 >= input_idx or args[i + 1].startswith("-")):
+            errors.append(f"input option {token!r} has no value")
+            i += 1
+            continue
+        if i + 1 < input_idx and not args[i + 1].startswith("-"):
+            i += 2
+        else:
+            i += 1
+
+    target = args[-1]
+    if target.startswith("-") and target != "-":
+        errors.append(f"final output target {target!r} is an option")
+    i = input_idx + 2
+    end = len(args) - 1
+    while i < end:
+        token = args[i]
+        if token.startswith("-"):
+            missing_value = (token in _REQUIRED_VALUE_FLAGS
+                             and (i + 1 >= end or args[i + 1].startswith("-")))
+            if missing_value:
+                errors.append(f"output option {token!r} has no value")
+                i += 1
+            elif token in _NO_VALUE_FLAGS:
+                i += 1
+            elif i + 1 >= end:
+                errors.append(f"output option {token!r} has no value")
+                i += 1
+            # A following option means this option is a custom no-value flag.
+            elif args[i + 1].startswith("-"):
+                i += 1
+            else:
+                i += 2
+            continue
+        errors.append(f"bare output token {token!r} before final target {target!r}")
+        i += 1
+    return errors
+
+
+def template_command_errors(command: str, *, require_placeholder: bool = True) -> list[str]:
+    """Validate a stored template's token shape without running FFmpeg."""
+    cmd = (command or "").strip()
+    if cmd == REDIRECT_COMMAND:
+        return []
+    if not cmd:
+        return ["empty command"]
+    if not cmd.startswith("ffmpeg"):
+        return ["command must start with ffmpeg"]
+    if require_placeholder and URL_PLACEHOLDER not in cmd:
+        return [f"command must contain {URL_PLACEHOLDER}"]
+    try:
+        args = shlex.split(cmd)
+    except ValueError as exc:
+        return [f"unbalanced quotes: {exc}"]
+    return argv_validation_errors(args)
+
+
 def serves_original_file(command: str | None) -> bool:
     """True when a local file should be sent as-is (no ffmpeg).
 
@@ -494,7 +676,7 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     c: list[str] = [ffmpeg_bin]
 
     # ---- resilient input flags (portal streams drop/stall all the time) ----
-    own_in = _tokens(opts.extra_input)
+    own_in, _input_warnings = _safe_extra_tokens(opts.extra_input, "extra input")
     for flag, val in RESILIENT_INPUT_OPTS:
         if flag not in own_in:
             c += [flag, val]
@@ -509,7 +691,8 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
               "-hwaccel_device", "hw", "-hwaccel_output_format", "qsv"]
 
     if opts.extra_input.strip():
-        c += shlex.split(opts.extra_input)
+        safe_input, _input_warnings = _safe_extra_tokens(opts.extra_input, "extra input")
+        c += safe_input
 
     c += ["-i", URL_PLACEHOLDER]
 
@@ -650,10 +833,11 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
         c += ["-c:s", "copy"]
 
     if opts.extra_output.strip():
-        c += shlex.split(opts.extra_output)
+        safe_output, _output_warnings = _safe_extra_tokens(opts.extra_output, "extra output")
+        c += safe_output
 
     # ---- output -------------------------------------------------------------
-    own_out = _tokens(opts.extra_output)
+    own_out, _output_warnings = _safe_extra_tokens(opts.extra_output, "extra output")
     if container == "matroska":
         c += ["-f", "matroska"]
         for flag, val in _MKV_OUTPUT_OPTS:
@@ -703,6 +887,7 @@ def option_warnings(opts: FFmpegOptions) -> list[str]:
     believe a template keeps subtitles it cannot keep.
     """
     out: list[str] = []
+    out.extend(extra_option_warnings(opts))
     if opts.subs == "keep" and opts.output_format != "matroska":
         out.append("subtitles \"copy all\" needs Output = Matroska; MPEG-TS/HLS "
                    "cannot carry text subtitles, so the command renders the "
@@ -950,8 +1135,13 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
         unhandled_out.append(t)
         i += 1
 
-    opts.extra_input = " ".join(x for x in unhandled_in if x != URL_PLACEHOLDER)
-    opts.extra_output = " ".join(x for x in unhandled_out if x not in _OWNED_TARGETS)
+    raw_in = " ".join(x for x in unhandled_in if x != URL_PLACEHOLDER)
+    raw_out = " ".join(x for x in unhandled_out if x not in _OWNED_TARGETS)
+    safe_in, in_warnings = _safe_extra_tokens(raw_in, "extra input")
+    safe_out, out_warnings = _safe_extra_tokens(raw_out, "extra output")
+    opts.extra_input = " ".join(safe_in)
+    opts.extra_output = " ".join(safe_out)
+    warnings.extend(in_warnings + out_warnings)
     # Subtitle verdict, order-independent (build_command emits -map and -sn in
     # its own order; a hand-written command may use any): a subtitle map or
     # codec without -sn means "keep as DVB", an explicit -sn alone means drop.

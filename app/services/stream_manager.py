@@ -50,8 +50,8 @@ from . import stream_identity
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
                                HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
-                               URL_PLACEHOLDER, mpegts_copy_command,
-                               serves_original_file)
+                               URL_PLACEHOLDER, argv_validation_errors,
+                               mpegts_copy_command, serves_original_file)
 from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
 from .item_info import local_file_path
 # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
@@ -60,6 +60,44 @@ from .redirect_guard import (demote_recently_handed, link_is_alive, note_handed_
 # <<< redirect-guard
 
 log = logging.getLogger("spm.stream")
+
+
+class FFmpegTemplateError(RuntimeError):
+    """The stored/generated command cannot be used for this stream.
+
+    This is deliberately distinct from a source/MAC failure: retrying the same
+    malformed argv against every MAC only delays the useful error and can hold
+    portal connection slots while a command that can never work is retried.
+    """
+
+
+_OUTPUT_FAILURE_MARKERS = (
+    "unable to choose an output format",
+    "unable to find a suitable output format",
+    "error initializing the muxer",
+    "error initializing output stream",
+    "error opening output file",
+    "could not write header for output file",
+    "output file #0 does not contain any stream",
+    "unknown encoder",
+    "no such filter",
+    "invalid filtergraph",
+    "error reinitializing filters",
+    "error while opening encoder",
+)
+
+
+def _is_template_output_failure(fail: dict | None) -> bool:
+    """True when FFmpeg opened/parsed the input but failed at output setup."""
+    if not fail or fail.get("stalled") or fail.get("rc") in (None, 0):
+        return False
+    text = str(fail.get("tail") or "").lower()
+    if any(marker in text for marker in _OUTPUT_FAILURE_MARKERS):
+        return True
+    # FFmpeg sometimes only leaves the final "Invalid argument" line. Require
+    # output-shaped context so a bad input URL can still use source/MAC fallback.
+    return (fail.get("rc") == 234 and "invalid argument" in text
+            and any(word in text for word in ("output", "pipe:", "scale_", "map ")))
 
 
 async def _store_resolved_portal(portal_id: int, portal_url: str, path: str | None = None) -> None:
@@ -888,7 +926,10 @@ class StreamManager:
         args = StreamManager._ensure_interleave_flush(args)
         # Live Matroska is audio-only on Enigma2 (no cues on a pipe). A VOD
         # MKV template assigned to a live channel is rewritten to MPEG-TS.
-        if not pace:
+        if not pace and is_net:
+            # `pace=False` is normally live, but callers also use the pure
+            # argv renderer for local-file diagnostics. Only a network/live
+            # input should have its Matroska pipe rewritten for Enigma2.
             args = StreamManager._matroska_to_mpegts_for_live(args)
             args = StreamManager._ensure_annexb(args)
             args = StreamManager._ensure_interleave_flush(args)
@@ -1301,6 +1342,11 @@ class StreamManager:
             tail = self._stderr_tail(proc)
             elapsed = time.monotonic() - t0
             last = {"rc": proc.returncode, "tail": tail, "stalled": stalled}
+            # A deterministic output/template failure cannot be repaired by a
+            # different HTTP identity. Return it immediately so the caller can
+            # mark the handle dead instead of spending the browser-UA rung.
+            if _is_template_output_failure(last):
+                return None, b"", last
             status = stream_identity.http_open_error(last["rc"], tail, elapsed)
             if status is None and stalled is False and not template_owns:
                 # Explain why an apparently identity-shaped 4xx did NOT spend
@@ -1341,11 +1387,24 @@ class StreamManager:
         args = self._ffmpeg_argv(cmd_template, url, title, pace, user_agent)
         if not args:
             await db_log("ERROR", "stream", "unparseable ffmpeg template")
-            return None
+            raise FFmpegTemplateError("template could not be tokenized")
+        argv_errors = argv_validation_errors(args)
+        if argv_errors:
+            detail = "; ".join(argv_errors)
+            await db_log("ERROR", "stream",
+                         f"invalid FFmpeg template argv: {detail}")
+            raise FFmpegTemplateError(detail)
         args = await self._remux_gate(args, url, pace, title or "")
         args = await self._subs_gate(args, url, pace, title or "")
-        # Log the full command for debugging
-        await db_log("DEBUG", "ffmpeg", f"spawn command: {' '.join(args)}")
+        argv_errors = argv_validation_errors(args)
+        if argv_errors:
+            detail = "; ".join(argv_errors)
+            await db_log("ERROR", "stream",
+                         f"invalid FFmpeg argv after stream gates: {detail}")
+            raise FFmpegTemplateError(detail)
+        # Use shell-escaped text for humans copying the diagnostic. The process
+        # itself still receives the original argv through create_subprocess_exec.
+        await db_log("DEBUG", "ffmpeg", f"spawn command: {shlex.join(args)}")
         try:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdin=asyncio.subprocess.DEVNULL,
@@ -2023,8 +2082,17 @@ class StreamManager:
                 if not chain:
                     return
                 _tag, path = chain[0]
-                proc = await self._spawn(h.command, path, h.item_name, pace=True)
+                try:
+                    proc = await self._spawn(h.command, path, h.item_name, pace=True)
+                except FFmpegTemplateError as exc:
+                    h.dead = True
+                    h.fail_note = f"invalid FFmpeg template: {exc}"
+                    await db_log("ERROR", "stream",
+                                 f"[{h.item_name}] {h.fail_note} -> no fallback")
+                    return
                 if proc is None:
+                    h.dead = True
+                    h.fail_note = "FFmpeg could not be spawned"
                     return
                 h.url, h.proc = path, proc
                 await self._register(h)
@@ -2227,12 +2295,37 @@ class StreamManager:
                         # play/live.php origins answer the portal browser UA with
                         # HTTP 456/403 and zero bytes while a player-shaped request
                         # plays the very same play_token - see stream_identity.
-                        proc, first, open_fail = await self._open_with_identity(
-                            h.command, url, title=h.item_name,
-                            pace=(kind != "live"))
+                        try:
+                            proc, first, open_fail = await self._open_with_identity(
+                                h.command, url, title=h.item_name,
+                                pace=(kind != "live"))
+                        except FFmpegTemplateError as exc:
+                            if locked is not None:
+                                self.mac_locks.pop(locked, None)
+                            h.dead = True
+                            h.fail_note = f"invalid FFmpeg template: {exc}"
+                            h.note_attempt(f"template: {exc}")
+                            await db_log("ERROR", "stream",
+                                         f"[{h.item_name}] {h.fail_note} -> no MAC/source fallback")
+                            return
                         if proc is None:
+                            if _is_template_output_failure(open_fail):
+                                tail = (open_fail.get("tail") or "").strip()
+                                detail = tail[-500:] if tail else f"rc={open_fail.get('rc')}"
+                                if locked is not None:
+                                    self.mac_locks.pop(locked, None)
+                                h.dead = True
+                                h.fail_note = ("FFmpeg template/output initialization failed "
+                                               f"(rc={open_fail.get('rc')})")
+                                h.note_attempt("template: " + h.fail_note)
+                                await db_log(
+                                    "ERROR", "stream",
+                                    f"[{h.item_name}] {h.fail_note} -> no MAC/source fallback | "
+                                    f"ffmpeg's last words: {detail}")
+                                return
                             if open_fail is not None:
-                                who = portal.name + ("/xtream" if adopted
+                                who = portal.name + ("/xtream"
+                                                     if adopted
                                                      else f"/{mac_row.mac}")
                                 # The stderr tail is the *only* evidence for a silent
                                 # stall (rc == -9 because we killed it, which is

@@ -12,7 +12,8 @@ import time
 
 from ..config import FFMPEG_BIN
 from . import stream_identity
-from .ffmpeg_templates import REDIRECT_COMMAND, URL_PLACEHOLDER
+from .ffmpeg_templates import (REDIRECT_COMMAND, URL_PLACEHOLDER,
+                                template_command_errors)
 
 # 10-second H.264 360p clip (CC-BY Big Buck Bunny) — small enough to probe
 # a real HTTP input without downloading a movie.
@@ -67,6 +68,10 @@ def syntax_check(command: str) -> dict:
         return {"ok": False, "mode": "syntax", "detail": f"unbalanced quotes: {exc}"}
     if "-i" not in toks:
         return {"ok": False, "mode": "syntax", "detail": "no -i input"}
+    errors = template_command_errors(cmd)
+    if errors:
+        return {"ok": False, "mode": "syntax",
+                "detail": "invalid FFmpeg argument structure: " + "; ".join(errors)}
     return {"ok": True, "mode": "syntax",
             "detail": f"{len(toks)} tokens, placeholder at input"}
 
