@@ -18,7 +18,9 @@ from ..security import require_admin
 from ..services import item_info
 from ..services.ffmpeg_templates import (FFmpegOptions, REDIRECT_COMMAND,
                                      build_command, coerce_options,
-                                     option_warnings, parse_command)
+                                     extra_option_warnings,
+                                     option_warnings, parse_command,
+                                     template_command_errors)
 from ..services.ffmpeg_validate import run_demo, syntax_check
 
 router = APIRouter(prefix="/api/ffmpeg", tags=["ffmpeg"], dependencies=[Depends(require_admin)])
@@ -28,6 +30,48 @@ FIELDS = [c for c in FFmpegTemplate.__table__.columns.keys() if c != "id"]
 
 def _row(t: FFmpegTemplate) -> dict:
     return {c: getattr(t, c) for c in FIELDS} | {"id": t.id}
+
+
+def _template_errors(t: FFmpegTemplate) -> list[str]:
+    """Validate the stored command and raw extension fields before persistence."""
+    errors = extra_option_warnings(_opts(t))
+    errors.extend(template_command_errors(t.command or ""))
+    return errors
+
+
+def _reject_template(errors: list[str]) -> None:
+    if errors:
+        raise HTTPException(422, {
+            "message": "invalid FFmpeg template",
+            "errors": errors,
+        })
+
+
+def _source_from_payload(t: FFmpegTemplate, payload: dict) -> str:
+    """Choose the command authority, inferring legacy/GUI requests safely.
+
+    Older clients sent fields and command together but did not always send a
+    reliable command_source for a newly-created row. If the supplied text is
+    different from what the fields would render, it is necessarily a manual
+    command and must not be re-rendered behind the user's back.
+    """
+    requested = payload.get("command_source")
+    if requested is not None and requested not in ("fields", "manual"):
+        raise HTTPException(422, "command_source must be fields or manual")
+    if requested == "manual":
+        return "manual"
+    if requested == "fields":
+        # An explicit source is authoritative in both directions. The fields
+        # editor may send stale command text while a request is being assembled;
+        # fields mode must deterministically replace it rather than guessing
+        # that the user meant manual mode.
+        return "fields"
+    if "command" in payload:
+        supplied = str(payload.get("command", "") or "").strip()
+        expected = (REDIRECT_COMMAND if supplied == REDIRECT_COMMAND
+                    else build_command(_opts(t))).strip()
+        return "manual" if supplied and supplied != expected else "fields"
+    return t.command_source if t.command_source in ("fields", "manual") else "fields"
 
 
 @router.get("")
@@ -42,7 +86,11 @@ async def create_template(payload: dict, db=Depends(get_db)):
     for f in FIELDS:
         if f in payload:
             setattr(t, f, payload[f])
-    t.command = t.command or build_command(_opts(t))
+    t.command_source = _source_from_payload(t, payload)
+    if t.command_source == "fields":
+        t.command = ((t.command or "").strip() == REDIRECT_COMMAND
+                     and REDIRECT_COMMAND) or build_command(_opts(t))
+    _reject_template(_template_errors(t))
     db.add(t)
     await db.commit()
     return {"item": _row(t)}
@@ -53,22 +101,38 @@ async def update_template(tid: int, payload: dict, db=Depends(get_db)):
     t = await db.get(FFmpegTemplate, tid)
     if not t:
         raise HTTPException(404, "template not found")
-    touched_opts = False
+    old_command = (t.command or "").strip()
+    was_redirect = old_command == REDIRECT_COMMAND
     for f in FIELDS:
         if f in payload:
             setattr(t, f, payload[f])
-            touched_opts = touched_opts or f in FFmpegOptions.__dataclass_fields__
-    # `command` is derived state while command_source says it was rendered from
-    # the fields, so a caller that edits those fields without resending the text
-    # (a script, an import, a PATCH-style UI widget) must not be left with a
-    # command that contradicts the row - it is what the stream path runs. A
-    # payload that carries its own command wins as sent, and a manual command is
-    # the user's text and stays byte-for-byte theirs. The redirect preset is not
-    # a command at all: rendering one would quietly turn the 302 marker back into
-    # an ffmpeg invocation.
-    if (touched_opts and "command" not in payload and t.command_source == "fields"
-            and (t.command or "").strip() != REDIRECT_COMMAND):
-        t.command = build_command(_opts(t))
+
+    source = _source_from_payload(t, payload)
+    supplied_command = str(payload.get("command", "") or "").strip()
+    if "command" in payload:
+        t.command = supplied_command
+    t.command_source = source
+
+    # Fields are authoritative only in fields mode. A manual command remains
+    # byte-for-byte intact when a script or an older UI sends unrelated field
+    # updates without the command text.
+    if source == "fields":
+        if (t.command or "").strip() == REDIRECT_COMMAND:
+            t.command = REDIRECT_COMMAND
+        elif "command" not in payload or supplied_command != build_command(_opts(t)):
+            t.command = build_command(_opts(t))
+
+    # A redirect row carries structured defaults only for seeding/UI shape. It
+    # must not leak stale raw extras into a newly-created FFmpeg command.
+    if was_redirect and (t.command or "").strip() != REDIRECT_COMMAND:
+        if "extra_input" not in payload:
+            t.extra_input = ""
+        if "extra_output" not in payload:
+            t.extra_output = ""
+        if source == "fields":
+            t.command = build_command(_opts(t))
+
+    _reject_template(_template_errors(t))
     await db.commit()
     return {"item": _row(t)}
 

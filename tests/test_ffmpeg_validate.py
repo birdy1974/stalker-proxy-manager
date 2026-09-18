@@ -32,3 +32,13 @@ def test_bound_demo_swaps_hls_file_output_to_pipe():
     assert args[args.index("-f") + 1] == "mpegts"
     assert args[-1] == "pipe:1"
     assert "<out_dir>/index.m3u8" not in args
+
+
+def test_syntax_rejects_orphaned_output_tokens():
+    malformed = (
+        f"ffmpeg -i {URL_PLACEHOLDER} -vf scale_vaapi=w=1280:h=720 "
+        "-map 0:v:0 scale_vaapi=w=1280:h=720 0:v:0 -f mpegts pipe:1"
+    )
+    result = syntax_check(malformed)
+    assert result["ok"] is False
+    assert "bare output token" in result["detail"]

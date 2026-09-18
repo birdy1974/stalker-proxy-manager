@@ -127,6 +127,8 @@
             <textarea class="form-control ff-edit mono" id="f-command" spellcheck="false"></textarea>
             <div class="d-flex align-items-center gap-2 mt-1 flex-wrap">
               <span class="small" id="sync-state"></span>
+              <button class="btn btn-sm btn-outline-warning d-none" id="btn-fields-mode" type="button"
+                      title="Allow the structured fields to replace the manual command">Switch to fields mode</button>
               <div class="btn-group ms-auto">
                 <button class="btn btn-sm btn-outline-secondary" id="btn-test-syntax">Validate syntax</button>
                 <button class="btn btn-sm btn-outline-secondary" id="btn-test-playlist" title="Run this template against an enabled playlist source for ~2s">Demo (playlist source)</button>
@@ -158,8 +160,33 @@ const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","v
   "maxrate","bufsize","fps","gop","profile","level","low_power","rc_mode","global_quality","async_depth",
   "audio_codec","audio_bitrate","audio_channels",
   "audio_rate","output_format","subs","vf_preset","extra_input","extra_output"];
-let current = null, templates = [];
-const isRedirectTpl = (t) => (t.command || "").trim() === "@redirect";
+let current = null, templates = [], draftCommandSource = "fields";
+const isRedirectTpl = (t) => (t && (t.command || "").trim() === "@redirect");
+const sourceOf = () => current?.command_source || draftCommandSource || "fields";
+
+function setDraftSource(source) {
+  if (current) current.command_source = source; else draftCommandSource = source;
+}
+
+function applyEditorMode() {
+  const redir = isRedirectTpl(current);
+  const manual = !redir && sourceOf() === "manual";
+  const fieldsButton = $("#btn-fields-mode");
+  fieldsButton.classList.toggle("d-none", !(redir || manual));
+  fieldsButton.textContent = redir ? "Switch to FFmpeg fields" : "Switch to fields mode";
+  fieldsButton.title = redir
+    ? "Leave Redirect mode, clear its raw extras and render a fresh FFmpeg command"
+    : "Allow the structured fields to replace the manual command";
+  $$(".ff-field").forEach(n => {
+    // Name and enabled remain editable in manual mode; changing any other
+    // field would silently rebuild the command the user just wrote.
+    n.disabled = redir || (manual && n.id !== "f-name" && n.id !== "f-enabled");
+  });
+  $("#f-command").disabled = redir;
+  $("#btn-test-syntax").disabled = redir;
+  $("#btn-test-playlist").disabled = redir;
+  $("#btn-test-url").disabled = redir;
+}
 
 /* CQP makes the rate flags redundant and every other mode makes the QP
    redundant; the encoder ignores whichever group is out of play, so the form
@@ -192,27 +219,34 @@ function writeFields(t) {
     }
   }
   const match = String(t.extra_input || "").match(/(?:^|\s)-rw_timeout\s+(\d+)/);
-  if (match) $("#f-timeout").value = match[1];
+  $("#f-timeout").value = match ? match[1] : "10000000";
 }
 
 /* fields -> command */
 let syncTimer;
 async function fieldsToCommand() {
   clearTimeout(syncTimer);
-  if (current && isRedirectTpl(current)) return;   // marker template: command is fixed
+  if (isRedirectTpl(current) || sourceOf() === "manual") return;
   syncTimer = setTimeout(async () => {
     const o = readFields();
     const r = await api("/api/ffmpeg/build", { method: "POST", body: o });
     $("#f-command").value = r.command;
     $("#sync-state").innerHTML = '<span class="text-success">fields → command</span>' +
       ((r.warnings || []).length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
-    if (current) current.command_source = "fields";
+    setDraftSource("fields");
+    applyEditorMode();
   }, 200);
 }
 /* command -> fields */
 let parseTimer;
 $("#f-command").addEventListener("input", () => {
   clearTimeout(parseTimer);
+  // The moment the user types in the full command, make it authoritative.
+  // This also cancels a pending fields->command render from a new-template
+  // click, which otherwise could overwrite the first keystrokes.
+  clearTimeout(syncTimer);
+  setDraftSource("manual");
+  applyEditorMode();
   parseTimer = setTimeout(async () => {
     // send the current fields along: anything the typed command does not mention
     // (no -rc_mode, no -b:v under CQP) must stay as the row had it
@@ -221,8 +255,29 @@ $("#f-command").addEventListener("input", () => {
     writeFields(r.options);
     $("#sync-state").innerHTML = '<span class="text-success">command → fields</span>' +
       (r.warnings.length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
-    if (current) current.command_source = "manual";
+    setDraftSource("manual");
+    applyEditorMode();
   }, 350);
+});
+$("#btn-fields-mode").addEventListener("click", () => {
+  if (isRedirectTpl(current)) {
+    // @redirect is a sentinel, not a partially-rendered FFmpeg command. Do not
+    // let its old raw extras leak into the first real command after conversion.
+    if (current) {
+      current.command = "";
+      current.command_source = "fields";
+      current.extra_input = "";
+      current.extra_output = "";
+    }
+    $("#f-command").value = "";
+    $("#f-extra_input").value = "";
+    $("#f-extra_output").value = "";
+    $("#f-timeout").value = "10000000";
+    $("#redirect-note").classList.add("d-none");
+  }
+  setDraftSource("fields");
+  applyEditorMode();
+  fieldsToCommand();
 });
 $$(".ff-field").forEach(n => n.addEventListener("change", fieldsToCommand));
 $$(".ff-field").forEach(n => n.addEventListener("change", syncRcFields));
@@ -245,38 +300,40 @@ async function loadList() {
 }
 async function selectTemplate(id) {
   current = templates.find(t => t.id === id);
+  draftCommandSource = current.command_source || "fields";
   $("#ed-title").textContent = "Edit template: " + current.name;
   writeFields(current);
   $("#f-command").value = current.command || "";
   $("#sync-state").textContent = "";
+  $("#redirect-note").classList.toggle("d-none", !isRedirectTpl(current));
   syncRcFields();
-  /* the redirect preset is a marker, not an ffmpeg command: lock the option
-     fields and command text so a stray edit cannot turn it back into a real
-     command (name + enabled stay editable) */
-  const redir = isRedirectTpl(current);
-  $("#redirect-note").classList.toggle("d-none", !redir);
-  $$(".ff-field").forEach(n => { if (n.id !== "f-enabled") n.disabled = redir; });
-  $("#f-command").disabled = redir;
-  $("#btn-test-syntax").disabled = redir;
-  $("#btn-test-playlist").disabled = redir;
-  $("#btn-test-url").disabled = redir;
+  applyEditorMode();
 }
 $("#tpl-new").addEventListener("click", () => {
-  current = null; $("#ed-title").textContent = "New template (unsaved)";
+  current = null;
+  draftCommandSource = "fields";
+  $("#ed-title").textContent = "New template (unsaved)";
   $("#redirect-note").classList.add("d-none");
-  $$(".ff-field").forEach(n => n.disabled = false);
-  $("#f-command").disabled = false;
-  $("#btn-test-syntax").disabled = false;
-  $("#btn-test-playlist").disabled = false;
-  $("#btn-test-url").disabled = false;
+  // A new template must not inherit extra flags, FPS, filters or codec state
+  // from whichever template happened to be selected before it.
   writeFields({ name: "New template", enabled: true, hw_accel: "vaapi",
-                low_power: true, rc_mode: "CQP", global_quality: "26", async_depth: "4" });
+                device: "/dev/dri/renderD128", resolution: "720p", aspect: "16:9",
+                video_codec: "h264_vaapi", video_bitrate: "1000k",
+                maxrate: "1100k", bufsize: "2000k", fps: "25", gop: "50",
+                profile: "high", level: "4.1", low_power: true, rc_mode: "CQP",
+                global_quality: "26", async_depth: "4", audio_codec: "aac",
+                audio_bitrate: "128k", audio_channels: "2", audio_rate: "48000",
+                output_format: "mpegts", subs: "drop", vf_preset: "none",
+                extra_input: "", extra_output: "" });
+  $("#f-timeout").value = "10000000";
+  $("#f-command").value = "";
+  applyEditorMode();
   syncRcFields();
   fieldsToCommand();
 });
 $("#tpl-save").addEventListener("click", async () => {
   const body = { ...readFields(), command: $("#f-command").value,
-                 command_source: current?.command_source || "fields" };
+                 command_source: sourceOf() };
   if (!body.name.trim()) return toast("name required", "warn");
   if (current) { await api(`/api/ffmpeg/${current.id}`, { method: "PUT", body }); }
   else { const r = await api("/api/ffmpeg", { method: "POST", body }); body.id = r.item.id; }

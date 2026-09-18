@@ -71,6 +71,42 @@ async def test_a_payload_carrying_its_own_command_wins_as_sent():
     assert (await _by_name(REFERENCE_PRESET_NAME))["command"] == mine
 
 
+async def test_invalid_orphaned_command_is_rejected_before_save():
+    await _seed_defaults()
+    row = await _by_name(REFERENCE_PRESET_NAME)
+    malformed = ("ffmpeg -i <url> -vf scale_vaapi=w=1280:h=720 "
+                 "-map 0:v:0 scale_vaapi=w=1280:h=720 0:v:0 "
+                 "-f mpegts pipe:1")
+    async with await _client() as c:
+        r = await c.put(f"/api/ffmpeg/{row['id']}", json={
+            "command": malformed, "command_source": "manual"})
+    assert r.status_code == 422
+    assert (await _by_name(REFERENCE_PRESET_NAME))["command"] != malformed
+
+
+async def test_structured_flags_are_not_accepted_in_extra_output():
+    await _seed_defaults()
+    row = await _by_name(REFERENCE_PRESET_NAME)
+    async with await _client() as c:
+        r = await c.put(f"/api/ffmpeg/{row['id']}", json={
+            "extra_output": "-vf scale=1280:720", "command_source": "fields"})
+    assert r.status_code == 422
+
+
+async def test_explicit_fields_source_rebuilds_stale_command():
+    await _seed_defaults()
+    row = await _by_name(REFERENCE_PRESET_NAME)
+    stale = "ffmpeg -i <url> -c copy -f mpegts pipe:1"
+    async with await _client() as c:
+        r = await c.put(f"/api/ffmpeg/{row['id']}", json={
+            "command": stale, "command_source": "fields", "rc_mode": "VBR"})
+        assert r.status_code == 200, r.text
+    after = await _by_name(REFERENCE_PRESET_NAME)
+    assert after["command_source"] == "fields"
+    assert after["command"] != stale
+    assert "-rc_mode VBR" in after["command"]
+
+
 async def test_a_manual_command_survives_field_edits():
     """`command_source: manual` is the promise that the text is the user's."""
     await _seed_defaults()

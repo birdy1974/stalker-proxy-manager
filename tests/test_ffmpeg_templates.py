@@ -26,8 +26,9 @@ from app.services.ffmpeg_templates import (
     COPY_PRESET_NAME, E2_DUO2_LIVE_PRESET_NAME, E2_VOD_REMUX_PRESET_NAME,
     E2_VOD_TRANSCODE_PRESET_NAME, FFmpegOptions, REDIRECT_COMMAND,
     REDIRECT_PRESET_NAME, asdict,
-    REFERENCE_PRESET_NAME, build_command, default_presets, parse_command,
-    serves_original_file, URL_PLACEHOLDER,
+    REFERENCE_PRESET_NAME, argv_validation_errors, build_command,
+    default_presets, extra_option_warnings, parse_command, serves_original_file,
+    template_command_errors, URL_PLACEHOLDER,
 )
 
 
@@ -386,3 +387,33 @@ def test_subtitle_modes_drop_by_default_dvb_as_opt_in():
     assert "-map 0:s?" in cmd and "-c:s dvbsub" in cmd and "-sn" not in cmd
     assert parse_command(cmd)["options"]["subs"] == "dvb"
     assert build_command(FFmpegOptions(**parse_command(cmd)["options"])) == cmd
+
+
+def test_raw_extra_values_cannot_become_orphaned_output_targets():
+    """A stale two-way parse may leave a filter/map value in extra_output.
+    It is safer to omit that malformed escape-hatch field than to append the
+    value after the real output flags, where FFmpeg treats it as a filename."""
+    opts = FFmpegOptions(extra_output="scale_vaapi=w=1280:h=720:format=nv12,fps=25 0:v:0")
+    cmd = build_command(opts)
+    # The renderer's legitimate structured filter remains; the stale extra
+    # copy is not appended a second time, and the orphaned map value is absent.
+    assert cmd.count("scale_vaapi=w=1280:h=720:format=nv12,fps=25") == 1
+    assert cmd.count("0:v:0") == 1
+    assert any("extra output" in warning for warning in extra_option_warnings(opts))
+
+
+def test_final_argv_validation_rejects_orphaned_filter_and_map_values():
+    args = shlex.split(
+        "ffmpeg -i <url> -vf scale_vaapi=w=1280:h=720 "
+        "-map 0:v:0 scale_vaapi=w=1280:h=720 0:v:0 -f mpegts pipe:1"
+    )
+    errors = argv_validation_errors(args)
+    assert any("scale_vaapi=w=1280:h=720" in error for error in errors)
+    assert any("0:v:0" in error for error in errors)
+    assert template_command_errors(" ".join(args))
+
+
+def test_rendered_templates_have_a_valid_final_argv():
+    for preset in default_presets():
+        if preset["command"] != REDIRECT_COMMAND:
+            assert template_command_errors(preset["command"]) == [], preset["name"]

@@ -26,7 +26,9 @@ from app.models import (
     LivePlaylist, LivePlaylistSource, LiveSource, MacAddress, Portal,
 )
 from app.services import stream_identity
-from app.services.stream_manager import MANAGER, StreamManager
+from app.services.stream_manager import (
+    MANAGER, StreamManager, _is_template_output_failure,
+)
 from app.services.stream_identity import (
     PLAYER_UA, STB_UA, http_open_error, ladder, learned, origin_of, remember,
     reset,
@@ -87,6 +89,22 @@ def test_http_open_error_distinguishes_fast_waf_from_slow_slot_refusal():
     assert http_open_error(8, err, elapsed=None) == 456     # no timing: trust it
     # boundary uses the configurable constant
     assert stream_identity.FAST_REFUSAL_S == 5.0
+
+
+def test_output_template_failures_stop_fallback_but_http_456_does_not():
+    output_fail = {
+        "rc": 234,
+        "stalled": False,
+        "tail": "[NULL] Unable to find a suitable output format for '0:v:0'",
+    }
+    assert _is_template_output_failure(output_fail) is True
+    assert _is_template_output_failure({
+        "rc": 8, "stalled": False,
+        "tail": "HTTP error 456 Server returned 4XX Client Error",
+    }) is False
+    assert _is_template_output_failure({
+        "rc": -9, "stalled": True, "tail": "Error opening output file",
+    }) is False
 
 
 def test_ladder_order_and_disable_switch(monkeypatch):
