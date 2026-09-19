@@ -7,68 +7,79 @@
         <span><i class="bi bi-gear-wide-connected"></i> Templates</span>
         <button class="btn btn-sm btn-accent" id="tpl-new"><i class="bi bi-plus-circle"></i> New</button>
       </div>
+      <div class="card-body border-bottom">
+        <label for="tpl-default" class="muted-label">Default template</label>
+        <div class="d-flex gap-2">
+          <select class="form-select form-select-sm" id="tpl-default" aria-describedby="tpl-default-help"></select>
+          <button class="btn btn-sm btn-outline-primary text-nowrap" id="tpl-set-default" type="button" disabled>Set default</button>
+        </div>
+        <div class="small text-muted mt-2" id="tpl-default-help" data-help="Default template" data-help-for="tpl-default">Used when no item or area template is assigned. Initially Redirect (bypass ffmpeg). Choose another default before disabling or deleting it.</div>
+      </div>
       <div class="card-body p-1" id="tpl-list" style="max-height:calc(100vh - 220px);overflow:auto"></div>
     </div>
   </div>
   <div class="col-lg-8">
-    <div class="card">
-      <div class="card-header d-flex justify-content-between align-items-center">
+    <div class="card" id="ff-editor-card">
+      <div class="card-header d-flex justify-content-between align-items-center gap-2">
         <span id="ed-title">Template editor</span>
-        <span class="small text-muted">fields ⇄ command stay in sync automatically</span>
+        <button class="btn btn-sm btn-accent flex-shrink-0" id="tpl-save-top" type="button"><i class="bi bi-check2"></i> Save template</button>
       </div>
       <div class="card-body">
         <div class="alert alert-info py-2 small d-none" id="redirect-note">
-          <i class="bi bi-arrow-right-circle me-1"></i><b>Bypass ffmpeg.</b>
+          <i class="bi bi-arrow-right-circle me-1"></i><b id="redirect-help-label">Bypass ffmpeg.</b><span data-help="Redirect mode" data-help-for="redirect-help-label">
           Channels assigned this template are 302-redirected straight to the portal's CDN:
           instant start and no CPU, but no transcode and no mid-stream fallback.
-          The command text is a marker and cannot be edited here.
+          The command text is a marker and cannot be edited here.</span>
         </div>
+        <p class="small text-muted" data-help="Editing FFmpeg templates" data-help-for="ed-title">Choose a preset or <b>Custom value…</b>. Click <i class="bi bi-question-circle"></i> beside any label for help.
+          Ignored controls are disabled with a reason; their values return when the mode applies again.
+          Available encoders and valid combinations depend on your FFmpeg build and hardware; use the Demo buttons to test.</p>
         <div class="row g-2">
-              <div class="col-8"><label class="muted-label">Name</label><input class="form-control form-control-sm" id="f-name"></div>
-              <div class="col-4 d-flex align-items-end"><div class="form-check form-switch">
+              <div class="col-12 col-sm-8"><label class="muted-label">Name</label><input class="form-control form-control-sm" id="f-name"></div>
+              <div class="col-12 col-sm-4 d-flex align-items-end"><div class="form-check form-switch">
                 <input class="form-check-input ff-field" type="checkbox" id="f-enabled"><label class="form-check-label small">enabled</label></div></div>
-              <div class="col-4"><label class="muted-label">Hardware</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Hardware</label>
                 <select class="form-select form-select-sm ff-field" id="f-hw_accel">
                   <option value="none">none (CPU)</option><option value="vaapi">VAAPI (Intel)</option><option value="qsv">Quick Sync (QSV)</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label">Device</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Device</label>
                 <select class="form-select form-select-sm ff-field" id="f-device">
                   <option>/dev/dri/renderD128</option><option>/dev/dri/renderD129</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label">Resolution</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Resolution</label>
                 <select class="form-select form-select-sm ff-field" id="f-resolution">
                   <option>source</option><option>360p</option><option>480p</option><option>576p</option>
                   <option selected>720p</option><option>1080p</option><option>1440p</option><option>2160p</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label">Aspect</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Aspect</label>
                 <select class="form-select form-select-sm ff-field" id="f-aspect"><option>16:9</option><option>4:3</option><option>21:9</option></select></div>
-              <div class="col-4"><label class="muted-label">Video codec</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Video codec</label>
                 <select class="form-select form-select-sm ff-field" id="f-video_codec">
                   <option value="copy">copy (passthrough)</option><option>libx264</option><option>libx265</option>
                   <option value="h264_vaapi">h264_vaapi (QSync/VAAPI)</option><option value="hevc_vaapi">hevc_vaapi</option>
                   <option value="h264_qsv">h264_qsv</option><option value="hevc_qsv">hevc_qsv</option>
                 </select></div>
-              <div class="col-4 rc-rate"><label class="muted-label">Bitrate</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Bitrate</label>
                 <select class="form-select form-select-sm ff-field" id="f-video_bitrate">
                   <option>500k</option><option>750k</option><option selected>1000k</option><option>1500k</option>
                   <option>2500k</option><option>4000k</option><option>6000k</option>
                 </select></div>
-              <div class="col-4 rc-rate"><label class="muted-label">Maxrate</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Maxrate</label>
                 <select class="form-select form-select-sm ff-field" id="f-maxrate">
                   <option value="">—</option><option>750k</option><option selected>1100k</option><option>1300k</option><option>1800k</option><option>2750k</option><option>3000k</option><option>4800k</option><option>8000k</option>
                 </select></div>
-              <div class="col-4 rc-rate"><label class="muted-label">Bufsize</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Bufsize</label>
                 <select class="form-select form-select-sm ff-field" id="f-bufsize">
                   <option value="">—</option><option selected>2000k</option><option>2400k</option><option>2700k</option><option>4500k</option><option>5000k</option><option>7200k</option>
                 </select></div>
-              <div class="col-3"><label class="muted-label">FPS</label>
+              <div class="col-6 col-sm-3"><label class="muted-label">FPS</label>
                 <select class="form-select form-select-sm ff-field" id="f-fps"><option value="">src</option><option selected>25</option><option>30</option><option>50</option></select></div>
-              <div class="col-3"><label class="muted-label">GOP</label><input class="form-control form-control-sm ff-field" id="f-gop" value="50"></div>
-              <div class="col-3"><label class="muted-label">Profile</label>
+              <div class="col-6 col-sm-3"><label class="muted-label">GOP</label><input class="form-control form-control-sm ff-field" id="f-gop" value="50"></div>
+              <div class="col-6 col-sm-3"><label class="muted-label">Profile</label>
                 <select class="form-select form-select-sm ff-field" id="f-profile"><option>high</option><option>main</option><option>baseline</option></select></div>
-              <div class="col-3"><label class="muted-label">Level</label>
+              <div class="col-6 col-sm-3"><label class="muted-label">Level</label>
                 <select class="form-select form-select-sm ff-field" id="f-level"><option>4.1</option><option>4.0</option><option>3.1</option><option>5.1</option></select></div>
-              <div class="col-6"><label class="muted-label" title="Extra video filter, spliced FIRST into -vf (before scale/fps): each preset isolates one suspect when the picture misbehaves - interlaced source, 10-bit pixels, wrong field flags, broken surface handling. VAAPI/QSV presets stay on the GPU; (CPU) presets download frames, filter on the CPU and re-upload (diagnostic, expect CPU load). Bob presets output one frame per field (25i becomes 50p), so pair them with FPS 50 or src - with FPS 25 the fps filter halves it straight back. A preset that does not fit the Hardware/decoder choice is left out of the command and flagged beside it.">Video filter</label>
+              <div class="col-12 col-sm-6"><label class="muted-label" title="Extra video filter, spliced FIRST into -vf (before scale/fps): each preset isolates one suspect when the picture misbehaves - interlaced source, 10-bit pixels, wrong field flags, broken surface handling. VAAPI/QSV presets stay on the GPU; (CPU) presets download frames, filter on the CPU and re-upload (diagnostic, expect CPU load). Bob presets output one frame per field (25i becomes 50p), so pair them with FPS 50 or src - with FPS 25 the fps filter halves it straight back. A preset that does not fit the Hardware/decoder choice is left out of the command and flagged beside it.">Video filter</label>
                 <select class="form-select form-select-sm ff-field" id="f-vf_preset">
                   <option value="none" selected>None (default, current behaviour)</option>
                   <option value="deint-vaapi-frame">Deinterlace (VAAPI, frame rate kept)</option>
@@ -88,40 +99,56 @@
                   <option value="setfield-tff">Force top-field-first flag</option>
                   <option value="null">Null (filter-graph sanity check)</option>
                 </select></div>
-              <div class="col-6 small text-muted">Fault-finding bank: start with the VAAPI deinterlacer for interlaced live TV, then narrow it down with the Demo buttons. Bob wants FPS 50; (CPU) presets load the CPU.</div>
-              <div class="col-4 d-flex align-items-end"><div class="form-check form-switch">
+              <div class="col-12 col-sm-6 small text-muted" data-help="Video filter diagnostics" data-help-for="f-vf_preset">Fault-finding bank: start with the VAAPI deinterlacer for interlaced live TV, then narrow it down with the Demo buttons. Bob wants FPS 50; (CPU) presets load the CPU.</div>
+              <div class="col-12 col-sm-4 d-flex align-items-end"><div class="form-check form-switch">
                 <input class="form-check-input ff-field" type="checkbox" id="f-low_power"><label class="form-check-label small">VAAPI low-power (LP encoder)</label></div></div>
-              <div class="col-3"><label class="muted-label">VAAPI rate control</label>
+              <div class="col-6 col-sm-3"><label class="muted-label">VAAPI rate control</label>
                 <select class="form-select form-select-sm ff-field" id="f-rc_mode">
                   <option value="AUTO">AUTO</option><option value="CQP" selected>CQP</option><option value="CBR">CBR</option>
                   <option value="VBR">VBR</option><option value="ICQ">ICQ</option><option value="QVBR">QVBR</option><option value="AVBR">AVBR</option>
                 </select></div>
-              <div class="col-2 rc-qp"><label class="muted-label" title="the quantiser CQP encodes at - ignored by every other mode">QP</label>
+              <div class="col-6 col-sm-2"><label class="muted-label" title="Quality target for VAAPI CQP, ICQ and QVBR">Quality</label>
                 <input class="form-control form-control-sm ff-field" id="f-global_quality" value="26" inputmode="numeric"></div>
-              <div class="col-3"><label class="muted-label">VAAPI async depth</label>
+              <div class="col-6 col-sm-3"><label class="muted-label">VAAPI async depth</label>
                 <input class="form-control form-control-sm ff-field" id="f-async_depth" value="4" inputmode="numeric"></div>
-              <div class="col-12 small text-muted mb-1">Low-power / rate-control / async-depth apply to <code>h264_vaapi</code>·<code>hevc_vaapi</code> encoders (the DS918+ hardware path).
-                <b>CQP</b> pins picture quality at the QP beside it (0-51, lower = better and bigger) and lets the bitrate float, so Bitrate/Maxrate/Bufsize are not rendered;
+              <div class="col-12 small text-muted mb-1" data-help="VAAPI tuning" data-help-for="f-rc_mode">Rate-control and async-depth apply to VAAPI encoders; low-power is generated only for <code>h264_vaapi</code>.
+                <b>CQP / ICQ</b> target quality and let the bitrate float, so Bitrate/Maxrate/Bufsize are disabled and omitted;
                 pick VBR or CBR to drive the rate instead.</div>
-              <div class="col-4"><label class="muted-label">Audio codec</label>
+              <div class="col-12 col-sm-4"><label class="muted-label">Audio codec</label>
                 <select class="form-select form-select-sm ff-field" id="f-audio_codec"><option>aac</option><option>ac3</option><option>mp2</option><option>mp3</option><option value="copy">copy</option><option value="none">none</option></select></div>
-              <div class="col-3"><label class="muted-label">Audio bitrate</label>
+              <div class="col-6 col-sm-3"><label class="muted-label">Audio bitrate</label>
                 <select class="form-select form-select-sm ff-field" id="f-audio_bitrate"><option>96k</option><option selected>128k</option><option>160k</option><option>192k</option><option>256k</option><option>384k</option></select></div>
-              <div class="col-2"><label class="muted-label">Channels</label>
+              <div class="col-6 col-sm-2"><label class="muted-label">Channels</label>
                 <select class="form-select form-select-sm ff-field" id="f-audio_channels"><option selected>2</option><option>1</option><option>6</option></select></div>
-              <div class="col-3"><label class="muted-label">Sample rate</label>
+              <div class="col-6 col-sm-3"><label class="muted-label">Sample rate</label>
                 <select class="form-select form-select-sm ff-field" id="f-audio_rate"><option selected>48000</option><option>44100</option></select></div>
-              <div class="col-4"><label class="muted-label" title="drop = no subtitles in the output pipe (safe default). dvb = keep BITMAP subtitles (PGS/DVD/DVB) as a DVB track in the TS - hardware-safe, the video stays fully VAAPI/QSV; text-only sources are auto-dropped. keep = copy EVERY track (SRT/ASS too) into a Matroska output - the only way to get VOD/series subtitles without burning them in; needs Output = Matroska. Burn-in is not offered: it needs CPU video frames (software transcoding).">Subtitles</label>
+              <div class="col-12 col-sm-4"><label class="muted-label" title="drop = no subtitles in the output pipe (safe default). dvb = keep BITMAP subtitles (PGS/DVD/DVB) as a DVB track in the TS - hardware-safe, the video stays fully VAAPI/QSV; text-only sources are auto-dropped. keep = copy EVERY track (SRT/ASS too) into a Matroska output - the only way to get VOD/series subtitles without burning them in; needs Output = Matroska. Burn-in is not offered: it needs CPU video frames (software transcoding).">Subtitles</label>
                 <select class="form-select form-select-sm ff-field" id="f-subs">
                   <option value="drop" selected>Drop (-sn)</option>
                   <option value="dvb">Keep as DVB (bitmap, hw-safe)</option>
                   <option value="keep">Copy all (text + bitmap, MKV only)</option>
                 </select></div>
-              <div class="col-4"><label class="muted-label" title="MPEG-TS: live TV, DVB bitmap subtitles only. Matroska: VOD/series with text subtitles (SRT/ASS) - play it with exteplayer3 (Enigma2 service reference 5002), VLC or Kodi. HLS writes segment files.">Output</label>
+              <div class="col-12 col-sm-4"><label class="muted-label" title="MPEG-TS: live TV, DVB bitmap subtitles only. Matroska: VOD/series with text subtitles (SRT/ASS) - play it with exteplayer3 (Enigma2 service reference 5002), VLC or Kodi. HLS writes segment files.">Output</label>
                 <select class="form-select form-select-sm ff-field" id="f-output_format"><option value="mpegts">MPEG-TS (pipe)</option><option value="matroska">Matroska / MKV (pipe, subtitle-capable)</option><option value="hls">HLS (files)</option></select></div>
-              <div class="col-3"><label class="muted-label" title="FFmpeg network read timeout in microseconds">Read timeout (µs)</label><input class="form-control form-control-sm ff-field" id="f-timeout" value="10000000" inputmode="numeric" min="0"></div>
-              <div class="col-5"><label class="muted-label">Extra input flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_input"></div>
-              <div class="col-6"><label class="muted-label">Extra output flags</label><input class="form-control form-control-sm mono ff-field" id="f-extra_output"></div>
+              <div class="col-12 mt-3"><h6 class="border-top pt-3">Advanced FFmpeg options</h6>
+                <p class="small text-muted mb-2" data-help="Advanced FFmpeg options">All other parameters can be supplied through extra flags or the full command below. The helper explains common options and validates their ranges; it does not replace FFmpeg's codec-specific documentation.</p>
+                <div class="row g-2 border rounded p-2 mb-2">
+                  <div class="col-md-7"><label for="ff-advanced-option" class="muted-label">Option to add or replace</label>
+                    <select id="ff-advanced-option" class="form-select form-select-sm" data-ff-advanced></select></div>
+                  <div class="col-md-5"><label for="ff-advanced-value" class="muted-label">Value (select or type)</label>
+                    <input id="ff-advanced-value" class="form-control form-control-sm" list="ff-advanced-suggestions" data-ff-advanced>
+                    <datalist id="ff-advanced-suggestions"></datalist></div>
+                  <div class="col-12" id="ff-advanced-custom" hidden><div class="row g-2">
+                    <div class="col-12 col-sm-6"><label for="ff-advanced-flag" class="muted-label">FFmpeg flag</label><input id="ff-advanced-flag" class="form-control form-control-sm mono" placeholder="-option_name" data-ff-advanced></div>
+                    <div class="col-12 col-sm-6"><label for="ff-advanced-side" class="muted-label">Placement</label><select id="ff-advanced-side" class="form-select form-select-sm" data-ff-advanced><option value="input">Input (before -i)</option><option value="output">Output (after -i)</option></select></div>
+                  </div></div>
+                  <div class="col-12 small text-muted" id="ff-advanced-help" data-help="Selected advanced option" data-help-for="ff-advanced-option"></div>
+                  <div class="col-12"><button id="ff-advanced-add" type="button" class="btn btn-sm btn-outline-secondary" data-ff-advanced>Add / replace option</button>
+                    <span id="ff-advanced-status" class="small ms-2" role="status"></span></div>
+                </div>
+              </div>
+              <div class="col-md-6"><label class="muted-label">Extra input flags</label><textarea rows="2" class="form-control form-control-sm mono ff-field" id="f-extra_input" spellcheck="false"></textarea></div>
+              <div class="col-md-6"><label class="muted-label">Extra output flags</label><textarea rows="2" class="form-control form-control-sm mono ff-field" id="f-extra_output" spellcheck="false"></textarea></div>
           <div class="col-12 mt-2">
             <label class="muted-label">Full ffmpeg command (edit freely — fields update on the fly)</label>
             <textarea class="form-control ff-edit mono" id="f-command" spellcheck="false"></textarea>
@@ -136,7 +163,7 @@
               </div>
             </div>
             <pre class="small bg-dark text-light p-2 mt-2 d-none mono" id="validate-out" style="max-height:480px;overflow:auto;white-space:pre-wrap"></pre>
-            <div class="small text-muted mt-2">The literal <code>&lt;url&gt;</code> is replaced with the real stream at runtime.
+            <div class="small text-muted mt-2" data-help="FFmpeg command and demos" data-help-for="f-command">The literal <code>&lt;url&gt;</code> is replaced with the real stream at runtime.
               <b>Demo (playlist source)</b> lets you pick an enabled Playlist item and runs the actual command against its primary source for ~2s, with the full ffmpeg argv and stderr.
               Test video is <a href="https://test-videos.co.uk/" target="_blank" rel="noopener">test-videos.co.uk</a> Big Buck Bunny H.264 360p.</div>
           </div>
@@ -155,12 +182,14 @@
 {% endblock %}
 
 {% block scripts %}
+<script src="/static/js/ffmpeg-editor.js?v={{ static_v.ffmpeg_editor_js }}"></script>
 <script>
+FFmpegEditor.setup({{ ffmpeg_editor_schema()|tojson }});
 const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","video_codec","video_bitrate",
   "maxrate","bufsize","fps","gop","profile","level","low_power","rc_mode","global_quality","async_depth",
   "audio_codec","audio_bitrate","audio_channels",
   "audio_rate","output_format","subs","vf_preset","extra_input","extra_output"];
-let current = null, templates = [], draftCommandSource = "fields";
+let current = null, templates = [], draftCommandSource = "fields", editorRevision = 0;
 const isRedirectTpl = (t) => (t && (t.command || "").trim() === "@redirect");
 const sourceOf = () => current?.command_source || draftCommandSource || "fields";
 
@@ -177,70 +206,62 @@ function applyEditorMode() {
   fieldsButton.title = redir
     ? "Leave Redirect mode, clear its raw extras and render a fresh FFmpeg command"
     : "Allow the structured fields to replace the manual command";
-  $$(".ff-field").forEach(n => {
-    // Name and enabled remain editable in manual mode; changing any other
-    // field would silently rebuild the command the user just wrote.
-    n.disabled = redir || (manual && n.id !== "f-name" && n.id !== "f-enabled");
-  });
+  FFmpegEditor.mode(manual, redir);
+  $("#tpl-delete").disabled = !current || current.is_default;
+  $("#tpl-delete").title = current?.is_default ? "Choose another default before deleting this template" : "";
+  if (current?.is_default) {
+    $("#f-enabled").disabled = true;
+    const note = $("#f-enabled-inactive");
+    note.textContent = "The default must stay enabled. Choose another default first.";
+    note.hidden = false;
+  }
   $("#f-command").disabled = redir;
   $("#btn-test-syntax").disabled = redir;
   $("#btn-test-playlist").disabled = redir;
   $("#btn-test-url").disabled = redir;
 }
 
-/* CQP makes the rate flags redundant and every other mode makes the QP
-   redundant; the encoder ignores whichever group is out of play, so the form
-   dims it instead of inviting edits that go nowhere. */
-function syncRcFields() {
-  const live = $("#f-rc_mode").value === "CQP" && ($("#f-video_codec").value || "").endsWith("_vaapi");
-  $$(".rc-rate").forEach(n => n.style.opacity = live ? "0.4" : "");
-  $$(".rc-qp").forEach(n => n.style.opacity = live ? "" : "0.4");
-}
 function readFields() {
-  const o = {};
-  for (const k of FIELD_IDS) {
-    const n = $("#f-" + k);
-    o[k] = n.type === "checkbox" ? n.checked : n.value;
-  }
-  // Keep the timeout as a normal extra input option so it works with the
-  // existing template schema and remains compatible with imported templates.
-  const extra = o.extra_input.replace(/(^|\s)-rw_timeout\s+\S+/g, "").trim();
-  o.extra_input = `-rw_timeout ${Math.max(0, Number($("#f-timeout").value) || 0)}${extra ? " " + extra : ""}`;
-  return o;
+  return Object.fromEntries(FIELD_IDS.map(k => [k, FFmpegEditor.value(k)]));
 }
 function writeFields(t) {
-  for (const k of FIELD_IDS) if (t[k] !== undefined && t[k] !== null) {
+  for (const k of FIELD_IDS) if (t[k] !== undefined) {
     let val = t[k];
     if (k === "rc_mode" && typeof val === "string") val = val.toUpperCase();
-    const n = $("#f-" + k);
-    if (n.type === "checkbox") n.checked = !!val; else n.value = val;
-    if (n.tagName === "SELECT" && n.value !== String(val)) {
-      n.append(el("option", { value: val, selected: "" }, val));   // keep unknown custom values
-    }
+    FFmpegEditor.setValue(k, val);
   }
-  const match = String(t.extra_input || "").match(/(?:^|\s)-rw_timeout\s+(\d+)/);
-  $("#f-timeout").value = match ? match[1] : "10000000";
 }
 
 /* fields -> command */
 let syncTimer;
 async function fieldsToCommand() {
   clearTimeout(syncTimer);
+  const revision = ++editorRevision;
+  applyEditorMode(); // recompute dependencies before validation, not after the API response
   if (isRedirectTpl(current) || sourceOf() === "manual") return;
+  if (!FFmpegEditor.valid()) {
+    $("#sync-state").textContent = "Fix the highlighted value before building or saving.";
+    return;
+  }
   syncTimer = setTimeout(async () => {
-    const o = readFields();
-    const r = await api("/api/ffmpeg/build", { method: "POST", body: o });
-    $("#f-command").value = r.command;
-    $("#sync-state").innerHTML = '<span class="text-success">fields → command</span>' +
-      ((r.warnings || []).length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
-    setDraftSource("fields");
-    applyEditorMode();
+    try {
+      const r = await api("/api/ffmpeg/build", { method: "POST", body: readFields() });
+      if (revision !== editorRevision || sourceOf() === "manual") return;
+      $("#f-command").value = r.command;
+      $("#sync-state").innerHTML = '<span class="text-success">fields → command</span>' +
+        ((r.warnings || []).length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
+      setDraftSource("fields");
+      applyEditorMode();
+    } catch (err) {
+      if (revision === editorRevision) $("#sync-state").textContent = err.message;
+    }
   }, 200);
 }
 /* command -> fields */
 let parseTimer;
 $("#f-command").addEventListener("input", () => {
   clearTimeout(parseTimer);
+  const revision = ++editorRevision;
   // The moment the user types in the full command, make it authoritative.
   // This also cancels a pending fields->command render from a new-template
   // click, which otherwise could overwrite the first keystrokes.
@@ -252,6 +273,7 @@ $("#f-command").addEventListener("input", () => {
     // (no -rc_mode, no -b:v under CQP) must stay as the row had it
     const r = await api("/api/ffmpeg/parse", { method: "POST",
       body: { command: $("#f-command").value, base: readFields() } });
+    if (revision !== editorRevision) return;
     writeFields(r.options);
     $("#sync-state").innerHTML = '<span class="text-success">command → fields</span>' +
       (r.warnings.length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
@@ -272,7 +294,6 @@ $("#btn-fields-mode").addEventListener("click", () => {
     $("#f-command").value = "";
     $("#f-extra_input").value = "";
     $("#f-extra_output").value = "";
-    $("#f-timeout").value = "10000000";
     $("#redirect-note").classList.add("d-none");
   }
   setDraftSource("fields");
@@ -280,37 +301,71 @@ $("#btn-fields-mode").addEventListener("click", () => {
   fieldsToCommand();
 });
 $$(".ff-field").forEach(n => n.addEventListener("change", fieldsToCommand));
-$$(".ff-field").forEach(n => n.addEventListener("change", syncRcFields));
 $$(".ff-field").forEach(n => n.addEventListener("input", fieldsToCommand));
 
+function updateDefaultButton() {
+  const selected = templates.find(t => String(t.id) === $("#tpl-default").value);
+  $("#tpl-set-default").disabled = !selected?.enabled || selected.is_default;
+}
+$("#tpl-default").addEventListener("change", updateDefaultButton);
+$("#tpl-set-default").addEventListener("click", async () => {
+  const id = $("#tpl-default").value;
+  if (!id) return;
+  $("#tpl-set-default").disabled = true;
+  try {
+    await api(`/api/ffmpeg/${id}/default`, {method:"POST"});
+    await loadList(); // update badges/selection without replacing an unsaved editor draft
+    toast("Default template updated", "ok");
+  } finally { updateDefaultButton(); }
+});
+function highlightTemplate() {
+  $$("#tpl-list [data-template-id]").forEach(b => {
+    const selected = b.dataset.templateId === String(current?.id);
+    b.classList.toggle("btn-accent", selected);
+    b.classList.toggle("btn-light", !selected);
+  });
+}
 async function loadList() {
   templates = (await api("/api/ffmpeg")).items;
+  const selector = $("#tpl-default");
+  selector.replaceChildren(...templates.map(t => {
+    const option = el("option", {value:t.id}, t.name + (t.enabled ? "" : " (disabled)"));
+    option.disabled = !t.enabled;
+    return option;
+  }));
+  selector.value = String(templates.find(t => t.is_default)?.id || "");
+  updateDefaultButton();
+  if (current) current.is_default = templates.find(t => t.id === current.id)?.is_default || false;
+  applyEditorMode();
   const host = $("#tpl-list"); host.innerHTML = "";
   for (const t of templates) {
-    const b = el("button", { class: "btn btn-sm w-100 text-start mb-1 " + (current?.id === t.id ? "btn-accent" : "btn-light") });
+    const b = el("button", { "data-template-id":t.id, class: "btn btn-sm w-100 text-start mb-1 " + (current?.id === t.id ? "btn-accent" : "btn-light") });
     const sub = isRedirectTpl(t)
       ? "302 redirect to panel CDN · bypasses ffmpeg"
       : `${esc(t.hw_accel)} · ${esc(t.video_codec)} · ${esc(t.resolution)} · ${esc(t.audio_codec)}`;
     b.innerHTML = `<div class="d-flex justify-content-between"><span>${esc(t.name)} ${t.is_default ? '<span class="badge text-bg-dark">default</span>' : ""}</span>
       <span class="badge ${t.enabled ? "st-online" : "st-unknown"}">${t.enabled ? "on" : "off"}</span></div>
       <div class="small text-muted">${sub}</div>`;
-    b.addEventListener("click", () => selectTemplate(t.id));
+    b.addEventListener("click", () => { selectTemplate(t.id); $("#ff-editor-card").scrollIntoView({block:"start", behavior:"smooth"}); });
     host.append(b);
   }
 }
 async function selectTemplate(id) {
+  ++editorRevision; clearTimeout(syncTimer); clearTimeout(parseTimer);
   current = templates.find(t => t.id === id);
+  highlightTemplate();
   draftCommandSource = current.command_source || "fields";
   $("#ed-title").textContent = "Edit template: " + current.name;
   writeFields(current);
   $("#f-command").value = current.command || "";
   $("#sync-state").textContent = "";
   $("#redirect-note").classList.toggle("d-none", !isRedirectTpl(current));
-  syncRcFields();
   applyEditorMode();
 }
 $("#tpl-new").addEventListener("click", () => {
+  ++editorRevision; clearTimeout(syncTimer); clearTimeout(parseTimer);
   current = null;
+  highlightTemplate();
   draftCommandSource = "fields";
   $("#ed-title").textContent = "New template (unsaved)";
   $("#redirect-note").classList.add("d-none");
@@ -325,25 +380,32 @@ $("#tpl-new").addEventListener("click", () => {
                 audio_bitrate: "128k", audio_channels: "2", audio_rate: "48000",
                 output_format: "mpegts", subs: "drop", vf_preset: "none",
                 extra_input: "", extra_output: "" });
-  $("#f-timeout").value = "10000000";
   $("#f-command").value = "";
   applyEditorMode();
-  syncRcFields();
   fieldsToCommand();
+  $("#ff-editor-card").scrollIntoView({block:"start", behavior:"smooth"});
+  $("#f-name").focus({preventScroll:true});
 });
+$("#tpl-save-top").addEventListener("click", () => $("#tpl-save").click());
 $("#tpl-save").addEventListener("click", async () => {
+  if (sourceOf() === "fields" && !isRedirectTpl(current) && !FFmpegEditor.valid(true)) return;
+  ++editorRevision; clearTimeout(syncTimer); clearTimeout(parseTimer);
   const body = { ...readFields(), command: $("#f-command").value,
                  command_source: sourceOf() };
   if (!body.name.trim()) return toast("name required", "warn");
-  if (current) { await api(`/api/ffmpeg/${current.id}`, { method: "PUT", body }); }
-  else { const r = await api("/api/ffmpeg", { method: "POST", body }); body.id = r.item.id; }
-  toast("template saved", "ok"); await loadList();
-  if (current) selectTemplate(current.id); else { const last = templates[templates.length - 1]; if (last) selectTemplate(last.id); }
+  const buttons = [$("#tpl-save"), $("#tpl-save-top")];
+  buttons.forEach(button => { button.disabled = true; });
+  try {
+    const r = await api(current ? `/api/ffmpeg/${current.id}` : "/api/ffmpeg", {
+      method: current ? "PUT" : "POST", body });
+    toast("template saved", "ok"); await loadList();
+    selectTemplate(r.item.id);
+  } finally { buttons.forEach(button => { button.disabled = false; }); }
 });
 $("#tpl-delete").addEventListener("click", () => {
   if (!current) return toast("nothing selected", "warn");
   confirmDialog({ title: "Delete template", body: `Delete <b>${esc(current.name)}</b>? Channels using it fall back to the default template.`,
-    okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/ffmpeg/${current.id}`, { method: "DELETE" }); current = null; loadList(); } });
+    okText: "Delete", okClass: "btn-danger", onOk: async () => { await api(`/api/ffmpeg/${current.id}`, { method: "DELETE" }); current = null; await loadList(); if (templates.length) selectTemplate((templates.find(t => t.is_default) || templates[0]).id); } });
 });
 function showValidate(result, label) {
   const box = $("#validate-out");
@@ -398,7 +460,7 @@ function pickPlaylistAndDemo() {
       ([v, l]) => el("option", { value: v }, l)));
   const q = el("input", { class: "form-control form-control-sm", placeholder: "filter enabled playlist items…" });
   const list = el("div", { class: "list-group mt-2", style: "max-height:360px;overflow:auto" });
-  const hint = el("p", { class: "small text-muted mb-2" },
+  const hint = el("p", { class: "small text-muted mb-2", "data-help":"Playlist demo" },
     "Pick an enabled Playlist item. ffmpeg runs this template against its primary source for ~2 seconds and prints the full command plus stderr.");
   const body = el("div", {}, hint,
     el("div", { class: "row g-2" },
@@ -451,6 +513,6 @@ $("#tpl-import-file").addEventListener("change", async (e) => {
   const r = await api("/api/import", { method: "POST", body: { mode: "merge", data } });
   toast(`imported ${r.imported}, skipped ${r.skipped.length}`, "ok"); loadList(); e.target.value = "";
 });
-loadList().then(() => { if (templates.length) selectTemplate(templates[0].id); });
+loadList().then(() => { if (templates.length) selectTemplate((templates.find(t => t.is_default) || templates[0]).id); });
 </script>
 {% endblock %}

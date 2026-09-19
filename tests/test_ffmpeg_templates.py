@@ -177,12 +177,12 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
     assert "-rc_mode CQP" in vaapi["command"]
     assert "-global_quality 26" in vaapi["command"]
     assert "-async_depth 4" in vaapi["command"]
-    # every template the app owns asks for CQP, and none of them renders a
-    # -rc_mode the encoder would ignore
+    # VAAPI templates use explicit rate control; Duo2 live is rate-driven,
+    # while the other VAAPI presets retain CQP.
     for name, p in presets.items():
         if p["video_codec"].endswith("_vaapi"):
-            assert "-rc_mode CQP" in p["command"], name
-            assert "-b:v" not in p["command"], name
+            assert f"-rc_mode {p['rc_mode']}" in p["command"], name
+            assert ("-b:v" in p["command"]) == (p["rc_mode"] != "CQP"), name
         else:
             assert "-rc_mode" not in p["command"], name
     # every preset's stored command must match its structured fields (2-way sync);

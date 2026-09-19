@@ -271,11 +271,11 @@ async def test_full_restore_onto_fresh_id_space():
         assert plp.local_file_id == a.id
 
 
-async def test_restore_updates_existing_rows_to_backup_state():
+async def test_restore_preserves_existing_rows_instead_of_overwriting():
     await _seed()
     backup = await _export_all()
     # the local install drifted: a channel disabled, a group renamed, a
-    # priority swapped - a restore must put the backup's values back
+    # priority swapped - an additive restore must preserve the local values
     async with SessionLocal() as s:
         ch1 = (await s.execute(select(LiveSource).where(
             LiveSource.portal_channel_id == "101"))).scalar_one()
@@ -293,19 +293,20 @@ async def test_restore_updates_existing_rows_to_backup_state():
         r = await c.post("/api/import", json={"mode": "merge", "data": backup})
         assert r.status_code == 200, r.text
         applied = r.json()
-    assert applied["updated"] > 0
+    assert applied["updated"] == 0
+    assert applied["skipped"]
 
     async with SessionLocal() as s:
         ch1 = (await s.execute(select(LiveSource).where(
             LiveSource.portal_channel_id == "101"))).scalar_one()
-        assert ch1.enabled is True
+        assert ch1.enabled is False
         lp = (await s.execute(select(LivePlaylist).where(
             LivePlaylist.custom_name == "LIVE-1"))).scalar_one()
-        assert lp.group_name == "TV"
+        assert lp.group_name == "Drifted"
         link = (await s.execute(select(LivePlaylistSource).where(
             LivePlaylistSource.live_playlist_id == lp.id))).scalars().all()
-        assert sorted(l.priority for l in link) == [1, 2]
-        # no duplication: the restore updated, it did not append
+        assert sorted(l.priority for l in link) == [2, 9]
+        # no duplication: existing identities are skipped
         assert len(link) == 2
 
 
@@ -372,8 +373,8 @@ async def test_legacy_live_playlist_section_still_imports():
     async with SessionLocal() as s:
         lp = (await s.execute(select(LivePlaylist).where(
             LivePlaylist.custom_name == "LIVE-1"))).scalar_one()
-        assert lp.group_name == "Legacy"
-        assert lp.number == 7
+        assert lp.group_name == "TV"
+        assert lp.number == 1
         assert lp.ffmpeg_template_id == tpl_id
         # the seeded links survived the legacy restore (nothing is deleted)
         assert (await s.execute(select(LivePlaylistSource).where(

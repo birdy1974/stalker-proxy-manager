@@ -90,7 +90,7 @@ async def test_unlinked_series_contribute_no_episodes_until_synced():
     """The bug, end to end: the playlist is silently missing the whole series."""
     await _series_without_season_links()
     async with SessionLocal() as s:
-        user = User(name="u1", password="x")
+        user = User(name="u1", password="x", groups_json='{"series":["SciFi"]}')
         s.add(user)
         await s.commit()
         await s.refresh(user)

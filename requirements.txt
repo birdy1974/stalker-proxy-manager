@@ -9,3 +9,5 @@ httpx>=0.27              # async HTTP client for Stalker portal calls
 jinja2>=3.1              # server-side templates (GUI)
 python-multipart>=0.0.9  # form parsing (login, imports)
 itsdangerous>=2.2        # signed session cookies (admin auth)
+
+tzdata>=2025.2          # IANA timezone fallback on hosts without system zoneinfo

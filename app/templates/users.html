@@ -3,7 +3,7 @@
 <div class="card">
   <div class="card-header d-flex gap-2 align-items-center">
     <span><i class="bi bi-people"></i> Users (M3U / Xtream output consumers)</span>
-    <button class="btn btn-sm btn-accent ms-auto" id="u-add"><i class="bi bi-person-plus"></i> Add user</button>
+    <button class="btn btn-sm btn-accent ms-auto" id="u-add" disabled><i class="bi bi-person-plus"></i> Add user</button>
   </div>
   <div class="card-body p-2"><div id="users-table"></div></div>
 </div>
@@ -17,6 +17,7 @@ function make() {
     server: async () => {
       const d = await api("/api/users");
       GROUPS = d.groups_available;
+      $("#u-add").disabled = false;
       AREAS = d.areas || [];
       return { total: d.items.length, items: d.items };
     },
@@ -27,12 +28,12 @@ function make() {
       { key: "access", label: "Access", render: r => `${r.m3u_enabled ? '<span class="badge st-online me-1">m3u</span>' : ""}${r.xtream_enabled ? '<span class="badge st-online">xtream</span>' : ""}` },
       { key: "expire_date", label: "Expires", render: r => esc(r.expire_date || "—") },
       { key: "max_connections", label: "Max conn", width: "80px" },
-      { key: "groups", label: "Group whitelist", render: r => Object.entries(r.groups || {}).filter(([k, v]) => v.length).map(([k, v]) => {
-        const st = r.groups_stale?.[k] || [];
+      { key: "groups", label: "Group whitelist", render: r => ["live", "vod", "series", "local"].map(k => {
+        const v = r.groups?.[k] || [], st = r.groups_stale?.[k] || [];
         return st.length
-          ? `<span class="badge text-bg-warning me-1" title="holds ${st.length} group(s) that no longer exist: ${esc(st.join(', '))}${st.length >= v.length ? ' - filters EVERYTHING of this type out right now' : ''}">${k}: ${v.length} stale</span>`
-          : `<span class="badge text-bg-light me-1">${k}: ${v.length}</span>`;
-      }).join("") || '<span class="text-muted small">all groups</span>' },
+          ? `<span class="badge text-bg-warning me-1" title="${st.length} selected group(s) no longer exist: ${esc(st.join(', '))}">${k}: ${v.length} (${st.length} stale)</span>`
+          : `<span class="badge text-bg-light me-1">${k}: ${v.length || "none"}</span>`;
+      }).join("") },
       { key: "links", label: "Output — M3U URL / Xtream login", render: r => `
         <div class="d-flex gap-1 align-items-center">
           <span class="muted-label mb-0" style="width:40px">M3U</span>
@@ -64,19 +65,22 @@ window.showLinks = (id) => {
       <tr><td class="text-muted">Password</td><td class="mono">${esc(u.password)}</td></tr>
       <tr><td class="text-muted">player_api</td><td class="mono">${esc(u.xtream.player_api)}</td></tr>
       <tr><td class="text-muted">get.php</td><td class="mono small">${esc(u.xtream.get_php)}</td></tr>
-      <tr><td class="text-muted">EPG (xmltv)</td><td class="mono small">${esc(u.xtream.url)}/xmltv.php?username=${esc(u.name)}&password=${esc(u.password)}</td></tr>
+      <tr><td class="text-muted">EPG (xmltv)</td><td class="mono small">${esc(u.epg_url)}</td></tr>
     </table>`;
   const footer = el("div");
   const m = openModal({ title: `Output for ${u.name}`, body, footer, size: "lg" });
-  footer.append(mBtn("Close", "btn-outline-secondary", m.close));
+  footer.append(mBtn("Copy EPG URL", "btn-outline-primary", async () => {
+    try { await navigator.clipboard.writeText(u.epg_url); toast("EPG URL copied", "ok"); }
+    catch (_) { toast("Clipboard unavailable; copy the EPG URL from the table", "warn"); }
+  }, "bi-clipboard"), mBtn("Close", "btn-outline-secondary", m.close));
 };
 window.editUser = (id) => {
   const u = id ? table.items.find(x => x.id === id) : { name: "", password: "", m3u_enabled: true, xtream_enabled: true, expire_date: "", max_connections: 1, enabled: true, groups: {}, area_id: null };
   const body = el("div");
   const grpChk = (kind) => {
     const have = GROUPS[kind] || [];
-    const cur = u.groups?.[kind] || [];
-    const curLow = cur.map(x => String(x).toLowerCase());
+    const cur = id ? (u.groups?.[kind] || []) : have;
+    const curLow = cur.map(x => String(x).trim().toLowerCase());
     const boxes = have.map(g =>
       `<label class="d-block small"><input type="checkbox" class="g-${kind}" value="${esc(g)}" ${curLow.includes(g.toLowerCase()) ? "checked" : ""}> ${esc(g)}</label>`);
     // stored whitelist entries whose group no longer exists: render them too,
@@ -91,7 +95,7 @@ window.editUser = (id) => {
       <div class="col-md-4"><label class="muted-label">Password</label><input class="form-control form-control-sm mono" id="u-pass" value="${esc(u.password)}"></div>
       <div class="col-md-2"><label class="muted-label">Max conn.</label><input class="form-control form-control-sm" type="number" min="1" id="u-max" value="${u.max_connections}"></div>
       <div class="col-md-2"><label class="muted-label">Expires</label><input class="form-control form-control-sm" type="date" id="u-exp" value="${esc(u.expire_date || "")}"></div>
-      <div class="col-md-6"><label class="muted-label">Area (FFmpeg overlay — empty = playlist defaults)</label>
+      <div class="col-md-6"><label class="muted-label" title="Choose the FFmpeg overlay for this user. Empty uses playlist defaults.">Area</label>
         <select class="form-select form-select-sm" id="u-area">
           <option value="">(no area — playlist FFmpeg column)</option>
           ${AREAS.map(a => `<option value="${a.id}" ${u.area_id === a.id ? "selected" : ""}>${esc(a.name)}${a.enabled ? "" : " (off)"}</option>`).join("")}
@@ -103,25 +107,35 @@ window.editUser = (id) => {
       </div>
     </div>
     <hr class="my-2">
-    <div class="small text-muted mb-1">Group whitelist — empty type = ALL groups of that type allowed</div>
+    <div class="muted-label mb-1" title="Only selected groups are visible to this user. No selection means no groups of that type. New users start with all currently available groups selected; newly added groups must be selected separately.">Group whitelist</div>
     <div class="row g-2">
       ${["live", "vod", "series", "local"].map(k => `<div class="col-md-3">
         <div class="d-flex justify-content-between align-items-center">
           <span class="muted-label mb-0">${k}</span>
-          <label class="small mb-0 user-select-none"><input type="checkbox" class="sa-${k}" title="select all ${k} groups"> all</label>
+          <span class="small text-muted" id="gs-${k}" role="status" aria-live="polite"></span>
+        </div>
+        <div class="d-flex gap-1 mb-1">
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-select-groups="${k}" aria-label="Select all ${k} groups">Select all</button>
+          <button type="button" class="btn btn-sm btn-outline-secondary" data-deselect-groups="${k}" aria-label="Deselect all ${k} groups">Deselect all</button>
         </div>
         <div class="border rounded p-1" style="max-height:150px;overflow:auto">${grpChk(k)}</div></div>`).join("")}
     </div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: id ? "Edit user" : "Add user", body, footer, size: "xl" });
-  /* select-all toggles per content type (kept in sync with individual boxes) */
   for (const k of ["live", "vod", "series", "local"]) {
-    const boxes = $$( ".g-" + k, body), sa = $(".sa-" + k, body);
-    if (!sa) continue;
-    const sync = () => sa.checked = boxes.length > 0 && boxes.every(b => b.checked);
-    sa.checked = boxes.length > 0 && boxes.every(b => b.checked);
-    sa.addEventListener("change", () => boxes.forEach(b => { b.checked = sa.checked; }));
+    const boxes = $$(".g-" + k, body);
+    const select = $(`[data-select-groups="${k}"]`, body);
+    const deselect = $(`[data-deselect-groups="${k}"]`, body);
+    const sync = () => {
+      const n = boxes.filter(b => b.checked).length;
+      $("#gs-" + k, body).textContent = `${n} / ${boxes.length} selected`;
+      select.disabled = n === boxes.length;
+      deselect.disabled = n === 0;
+    };
+    select.addEventListener("click", () => { boxes.forEach(b => b.checked = true); sync(); });
+    deselect.addEventListener("click", () => { boxes.forEach(b => b.checked = false); sync(); });
     boxes.forEach(b => b.addEventListener("change", sync));
+    sync();
   }
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
     mBtn("Save", "btn-accent", async () => {

@@ -105,7 +105,8 @@ async def _catalogue() -> User:
     """A small library: 3 live channels in 2 groups, 2 movies, 1 series with
     two seasons."""
     async with SessionLocal() as s:
-        user = User(name="box", password="pw", enabled=True, m3u_enabled=True)
+        user = User(name="box", password="pw", enabled=True, m3u_enabled=True,
+                    groups_json='{"live":["News","Sport"],"vod":["Action"],"series":["Drama"]}')
         s.add(user)
         portal = Portal(name="p", base_url="http://127.0.0.1:1/c/")
         s.add(portal)
@@ -212,7 +213,7 @@ async def test_big_bouquets_are_split_into_numbered_parts():
     """Enigma2 redraws the whole list on every zap, so an unbounded bouquet is
     a slideshow. Splitting is what keeps a 10 000-title VOD library usable."""
     async with SessionLocal() as s:
-        user = User(name="box2", password="pw", enabled=True)
+        user = User(name="box2", password="pw", enabled=True, groups_json='{"vod":["Action"]}')
         s.add(user)
         portal = Portal(name="p2", base_url="http://127.0.0.1:1/c/")
         s.add(portal)
@@ -257,7 +258,7 @@ async def test_default_local_files_are_advertised_as_mpegts():
     """An unassigned local MP4 uses the default redirect/copy path, which an
     Enigma2 profile safely requests as MPEG-TS rather than progressive MP4."""
     async with SessionLocal() as s:
-        user = User(name="locbox", password="pw", enabled=True)
+        user = User(name="locbox", password="pw", enabled=True, groups_json='{"local":["Files"]}')
         s.add(user)
         ls = LocalSource(directory="/tmp", enabled=True)
         s.add(ls)
@@ -285,7 +286,7 @@ async def test_local_matroska_template_is_advertised_as_mkv():
     playback for MP4/AVI files on Enigma2.
     """
     async with SessionLocal() as s:
-        user = User(name="locmkv", password="pw", enabled=True)
+        user = User(name="locmkv", password="pw", enabled=True, groups_json='{"local":["Files"]}')
         template = FFmpegTemplate(
             name="Enigma2 VOD - remux + subtitles (MKV)", enabled=True,
             output_format="matroska", video_codec="copy", audio_codec="copy",
@@ -473,7 +474,7 @@ async def _mixed_vod(tpl: dict) -> User:
     from app.models import Portal, VodSource
 
     async with SessionLocal() as s:
-        user = User(name="mix", password="pw", enabled=True, m3u_enabled=True)
+        user = User(name="mix", password="pw", enabled=True, m3u_enabled=True, groups_json='{"vod":["Mixed"]}')
         s.add(user)
         portal = Portal(name="p", base_url="http://127.0.0.1:1/c/")
         s.add(portal)
@@ -592,7 +593,7 @@ async def test_delivery_override_leaves_local_files_on_the_template_call():
     override must not reclassify them: a local MKV remux stays an MKV line
     even under delivery=redirect."""
     async with SessionLocal() as s:
-        user = User(name="locovr", password="pw", enabled=True)
+        user = User(name="locovr", password="pw", enabled=True, groups_json='{"local":["Files"]}')
         template = FFmpegTemplate(
             name="Enigma2 VOD - remux + subtitles (MKV)", enabled=True,
             output_format="matroska", video_codec="copy", audio_codec="copy",
@@ -643,7 +644,7 @@ async def test_local_redirect_items_ask_for_the_original_suffix():
     from app.services.ffmpeg_templates import REDIRECT_COMMAND
 
     async with SessionLocal() as s:
-        user = User(name="locredir", password="pw", enabled=True)
+        user = User(name="locredir", password="pw", enabled=True, groups_json='{"local":["Files"]}')
         template = FFmpegTemplate(name="Redirect (bypass ffmpeg)",
                                   command=REDIRECT_COMMAND, command_source="fields",
                                   enabled=True, is_default=True,

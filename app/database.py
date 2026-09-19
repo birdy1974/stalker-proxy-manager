@@ -36,6 +36,7 @@ _CACHE_TABLES = (
     "serie_playlist", "serie_playlist_sources", "serie_playlist_seasons",
     "local_playlist", "local_files", "local_sources", "ffmpeg_templates",
     "users", "areas", "area_item_templates", "settings", "enigma2_profiles",
+    "epg_sources", "epg_programmes", "epg_channel_sources",
 )
 
 
@@ -332,6 +333,7 @@ async def _ensure_schema(metadata) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
         await conn.run_sync(_add_missing_columns)
+        await conn.run_sync(_migrate_epg_programme_key)
 
 
 async def init_db() -> None:
@@ -355,6 +357,13 @@ async def init_db() -> None:
 # with "no such column" on the next SELECT. (name, sql-type, default) - the
 # default is dialect-specific for booleans, hence the tiny branch below.
 _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
+    "epg_sources": {"portal_id": ("INTEGER", "NULL"),
+                    "timezone_mode": ("VARCHAR(16)", "'auto'"), "timezone_name": ("VARCHAR(64)", "NULL"),
+                    "offset_minutes": ("INTEGER", "0"),
+                    "applied_timezone_mode": ("VARCHAR(16)", "'auto'"), "applied_timezone_name": ("VARCHAR(64)", "NULL"),
+                    "refresh_hours": ("INTEGER", "NULL"), "stale_hours": ("INTEGER", "NULL"),
+                    "last_attempt": ("TIMESTAMP", "NULL"), "last_error": ("VARCHAR(500)", "NULL")},
+    "epg_programmes": {"epg_source_id": ("INTEGER", "NULL")},
     "portals": {
         "tls_insecure": ("BOOLEAN", "0"),
         "identity_mode": ("VARCHAR(12)", "'minimal'"),
@@ -438,6 +447,8 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         "area_id": ("INTEGER", "NULL"),
     },
     "live_playlist": {
+        "epg_sources_explicit": ("BOOLEAN", "0"), "epg_custom": ("BOOLEAN", "0"), "epg_gap_fill": ("BOOLEAN", "1"),
+        "epg_offset_minutes": ("INTEGER", "0"),
         # channel-number lock: a locked channel keeps its number through
         # reordering / deletes / adds (the rest renumber around it)
         "lock_number": ("BOOLEAN", "0"),
@@ -469,7 +480,45 @@ def _add_missing_columns(sync_conn) -> None:
             if name in existing:
                 continue
             if typ == "BOOLEAN" and not is_sqlite:
-                default = "TRUE"          # postgres rejects DEFAULT 1 on boolean
+                default = "TRUE" if default == "1" else "FALSE"
             sync_conn.execute(text(
                 f"ALTER TABLE {table} ADD COLUMN {name} {typ} DEFAULT {default}"))
             log.info("schema: added %s.%s (%s default %s)", table, name, typ, default)
+
+
+def _migrate_epg_programme_key(sync_conn):
+    """Keep each feed's events independently, preserving old rows and IDs.
+
+    SQLite cannot drop a UNIQUE constraint. This table has no inbound FKs, so
+    rebuild only it inside the startup transaction; never discard a guide to
+    upgrade. PostgreSQL can replace the constraint directly.
+    """
+    from sqlalchemy import inspect, text
+    from sqlalchemy.schema import CreateTable
+    from .models import EpgProgramme
+    inspector = inspect(sync_conn)
+    constraints = inspector.get_unique_constraints("epg_programmes")
+    old = next((c for c in constraints if c["column_names"] == ["tvg_id", "start_ts", "title"]), None)
+    table = EpgProgramme.__table__
+    if old and sync_conn.dialect.name == "sqlite":
+        # Explicit transaction is necessary for sqlite3's legacy DDL mode.
+        if not sync_conn.connection.driver_connection.in_transaction:
+            sync_conn.exec_driver_sql("BEGIN")
+        ddl = str(CreateTable(table).compile(dialect=sync_conn.dialect))
+        ddl = ddl.replace("CREATE TABLE epg_programmes", "CREATE TABLE epg_programmes_upgrade", 1)
+        sync_conn.exec_driver_sql(ddl)
+        columns = ", ".join('"' + c.name + '"' for c in table.columns)
+        # Older ALTER-added provenance had no FK. Preserve orphaned rows as
+        # legacy/unattributed rather than failing the entire startup upgrade.
+        selected = ", ".join(
+            'CASE WHEN epg_source_id IN (SELECT id FROM epg_sources) THEN epg_source_id ELSE NULL END'
+            if c.name == 'epg_source_id' else '"' + c.name + '"' for c in table.columns)
+        sync_conn.exec_driver_sql(f"INSERT INTO epg_programmes_upgrade ({columns}) SELECT {selected} FROM epg_programmes")
+        sync_conn.exec_driver_sql("DROP TABLE epg_programmes")
+        sync_conn.exec_driver_sql("ALTER TABLE epg_programmes_upgrade RENAME TO epg_programmes")
+    elif old:
+        name = sync_conn.dialect.identifier_preparer.quote(old["name"])
+        sync_conn.execute(text(f"ALTER TABLE epg_programmes DROP CONSTRAINT {name}"))
+        sync_conn.execute(text("ALTER TABLE epg_programmes ADD CONSTRAINT uq_epg_prog_source UNIQUE (epg_source_id, tvg_id, start_ts, title)"))
+    for index in table.indexes:
+        index.create(sync_conn, checkfirst=True)

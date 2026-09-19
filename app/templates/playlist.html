@@ -1,5 +1,13 @@
 {% extends "base.html" %}
 {% block content %}
+<div class="card mb-3" data-health-problems-only hidden>
+  <div class="card-header" id="playlist-health-heading">Playlist source health</div>
+  <span data-help="Playlist source health" data-help-for="playlist-health-heading">Checks enabled Live, VOD, Series and Local playlist items every 30 seconds. Missing links, empty commands, disabled portals, banned/expired accounts, missing episode fallbacks and missing/unreadable files are reported. Busy accounts and recorded connection failures are warnings. Unverified does not mean working. Recent media-probe/playback evidence lasts 15 minutes in this server process. Local availability checks do not verify decoding. Automatic checks never open streams; Probe source is an explicit, bounded check before FFmpeg. Input catalogue selection flags alone do not disable explicit playback links. Disabled playlist items are excluded.</span>
+  <div id="playlist-health" class="card-body">Checking playlist sources…</div>
+</div>
+
+<div class="card mb-3" data-health-problems-only hidden><div class="card-header">EPG guide health</div><div id="playlist-epg-health" class="card-body py-2">Checking guide coverage…</div></div>
+
 <div class="card">
   <div class="card-header pb-0">
     <ul class="nav nav-tabs card-header-tabs nav-subtabs" id="pl-tabs">
@@ -16,7 +24,7 @@
       <div class="d-flex align-items-center gap-2 px-1 pt-1 pb-2">
         <button class="btn btn-sm btn-outline-secondary" id="sync-seasons">
           <i class="bi bi-arrow-repeat"></i> Re-link seasons</button>
-        <span class="small text-muted">Seasons fetched after a series was added are linked
+        <span class="small text-muted" data-help="Series seasons" data-help-for="sync-seasons">Seasons fetched after a series was added are linked
           automatically; use this if you fetched moments ago.</span>
       </div>
       <div id="pl-series-table"></div>
@@ -36,20 +44,87 @@ const tplOptions = (selected) =>
   `<option value="">(default template)</option>` +
   TEMPLATES.map(t => `<option value="${t.id}" ${t.id === selected ? "selected" : ""}>${esc(t.name)}</option>`).join("");
 
-/* inline template switch, directly in any playlist list row */
-window.inlineTpl = async (kind, id, value, table) => {
-  await api(`/api/playlist/${kind}/${id}`, { method: "PUT",
-    body: { ffmpeg_template_id: +value || null } });
-  toast("template updated", "ok");
-  /* Do not reload: a list sorted by order used to reshuffle after the UPDATE
-     (equal-order rows have no stable secondary key). The <select> already
-     shows the new template. */
-};
+/* Persist assignments without re-fetching/rebuilding the whole playlist page. */
+function assignmentMessage(node, text, state) {
+  node.hidden = false;
+  node.className = `small text-${state === "error" ? "danger" : state === "saving" ? "primary" : "success"}`;
+  node.replaceChildren();
+  if (state === "saving") node.append(el("span", {class:"spinner-border spinner-border-sm me-1", "aria-hidden":"true"}));
+  node.append(document.createTextNode(text));
+}
+function applyAssignmentLocally(kind, ids, patch) {
+  const table = PL_TABLES[kind], wanted = new Set(ids);
+  for (const row of table.items) {
+    if (!wanted.has(row.id)) continue;
+    Object.assign(row, patch);
+    if ("ffmpeg_template_id" in patch) row.template = TEMPLATES.find(t => t.id === patch.ffmpeg_template_id)?.name || "";
+    for (const [field, value] of Object.entries(patch)) {
+      const input = table.host.querySelector(`[data-inline-id="${row.id}"][data-inline-field="${field}"] input, [data-inline-id="${row.id}"][data-inline-field="${field}"] select`);
+      if (input) input.value = value ?? "";
+    }
+  }
+  if (table.lastData) table.lastData.items = table.items;
+  if ("group_name" in patch) {
+    const name = patch.group_name;
+    if (table.lastData && name) table.lastData.groups = [...new Set([...(table.lastData.groups || []), name])].sort();
+    for (const list of table.host.querySelectorAll('datalist[data-group-options]')) {
+      if (name && ![...list.options].some(o => o.value === name)) list.append(el("option", {value:name}));
+    }
+    for (const col of table.opts.columns) if (col.filter?.param === "group") col.filter.optionsLoader?.(col._fill, table);
+    // Group-sorted/filtered views must be reconciled with the server. The
+    // normal order-sorted, unfiltered view needs only the one save request.
+    if (table.state.filters.group || table.state.sort === "group") table.reload();
+  }
+  table._clientFilter();
+}
+async function inlineAssignment(kind, id, field, value, input) {
+  const table = PL_TABLES[kind], row = table.items.find(r => r.id === id);
+  if (!row || input?.dataset.saving) return;
+  const previous = row[field] ?? (field === "group_name" ? "" : null);
+  if (previous === value) { if (input) input.value = value ?? ""; return; }
+  const status = input?.closest('.playlist-inline-field')?.querySelector('[role="status"]');
+  const label = field === "group_name" ? "group" : "template";
+  if (input) {input.dataset.saving = "1"; input.setAttribute("aria-busy", "true"); if (input.tagName === "INPUT") input.readOnly = true; else input.disabled = true;}
+  table.beginEdit();
+  if (status) assignmentMessage(status, `Saving ${label}…`, "saving");
+  try {
+    await api(`/api/playlist/${kind}/${id}`, {method:"PUT", body:{[field]:value}});
+    applyAssignmentLocally(kind, [id], {[field]:value});
+    if (status) assignmentMessage(status, "Saved", "success");
+  } catch(e) {
+    if (input) input.value = previous ?? "";
+    if (status) assignmentMessage(status, "Save not confirmed. Previous value restored; retry or reload.", "error");
+  } finally {
+    if (input) {delete input.dataset.saving; input.removeAttribute("aria-busy"); input.readOnly = false; input.disabled = false;}
+    table.endEdit();
+  }
+}
+window.inlineTpl = (kind, id, value, input) => inlineAssignment(kind, id, "ffmpeg_template_id", +value || null, input);
 const tplInlineCell = (kind, r) => `
-  <select class="form-select form-select-sm" style="min-width:150px"
-    onchange="event.stopPropagation();inlineTpl('${kind}', ${r.id}, this.value)">
-    ${tplOptions(r.ffmpeg_template_id)}
-  </select>`;
+  <div class="playlist-inline-field" data-no-row-drag data-inline-id="${r.id}" data-inline-field="ffmpeg_template_id">
+    <select class="form-select form-select-sm" aria-label="FFmpeg template" style="min-width:150px"
+      onchange="event.stopPropagation();inlineTpl('${kind}', ${r.id}, this.value, this)">
+      ${tplOptions(r.ffmpeg_template_id)}
+    </select><div role="status" aria-live="polite" hidden style="white-space:normal"></div>
+  </div>`;
+
+// Select on first focus/click, but leave subsequent caret placement and
+// mouse-drag selection entirely native. Also used in group-edit dialogs.
+const groupPointer = new WeakMap();
+document.addEventListener("pointerdown", e => {
+  if (e.target.matches?.('[data-group-edit]')) groupPointer.set(e.target, {first:document.activeElement !== e.target, x:e.clientX, y:e.clientY});
+}, true);
+document.addEventListener("focusin", e => {
+  // During a pointer gesture, wait for click: selecting here turns a first
+  // click-and-drag into dragging the entire existing value instead of a range.
+  if(e.target.matches?.('[data-group-edit]') && !groupPointer.has(e.target)) e.target.select();
+});
+document.addEventListener("focusout", e => {groupPointer.delete(e.target);});
+document.addEventListener("click", e => {
+  if (!e.target.matches?.('[data-group-edit]')) return;
+  const start = groupPointer.get(e.target); groupPointer.delete(e.target);
+  if (start?.first && Math.abs(e.clientX-start.x)<4 && Math.abs(e.clientY-start.y)<4) e.target.select();
+});
 
 /* shortcuts shared by playlist tables */
 const groupFilter = { type: "select", param: "group", placeholder: "group" };
@@ -66,7 +141,7 @@ function chainHtml(chain) {
 const ALL_GROUPS = () => [...new Set(Object.values(PL_TABLES)
   .flatMap(t => t?.lastData?.groups || []))].sort();
 const groupDialogHtml = (id, value, dlId) => `
-  <input class="form-control form-control-sm" id="${id}" value="${esc(value || "")}" list="${dlId}" placeholder="type or pick a group…">
+  <input data-group-edit class="form-control form-control-sm" id="${id}" value="${esc(value || "")}" list="${dlId}" placeholder="type or pick a group…">
   <datalist id="${dlId}">${ALL_GROUPS().map(g => `<option value="${esc(g)}"></option>`).join("")}</datalist>`;
 
 const PL_TABLES = {};
@@ -75,18 +150,16 @@ window.playTest = (id, kind) => playInModal(`/preview-play/${kind}/${id}.ts`, `$
 /* group picker: free text WITH dropdown suggestions (existing groups).
    Used inline in rows, in edit popups and in the bulk-assign dialog. */
 const groupDatalist = (kind, dlId) =>
-  `<datalist id="${dlId}">${((PL_TABLES[kind]?.lastData?.groups) || []).map(g => `<option value="${esc(g)}"></option>`).join("")}</datalist>`;
-window.inlineGroup = async (kind, id, value) => {
-  await api(`/api/playlist/${kind}/${id}`, { method: "PUT", body: { group_name: value.trim() } });
-  toast("group updated", "ok");
-  PL_TABLES[kind].reload();
-};
+  `<datalist data-group-options id="${dlId}">${((PL_TABLES[kind]?.lastData?.groups) || []).map(g => `<option value="${esc(g)}"></option>`).join("")}</datalist>`;
+window.inlineGroup = (kind, id, value, input) => inlineAssignment(kind, id, "group_name", value.trim(), input);
 function groupCell(kind, r) {
   const dlId = `dl-${kind}-${r.id}`;
-  return `<input class="form-control form-control-sm" list="${dlId}" value="${esc(r.group_name || "")}"
-    placeholder="group…" style="min-width:130px"
-    onchange="event.stopPropagation();inlineGroup('${kind}', ${r.id}, this.value)">
-    ${groupDatalist(kind, dlId)}`;
+  return `<div class="playlist-inline-field" data-no-row-drag data-inline-id="${r.id}" data-inline-field="group_name">
+    <input data-group-edit class="form-control form-control-sm" aria-label="Group name" list="${dlId}" value="${esc(r.group_name || "")}"
+      placeholder="group…" style="min-width:130px"
+      onchange="event.stopPropagation();inlineGroup('${kind}', ${r.id}, this.value, this)">
+    <div role="status" aria-live="polite" hidden style="white-space:normal"></div>
+    ${groupDatalist(kind, dlId)}</div>`;
 }
 
 /* ========================= details popup (vod/series/local) =========================
@@ -129,7 +202,7 @@ window.showDetails = (kind, row) => {
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: `${kind === "local" ? "File" : kind.toUpperCase()} details`, body, footer, size: "lg" });
   footer.append(mBtn("Close", "btn-outline-secondary", m.close),
-    kind !== "local" ? mBtn("Play test", "btn-outline-primary", () => playInModal(`/preview-play/${kind}/${row.id}.ts`, row.custom_name), "bi-play-btn") : null);
+    mBtn("Play test", "btn-outline-primary", () => playInModal(`/preview-play/${kind}/${row.id}.ts`, row.custom_name), "bi-play-btn"));
   api(`/api/playlist/info?kind=${kind}&id=${row.id}`).then(d => {
     body.querySelector(".probe-box").innerHTML = probeHtml(d.probe);
     body.querySelector(".tmdb-box").innerHTML = tmdbHtml(d.tmdb);
@@ -159,13 +232,34 @@ function bulkBar(kind, getTable, { allowGroup = true } = {}) {
     body.innerHTML = what === "group"
       ? `<label class="muted-label">Group name (type or pick)</label>${groupDialogHtml("ba-val", "", "dl-bulk-" + kind)}`
       : `<label class="muted-label">FFmpeg template</label><select class="form-select" id="ba-val">${tplOptions()}</select>`;
-    confirmDialog({ title: what === "group" ? "Assign group" : "Assign template",
-      body, okText: `Apply to ${ids.length} ${kind} item(s)`,
-      onOk: async () => {
-        const v = body.querySelector("#ba-val").value;
-        await api(`/api/playlist/${kind}/bulk`, { method: "POST", body: { ids, ...(what === "group" ? { group_name: v } : { ffmpeg_template_id: +v || null }) } });
-        toast("bulk update applied", "ok"); table().reload();
-      } });
+    const status = el("div", {role:"status", "aria-live":"polite", hidden:""});
+    body.append(status);
+    const footer = el("div", {class:"d-flex gap-2"});
+    const m = openModal({title:what === "group" ? "Assign group" : "Assign template", body, footer});
+    let saving = false;
+    const apply = mBtn(`Apply to ${ids.length} ${kind} item(s)`, "btn-accent", async () => {
+      if (saving) return;
+      if (table()._pendingEdits || table()._reordering) {
+        assignmentMessage(status, "Wait for the current playlist changes to finish, then apply again.", "error"); return;
+      }
+      saving = true; apply.disabled = true; cancel.disabled = true;
+      const control = body.querySelector("#ba-val"), v = control.value;
+      const patch = what === "group" ? {group_name:v.trim()} : {ffmpeg_template_id:+v || null};
+      control.disabled = true;
+      assignmentMessage(status, `Saving ${what} for ${ids.length} item(s)…`, "saving");
+      table().beginEdit();
+      try {
+        const result = await api(`/api/playlist/${kind}/bulk`, {method:"POST", body:{ids, ...patch}});
+        applyAssignmentLocally(kind, ids, patch);
+        if (result.count !== ids.length) table().reload();
+        toast(`Updated ${result.count ?? ids.length} item(s)`, "ok");
+        await m.close();
+      } catch(e) {assignmentMessage(status, "Save not confirmed. Check the connection and retry, or reload to verify.", "error");}
+      finally {saving = false; apply.disabled = false; cancel.disabled = false; control.disabled = false; table().endEdit();}
+    });
+    const cancel = mBtn("Cancel", "btn-outline-secondary", () => {if(!saving) m.close();});
+    footer.append(cancel, apply);
+
   };
   bar.append(mBtn("Assign template…", "btn-outline-secondary", mkAssign("template"), "bi-gear"));
   if (allowGroup) bar.append(mBtn("Assign group…", "btn-outline-secondary", mkAssign("group"), "bi-tags"));
@@ -184,13 +278,9 @@ function bulkBar(kind, getTable, { allowGroup = true } = {}) {
 
 /* toolbar shared by the vod/series/local tabs: bulk add first, then bulk edit */
 const orderCol = { key: "order", label: "Ord", sort: "order", width: "52px" };
-function orderDnd(kind, getTable) {
+function orderDnd(kind) {
   return { onReorder: async (ids) => {
-    const t = getTable();
-    const orders = (t.items || []).map(r => r.order).sort((a, b) => a - b);
-    await api(`/api/playlist/${kind}/order`, { method: "POST",
-      body: { items: ids.map((id, i) => ({ id, order: orders[i] ?? (i + 1) })) } });
-    toast("order saved", "ok");
+    return await api(`/api/playlist/${kind}/order`, { method: "POST", body: { ids } });
   } };
 }
 
@@ -199,8 +289,8 @@ function builderBar(kind, getTable, primary) {
   bar.append(mBtn("Add from sources…", primary ? "btn-accent" : "btn-outline-secondary",
     () => addSourcesDialog(kind, () => getTable().reload()), "bi-plus-circle"),
     bulkBar(kind, getTable),
-    el("span", { class: "small text-muted ms-auto" },
-      "Drag rows to reorder (only while sorted by Ord)."));
+    el("span", { class: "small text-muted ms-auto", "data-help":"Reordering playlist items" },
+      "Drag rows to reorder (sort by Ord ascending). Rows move immediately; Saving order shows until the change is confirmed."));
   return bar;
 }
 
@@ -307,7 +397,7 @@ function liveBuilder() {
       { key: "custom_name", class: "col-name", label: "Custom name", sort: "name", filter: { type: "text", param: "q", placeholder: "name…" }, render: r => `<b>${esc(r.custom_name)}</b>` },
       { key: "group_name", label: "Group", sort: "group", filter: groupFilterLoader, render: r => groupCell("live", r) },
       { key: "chain", label: "Source chain (1=primary, then fallbacks)", render: r => chainHtml(r.chain) },
-      { key: "epg_id", label: "EPG id", render: r => `<span class="mono small">${esc(r.epg_id || "")}</span>` },
+      { key: "epg_id", label: "EPG id", render: r => `<span class="mono small">${esc(r.output_epg_id || r.epg_id || "")}</span>` },
       { key: "logo", label: "Logo", render: r => r.logo ? `<img class="logo-thumb" loading="lazy" src="${esc(r.logo)}" onerror="this.style.opacity=.2">` : "" },
       { key: "template", label: "FFmpeg tpl (default)", render: r => tplInlineCell("live", r) },
       { key: "test", label: "", width: "36px", render: r => `<button class="btn btn-sm btn-outline-secondary" title="Play proxied stream" onclick="event.stopPropagation();playTest(${r.id},'live')"><i class="bi bi-play-btn"></i></button>` },
@@ -315,13 +405,7 @@ function liveBuilder() {
         <button class="btn btn-sm btn-outline-secondary" onclick="editCustomChannel(${r.id})"><i class="bi bi-pencil"></i></button>
         <button class="btn btn-sm btn-outline-danger" onclick="delCustom(${r.id})"><i class="bi bi-trash"></i></button>` },
     ],
-    dnd: {
-      isLocked: (r) => r.lock_number,   // locked channels cannot be dragged
-      onReorder: async (ids) => {
-        await api("/api/playlist/live/order", { method: "POST",
-          body: { items: ids.map((id, i) => ({ id, order: i + 1 })) } });
-        toast("order saved · channel numbers updated", "ok");
-      } },
+    dnd: { ...orderDnd("live"), isLocked: (r) => r.lock_number },
     emptyText: "No custom channels yet. Click 'Add custom channel' (or 'Add from sources…' to turn a whole group of enabled channels into channels at once).",
   });
   PL_TABLES.live = liveTable;
@@ -340,17 +424,22 @@ window.toggleLock = async (id, lock) => {
 async function editCustomChannel(id) {
   const row = id ? liveTable.items.find(x => x.id === id) : null;
   let chain = row ? row.chain.map(c => ({ id: c.source_id, name: c.name, portal: c.portal })) : [];
+  let deb, candidateRevision = 0, epgPolicy = null;
   const body = el("div");
   body.innerHTML = `
     <div class="row g-2">
       <div class="col-md-6">
-        <label class="muted-label">Custom channel name (typing filters candidates below)</label>
+        <label class="muted-label" title="Typing filters the source candidates below.">Custom channel name</label>
         <input class="form-control form-control-sm" id="cc-name" value="${esc(row?.custom_name || "")}" autocomplete="off">
       </div>
       <div class="col-md-3"><label class="muted-label">Group (editable)</label>
         ${groupDialogHtml("cc-group", row?.group_name || "", "dl-cc")}</div>
       <div class="col-md-3"><label class="muted-label">EPG id (tvg-id)</label>
-        <input class="form-control form-control-sm mono" id="cc-epg" value="${esc(row?.epg_id || "")}"></div>
+        <div class="input-group input-group-sm"><input class="form-control mono" id="cc-epg" value="${esc(row?.epg_id || "")}">
+        <button class="btn btn-outline-secondary" id="cc-epg-match" type="button">Match EPG</button></div>
+        <button class="btn btn-sm btn-outline-secondary mt-1" type="button" id="cc-epg-policy">Guide priority & timing</button>
+        <div class="small text-muted" id="cc-epg-policy-state">${row?.epg_custom ? "Custom guide policy" : "Automatic guide policy"}</div>
+        <span data-help="EPG matching" data-help-for="cc-epg-match">Fuzzy-match the custom channel name against enabled guides. Multiple possibilities open a selection dialog. Save the channel to apply the selected ID.</span></div>
       <div class="col-md-3"><label class="muted-label">FFmpeg template (default)</label>
         <select class="form-select form-select-sm" id="cc-tpl">${tplOptions(row?.ffmpeg_template_id)}</select></div>
       <div class="col-md-3">
@@ -376,22 +465,40 @@ async function editCustomChannel(id) {
     <hr class="my-2">
     <div class="row g-2">
       <div class="col-md-6">
-        <div class="d-flex justify-content-between"><span class="muted-label">Matching source channels (click → add to chain)</span>
-          <span class="small text-muted" id="cc-count"></span></div>
+        <div class="d-flex justify-content-between"><span class="muted-label" title="Click a source channel to add it to the fallback chain.">Matching source channels</span>
+          <span class="small text-muted" id="cc-count" role="status" aria-live="polite"></span></div>
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="checkbox" id="cc-relaxed">
+          <label class="form-check-label small" for="cc-relaxed"
+            title="Include weaker name matches when the normal search is too strict. The closest matches stay first; up to 60 enabled sources are shown. Ignored while Show all source channels is on. This only changes the search, not the channel name or fallback chain.">Less strict matching</label>
+        </div>
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="checkbox" id="cc-show-all">
+          <label class="form-check-label small" for="cc-show-all"
+            title="Browse every enabled source regardless of the custom channel name, including sources already used in a playlist. Use the separate filter to search and Load more to browse further. The channel name and fallback chain are unchanged.">Show all source channels</label>
+        </div>
+        <div id="cc-source-filter-wrap" class="mb-2" hidden>
+          <label class="muted-label" for="cc-source-filter"
+            title="Search words in source names or portal names, ignoring case. All words must match. This search is independent of the custom channel name.">Filter source channels</label>
+          <input class="form-control form-control-sm" id="cc-source-filter" type="search"
+            placeholder="Channel or portal name…" autocomplete="off">
+        </div>
         <div id="cc-cand" class="border rounded p-1" style="max-height:220px;overflow:auto"></div>
+        <button class="btn btn-sm btn-outline-secondary mt-1" id="cc-load-more" type="button" hidden>Load more</button>
       </div>
       <div class="col-md-6">
-        <div class="muted-label">Fallback chain (order = priority; first = primary · drag to reorder, or use ↑ ↓)</div>
+        <div class="muted-label" title="Order defines priority; the first source is primary. Drag to reorder or use the arrow buttons.">Fallback chain</div>
         <div id="cc-chain" class="border rounded p-1" style="max-height:220px;overflow:auto"></div>
       </div>
     </div>`;
   const footer = el("div", { class: "d-flex gap-2" });
-  const m = openModal({ title: row ? `Edit channel: ${row.custom_name}` : "Add custom channel", body, footer, size: "xl" });
+  const m = openModal({ title: row ? `Edit channel: ${row.custom_name}` : "Add custom channel", body, footer, size: "xl",
+    onClose: () => { clearTimeout(deb); ++candidateRevision; } });
 
   const candBox = $("#cc-cand", body), chainBox = $("#cc-chain", body);
   let dragIdx = null;
   const renderChain = () => {
-    chainBox.innerHTML = chain.length ? "" : '<div class="small text-muted p-2">empty — click candidates on the left</div>';
+    chainBox.innerHTML = chain.length ? "" : '<div class="small text-muted p-2">Empty chain.</div><span data-help="Adding fallback sources">Click source candidates on the left to add them.</span>';
     chain.forEach((c, i) => {
       const r = el("div", { class: "d-flex align-items-center gap-1 small mb-1 border-bottom pb-1", draggable: "true" });
       r.innerHTML = `<i class="bi bi-grip-vertical row-drag" title="drag to reorder"></i>
@@ -416,27 +523,92 @@ async function editCustomChannel(id) {
       chainBox.append(r);
     });
   };
-  let deb;
-  $("#cc-name", body).addEventListener("input", () => { clearTimeout(deb); deb = setTimeout(loadCand, 250); });
-  async function loadCand() {
-    const q = $("#cc-name", body).value;
-    const d = await api(`/api/playlist/suggest?kind=live&q=${encodeURIComponent(q)}`);
-    $("#cc-count", body).textContent = q ? `${d.items.length} matches` : `all enabled (${d.items.length})`;
-    candBox.innerHTML = d.items.length ? "" : '<div class="small text-muted p-2">no close match — showing nothing; clear the name to list all enabled channels</div>';
-    for (const c of d.items) {
-      const b = el("button", { class: "btn btn-sm btn-light w-100 text-start mb-1 small", type: "button" });
-      b.innerHTML = `${esc(c.name)} <span class="text-muted">@ ${esc(c.portal)}</span>`;
-      b.addEventListener("click", () => {
-        if (chain.some(x => x.id === c.id)) return toast("already in chain", "warn");
-        chain.push(c); renderChain();
-      });
-      candBox.append(b);
+  let candidateItems = [], nextOffset = null;
+  const moreButton = $("#cc-load-more", body);
+  const showAllInput = $("#cc-show-all", body);
+  function queueCandidates() {
+    clearTimeout(deb);
+    ++candidateRevision; // invalidate an in-flight response before the debounce expires
+    moreButton.hidden = true;
+    candBox.setAttribute("aria-busy", "true");
+    candBox.textContent = "Searching…";
+    $("#cc-count", body).textContent = "Searching…";
+    $("#cc-logo-cand", body).replaceChildren();
+    deb = setTimeout(loadCand, 250);
+  }
+  $("#cc-name", body).addEventListener("input", () => {
+    if (!showAllInput.checked) queueCandidates();
+  });
+  $("#cc-source-filter", body).addEventListener("input", queueCandidates);
+  $("#cc-relaxed", body).addEventListener("change", loadCand);
+  showAllInput.addEventListener("change", () => {
+    $("#cc-source-filter-wrap", body).hidden = !showAllInput.checked;
+    $("#cc-relaxed", body).disabled = showAllInput.checked;
+    loadCand();
+  });
+  moreButton.addEventListener("click", () => {
+    if (nextOffset !== null && candBox.getAttribute("aria-busy") !== "true") loadCand(true);
+  });
+  async function loadCand(append = false) {
+    append = append === true; // event listeners pass an Event, not a paging request
+    clearTimeout(deb);
+    if (!body.isConnected) return;
+    const revision = ++candidateRevision;
+    const q = $("#cc-name", body).value.trim();
+    const relaxed = $("#cc-relaxed", body).checked;
+    const showAll = showAllInput.checked;
+    const sourceFilter = $("#cc-source-filter", body).value.trim();
+    if (!append) { candidateItems = []; nextOffset = null; }
+    const offset = append ? nextOffset : 0;
+    const previousScrollTop = append ? candBox.scrollTop : 0;
+    moreButton.hidden = true;
+    candBox.setAttribute("aria-busy", "true");
+    candBox.textContent = "Searching…";
+    $("#cc-count", body).textContent = "Searching…";
+    $("#cc-logo-cand", body).replaceChildren();
+    try {
+      const d = await api(`/api/playlist/suggest?kind=live&q=${encodeURIComponent(q)}&relaxed=${relaxed}&show_all=${showAll}&source_filter=${encodeURIComponent(sourceFilter)}&offset=${offset}`);
+      if (revision !== candidateRevision || !body.isConnected) return;
+      candidateItems = append ? candidateItems.concat(d.items) : d.items;
+      nextOffset = showAll ? d.next_offset ?? null : null;
+      moreButton.hidden = nextOffset === null;
+      $("#cc-count", body).textContent = showAll
+        ? `${candidateItems.length} of ${d.total} sources`
+        : q ? `${d.items.length} matches${relaxed ? " (less strict)" : ""}` : `all enabled (${d.items.length})`;
+      candBox.replaceChildren();
+      if (!candidateItems.length) {
+        candBox.append(el("div", {class:"small text-muted p-2"}, "No matching source channels."));
+        if (!showAll && q && !relaxed) {
+          const broaden = mBtn("Try less strict matching", "btn-outline-secondary", () => {
+            $("#cc-relaxed", body).checked = true;
+            loadCand();
+          });
+          candBox.append(broaden);
+        }
+      }
+      for (const c of candidateItems) {
+        const b = el("button", { class: "btn btn-sm btn-light w-100 text-start mb-1 small", type: "button" });
+        b.innerHTML = `${esc(c.name)} <span class="text-muted">@ ${esc(c.portal)}</span>`;
+        b.addEventListener("click", () => {
+          if (chain.some(x => x.id === c.id)) return toast("already in chain", "warn");
+          chain.push(c); renderChain();
+        });
+        candBox.append(b);
+      }
+      candBox.scrollTop = previousScrollTop;
+      /* logo candidates: portal logos of top matches (spec: portal first) */
+      const logos = [...new Set(candidateItems.map(x => x.logo).filter(Boolean))].slice(0, 6);
+      const lc = $("#cc-logo-cand", body); lc.innerHTML = logos.map(u =>
+        `<img src="${esc(u)}" class="logo-thumb border rounded p-1" style="cursor:pointer;height:30px" title="use this logo"
+          onclick="document.querySelector('#cc-logo').value='${esc(u)}'">`).join("");
+    } catch (error) {
+      if (revision !== candidateRevision || !body.isConnected) return;
+      $("#cc-count", body).textContent = "Search failed";
+      candBox.textContent = "Could not load source channels: " + error.message;
+      candBox.append(mBtn("Retry", "btn-outline-secondary", () => loadCand(append)));
+    } finally {
+      if (revision === candidateRevision) candBox.setAttribute("aria-busy", "false");
     }
-    /* logo candidates: portal logos of top matches (spec: portal first) */
-    const logos = [...new Set(d.items.map(x => x.logo).filter(Boolean))].slice(0, 6);
-    const lc = $("#cc-logo-cand", body); lc.innerHTML = logos.map(u =>
-      `<img src="${esc(u)}" class="logo-thumb border rounded p-1" style="cursor:pointer;height:30px" title="use this logo"
-        onclick="document.querySelector('#cc-logo').value='${esc(u)}'">`).join("");
   }
   $("#cc-logo-suggest", body).addEventListener("click", loadCand);
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
@@ -445,6 +617,7 @@ async function editCustomChannel(id) {
         custom_name: $("#cc-name", body).value.trim(),
         group_name: $("#cc-group", body).value.trim(),
         epg_id: $("#cc-epg", body).value.trim(),
+        ...(epgPolicy ? {epg_policy: epgPolicy} : {}),
         logo: $("#cc-logo", body).value.trim(),
         ffmpeg_template_id: +$("#cc-tpl", body).value || null,
         number: +$("#cc-number", body).value || null,
@@ -457,6 +630,24 @@ async function editCustomChannel(id) {
       else await api("/api/playlist/live", { method: "POST", body: payload });
       toast("channel saved", "ok"); m.close(); liveTable.reload();
     }, "bi-check2"));
+  $("#cc-epg-policy", body).addEventListener("click", async () => {
+    const button = $("#cc-epg-policy", body); button.disabled = true;
+    try {
+      await EpgControls.editChannel(row?.id, epgPolicy, $("#cc-epg", body).value.trim(), policy => {
+        epgPolicy = policy;
+        $("#cc-epg-policy-state", body).textContent = "Guide policy changed — save channel to apply";
+      });
+    } catch(e) { toast(e.message, "error"); }
+    finally { button.disabled = false; }
+  });
+  $("#cc-epg-match", body).addEventListener("click", async () => {
+    const button = $("#cc-epg-match", body), name = $("#cc-name", body).value.trim();
+    if (!name) return toast("Enter a custom channel name first", "warn");
+    button.disabled = true;
+    try { await EpgMatching.choose(name, id => { $("#cc-epg", body).value = id; }); }
+    catch (e) { toast(e.message, "err"); }
+    finally { button.disabled = false; }
+  });
   renderChain(); loadCand();
 }
 
@@ -467,7 +658,7 @@ function vodBuilder() {
     selectable: true, defaultSort: "order", extraHeader: builderBar("vod", () => vodTable, true),
     server: async (q) => await api("/api/playlist/vod?" + q),
     onRowClick: (row) => showDetails("vod", row),
-    dnd: orderDnd("vod", () => vodTable),
+    dnd: orderDnd("vod"),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/vod/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
       orderCol,
@@ -503,7 +694,7 @@ window.editVod = async (id) => {
       <div class="col-md-6"><label class="muted-label">Custom title</label><input class="form-control form-control-sm" id="v-name" value="${esc(row.custom_name)}"></div>
       <div class="col-md-4"><label class="muted-label">Group</label>${groupDialogHtml("v-group", row.group_name || "", "dl-v")}</div>
       <div class="col-md-4"><label class="muted-label">FFmpeg template (default)</label><select class="form-select form-select-sm" id="v-tpl">${tplOptions(row.ffmpeg_template_id)}</select></div>
-    </div><div class="small text-muted mt-2">Logo/poster: automatic (portal/TMDB) per Phase-1 decision Q1=C.</div>`;
+    </div><div class="small text-muted mt-2" data-help="Logos and posters">Logo/poster: automatic (portal/TMDB) per Phase-1 decision Q1=C.</div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: "Edit VOD item", body, footer, size: "lg" });
   footer.append(mBtn("Cancel", "btn-outline-secondary", m.close),
@@ -520,7 +711,7 @@ function seriesBuilder() {
     selectable: true, defaultSort: "order", extraHeader: builderBar("series", () => seriesTable, true),
     server: async (q) => await api("/api/playlist/series?" + q),
     onRowClick: (row) => showDetails("series", row),
-    dnd: orderDnd("series", () => seriesTable),
+    dnd: orderDnd("series"),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/series/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
       orderCol,
@@ -587,7 +778,7 @@ function localBuilder() {
   localTable = new DataTable($("#pl-local"), {
     selectable: true, defaultSort: "order", extraHeader: builderBar("local", () => localTable, true),
     server: async (q) => await api("/api/playlist/local?" + q),
-    dnd: orderDnd("local", () => localTable),
+    dnd: orderDnd("local"),
     columns: [
       { key: "enabled", label: "Enable", width: "60px", render: r => `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""} onchange="event.stopPropagation();api('/api/playlist/local/${r.id}',{method:'PUT',body:{enabled:this.checked}})"></div>` },
       orderCol,
@@ -626,6 +817,9 @@ window.editLocal = (id) => {
 };
 
 /* ---------------- boot ---------------- */
+EpgControls.health($("#playlist-epg-health"), true);
+const playlistGuideHealthPoll = setInterval(() => EpgControls.health($("#playlist-epg-health"), true), 30000);
+window.addEventListener("pagehide", () => clearInterval(playlistGuideHealthPoll), {once:true});
 (async () => {
   await loadTemplates();
   liveBuilder(); vodBuilder(); seriesBuilder(); localBuilder();
@@ -641,6 +835,18 @@ window.editLocal = (id) => {
     selectTab(a.dataset.tab);
     history.replaceState(null, "", "/playlist?tab=" + a.dataset.tab);
   }));
+  PlaylistHealth.mount($("#playlist-health"), {onEdit: async (kind,id) => {
+    try {
+      const data = await api(`/api/playlist/${kind}?item_id=${id}`);
+      const row = data.items.find(item => item.id === id);
+      if (!row) return toast("This playlist item was removed", "warn");
+      selectTab(kind);
+      const table = PL_TABLES[kind];
+      table.items = table.items.filter(item => item.id !== id).concat(row);
+      const edit = {live:editCustomChannel,vod:window.editVod,series:window.editSeries,local:window.editLocal}[kind];
+      await edit(id);
+    } catch(e) {toast(e.message, "error");}
+  }});
   const requestedTab = new URLSearchParams(location.search).get("tab");
   if (["live", "vod", "series", "local"].includes(requestedTab)) selectTab(requestedTab);
 })();

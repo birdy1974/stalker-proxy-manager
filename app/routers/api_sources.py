@@ -20,7 +20,7 @@ from sqlalchemy import func, or_, select
 from ..config import MEDIA_ROOT
 from ..database import get_db, spawn
 from ..services.permissions import describe_access, permission_hint
-from ..services.playlist_sync import (SYNC_KINDS, add_sources,
+from ..services.playlist_sync import (SYNC_KINDS, add_sources, _clean_ids,
                                         assign_live_custom_group,
                                         assign_live_custom_name,
                                         live_playlist_links_for, sync_sources)
@@ -32,6 +32,7 @@ from ..security import require_admin
 from ..services import item_info
 from ..services.db_logging import db_log
 from ..services.local_files import fill_local_durations, missing_duration_ids
+from ..services.playlist_order import ORDER_MODELS, lock_playlist_order
 
 router = APIRouter(prefix="/api/sources", tags=["sources"], dependencies=[Depends(require_admin)])
 
@@ -296,9 +297,12 @@ async def toggle(payload: dict, db=Depends(get_db)):
     model = {"live": LiveSource, "vod": VodSource, "series": SerieSource}.get(payload.get("kind"))
     if model is None:
         raise HTTPException(400, "kind must be live|vod|series")
-    ids = payload.get("ids", [])
+    ids = _clean_ids(payload.get("ids", []))
     enabled = bool(payload.get("enabled"))
+    await lock_playlist_order(db, ORDER_MODELS[payload["kind"]])
     rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
+    by_id = {r.id: r for r in rows}
+    rows = [by_id[i] for i in ids if i in by_id]
     for r in rows:
         r.enabled = enabled
     # Mirror the switch into the output playlist. A newly enabled live source
@@ -441,6 +445,7 @@ async def del_local_dir(did: int, db=Depends(get_db)):
 
 @router.post("/local/dirs/toggle")
 async def toggle_local_dirs(payload: dict, db=Depends(get_db)):
+    await lock_playlist_order(db, LocalPlaylist)
     enabled = bool(payload.get("enabled"))
     rows = (await db.execute(select(LocalSource).where(
         LocalSource.id.in_(payload.get("ids", []))))).scalars().all()
@@ -460,9 +465,12 @@ async def toggle_local_dirs(payload: dict, db=Depends(get_db)):
 @router.post("/local/files/toggle")
 async def toggle_local_files(payload: dict, db=Depends(get_db)):
     """Enable/disable individual scanned files (also syncs the Local playlist)."""
+    await lock_playlist_order(db, LocalPlaylist)
     enabled = bool(payload.get("enabled"))
-    rows = (await db.execute(select(LocalFile).where(
-        LocalFile.id.in_(payload.get("ids", []))))).scalars().all()
+    ids = _clean_ids(payload.get("ids", []))
+    rows = (await db.execute(select(LocalFile).where(LocalFile.id.in_(ids)))).scalars().all()
+    by_id = {r.id: r for r in rows}
+    rows = [by_id[i] for i in ids if i in by_id]
     for r in rows:
         r.enabled = enabled
     synced = await sync_sources(db, "local", [r.id for r in rows], enabled)

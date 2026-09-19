@@ -352,6 +352,12 @@ _OWNED_OUT = {"-mpegts_flags": "+resend_headers",
 _OWNED_TARGETS = ("pipe:1", "<out_dir>/index.m3u8")
 
 
+def _join_tokens(tokens: list[str]) -> str:
+    """Preserve quoted values without changing the familiar generated command."""
+    return " ".join(shlex.quote(t) if not t or any(c.isspace() or c in "\\\"'" for c in t)
+                    else t for t in tokens)
+
+
 def _tokens(raw: str | None) -> list[str]:
     """shlex for the 'does the template already set this flag?' tests - tolerant,
     because an unbalanced quote in a half-typed command must not raise here."""
@@ -365,6 +371,11 @@ _STRUCTURED_OUTPUT_FLAGS = {
     "-vf", "-map", "-c", "-codec", "-c:v", "-vcodec", "-c:a",
     "-acodec", "-c:s", "-scodec", "-an", "-sn", "-dn", "-f",
 }
+
+
+def _is_option(token: str) -> bool:
+    # Negative numeric values (e.g. -flush_packets -1) are not option names.
+    return token.startswith("-") and not re.fullmatch(r"-\d+(?:\.\d+)?", token)
 
 
 def _safe_extra_tokens(raw: str | None, side: str) -> tuple[list[str], list[str]]:
@@ -406,7 +417,7 @@ def _safe_extra_tokens(raw: str | None, side: str) -> tuple[list[str], list[str]
             return [], [f"{side} flags ignored: orphan token {token!r}"]
         if token in _NO_VALUE_FLAGS:
             i += 1
-        elif i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+        elif i + 1 < len(tokens) and not _is_option(tokens[i + 1]):
             i += 2
         else:
             i += 1
@@ -476,7 +487,8 @@ def argv_validation_errors(args: list[str]) -> list[str]:
     # Validate the input-option region too. Runtime-added reconnect, hardware
     # and identity arguments live here; a missing value must not reach exec just
     # because the output side happens to look well formed.
-    i = 1 if args[0] == "ffmpeg" or args[0].endswith("/ffmpeg") else 0
+    from ..config import FFMPEG_BIN
+    i = 1 if args[0] == FFMPEG_BIN or args[0] == "ffmpeg" or args[0].endswith("/ffmpeg") else 0
     while i < input_idx:
         token = args[i]
         if not token.startswith("-"):
@@ -487,11 +499,11 @@ def argv_validation_errors(args: list[str]) -> list[str]:
             i += 1
             continue
         if token in _REQUIRED_VALUE_FLAGS \
-                and (i + 1 >= input_idx or args[i + 1].startswith("-")):
+                and (i + 1 >= input_idx or _is_option(args[i + 1])):
             errors.append(f"input option {token!r} has no value")
             i += 1
             continue
-        if i + 1 < input_idx and not args[i + 1].startswith("-"):
+        if i + 1 < input_idx and not _is_option(args[i + 1]):
             i += 2
         else:
             i += 1
@@ -505,17 +517,18 @@ def argv_validation_errors(args: list[str]) -> list[str]:
         token = args[i]
         if token.startswith("-"):
             missing_value = (token in _REQUIRED_VALUE_FLAGS
-                             and (i + 1 >= end or args[i + 1].startswith("-")))
+                             and (i + 1 >= end or _is_option(args[i + 1])))
             if missing_value:
                 errors.append(f"output option {token!r} has no value")
                 i += 1
             elif token in _NO_VALUE_FLAGS:
                 i += 1
             elif i + 1 >= end:
-                errors.append(f"output option {token!r} has no value")
+                # Unknown build-specific switches can be valueless. Known
+                # options requiring a value were already checked above.
                 i += 1
             # A following option means this option is a custom no-value flag.
-            elif args[i + 1].startswith("-"):
+            elif _is_option(args[i + 1]):
                 i += 1
             else:
                 i += 2
@@ -586,13 +599,24 @@ def serves_original_file(command: str | None) -> bool:
 
 
 def target_size(resolution: str, aspect: str) -> tuple[int, int] | None:
-    """Pixel (w, h) for a resolution+aspect; None = keep source size."""
-    if resolution == "source" or resolution not in RESOLUTIONS:
+    """Preset/custom even pixel size; None = source size or invalid input."""
+    if resolution == "source":
         return None
-    _, h = RESOLUTIONS[resolution]
-    a = ASPECTS.get(aspect, 16 / 9)
-    w = int(round(h * a / 2) * 2)   # even width (encoders require it)
-    return w, h
+    dimensions = re.fullmatch(r"(\d+)x(\d+)", resolution or "")
+    if dimensions:
+        w, h = map(int, dimensions.groups())
+    else:
+        if resolution in RESOLUTIONS:
+            _, h = RESOLUTIONS[resolution]
+        else:
+            height = re.fullmatch(r"(\d+)p", resolution or "")
+            if not height:
+                return None
+            h = int(height[1])
+        ratio = re.fullmatch(r"([1-9]\d{0,2}):([1-9]\d{0,2})", aspect or "")
+        a = int(ratio[1]) / int(ratio[2]) if ratio else ASPECTS.get(aspect, 16 / 9)
+        w = int(round(h * a / 2) * 2)
+    return (w, h) if all(16 <= n <= 8192 and n % 2 == 0 for n in (w, h)) else None
 
 
 @dataclass
@@ -622,9 +646,7 @@ class FFmpegOptions:
     vf_preset: str = "none"            # extra video filter, first in -vf (see VF_PRESETS)
     low_power: bool = True           # h264_vaapi: use EncSliceLP (fixed-function)
     rc_mode: str = "CQP"             # VAAPI rate control: AUTO|CQP|CBR|VBR|ICQ|QVBR|AVBR
-    # QP for -rc_mode CQP (0-51, lower = better quality and more bits). Emitted
-    # only in CQP, because a constant-QP mode without a QP has no target at all
-    # and leaves the number to the driver. "" or "AUTO" = skip the flag on purpose.
+    # Quality for CQP/ICQ/QVBR; "" or "AUTO" deliberately omits the flag.
     global_quality: str = "26"
     async_depth: str = "4"           # VAAPI frames in flight (throughput / startup)
     audio_codec: str = "aac"
@@ -772,17 +794,16 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     # flag at all, so for them the bitrate knobs stay in charge whatever the
     # template's rate-control field says. Only where the mode is honoured can it
     # make the rate flags redundant.
-    cqp = transcode and rc == "CQP" and opts.video_codec in VAAPI_ENCODERS
+    from .ffmpeg_applicability import disabled_parameters
+    inactive = disabled_parameters(opts)
     if transcode:
-        # CQP pins the quantiser instead of the rate: -b:v/-maxrate/-bufsize are
-        # not honoured in that mode, so they are not rendered either. This text
-        # is what the GUI shows and what the user pastes into a shell, and a
-        # command carrying flags the encoder ignores is a command that lies.
-        if not cqp and opts.video_bitrate:
+        # The same dependency rules drive the editor and command, including
+        # quality-based modes and CBR's conditional maxrate/buffer fallback.
+        if "video_bitrate" not in inactive and opts.video_bitrate:
             c += ["-b:v", opts.video_bitrate]
-        if not cqp and opts.maxrate:
+        if "maxrate" not in inactive and opts.maxrate:
             c += ["-maxrate", opts.maxrate]
-        if not cqp and opts.bufsize:
+        if "bufsize" not in inactive and opts.bufsize:
             c += ["-bufsize", opts.bufsize]
         # profile/level only make sense for h.264-family encoders
         if opts.video_codec in ("libx264", "h264_vaapi", "h264_qsv"):
@@ -802,7 +823,7 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
                 c += ["-low_power", "1"]
             if rc and rc != "AUTO":
                 c += ["-rc_mode", rc]
-            if cqp and str(opts.global_quality or "") not in ("", "AUTO"):
+            if "global_quality" not in inactive and str(opts.global_quality or "") not in ("", "AUTO"):
                 c += ["-global_quality", str(opts.global_quality)]
             if opts.async_depth:
                 c += ["-async_depth", opts.async_depth]
@@ -811,7 +832,7 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
     if opts.audio_codec != "none":
         c += ["-c:a", opts.audio_codec]
         if opts.audio_codec != "copy":
-            if opts.audio_bitrate:
+            if "audio_bitrate" not in inactive and opts.audio_bitrate:
                 c += ["-b:a", opts.audio_bitrate]
             if opts.audio_channels:
                 c += ["-ac", opts.audio_channels]
@@ -863,7 +884,7 @@ def build_command(opts: FFmpegOptions, ffmpeg_bin: str = "ffmpeg") -> str:
             if flag not in own_out:
                 c += [flag, val]
         c += ["pipe:1"]
-    return " ".join(c)
+    return _join_tokens(c)
 
 
 def mpegts_copy_command(ffmpeg_bin: str = "ffmpeg") -> str:
@@ -888,6 +909,15 @@ def option_warnings(opts: FFmpegOptions) -> list[str]:
     """
     out: list[str] = []
     out.extend(extra_option_warnings(opts))
+    if opts.video_codec != "copy":
+        if opts.video_codec.endswith("_vaapi") and opts.hw_accel != "vaapi":
+            out.append("VAAPI encoding normally requires VAAPI decoding/frames; choose Hardware = VAAPI or use a manual upload filter")
+        elif opts.video_codec.endswith("_qsv") and opts.hw_accel != "qsv":
+            out.append("QSV encoding normally requires Quick Sync frames; choose Hardware = QSV or use a manual upload filter")
+        elif opts.video_codec in ("libx264", "libx265") and opts.hw_accel != "none":
+            out.append("CPU encoding needs CPU frames: choose Hardware = none or use a manual download filter")
+    if opts.video_codec.startswith("h264_") and opts.profile in ("high10", "high422", "high444"):
+        out.append("this H.264 profile needs special pixel formats and hardware support; use main/high with the NV12 hardware pipeline")
     if opts.subs == "keep" and opts.output_format != "matroska":
         out.append("subtitles \"copy all\" needs Output = Matroska; MPEG-TS/HLS "
                    "cannot carry text subtitles, so the command renders the "
@@ -963,6 +993,11 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
     in its own form state and only what the text mentions is overwritten.
     """
     opts = FFmpegOptions(**coerce_options(base))
+    # Without a stored field value, absence of -r/fps means source timing,
+    # not the new-template default of 25 FPS. Keep explicit base values for
+    # partial parsing (e.g. dormant tuning on a copy template).
+    if "fps" not in (base or {}):
+        opts.fps = ""
     warnings: list[str] = []
     try:
         toks = shlex.split(cmd)
@@ -1030,13 +1065,21 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
                 # neither - i.e. the CPU fallback quietly asked for a GPU.
                 opts.hw_accel = {"scale_vaapi": "vaapi", "scale_qsv": "qsv"}.get(scale, "none")
                 m = True
-                wh = re.search(rf"{scale}=(?:w=)?(\d+)(?::h=|x)(\d+)", vf)
+                wh = re.search(rf"{scale}=(?:w=)?(\d+)(?::h=|:|x)(\d+)", vf)
                 if wh:
                     w, h = int(wh.group(1)), int(wh.group(2))
-                    opts.resolution = next((k for k, (_, vh) in RESOLUTIONS.items() if vh == h), "source")
-                    opts.aspect = next((k for k, a in ASPECTS.items() if abs(w / h - a) < 0.05), "16:9")
+                    # Keep an exact custom size; never round it back to an unrelated
+                    # 16:9 preset when switching from command to structured fields.
+                    if target_size(opts.resolution, opts.aspect) != (w, h):
+                        aspect = next((k for k in ASPECTS
+                                       if target_size(f"{h}p", k) == (w, h)), None)
+                        resolution = next((k for k, (_, vh) in RESOLUTIONS.items() if vh == h), None)
+                        if aspect and resolution:
+                            opts.resolution, opts.aspect = resolution, aspect
+                        else:
+                            opts.resolution = f"{w}x{h}"
                 break
-            fm = re.search(r"fps=(\d+)", vf)
+            fm = re.search(r"fps=(\d+(?:\.\d+)?(?:/\d+)?)", vf)
             if fm:
                 opts.fps = fm.group(1)
             preset, unknown_filters = _match_vf_preset(vf)
@@ -1129,18 +1172,15 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
             opts.output_format = fmt if fmt in OUTPUT_FORMATS else "mpegts"
             i += 2
             continue
-        if t == "-preset" and i + 1 < len(toks):
-            i += 2
-            continue
         unhandled_out.append(t)
         i += 1
 
-    raw_in = " ".join(x for x in unhandled_in if x != URL_PLACEHOLDER)
-    raw_out = " ".join(x for x in unhandled_out if x not in _OWNED_TARGETS)
+    raw_in = _join_tokens([x for x in unhandled_in if x != URL_PLACEHOLDER])
+    raw_out = _join_tokens([x for x in unhandled_out if x not in _OWNED_TARGETS])
     safe_in, in_warnings = _safe_extra_tokens(raw_in, "extra input")
     safe_out, out_warnings = _safe_extra_tokens(raw_out, "extra output")
-    opts.extra_input = " ".join(safe_in)
-    opts.extra_output = " ".join(safe_out)
+    opts.extra_input = _join_tokens(safe_in)
+    opts.extra_output = _join_tokens(safe_out)
     warnings.extend(in_warnings + out_warnings)
     # Subtitle verdict, order-independent (build_command emits -map and -sn in
     # its own order; a hand-written command may use any): a subtitle map or
@@ -1215,7 +1255,7 @@ def default_presets() -> list[dict]:
         mk(E2_DUO2_LIVE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            extra_input=fast_input,
-           maxrate="4400k", bufsize="8000k", fps="25", gop="50",
+           maxrate="4400k", bufsize="8000k", fps="", gop="50", rc_mode="VBR",
            profile="high", level="4.0", low_power=True, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
            subs="dvb"),

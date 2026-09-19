@@ -31,7 +31,8 @@ def test_probe_args_impersonate_the_mag_player_for_network_streams():
     assert STB_UA not in " ".join(args)           # not the portal browser UA
     assert args[args.index("-referer") + 1] == "http://cdn.example.com/"
     assert "-reconnect" in args and "-rw_timeout" in args
-    assert args[0] == "ffmpeg"                    # replaced by FFMPEG_BIN at runtime
+    from app.config import FFMPEG_BIN
+    assert args[0] == FFMPEG_BIN
 
 
 def test_probe_args_accept_a_ladder_chosen_ua():

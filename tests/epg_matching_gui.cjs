@@ -1,0 +1,35 @@
+/* node tests/epg_matching_gui.cjs (requires jsdom). */
+const assert=require('node:assert/strict'), fs=require('node:fs');
+const {JSDOM}=require('jsdom');
+const dom=new JSDOM('<body></body>',{runScripts:'outside-only'}), w=dom.window;
+const app=fs.readFileSync('app/static/js/app.js','utf8');
+w.eval(app.slice(app.indexOf('const $ ='),app.indexOf('/* ----------------------------------------------------- time formatting'))+'\nwindow.el=el;window.esc=esc;');
+const modals=[], calls=[];let items=[],result;
+w.toast=()=>{};
+w.mBtn=(label,cls,fn)=>{const b=w.el('button');b.textContent=label;b.onclick=fn;return b;};
+w.openModal=({body,footer,onClose})=>{const root=w.el('div');root.append(body,footer);w.document.body.append(root);const m={root,footer,close:()=>{onClose?.();root.remove();}};modals.push(m);return m;};
+w.api=async(url,opts)=>{calls.push({url,opts});return url.includes('/suggest')?{items}:{matched:1};};
+w.eval(fs.readFileSync('app/static/js/epg-matching.js','utf8'));
+const candidate=(id,name='Viaplay TV',score=1)=>({tvg_id:id,name,score,sources:['https://guide.test'],source_ids:[1]});
+const tick=()=>new Promise(r=>setImmediate(r));
+(async()=>{
+ items=[candidate('single')];await w.EpgMatching.choose('Viaplay TV',id=>{result=id;});
+ assert.equal(result,'single');assert.equal(modals.length,0);
+ result=null;items=[candidate('one','<img src=x onerror=alert(1)>'),candidate('two')];
+ await w.EpgMatching.choose('Custom Viaplay',id=>{result=id;});
+ const modal=modals.at(-1);assert.equal(result,null);assert.equal(modal.root.querySelectorAll('img').length,0);
+ assert(modal.root.textContent.includes('<img src=x onerror=alert(1)>'));
+ modal.root.querySelectorAll('.border-bottom button')[1].click();assert.equal(result,'two');assert(!modal.root.isConnected);
+ items=[];await w.EpgMatching.choose('Unknown',()=>{throw new Error('must not auto-assign');});
+ assert(modals.at(-1).root.textContent.includes('No matching EPG channel'));modals.at(-1).close();
+ const report={matched:1,unmatched:2,ambiguous:[{id:5,name:'Viaplay TV',epg_id:'saved',candidates:[candidate('one'),candidate('two')]}]};
+ let saved=false;w.EpgMatching.review(report,()=>{saved=true;});
+ const review=modals.at(-1), select=review.root.querySelector('select');
+ const save=[...review.footer.querySelectorAll('button')].find(b=>b.textContent==='Save selected matches');
+ assert.equal(select.value,'');assert(save.disabled,'ambiguous choices must never be preselected');
+ select.value='two';select.dispatchEvent(new w.Event('change'));assert(!save.disabled);save.click();await tick();
+ assert(saved);const request=calls.at(-1);assert.equal(request.url,'/api/epg/match/assign');
+ assert.deepEqual(JSON.parse(JSON.stringify(request.opts.body)),{items:[{id:5,epg_id:'two',previous:'saved'}]});
+ assert(!review.root.isConnected);
+ dom.window.close();console.log('EPG matching GUI passed: unique match, ambiguous selection, no guessed default, escaping, no match, staged edit, bulk save and existing-ID guard.');
+})().catch(e=>{console.error(e);dom.window.close();process.exitCode=1;});

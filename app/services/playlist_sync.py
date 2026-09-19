@@ -31,6 +31,7 @@ from ..models import (LiveGenre, LivePlaylist, LivePlaylistSource, LiveSource,
                       SerieSource, VodGenre, VodPlaylist, VodPlaylistSource,
                       VodSource)
 from .titles import best_title
+from .playlist_order import ORDER_MODELS, lock_playlist_order, next_playlist_order, repair_playlist_order
 
 # kinds whose "enabled" switch mirrors straight into the output playlist
 SYNC_KINDS = ("live", "vod", "series", "local")
@@ -40,17 +41,20 @@ ADD_KINDS = ("live", "vod", "series", "local")
 
 def _clean_ids(ids) -> list[int]:
     out: list[int] = []
+    seen: set[int] = set()
     for i in ids or []:
         try:
-            out.append(int(i))
+            value = int(i)
+            if value not in seen:
+                out.append(value)
+                seen.add(value)
         except (TypeError, ValueError):
             continue
     return out
 
 
 async def _next_order(db, model, start: int) -> int:
-    cur = await db.scalar(select(func.max(model.order)))
-    return (cur or 0) + start
+    return await next_playlist_order(db, model) + start - 1
 
 
 # --------------------------------------------------------------------- live numbers
@@ -88,6 +92,7 @@ async def move_live_to_rank(db, pid: int, rank: int) -> bool:
     held by a locked channel can never be taken). A locked target cannot be
     moved at all - its number is frozen. Returns False when the channel has
     no position (disabled) or is locked."""
+    await repair_playlist_order(db, LivePlaylist)
     rows = (await db.execute(select(LivePlaylist)
              .where(LivePlaylist.enabled.is_(True))
              .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
@@ -116,9 +121,11 @@ async def move_live_to_rank(db, pid: int, rank: int) -> bool:
         if not r.lock_number:
             seen += 1
     seq = others[:slot] + [target] + others[slot:]
-    for i, r in enumerate(seq, 1):
-        if r.order != i:
-            r.order = i
+    # Reuse enabled rows' slots; disabled rows still own their positions.
+    positions = sorted(r.order for r in rows)
+    for order, r in zip(positions, seq):
+        if r.order != order:
+            r.order = order
     await db.flush()
     return True
 
@@ -126,6 +133,8 @@ async def move_live_to_rank(db, pid: int, rank: int) -> bool:
 # --------------------------------------------------------------------- vod
 async def _sync_vod(db, ids: list[int], enabled: bool) -> dict:
     srcs = (await db.execute(select(VodSource).where(VodSource.id.in_(ids)))).scalars().all()
+    by_id = {r.id: r for r in srcs}
+    srcs = [by_id[i] for i in ids if i in by_id]
     existing = {r.vod_source_id: r for r in (await db.execute(
         select(VodPlaylist).where(VodPlaylist.vod_source_id.in_(ids)))).scalars().all()}
     nxt = await _next_order(db, VodPlaylist, 1)
@@ -156,6 +165,8 @@ async def _sync_vod(db, ids: list[int], enabled: bool) -> dict:
 # ------------------------------------------------------------------ series
 async def _sync_series(db, ids: list[int], enabled: bool) -> dict:
     srcs = (await db.execute(select(SerieSource).where(SerieSource.id.in_(ids)))).scalars().all()
+    by_id = {r.id: r for r in srcs}
+    srcs = [by_id[i] for i in ids if i in by_id]
     existing = {r.serie_source_id: r for r in (await db.execute(
         select(SeriePlaylist).where(SeriePlaylist.serie_source_id.in_(ids)))).scalars().all()}
     nxt = await _next_order(db, SeriePlaylist, 1)
@@ -193,6 +204,8 @@ async def _sync_series(db, ids: list[int], enabled: bool) -> dict:
 async def _sync_local(db, ids: list[int], enabled: bool) -> dict:
     """`ids` are local_files ids (the Local playlist references files)."""
     files = (await db.execute(select(LocalFile).where(LocalFile.id.in_(ids)))).scalars().all()
+    by_id = {r.id: r for r in files}
+    files = [by_id[i] for i in ids if i in by_id]
     existing = {r.local_file_id: r for r in (await db.execute(
         select(LocalPlaylist).where(LocalPlaylist.local_file_id.in_(ids)))).scalars().all()}
     nxt = await _next_order(db, LocalPlaylist, 1)
@@ -292,6 +305,7 @@ async def sync_sources(db, kind: str, ids, enabled: bool) -> dict:
     ids = _clean_ids(ids)
     if kind not in SYNC_KINDS or not ids:
         return {"kind": kind, "created": 0, "enabled": 0, "disabled": 0}
+    await lock_playlist_order(db, ORDER_MODELS[kind])
     if kind == "live":
         out = await _sync_live(db, ids, enabled)
     elif kind == "vod":
@@ -314,6 +328,7 @@ async def add_sources(db, kind: str, ids, group: str | None = None) -> dict:
     ids = _clean_ids(ids)
     if kind not in ADD_KINDS or not ids:
         return {"kind": kind, "added": 0, "existed": 0, "missing": 0}
+    await lock_playlist_order(db, ORDER_MODELS[kind])
     if kind == "live":
         return {"kind": kind, **await _add_live(db, ids, group)}
     before = await _existing_ids(db, kind, ids)
@@ -334,6 +349,8 @@ async def _add_live(db, ids: list[int], group: str | None) -> dict:
         select(LivePlaylistSource).where(LivePlaylistSource.live_source_id.in_(ids),
                                          LivePlaylistSource.priority == 1))).scalars().all()}
     srcs = (await db.execute(select(LiveSource).where(LiveSource.id.in_(ids)))).scalars().all()
+    by_id = {r.id: r for r in srcs}
+    srcs = [by_id[i] for i in ids if i in by_id]
     nxt = await _next_order(db, LivePlaylist, 1)
     added = 0
     for src in srcs:
@@ -445,6 +462,7 @@ async def assign_live_custom_name(db, source_id: int, custom_name: str) -> dict:
     name = (custom_name or "").strip()
     if not name:
         raise ValueError("custom name required")
+    await lock_playlist_order(db, LivePlaylist)
     src = await db.get(LiveSource, source_id)
     if not src:
         raise ValueError("source not found")

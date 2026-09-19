@@ -183,10 +183,10 @@ async def test_setting_rides_along_in_a_settings_backup():
         dump = (await c.get("/api/export?section=settings")).json()
         assert dump["settings"]["favicon"] == "signal"
 
-        # restoring a backup made elsewhere re-points the tab icon
+        # additive restore keeps the locally selected icon
         await c.post("/api/branding/favicon", json={"id": "dot"})
         before = branding.token()
         await c.post("/api/import", json={"mode": "merge",
                                           "data": {"settings": {"favicon": "tower"}}})
-        assert await _selected() == "tower"
-        assert branding.token() != before
+        assert await _selected() == "dot"
+        assert branding.token() == before

@@ -34,6 +34,8 @@ services:
       SPM_DATABASE_URL: postgresql+asyncpg://spm:spm@postgres:5432/stalker_proxy_manager
       SPM_ADMIN_USERNAME: ${SPM_ADMIN_USERNAME:-admin}
       SPM_ADMIN_PASSWORD: ${SPM_ADMIN_PASSWORD:?Set SPM_ADMIN_PASSWORD in .env}
+      # Optional initial TMDB API key (v3); saved GUI settings take precedence.
+      SPM_TMDB_API_KEY: "${SPM_TMDB_API_KEY:-}"
       SPM_VAAPI_DEVICE: /dev/dri/renderD128
       SPM_MOCK_PORTAL: ${SPM_MOCK_PORTAL:-0}
       TZ: ${TZ:-Europe/Amsterdam}

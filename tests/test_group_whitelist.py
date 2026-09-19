@@ -67,7 +67,7 @@ def test_allowed_is_case_and_whitespace_insensitive():
     assert _allowed("Action", ["ACTION"]) is True
     assert _allowed("Comedy", ["Action"]) is False
     assert _allowed(None, ["VOD"]) is False
-    assert _allowed(None, []) is True          # empty list = allow all
+    assert _allowed(None, []) is False         # empty list = no visibility
     assert _allowed(None, [""]) is True        # pre-existing semantics kept
 
 

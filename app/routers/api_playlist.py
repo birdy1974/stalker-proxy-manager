@@ -13,9 +13,10 @@ from __future__ import annotations
 import difflib
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import func, select, update
 
+from ..services.epg import channel_epg_id
 from ..database import get_db
 from ..models import (
     FFmpegTemplate, LiveGenre, LivePlaylist, LivePlaylistSource, LiveSource,
@@ -31,6 +32,8 @@ from ..services.playlist_sync import (
     ADD_KINDS, add_sources, move_live_to_rank, renumber_live_numbers,
 )
 from ..services.titles import best_title
+from ..services.playlist_order import (ORDER_MODELS, lock_playlist_order,
+                                       next_playlist_order, repair_playlist_order)
 
 
 async def _live_number_sync(db, r: LivePlaylist, payload: dict) -> None:
@@ -56,7 +59,7 @@ def norm(s: str) -> str:
     return "".join(c for c in (s or "").lower() if c.isalnum() or c.isspace()).strip()
 
 
-def fuzzy(query: str, candidates: list[tuple[int, str]], limit: int = 50) -> list[tuple[int, float]]:
+def fuzzy(query: str, candidates: list[tuple[int, str]], limit: int = 50, *, min_score: float = 0.45) -> list[tuple[int, float]]:
     """difflib-based fuzzy match, case-insensitive; returns sorted (id, score)."""
     q = norm(query)
     if not q:
@@ -68,7 +71,7 @@ def fuzzy(query: str, candidates: list[tuple[int, str]], limit: int = 50) -> lis
             scored.append((cid, 1.0 + len(q) / max(len(n), 1)))
         else:
             r = difflib.SequenceMatcher(None, q, n).ratio()
-            if r >= 0.45:                     # "close enough" per spec
+            if r >= min_score:                # default stays backward-compatible
                 scored.append((cid, r))
     scored.sort(key=lambda x: x[1], reverse=True)
     return scored[:limit]
@@ -76,25 +79,43 @@ def fuzzy(query: str, candidates: list[tuple[int, str]], limit: int = 50) -> lis
 
 # ----------------------------------------------------------------- suggest
 @router.get("/suggest")
-async def suggest(q: str = "", kind: str = "live", db=Depends(get_db)):
+async def suggest(q: str = "", kind: str = "live", relaxed: bool = False,
+                  show_all: bool = False, source_filter: str = "",
+                  offset: int = Query(0, ge=0), db=Depends(get_db)):
     """Fuzzy candidate list for the Add-channel popup and the fallback editor.
-    Empty query -> all enabled sources (spec: show all when filter is empty)."""
+    Empty query -> all enabled sources (up to 60). Relaxed matching lowers
+    the similarity cutoff but keeps the same ranking and enabled-only scope.
+    Show-all bypasses name similarity, with a separate literal word filter and
+    SQL pagination so every enabled source is reachable without loading it all.
+    """
     model = {"live": LiveSource, "vod": VodSource, "series": SerieSource}.get(kind)
     if model is None:
         raise HTTPException(400, "kind must be live|vod|series")
-    rows = (await db.execute(select(model, Portal).join(Portal, Portal.id == model.portal_id)
-                             .where(model.enabled.is_(True)))).all()
-    cand = [(r[0].id, r[0].original_name) for r in rows]
-    by_id = {r[0].id: r for r in rows}
-    matches = [cid for cid, _ in fuzzy(q, cand, 60)] if q else [c[0] for c in cand][:60]
+    stmt = select(model, Portal).join(Portal, Portal.id == model.portal_id).where(model.enabled.is_(True))
+    if show_all:
+        for word in source_filter.split():
+            stmt = stmt.where(
+                func.lower(model.original_name).contains(word.lower(), autoescape=True)
+                | func.lower(Portal.name).contains(word.lower(), autoescape=True))
+        total = await db.scalar(select(func.count()).select_from(stmt.subquery()))
+        rows = (await db.execute(stmt.order_by(func.lower(model.original_name), Portal.id, model.id)
+                                 .offset(offset).limit(60))).all()
+    else:
+        rows = (await db.execute(stmt)).all()
+        cand = [(r[0].id, r[0].original_name) for r in rows]
+        by_id = {r[0].id: r for r in rows}
+        matches = fuzzy(q, cand, 60, min_score=0.25 if relaxed else 0.45)
+        rows = [by_id[cid] for cid, _ in matches]
     out = []
-    for cid in matches:
-        src, portal = by_id[cid]
+    for src, portal in rows:
         out.append({"id": src.id, "name": src.original_name, "portal": portal.name,
                     "portal_id": portal.id,
                     "logo": getattr(src, "logo_original", None) or getattr(src, "poster", None),
                     "cmd": src.cmd})
-    return {"items": out, "query": q, "kind": kind}
+    result = {"items": out, "query": q, "kind": kind}
+    if show_all:
+        result.update(total=total, next_offset=offset + len(out) if offset + len(out) < total else None)
+    return result
 
 
 # ---------------------------------------------------------------- tv-logos (Phase 3)
@@ -150,9 +171,11 @@ async def _chains_for(db, playlist_ids: list[int], link_model, src_model,
 
 @router.get("/live")
 async def live_list(db=Depends(get_db), q: str = "", group: str = "", portal_id: int = 0,
-                    page: int = 1, per_page: int = 25, sort: str = "order", direction: str = "asc"):
+                    page: int = 1, per_page: int = 25, sort: str = "order", direction: str = "asc", item_id: int | None = None):
     per_page = min(max(per_page, 5), 500)
     stmt = select(LivePlaylist)
+    if item_id is not None:
+        stmt = stmt.where(LivePlaylist.id == item_id)
     if q:
         stmt = stmt.where(LivePlaylist.custom_name.ilike(f"%{q}%"))
     if group:
@@ -181,7 +204,9 @@ async def live_list(db=Depends(get_db), q: str = "", group: str = "", portal_id:
     for r in rows:
         chain = chains.get(r.id, [])
         items.append({"id": r.id, "custom_name": r.custom_name, "group_name": r.group_name,
-                      "epg_id": r.epg_id, "logo": r.logo, "number": r.number,
+                      "epg_id": r.epg_id, "output_epg_id": channel_epg_id(r), "epg_custom": r.epg_custom or r.epg_has_mappings,
+                      "epg_offset_minutes": r.epg_offset_minutes, "epg_gap_fill": r.epg_gap_fill,
+                      "logo": r.logo, "number": r.number,
                       "lock_number": bool(r.lock_number),
                       "ffmpeg_template_id": r.ffmpeg_template_id,
                       "template": tpls.get(r.ffmpeg_template_id or 0, ""),
@@ -202,8 +227,7 @@ async def live_create(payload: dict, db=Depends(get_db)):
     name = (payload.get("custom_name") or "").strip()
     if not name:
         raise HTTPException(400, "custom_name required")
-    max_order = await db.scalar(select(func.max(LivePlaylist.order))) or 0
-    r = LivePlaylist(custom_name=name, order=max_order + 1)
+    r = LivePlaylist(custom_name=name, order=await next_playlist_order(db, LivePlaylist))
     _apply_live_payload(r, payload)
     db.add(r)
     await db.flush()
@@ -217,7 +241,13 @@ async def live_create(payload: dict, db=Depends(get_db)):
         r.lock_number = True
     else:
         await _live_number_sync(db, r, payload)
+    if "epg_policy" in payload:
+        from ..services.epg_policy import apply_policy
+        await apply_policy(db, r, payload["epg_policy"])
     await db.commit()
+    if payload.get("epg_id") or "epg_policy" in payload:
+        from .api_epg import queue_cached_refresh
+        queue_cached_refresh()
     await db_log("INFO", "playlist", f"custom channel '{name}' created "
                                      f"({len(payload.get('source_ids', []))} fallback sources)")
     return {"id": r.id}
@@ -225,6 +255,7 @@ async def live_create(payload: dict, db=Depends(get_db)):
 
 @router.put("/live/{pid}")
 async def live_update(pid: int, payload: dict, db=Depends(get_db)):
+    await lock_playlist_order(db, LivePlaylist)
     r = await db.get(LivePlaylist, pid)
     if not r:
         raise HTTPException(404, "not found")
@@ -270,12 +301,19 @@ async def live_update(pid: int, payload: dict, db=Depends(get_db)):
             # locked target: move_live_to_rank is a no-op for it, but the
             # renumber still re-flows the other channels around its number
             await _live_number_sync(db, r, payload)
+    if "epg_policy" in payload:
+        from ..services.epg_policy import apply_policy
+        await apply_policy(db, r, payload["epg_policy"])
     await db.commit()
+    if "epg_id" in payload or "epg_policy" in payload:
+        from .api_epg import queue_cached_refresh
+        queue_cached_refresh()
     return {"ok": True}
 
 
 @router.delete("/live/{pid}")
 async def live_delete(pid: int, db=Depends(get_db)):
+    await lock_playlist_order(db, LivePlaylist)
     r = await db.get(LivePlaylist, pid)
     if not r:
         raise HTTPException(404, "not found")
@@ -288,16 +326,36 @@ async def live_delete(pid: int, db=Depends(get_db)):
 
 
 async def _set_order(db, model, payload: dict, *, renumber: bool = False) -> dict:
-    """Drag&drop result: [{id, order}, ...] (only valid when sorted by order)."""
-    for row in payload.get("items", []):
-        r = await db.get(model, int(row["id"]))
-        if r:
-            r.order = int(row["order"])
+    """Reorder selected slots; legacy explicit {id, order} payloads still work."""
+    await lock_playlist_order(db, model)
+    if "ids" in payload:
+        await repair_playlist_order(db, model)
+        ids = list(dict.fromkeys(int(i) for i in payload["ids"]))
+        rows = (await db.scalars(select(model).where(model.id.in_(ids))
+                                .order_by(model.order, model.id))).all()
+        by_id = {r.id: r for r in rows}
+        positions = [r.order for r in rows]
+        for pid, order in zip((pid for pid in ids if pid in by_id), positions):
+            by_id[pid].order = order
+    else:
+        for row in payload.get("items", []):
+            r = await db.get(model, int(row["id"]))
+            if r:
+                r.order = int(row["order"])
+        # Older clients may send page-local numbers that collide with another
+        # page. Keep those values from leaving duplicates in the database.
+        await repair_playlist_order(db, model)
     if renumber:
         # the final playlist moved, so the channel numbers follow it
         await renumber_live_numbers(db)
     await db.commit()
-    return {"ok": True}
+    result = {"ok": True}
+    if "ids" in payload:
+        # Return just the changed page's positions. The browser already has
+        # names/chains/posters and need not fetch the whole enriched page again.
+        result["items"] = [dict(id=r.id, order=r.order,
+                                **({"number": r.number} if renumber else {})) for r in rows]
+    return result
 
 
 @router.post("/live/order")
@@ -320,9 +378,32 @@ async def local_order(payload: dict, db=Depends(get_db)):
     return await _set_order(db, LocalPlaylist, payload)
 
 
+async def _bulk_metadata(db, model, payload) -> int | None:
+    """Set-based assignments: no full ORM rows, numbering work, or per-row writes."""
+    if payload.get("delete") or "enabled" in payload:
+        return None
+    values = {key: payload[key] for key in ("group_name", "ffmpeg_template_id") if key in payload}
+    if not values:
+        return None
+    if "ffmpeg_template_id" in values:
+        values["ffmpeg_template_id"] = values["ffmpeg_template_id"] or None
+    ids = list(dict.fromkeys(int(x) for x in payload.get("ids", [])))
+    count = 0
+    for start in range(0, len(ids), 500):
+        result = await db.execute(update(model).where(model.id.in_(ids[start:start+500]))
+                                  .values(**values).execution_options(synchronize_session=False))
+        count += result.rowcount
+    await db.commit()
+    return count
+
+
 @router.post("/live/bulk")
 async def live_bulk(payload: dict, db=Depends(get_db)):
     """Assign group and/or ffmpeg template to MANY channels in one go (spec)."""
+    await lock_playlist_order(db, LivePlaylist)
+    assigned = await _bulk_metadata(db, LivePlaylist, payload)
+    if assigned is not None:
+        return {"ok": True, "count": assigned}
     ids = [int(x) for x in payload.get("ids", [])]
     rows = (await db.execute(select(LivePlaylist).where(LivePlaylist.id.in_(ids)))).scalars().all()
     if payload.get("delete"):                     # "remove from playlist" in bulk
@@ -349,6 +430,10 @@ async def live_bulk(payload: dict, db=Depends(get_db)):
 
 async def _bulk_assign(db, model, payload) -> int:
     """Same semantics as /api/playlist/live/bulk for vod/series/local rows."""
+    await lock_playlist_order(db, model)
+    assigned = await _bulk_metadata(db, model, payload)
+    if assigned is not None:
+        return assigned
     ids = [int(x) for x in payload.get("ids", [])]
     rows = (await db.execute(select(model).where(model.id.in_(ids)))).scalars().all()
     if payload.get("delete"):                     # "remove from playlist" in bulk
@@ -391,6 +476,9 @@ async def add_from_source(payload: dict, db=Depends(get_db)):
     """Add a source item to the playlist (kind: vod|series|localfile)."""
     kind = payload.get("kind")
     sid = int(payload.get("source_id", 0))
+    model = ORDER_MODELS.get("local" if kind == "localfile" else kind)
+    if model is not None:
+        await lock_playlist_order(db, model)
     if kind == "vod":
         src = await db.get(VodSource, sid)
         if not src:
@@ -402,7 +490,7 @@ async def add_from_source(payload: dict, db=Depends(get_db)):
                         group_name=genre_row.name if genre_row else "VOD",
                         poster=src.poster, year=src.year, rating=src.rating,
                         overview=src.description,
-                        order=(await db.scalar(select(func.max(VodPlaylist.order))) or 0) + 1)
+                        order=await next_playlist_order(db, VodPlaylist))
         db.add(r)
         await db.flush()
         db.add(VodPlaylistSource(vod_playlist_id=r.id, vod_source_id=sid, priority=1))
@@ -419,7 +507,7 @@ async def add_from_source(payload: dict, db=Depends(get_db)):
                           group_name=genre_row.name if genre_row else "Series",
                           poster=src.poster, year=src.year, rating=src.rating,
                           overview=src.description,
-                          order=(await db.scalar(select(func.max(SeriePlaylist.order))) or 0) + 1)
+                          order=await next_playlist_order(db, SeriePlaylist))
         db.add(r)
         await db.flush()
         db.add(SeriePlaylistSource(serie_playlist_id=r.id, serie_source_id=sid, priority=1))
@@ -437,7 +525,7 @@ async def add_from_source(payload: dict, db=Depends(get_db)):
         if (await db.execute(select(LocalPlaylist).where(LocalPlaylist.local_file_id == sid))).scalar_one_or_none():
             return {"ok": True, "exists": True}
         r = LocalPlaylist(local_file_id=sid, custom_name=lf.filename,
-                          order=(await db.scalar(select(func.max(LocalPlaylist.order))) or 0) + 1)
+                          order=await next_playlist_order(db, LocalPlaylist))
         db.add(r)
         await db.commit()
         return {"ok": True, "id": r.id}
@@ -544,6 +632,8 @@ async def add_sources_bulk(payload: dict, db=Depends(get_db)):
 async def _pl_list(db, model, src_model, src_fk_name, q, group, filters, page, per_page,
                    sort, direction):
     stmt = select(model)
+    if filters.get("item_id") is not None:
+        stmt = stmt.where(model.id == filters["item_id"])
     if q:
         stmt = stmt.where(model.custom_name.ilike(f"%{q}%"))
     if group:
@@ -563,10 +653,10 @@ async def _pl_list(db, model, src_model, src_fk_name, q, group, filters, page, p
 @router.get("/vod")
 async def vod_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1,
                  per_page: int = 25, sort: str = "order", direction: str = "asc",
-                 selected: str = ""):
+                 selected: str = "", item_id: int | None = None):
     per_page = min(max(per_page, 5), 500)
     total, rows, groups, tpls = await _pl_list(db, VodPlaylist, VodSource, "vod_source_id",
-                                               q, group, {}, page, per_page, sort, direction)
+                                               q, group, {"item_id": item_id}, page, per_page, sort, direction)
     chains = await _chains_for(db, [r.id for r in rows], VodPlaylistSource, VodSource,
                                VodPlaylistSource.vod_playlist_id,
                                VodPlaylistSource.vod_source_id)
@@ -628,10 +718,10 @@ async def sync_series_seasons(db=Depends(get_db)):
 
 @router.get("/series")
 async def series_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1,
-                    per_page: int = 25, sort: str = "order", direction: str = "asc"):
+                    per_page: int = 25, sort: str = "order", direction: str = "asc", item_id: int | None = None):
     per_page = min(max(per_page, 5), 500)
     total, rows, groups, tpls = await _pl_list(db, SeriePlaylist, SerieSource, "serie_source_id",
-                                               q, group, {}, page, per_page, sort, direction)
+                                               q, group, {"item_id": item_id}, page, per_page, sort, direction)
     row_ids = [r.id for r in rows]
 
     # Read-repair for the whole page at once: seasons fetched AFTER the item was
@@ -708,9 +798,11 @@ async def series_delete(pid: int, db=Depends(get_db)):
 
 @router.get("/local")
 async def local_pl(db=Depends(get_db), q: str = "", group: str = "", page: int = 1,
-                   per_page: int = 25, sort: str = "order", direction: str = "asc"):
+                   per_page: int = 25, sort: str = "order", direction: str = "asc", item_id: int | None = None):
     per_page = min(max(per_page, 5), 500)
     stmt = select(LocalPlaylist)
+    if item_id is not None:
+        stmt = stmt.where(LocalPlaylist.id == item_id)
     if q:
         stmt = stmt.where(LocalPlaylist.custom_name.ilike(f"%{q}%"))
     if group:
@@ -743,6 +835,56 @@ async def local_pl(db=Depends(get_db), q: str = "", group: str = "", page: int =
     groups = [g[0] for g in (await db.execute(
         select(LocalPlaylist.group_name).distinct().order_by(LocalPlaylist.group_name))).all() if g[0]]
     return {"total": total or 0, "page": page, "per_page": per_page, "items": items, "groups": groups}
+
+
+@router.get("/probe")
+async def preview_probe(request: Request, scope: str, kind: str, id: int = Query(gt=0), db=Depends(get_db)):
+    """Admin-only technical probe of a stored preview input, not an arbitrary URL."""
+    import asyncio
+    import uuid
+    from ..services.technical_probe import probe_technical
+    from ..services.probe import PROBE_TIMEOUT
+    from ..services.stream_manager import MANAGER
+    # Closing the browser player aborts its fetch; allow its disconnect
+    # watchdog a short grace period to release the pipe's MAC lock.
+    for attempt in range(5):
+        try:
+            resolved = await item_info.resolve_preview_probe(db, scope, kind, id)
+            break
+        except ValueError as exc:
+            if str(exc).startswith("no free MAC") and attempt < 4:
+                await asyncio.sleep(.3)
+                continue
+            raise HTTPException(409, str(exc)) from exc
+    mid = resolved.get("mac_id")
+    holder = "technical-probe:" + uuid.uuid4().hex
+    if mid is not None:
+        if MANAGER.is_mac_busy(mid):
+            raise HTTPException(409, "Source became busy. Retry when its stream connection is free.")
+        MANAGER.lease_mac(mid, holder=holder, seconds=PROBE_TIMEOUT + 10,
+                          item=resolved.get("name") or "Stream probe", kind=kind, ref=id)
+    task = asyncio.create_task(probe_technical(resolved["url"], is_url=resolved["is_url"]))
+    try:
+        while not task.done():
+            await asyncio.wait({task}, timeout=.25)
+            if not task.done() and await request.is_disconnected():
+                raise HTTPException(499, "Probe cancelled")
+        result = await task
+        from ..services.playlist_health import record_probe
+        record_probe(resolved.get("_health_key"), result)
+        return {"probe": result, "name": resolved.get("name"),
+                "source": resolved.get("source"), "stage": "source (before FFmpeg)",
+                "selection": "primary playlist source" if scope == "playlist" else "selected source"}
+    finally:
+        if not task.done():
+            task.cancel()
+            from contextlib import suppress
+            with suppress(asyncio.CancelledError):
+                await task
+        if mid is not None and MANAGER.lease_holder(mid) == holder:
+            # Remove only our soft lease, never another viewer's pipe lock.
+            MANAGER.redirect_leases.pop(mid, None)
+            MANAGER.lease_meta.pop(mid, None)
 
 
 # ------------------------------------------------- detail popup enrichment
@@ -798,3 +940,20 @@ async def local_delete(pid: int, db=Depends(get_db)):
         await db.delete(r)
         await db.commit()
     return {"ok": True}
+
+
+@router.get("/health")
+async def playlist_health(kind: str = "", status: str = "issues", q: str = "",
+                          page: int = Query(1, ge=1), per_page: int = Query(25, ge=1, le=100),
+                          db=Depends(get_db)):
+    from ..services.playlist_health import report, KINDS
+    if kind and kind not in KINDS:
+        raise HTTPException(422, "kind must be live, vod, series or local")
+    if status not in ("all", "issues", "unavailable", "warning", "unverified", "healthy"):
+        raise HTTPException(422, "Unknown health status")
+    result = await report(db)
+    rows = [r for r in result.pop("items") if (not kind or r["kind"] == kind)
+            and (status == "all" or r["status"] == status or (status == "issues" and r["status"] in ("warning", "unavailable")))
+            and (not q or q.casefold() in (r["name"] + " " + r["group"]).casefold())]
+    result.update(total=len(rows), page=page, per_page=per_page, items=rows[(page-1)*per_page:page*per_page])
+    return result

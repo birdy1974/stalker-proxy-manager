@@ -41,8 +41,8 @@ function fmtTime(iso, { seconds = true } = {}) {
 }
 
 /* ---------------------------------------------------------------- API */
-async function api(path, { method = "GET", body, raw = false } = {}) {
-  const opts = { method, headers: {} };
+async function api(path, { method = "GET", body, raw = false, signal } = {}) {
+  const opts = { method, headers: {}, signal };
   if (body !== undefined) { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }
   const r = await fetch(path, opts);
   if (r.status === 401 && !path.startsWith("/api/login")) { location.href = "/login"; throw new Error("401"); }
@@ -86,7 +86,18 @@ function openModal({ title, body, footer, size = "lg", onClose, extraClass = "",
   $(".modal-footer", wrap).append(footer || el("div"));
   document.body.append(wrap);
   const modal = new bootstrap.Modal(wrap, { backdrop: "static", keyboard: false });
-  const close = () => { modal.hide(); setTimeout(() => wrap.remove(), 250); if (onClose) onClose(); };
+  let shown = false, closing = false, resolveClosed;
+  const closed = new Promise(resolve => { resolveClosed = resolve; });
+  wrap.addEventListener("shown.bs.modal", () => { shown = true; if (closing) modal.hide(); }, { once:true });
+  wrap.addEventListener("hidden.bs.modal", () => {
+    modal.dispose(); wrap.remove(); resolveClosed();
+  }, { once:true });
+  // Bootstrap ignores hide() during its opening transition. Wait for shown,
+  // then remove only after hidden so fast Close/Edit cannot orphan a backdrop.
+  const close = () => {
+    if (!closing) { closing = true; if (onClose) onClose(); if (shown) modal.hide(); }
+    return closed;
+  };
   if (closeButton) {
     $(".modal-header", wrap).append(
       el("button", { type: "button", class: "btn-close", "aria-label": "Close", onclick: close }));
@@ -100,7 +111,7 @@ function openModal({ title, body, footer, size = "lg", onClose, extraClass = "",
   return { close, root: wrap, modal, footer: $(".modal-footer", wrap) };
 }
 const mBtn = (label, cls, fn, icon = "") =>
-  el("button", { class: `btn btn-sm ${cls}`, type: "button", onclick: fn, html: (icon ? `<i class="bi ${icon} me-1"></i>` : "") + esc(label) });
+  el("button", { class: `btn btn-sm ${cls}`, type: "button", onclick: fn, html: (icon ? `<i class="bi ${icon} me-1" aria-hidden="true"></i>` : "") + esc(label) });
 
 function confirmDialog({ title, body, okText = "OK", okClass = "btn-accent", onOk, wide = false }) {
   const b = el("div"); if (typeof body === "string") b.innerHTML = body; else b.append(body);
@@ -134,7 +145,12 @@ class DataTable {
     this.table = el("table", { class: "table table-sm table-hover table-spm" });
     this.tableHost.append(this.table);
     this.pager = el("div", { class: "d-flex flex-wrap align-items-center gap-2 mt-2 small" });
-    this.host.append(this.toolbar, this.spinner, this.tableHost, this.pager);
+    this.host.append(this.toolbar, this.spinner);
+    if (this.opts.dnd) {
+      this.orderStatus = el("div", { class: "order-status small mb-2", role: "status", "aria-live": "polite", hidden: "" });
+      this.host.append(this.orderStatus);
+    }
+    this.host.append(this.tableHost, this.pager);
     if (this.opts.extraHeader) this.toolbar.append(this.opts.extraHeader);
     this._buildHead();
   }
@@ -151,15 +167,27 @@ class DataTable {
     }
     return p.toString();
   }
-  async reload() {
+  async reload({ duringReorder = false } = {}) {
+    if (this._pendingEdits) { this._reloadAfterEdit = true; return false; }
+    if (this._reordering && !duringReorder) { this._reloadAfterReorder = true; return false; }
+    const revision = this._loadRevision = (this._loadRevision || 0) + 1;
+    this._loading = true;
     this.spinner.style.display = "block";
     try {
       const data = await this.opts.server(this.params());
+      if (revision !== this._loadRevision) return false;
       this.items = data.items || []; this.total = data.total || 0;
       this.lastData = data;
+      this._loading = false;
       this._render();
-    } catch (e) { /* toast already shown */ }
-    this.spinner.style.display = "none";
+      return true;
+    } catch (e) { return false; /* toast already shown */ }
+    finally {
+      if (revision === this._loadRevision) {
+        this._loading = false;
+        this.spinner.style.display = "none";
+      }
+    }
   }
   _buildHead() {
     const o = this.opts;
@@ -302,31 +330,129 @@ class DataTable {
       this.tbody.append(tr);
     }
   }
+  beginEdit() {
+    if (!this._pendingEdits) {
+      // Ignore any pre-save list response; never repaint a field being edited.
+      this._reloadAfterEdit = Boolean(this._loading);
+      ++this._loadRevision;
+      this._loading = false;
+      this.spinner.style.display = "none";
+      this._editControls = [...this.host.querySelectorAll("button"), this._selAll].filter(Boolean)
+        .map(node => [node, node.disabled]);
+      this._editControls.forEach(([node]) => { node.disabled = true; });
+    }
+    this._pendingEdits = (this._pendingEdits || 0) + 1;
+  }
+  endEdit() {
+    this._pendingEdits = Math.max(0, (this._pendingEdits || 0) - 1);
+    if (!this._pendingEdits) {
+      this._editControls?.forEach(([node, disabled]) => { node.disabled = disabled; });
+      if (this._reloadAfterEdit) { this._reloadAfterEdit = false; this.reload(); }
+    }
+  }
+  _orderMessage(text, state) {
+    this.orderStatus.hidden = false;
+    this.orderStatus.className = `order-status small mb-2 text-${state === "error" ? "danger" : state === "saving" ? "primary" : "success"}`;
+    this.orderStatus.replaceChildren();
+    if (state === "saving") this.orderStatus.append(el("span", {
+      class: "spinner-border spinner-border-sm me-2", "aria-hidden": "true" }));
+    this.orderStatus.append(document.createTextNode(text));
+  }
+  _orderBusy(busy) {
+    this._reordering = busy;
+    this.tableHost.setAttribute("aria-busy", String(busy));
+    this.tableHost.classList.toggle("order-saving", busy);
+    // Prevent a second drag or a conflicting edit while the transaction runs.
+    // The status remains outside these inert controls for assistive technology.
+    for (const node of [this.toolbar, this.table, this.pager]) node.inert = busy;
+  }
+  async _saveOrder(fromId, targetId) {
+    if (this._reordering || this._loading || this._pendingEdits || this.state.sort !== "order" || this.state.direction !== "asc") return;
+    const before = this.items;
+    const from = before.findIndex(r => r.id === fromId), target = before.findIndex(r => r.id === targetId);
+    if (from < 0 || target < 0 || from === target || this.opts.dnd.isLocked?.(before[from])) return;
+    const scrollTop = this.tableHost.scrollTop;
+    const next = [...before];
+    next.splice(target, 0, next.splice(from, 1)[0]);
+    this._orderBusy(true);
+    this._orderMessage("Saving order…", "saving");
+    this.items = next;
+    this._renderBody(); // immediate visual move; numbers are confirmed by the server
+    this._clientFilter();
+    this.tableHost.scrollTop = scrollTop;
+    try {
+      const result = await this.opts.dnd.onReorder(next.map(r => r.id));
+      const positions = new Map((result?.items || []).map(r => [r.id, r]));
+      const complete = next.every(r => positions.has(r.id));
+      if (complete) {
+        this.items = next.map(r => ({ ...r, ...positions.get(r.id) }));
+        if (this.lastData) this.lastData.items = this.items;
+      }
+      // Compatibility with older servers, concurrent deletions, or a queued
+      // filter refresh. The normal path needs only the one save request.
+      let refreshed = true;
+      if (!complete || this._reloadAfterReorder) {
+        this._reloadAfterReorder = false;
+        this._orderMessage("Order saved. Refreshing…", "saving");
+        refreshed = await this.reload({ duringReorder: true });
+      }
+      this._orderMessage(refreshed ? "Order saved." : "Order saved, but refresh failed. Reload the table to verify positions.", refreshed ? "success" : "error");
+    } catch (e) {
+      this.items = before;
+      this._orderMessage("Could not save order. Previous display restored. Please try again.", "error");
+    } finally {
+      this._orderBusy(false);
+      this._renderBody();
+      this._clientFilter();
+      this.tableHost.scrollTop = scrollTop;
+      if (this._reloadAfterReorder) { this._reloadAfterReorder = false; this.reload(); }
+    }
+  }
   _bindDnd(tr, row, canDrag = true) {
     const grip = el("i", { class: "bi bi-grip-vertical row-drag" });
     if (!canDrag) {
-      // a locked row (a channel whose number is frozen) cannot itself be
-      // dragged - it still accepts drops, so others move around it
+      // Locked rows accept drops, but cannot themselves be dragged.
       grip.className = "bi bi-lock-fill row-drag row-locked";
       grip.title = "channel number locked - drag another row to move it around this one";
+    } else if (this.state.sort !== "order" || this.state.direction !== "asc") {
+      grip.title = "Sort by Ord ascending to reorder";
     }
     const g = el("td", {}, grip);
     tr.insertBefore(g, tr.children[1] || null);
-    if (canDrag) {
-      tr.draggable = true;
-      tr.addEventListener("dragstart", (e) => { this._dragRow = row; tr.classList.add("dragging"); });
-    }
-    tr.addEventListener("dragend", () => { tr.classList.remove("dragging"); $$("tr", this.tbody).forEach(x => x.classList.remove("drop-highlight")); });
-    tr.addEventListener("dragover", (e) => { e.preventDefault(); tr.classList.add("drop-highlight"); });
+    const interactive = target => target.closest("input,textarea,select,button,a,[contenteditable],[data-no-row-drag]");
+    const allowed = () => canDrag && !this._reordering && !this._pendingEdits && this.state.sort === "order" && this.state.direction === "asc";
+    tr.draggable = allowed();
+    // A draggable ancestor otherwise steals native text selection in inputs.
+    const arm = e => { tr.draggable = allowed() && !interactive(e.target); };
+    tr.addEventListener("pointerdown", arm);
+    tr.addEventListener("mousedown", arm);
+    tr.addEventListener("focusin", e => { if (interactive(e.target)) tr.draggable = false; });
+    tr.addEventListener("dragstart", (e) => {
+      if (interactive(e.target)) return; // native text drag, not a row reorder
+      if (!tr.draggable || this._reordering || this._loading || this._pendingEdits) { e.preventDefault(); return; }
+      this._dragRow = row; tr.classList.add("dragging");
+      e.dataTransfer?.setData("text/plain", String(row.id));
+    });
+    tr.addEventListener("dragend", () => {
+      this._dragRow = null;
+      tr.classList.remove("dragging");
+      $$("tr", this.tbody).forEach(x => x.classList.remove("drop-highlight"));
+    });
+    tr.addEventListener("dragover", (e) => {
+      if (!this._dragRow || this._reordering || this._loading || this._pendingEdits || interactive(e.target)) return;
+      e.preventDefault(); tr.classList.add("drop-highlight");
+    });
     tr.addEventListener("dragleave", () => tr.classList.remove("drop-highlight"));
-    tr.addEventListener("drop", async (e) => {
-      e.preventDefault(); tr.classList.remove("drop-highlight");
-      const from = this._dragRow; if (!from || from.id === row.id) return;
-      const ids = this.items.map(x => x.id);
-      ids.splice(ids.indexOf(from.id), 1);
-      ids.splice(ids.indexOf(row.id) + (ids.indexOf(from.id) > ids.indexOf(row.id) ? 1 : 0), 0, from.id);
-      await this.opts.dnd.onReorder(ids);
-      this.reload();
+    tr.addEventListener("drop", (e) => {
+      if (interactive(e.target)) {
+        if (this._dragRow) e.preventDefault(); // don't insert a dragged row ID into a textbox
+        return;
+      }
+      if (!this._dragRow) return; // leave external/native text drops alone
+      e.preventDefault();
+      $$("tr", this.tbody).forEach(x => x.classList.remove("drop-highlight"));
+      const from = this._dragRow; this._dragRow = null;
+      if (from) this._saveOrder(from.id, row.id);
     });
   }
   _renderPager() {
@@ -360,18 +486,28 @@ const fmtDur = (sec) => {
 const probeHtml = (pr) => {
   if (!pr) return "";
   if (pr.error) return `<span class="text-danger small">${esc(pr.error)}</span>`;
-  const v = pr.video, aud = (pr.audio || []).map(a =>
-    [esc(a.codec), a.rate_hz ? `${a.rate_hz / 1000} kHz` : "", esc(a.channels || ""),
-     a.kbps ? `@ ${a.kbps} kbps` : ""].filter(Boolean).join(" ")).join(" · ");
-  return `<table class="table table-sm mb-0 small">
-    ${v ? `<tr><td class="muted-label" style="width:120px">Video</td><td>${v.width}×${v.height}${v.ratio ? ` (${v.ratio})` : ""} · ${esc(v.codec)}${v.kbps ? ` @ ${v.kbps} kbps` : ""}${v.fps ? ` · ${v.fps} fps` : ""}</td></tr>` : ""}
-    ${aud ? `<tr><td class="muted-label">Audio</td><td>${aud}</td></tr>` : ""}
-    ${pr.duration_s ? `<tr><td class="muted-label">Duration</td><td>${fmtDur(pr.duration_s)}</td></tr>` : ""}
-    ${pr.overall_kbps ? `<tr><td class="muted-label">Overall</td><td>${pr.overall_kbps} kbps</td></tr>` : ""}
-  </table>`;
+  const value = x => x === null || x === undefined || x === "" ? "Not reported" : esc(x);
+  const row = (label, data) => `<tr><th class="small fw-normal text-muted" style="width:145px">${esc(label)}</th><td class="small">${data}</td></tr>`;
+  let html = '<table class="table table-sm mb-0">';
+  html += row("Container", value(pr.container));
+  html += row("Duration", pr.duration_s ? fmtDur(pr.duration_s) : "Not reported / live");
+  html += row("Overall bitrate", pr.overall_kbps ? `${value(pr.overall_kbps)} kb/s` : "Not reported");
+  for (const v of pr.videos || (pr.video ? [pr.video] : [])) {
+    html += row(`Video${v.index != null ? " #" + v.index : ""}`, `${value(v.codec)} · profile ${value(v.profile)} · level ${value(v.level)}`);
+    html += row("Resolution / frame rate", `${value(v.width)} × ${value(v.height)} · ${value(v.fps)} fps · DAR ${value(v.ratio)}`);
+    html += row("Video bitrate / format", `${value(v.kbps)} kb/s · ${value(v.pixel_format)} · ${value(v.bits_per_raw_sample)} bits · ${value(v.field_order)}`);
+    if (v.color_space || v.color_transfer || v.color_primaries) html += row("Color", [v.color_space, v.color_transfer, v.color_primaries].filter(Boolean).map(esc).join(" · "));
+  }
+  for (const a of pr.audio || []) html += row(`Audio${a.index != null ? " #" + a.index : ""}`,
+    `${value(a.codec)} · ${value(a.profile)} · ${value(a.kbps)} kb/s · ${value(a.rate_hz)} Hz · ${value(a.channels)} channels${a.channel_layout ? " (" + esc(a.channel_layout) + ")" : ""}${a.language ? " · " + esc(a.language) : ""}${a.sample_format ? " · " + esc(a.sample_format) : ""}`);
+  for (const sub of pr.subtitles || []) html += row(`Subtitle #${sub.index}`, `${value(sub.codec)}${sub.language ? " · " + esc(sub.language) : ""}`);
+  html += '</table>';
+  if (pr.notice) html += `<div class="small text-warning mt-1">${esc(pr.notice)}</div>`;
+  if (pr.technical) html += `<details class="mt-2"><summary class="small">All technical metadata (JSON)</summary><pre class="small border rounded p-2 mt-1" style="max-height:320px;overflow:auto;white-space:pre-wrap">${esc(JSON.stringify(pr.technical, null, 2))}</pre></details>`;
+  return html;
 };
 const tmdbHtml = (t) => !t
-  ? `<span class="text-muted small">No TMDB hit (set the TMDB API key in Settings → TMDB for enrichment).</span>`
+  ? `<span class="text-muted small">No TMDB hit.</span><span data-help="TMDB enrichment">Set the TMDB API key in Settings → TMDB for enrichment.</span>`
   : (t.error
     ? `<span class="text-warning small">TMDB: ${esc(t.error)}</span>`
     : `<div class="small">
@@ -398,8 +534,8 @@ const tmdbHtml = (t) => !t
  * HEVC or AC3/E-AC3/DTS IPTV streams cannot be transmuxed in a browser), or an
  * empty response body. All four now say what happened.
  */
-const MSE_OK_VIDEO = /^(avc1|h264|avc)$/i;
-const MSE_OK_AUDIO = /^(mp4a|aac)$/i;
+const MSE_OK_VIDEO = /^(avc1(?:\.[0-9a-f]+)?|h264|avc)$/i;
+const MSE_OK_AUDIO = /^(mp4a(?:\.[0-9a-z.]+)?|aac)$/i;
 const browserPlayable = (codec) => !codec || MSE_OK_VIDEO.test(codec) || MSE_OK_AUDIO.test(codec);
 
 function playInModal(url, title) {
@@ -410,15 +546,28 @@ function playInModal(url, title) {
      browser allows it). */
   const video = el("video", { controls: "", autoplay: "", muted: "", playsinline: "",
                               class: "w-100", style: "background:#000;max-height:65vh" });
+  // Dynamically setting the muted attribute only changes defaultMuted in
+  // some browsers; the live property must be set before attaching MediaSource.
+  video.muted = true;
+  video.defaultMuted = true;
   const status = el("div", { class: "small text-muted mt-1" }, `Source: ${url}`);
   const diag = el("div", { class: "small mt-2 p-2 bg-dark text-light mono",
                            style: "max-height:180px;overflow:auto;white-space:pre-wrap;border-radius:4px" });
   const body = el("div", {}, video, status, diag);
-  let engine = null, settled = false, ticker = null, received = 0, lastStats = "";
-  let soundBtn = null;
+  let engine = null, settled = false, ticker = null, received = 0, inputSeen = false, lastStats = "";
+  let soundBtn = null, closed = false, stopped = false, probeController = null;
+  const stopPlayback = () => {
+    stopped = true;
+    clearInterval(ticker); ticker = null;
+    try { engine?.destroy(); } catch {}
+    engine = null;
+    try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+    if (window.__spmActiveDiag === pushDiag) window.__spmActiveDiag = null;
+  };
 
   const diagLines = [];
   const pushDiag = (line) => {
+    if (closed) return;
     const t = new Date().toLocaleTimeString();
     diagLines.push(`[${t}] ${line}`);
     if (diagLines.length > 40) diagLines.splice(0, diagLines.length - 40);
@@ -426,6 +575,7 @@ function playInModal(url, title) {
     diag.scrollTop = diag.scrollHeight;
   };
   const say = (html, cls) => {
+    if (closed || stopped) return;
     diag.className = `small mt-2 alert ${cls || "alert-warning"} mb-0 py-2`;
     diag.innerHTML = html;
   };
@@ -434,21 +584,21 @@ function playInModal(url, title) {
     diag.style.cssText = "max-height:180px;overflow:auto;white-space:pre-wrap;border-radius:4px";
     diag.textContent = diagLines.join("\n");
   };
-  const ok = (txt) => { if (!settled) { settled = true; status.textContent = txt; } };
+  const ok = (txt) => { if (!closed && !stopped && !settled) { settled = true; status.textContent = txt; } };
   const fail = (why, hint) => {
     pushDiag("FAIL: " + why);
     say(`<div><b>Not playing:</b> ${esc(why)}</div>` +
         (hint ? `<div class="mt-1 text-muted">${hint}</div>` : "") +
-        `<div class="mt-1 text-muted">Technical detail below - scroll the log.</div>`, "alert-warning");
+        `<span data-help="Player diagnostics">Technical detail below - scroll the log.</span>`, "alert-warning");
   };
 
   const m = openModal({
     title: `▶ ${title}`, body, footer: el("div"), size: "xl", extraClass: "player-modal",
     closeButton: true,
     onClose: () => {
-      clearInterval(ticker);
-      try { engine?.destroy(); } catch {}
-      try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+      closed = true;
+      probeController?.abort();
+      stopPlayback();
     },
   });
   m.footer.append(mBtn("Stop & Close", "btn-outline-secondary", m.close, "bi-stop-circle"));
@@ -459,6 +609,40 @@ function playInModal(url, title) {
     pushDiag("sound enabled by user gesture");
   }, "bi-volume-up-fill");
   m.footer.append(soundBtn);
+
+  m.footer.append(mBtn("Replay", "btn-outline-primary", () => {
+    m.close(); playInModal(url, title);
+  }, "bi-arrow-clockwise"));
+  const probeMatch = /^\/(preview|preview-play)\/(live|vod|series|episode|local)\/(\d+)\.ts(?:\?|$)/.exec(url);
+  if (probeMatch) {
+    const scope = probeMatch[1] === "preview" ? "source" : "playlist";
+    const probeBox = el("div", { class: "mt-2 border-top pt-2", hidden: "", "aria-live": "polite" });
+    body.append(probeBox);
+    const probeButton = mBtn("Probe stream", "btn-outline-info", async () => {
+      if (probeButton.disabled || closed) return;
+      probeButton.disabled = true;
+      stopPlayback();
+      status.textContent = "Playback stopped for probing. Use Replay to resume.";
+      probeBox.hidden = false;
+      probeBox.textContent = "Probing source stream…";
+      probeBox.setAttribute("aria-busy", "true");
+      probeController = new AbortController();
+      try {
+        const d = await api(`/api/playlist/probe?scope=${scope}&kind=${probeMatch[2]}&id=${probeMatch[3]}`, {signal:probeController.signal});
+        if (closed) return;
+        probeBox.innerHTML = `<div class="muted-label">Source technical information (before FFmpeg)${scope === "playlist" ? " · primary source" : ""}</div>` +
+          (d.source ? `<div class="small mb-1">${esc(d.source)}</div>` : "") + probeHtml(d.probe);
+      } catch (e) {
+        if (!closed) probeBox.textContent = "Probe failed: " + e.message + ". You can retry.";
+      } finally {
+        if (!closed) { probeButton.disabled = false; probeBox.setAttribute("aria-busy", "false"); }
+      }
+    }, "bi-info-circle");
+    m.footer.append(probeButton);
+    const hint = el("span", {"data-help":"Stream probe"},
+      "Stops this preview to release its stream connection, then probes the original source before FFmpeg processing. Reports all available codec, resolution, frame rate, bitrate, audio, subtitle and container metadata. Playlist probes inspect the primary source, which may differ from a fallback used during playback. Live streams may not report every field. Use Replay to resume. A busy single-connection portal may require a moment before retrying.");
+    m.footer.append(hint);
+  }
 
   // The preview runs the source through an FFmpeg template, same as the real
   // output. If it stays black on copy (HEVC / AC3 / anything MediaSource cannot
@@ -484,12 +668,12 @@ function playInModal(url, title) {
   const haveTs = !!(window.mpegts && window.mpegts.isSupported && window.mpegts.isSupported());
 
   if (isHls && !haveHls)
-    return fail("hls.js is unavailable or this browser has no MediaSource support.",
-                "Use Chrome/Edge/Firefox, or switch the output format to MPEG-TS in FFmpeg → template.");
+    { fail("hls.js is unavailable or this browser has no MediaSource support.",
+                "Use Chrome/Edge/Firefox, or switch the output format to MPEG-TS in FFmpeg → template."); return m; }
   if (!isHls && !haveTs)
-    return fail("mpegts.js is unavailable or this browser has no MediaSource support.",
+    { fail("mpegts.js is unavailable or this browser has no MediaSource support.",
                 "The player library is served from /static/vendor/ - a blocked or stale " +
-                "static mount leaves the popup with nothing to decode the transport stream.");
+                "static mount leaves the popup with nothing to decode the transport stream."); return m; }
 
   // surface the player library's INTERNAL log (probe result, MSE init,
   // appendBuffer errors, loader errors) - this is what says exactly why a
@@ -497,8 +681,8 @@ function playInModal(url, title) {
   if (window.mpegts && mpegts.LoggingControl && mpegts.LoggingControl.addLogListener) {
     if (!window.__spmMpegtsLogHook) {
       window.__spmMpegtsLogHook = true;
-      mpegts.LoggingControl.addLogListener((tag, type, msg) => {
-        if (window.__spmActiveDiag) window.__spmActiveDiag(`${type}: ${msg}`);
+      mpegts.LoggingControl.addLogListener((...parts) => {
+        if (window.__spmActiveDiag) window.__spmActiveDiag(parts.filter(x => x != null).join(": "));
       });
     }
     window.__spmActiveDiag = pushDiag;
@@ -520,15 +704,15 @@ function playInModal(url, title) {
     try { bufEnd = video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0; } catch {}
     status.textContent =
       `${settled ? "▶" : "…"} rt${video.readyState} t=${video.currentTime.toFixed(1)}s ` +
-      `buf=${bufEnd.toFixed(1)}s rx=${(received / 1024).toFixed(0)} KB ${lastStats} · ${url}`;
+      `buf=${bufEnd.toFixed(1)}s ${received ? `rx=${(received / 1024).toFixed(0)} KB ` : ""}${lastStats} · ${url}`;
     if (settled) return;
-    if (received === 0 && performance.now() - t0 > 10000) {
+    if (!inputSeen && !bufEnd && performance.now() - t0 > 10000) {
       settled = true;
       fail("no stream bytes reached the browser in 10 s.",
         "The popup DID open the stream (the server log shows it) - something between " +
         "the server and this tab dropped it: a reverse proxy buffering the response, " +
         "or a browser shield. Check Logs → stream; try outside Brave/iframes.");
-    } else if (received > 0 && video.readyState <= 1 && performance.now() - t0 > 12000) {
+    } else if (inputSeen && video.readyState <= 1 && performance.now() - t0 > 12000) {
       settled = true;
       fail("stream data arrives but the browser never starts decoding it.",
         "Read the mpegts.js lines below: a codec MediaSource cannot take (HEVC/MPEG-2/AC3) " +
@@ -546,7 +730,10 @@ function playInModal(url, title) {
                           "A fatal HLS error means the variant playlist or segments are not " +
                           "reaching the player - check the proxy log for the stream.");
       });
-      engine.on(Hls.Events.MANIFEST_PARSED, () => ok(`▶ playing · ${url}`));
+      engine.on(Hls.Events.FRAG_LOADED, (_e, data) => { inputSeen = true; received += data?.stats?.total || data?.payload?.byteLength || 0; });
+      engine.on(Hls.Events.MANIFEST_PARSED, () => {
+        video.play().catch(() => say("Autoplay was blocked — press ▶ on the player.", "alert-secondary"));
+      });
       engine.loadSource(url); engine.attachMedia(video);
     } else {
       engine = mpegts.createPlayer({ type: "mpegts", isLive: true, url },
@@ -559,16 +746,18 @@ function playInModal(url, title) {
           "will stay black on copy - use a transcode template that converts it.");
       });
       engine.on(mpegts.Events.MEDIA_INFO, (mi) => {
+        inputSeen = true;
         pushDiag(`media info: video=${mi.videoCodec} audio=${mi.audioCodec} ` +
                  `${mi.width}x${mi.height}`);
         const v = mi.videoCodec || "", a = mi.audioCodec || "";
         const bad = [v, a].filter(c => c && !browserPlayable(c));
-        if (bad.length) say(`Codec ${bad.join(", ")} is not playable through MediaSource. ` +
+        if (bad.length) say(`Codec ${bad.map(esc).join(", ")} is not playable through MediaSource. ` +
           "Switch this item to a transcode template (H.264 + AAC) instead of copy.", "alert-danger");
       });
       engine.on(mpegts.Events.STATISTICS_INFO, (s) => {
         received = (s.receivedBytes ?? s.totalBytes ?? received);
         const kbps = s.speed ?? s.speedKBps ?? 0;
+        inputSeen ||= received > 0 || kbps > 0;
         lastStats = kbps ? `@${kbps.toFixed(0)} KB/s` : "";
       });
       engine.on(mpegts.Events.LOADING_COMPLETE, () => pushDiag("loader: server ended the stream"));

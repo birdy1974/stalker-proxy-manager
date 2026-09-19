@@ -85,7 +85,7 @@ async def _seed(n_series: int, *, seasons: int = 3, episodes: int = 4) -> User:
         user = (await s.execute(select(User).where(User.name == "user1"))).scalar_one_or_none()
         if user is None:
             user = User(name="user1", password="pw", m3u_enabled=True, xtream_enabled=True,
-                        groups_json=json.dumps({"live": [], "vod": [], "series": [], "local": []}))
+                        groups_json=json.dumps({"live": ["NL"], "vod": ["Action"], "series": ["Drama", "Kids"], "local": ["vod-local"]}))
             s.add(user)
         await s.commit()
         return user
@@ -165,14 +165,14 @@ async def test_playlist_only_contains_enabled_items_and_the_users_genres():
     assert "Home video" not in restricted, "'vod-local' is not in the user's local whitelist"
 
 
-async def test_empty_whitelist_means_all_groups_allowed():
-    """An empty list per type = 'everything', not 'nothing' (documented model)."""
+async def test_empty_whitelist_means_no_groups_allowed():
+    """An explicit empty selection must not act as an allow-all wildcard."""
     await _seed(2)
     async with SessionLocal() as s:
         user = await s.get(User, 1)
+    user.groups_json = json.dumps({"live": [], "vod": [], "series": [], "local": []})
     text = await build_m3u(BASE, user)
-    assert "Serie 0 " in text and "Serie 1 " in text
-    assert "Home video" in text
+    assert text.strip() == "#EXTM3U"
 
 
 async def test_full_titles_reach_the_playlist_and_carry_tvg_name():

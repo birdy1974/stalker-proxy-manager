@@ -33,6 +33,12 @@ def _static_versions() -> dict:
 
     out: dict[str, str] = {}
     for key, rel in (("js", "app/static/js/app.js"),
+                     ("backup_js", "app/static/js/settings-backup.js"),
+                     ("ffmpeg_editor_js", "app/static/js/ffmpeg-editor.js"),
+                     ("help_js", "app/static/js/help-tooltips.js"),
+                     ("epg_js", "app/static/js/epg-matching.js"),
+                     ("epg_controls_js", "app/static/js/epg-controls.js"),
+                     ("playlist_health_js", "app/static/js/playlist-health.js"),
                      ("css", "app/static/css/app.css")):
         try:
             st = os.stat(rel)
@@ -46,6 +52,8 @@ templates.env.globals["static_v"] = _static_versions()
 # Tab icon <link> tags for every page, including /login: the choice lives in the
 # `favicon` settings row, so it must be read at render time, not at import.
 templates.env.globals["favicon_tags"] = branding.favicon_tags
+from ..services.ffmpeg_editor import schema as ffmpeg_editor_schema
+templates.env.globals["ffmpeg_editor_schema"] = ffmpeg_editor_schema
 
 PAGES = {
     "/": ("dashboard.html", "Dashboard", "dashboard"),

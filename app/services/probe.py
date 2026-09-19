@@ -151,6 +151,13 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
                 except ProcessLookupError:
                     pass
                 return {"error": f"probe timed out (>{PROBE_TIMEOUT:.0f}s)"}
+            finally:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    await proc.wait()
         except FileNotFoundError:
             binary_missing = True
             break
@@ -185,7 +192,7 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
             out["overall_kbps"] = int(m.group(4))
     for m in _RE_STREAM_VIDEO.finditer(text):
         width, height = int(m.group(2)), int(m.group(3))
-        head = text[m.start():m.start() + 260]
+        head = text[m.start():].split("\n", 1)[0]
         dar = _RE_DAR.search(head)
         kb = re.search(r"(\d+(?:\.\d+)?)\s*kb/s", head)
         v = {"codec": m.group(1), "width": width, "height": height,
@@ -208,7 +215,8 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
         # A UA that produced real metadata is the one the stream path should
         # open with too, so share the learning (next play skips the retry).
         stream_identity.remember(target, used_ua)
-    _CACHE[key] = (time.time(), out)
+    if "error" not in out:
+        _CACHE[key] = (time.time(), out)
     return out
 
 

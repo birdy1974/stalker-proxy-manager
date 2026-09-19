@@ -180,3 +180,18 @@ async def _reset_portal_pool():
     MANAGER.redirect_leases.clear()
     MANAGER.lease_meta.clear()
     MANAGER.route_health = _RouteHealth()
+
+
+@pytest.fixture(autouse=True)
+async def _reset_playlist_health_evidence():
+    from app.services import playlist_health as health
+    health._OBSERVATIONS.clear()
+    health._files_task = None
+    health._files_paths = None
+    health._files_result = {}
+    health._files_at = 0.0
+    yield
+    if health._files_task and not health._files_task.done():
+        health._files_task.cancel()
+        await asyncio.gather(health._files_task, return_exceptions=True)
+    health._OBSERVATIONS.clear()

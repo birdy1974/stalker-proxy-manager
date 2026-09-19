@@ -11,10 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 
 from ..database import get_db
-from ..models import (
-    Area, LivePlaylist, LocalPlaylist, SeriePlaylist, User, VodPlaylist,
-)
+from ..models import Area, User
 from ..security import require_admin
+from ..services.user_groups import available_groups, clean_groups
 
 router = APIRouter(prefix="/api/users", tags=["users"], dependencies=[Depends(require_admin)])
 
@@ -32,7 +31,9 @@ async def _base(request: Request) -> str:
 
 def _row(u: User, base: str, available: dict | None = None,
          areas: dict[int, str] | None = None) -> dict:
-    groups = json.loads(u.groups_json or "{}")
+    from ..services.playlist_gen import _groups
+    from urllib.parse import urlencode
+    groups = _groups(u)
     stale: dict[str, list[str]] | None = None
     if available is not None:
         # whitelist entries that no longer match a group in the library: they
@@ -42,7 +43,8 @@ def _row(u: User, base: str, available: dict | None = None,
                      if str(v).strip().lower() not in {str(g).strip().lower()
                                                        for g in available.get(k, [])}]
                  for k in ("live", "vod", "series", "local")}
-    row = {"id": u.id, "name": u.name, "password": u.password,
+    epg_query = urlencode({"username": u.name, "password": u.password})
+    row = {"epg_url": f"{base}/xmltv.php?{epg_query}", "id": u.id, "name": u.name, "password": u.password,
             "m3u_enabled": u.m3u_enabled, "xtream_enabled": u.xtream_enabled,
             "expire_date": u.expire_date, "max_connections": u.max_connections,
             "enabled": u.enabled, "groups": groups,
@@ -63,14 +65,7 @@ def _row(u: User, base: str, available: dict | None = None,
 async def list_users(request: Request, db=Depends(get_db)):
     base = await _base(request)
     rows = (await db.execute(select(User).order_by(User.name))).scalars().all()
-    # all existing group names per type (for the group whitelist editor)
-    async def distinct(model):
-        return sorted(g for (g,) in (await db.execute(
-            select(model.group_name).distinct())).all() if g)
-    groups_available = {
-        "live": await distinct(LivePlaylist), "vod": await distinct(VodPlaylist),
-        "series": await distinct(SeriePlaylist), "local": await distinct(LocalPlaylist),
-    }
+    groups_available = await available_groups(db)
     area_rows = (await db.execute(select(Area).order_by(Area.name))).scalars().all()
     areas = {a.id: a.name for a in area_rows}
     return {"items": [_row(u, base, groups_available, areas) for u in rows],
@@ -79,28 +74,7 @@ async def list_users(request: Request, db=Depends(get_db)):
 
 
 def _clean_groups(value) -> dict:
-    """Normalise a group whitelist coming from the GUI/API: strings only,
-    whitespace trimmed (a stray space would silently blackhole that content
-    type in every output), empties dropped, per-type duplicates removed. A
-    bare string is treated as a one-element list instead of exploding into
-    single characters."""
-    if not isinstance(value, dict):
-        value = {}
-    out: dict[str, list[str]] = {}
-    for kind in ("live", "vod", "series", "local"):
-        vals = value.get(kind) or []
-        if isinstance(vals, str):
-            vals = [vals]
-        if not isinstance(vals, list):
-            vals = []
-        seen: set[str] = set()
-        out[kind] = []
-        for v in vals:
-            v = str(v).strip()
-            if v and v.lower() not in seen:
-                seen.add(v.lower())
-                out[kind].append(v)
-    return out
+    return clean_groups(value)
 
 
 @router.post("")
@@ -114,7 +88,10 @@ async def create_user(payload: dict, db=Depends(get_db)):
     for f in FIELDS:
         if f in payload:
             setattr(u, f, payload[f])
-    u.groups_json = json.dumps(_clean_groups(payload.get("groups")))
+    # Omitted selections on creation select today's groups; explicit empties
+    # are intentional denials and must never expand to all.
+    groups = payload["groups"] if "groups" in payload else await available_groups(db)
+    u.groups_json = json.dumps(_clean_groups(groups))
     if "area_id" in payload:
         u.area_id = int(payload["area_id"]) if payload.get("area_id") else None
     db.add(u)

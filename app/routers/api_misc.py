@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 
-from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL
+from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL, TMDB_API_KEY
 from ..database import get_db
 from ..models import (
     Area, AreaItemTemplate, EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre,
@@ -112,8 +112,9 @@ DEFAULT_SETTINGS = {
     # Seed from env so a first boot honours docker-compose; later GUI edits win.
     "fallback_strategy": FALLBACK_STRATEGY,     # macs_first | portal_first
     "epg_refresh_hours": 24,
+    "epg_portal_enabled": True,
     "logo_country": "netherlands",
-    "tmdb_api_key": "",
+    "tmdb_api_key": TMDB_API_KEY,              # initial env seed; stored GUI value wins
     "fetch_page_budget": FETCH_PAGE_BUDGET,
     "output_base_url": OUTPUT_BASE_URL,
     # VLC honours this per local-file entry; 0 omits the directive.
@@ -142,6 +143,12 @@ async def get_settings(db=Depends(get_db)):
 
 @router.post("/settings")
 async def set_settings(payload: dict, db=Depends(get_db)):
+    if "epg_refresh_hours" in payload:
+        value = payload["epg_refresh_hours"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value) or not 0 <= value <= 168:
+            raise HTTPException(400, "EPG refresh hours must be a whole number from 0 (paused) to 168")
+    if "epg_portal_enabled" in payload and not isinstance(payload["epg_portal_enabled"], bool):
+        raise HTTPException(400, "Portal EPG enabled must be true or false")
     for k, v in payload.items():
         row = await db.get(Setting, k)
         if row is None:
@@ -188,15 +195,16 @@ async def toggle_epg(payload: dict, db=Depends(get_db)):
     for r in rows:
         r.enabled = bool(payload.get("enabled"))
     await db.commit()
+    from .api_epg import queue_cached_refresh
+    queue_cached_refresh()
     return {"ok": True}
 
 
 @router.delete("/epg-sources/{eid}")
 async def del_epg(eid: int, db=Depends(get_db)):
-    r = await db.get(EpgSource, eid)
-    if r:
-        await db.delete(r)
-        await db.commit()
+    from .api_epg import delete_source
+    if await db.get(EpgSource, eid):
+        return await delete_source(eid, db)
     return {"ok": True}
 
 
@@ -491,6 +499,8 @@ async def export_config(section: str = "all", db=Depends(get_db)):
     source priorities, as NAME references a restore can re-bind on another
     install.
     """
+    if section not in {"all", "portals", "ffmpeg", "users", "areas", "settings", "epg", "sources", "playlists", "enigma2"}:
+        raise HTTPException(400, "Unknown backup section.")
     data: dict = {"app": "stalker-proxy-manager", "version": 1, "section": section}
 
     async def dump(model, fields):
@@ -579,23 +589,26 @@ def _jsonable(v):
 
 @router.post("/import")
 async def import_config(payload: dict, db=Depends(get_db)):
-    """
-    Import a previously exported JSON (merge-by-name semantics).
-    SoD: duplicates are skipped; nothing is deleted by an import.
+    """Legacy v1 importer. Add missing identities; never overwrite existing rows.
 
-    `sources` and `playlists` are the exception: they *restore*. An existing
-    row is updated in place to the backup's values (the operator's curated
-    catalog - enabled flags, custom names, logos, epg ids, template picks,
-    fallback priorities), missing rows are created, and rows the backup does
-    not mention are left untouched.
+    The Settings GUI uses the complete v2 backup API for new exports. This
+    endpoint remains available for older section-based backup files.
     """
     mode = payload.get("mode", "merge")
+    if mode not in ("merge", "add_only"):
+        raise HTTPException(400, "Only additive restore is supported.")
+    mode = "merge"
     data = payload.get("data", {})
+    if not isinstance(data, dict) or not data or not any(k in data for k in (
+            "ffmpeg_templates", "areas", "area_item_templates", "users", "portals",
+            "macs", "sources", "playlists", "settings", "epg_sources",
+            "enigma2_profiles", "live_playlist", "live_genres", "vod_genres", "serie_genres")):
+        raise HTTPException(400, "Not a recognized legacy backup.")
     applied = {"skipped": [], "imported": 0, "updated": 0}
 
     def _bump(res):
-        if res == "updated":
-            applied["updated"] += 1
+        if res == "existing":
+            applied["skipped"].append("existing catalog row")
         else:
             applied["imported"] += 1
 
@@ -768,7 +781,7 @@ async def import_config(payload: dict, db=Depends(get_db)):
                           sn=m.get("sn"), device_id=m.get("device_id")))
         applied["imported"] += 1
 
-    # ---- sources: RESTORE semantics (see docstring) ----
+    # ---- sources: additive restore (existing identities are unchanged) ----
     src = data.get("sources") or {}
     if not isinstance(src, dict):
         src = {}
@@ -807,14 +820,11 @@ async def import_config(payload: dict, db=Depends(get_db)):
             applied["imported"] += 1
 
     async def _restore_row(model, ident: dict, values: dict):
-        """update the identity-matched row in place, insert when missing;
-        returns 'updated' | 'inserted'."""
+        """Insert only; the identity-matched local row always wins."""
         exists = (await db.execute(select(model).where(*[
             getattr(model, k) == v for k, v in ident.items()]))).scalar_one_or_none()
         if exists is not None:
-            for k, v in values.items():
-                setattr(exists, k, v)
-            return "updated"
+            return "existing"
         db.add(model(**{**ident, **values}))
         return "inserted"
 
@@ -979,11 +989,9 @@ async def import_config(payload: dict, db=Depends(get_db)):
                                      }))
             await db.flush()
 
-    # ---- playlists: RESTORE semantics, like sources. Rows bind by
-    #      custom_name (first match). The primary source of a vod/serie/local
-    #      playlist is a NOT NULL FK: a NEW row whose primary cannot be
-    #      resolved is skipped (noted); an existing row keeps its current
-    #      primary when the backup's cannot be resolved.
+    # ---- playlists: add missing rows/links, keep existing fields unchanged.
+    #      Rows bind by custom_name (first match). A new vod/serie/local row
+    #      whose required primary source cannot be resolved is skipped (noted).
     async def _first(q):
         return (await db.execute(q.limit(1))).scalars().first()
 
@@ -1045,8 +1053,7 @@ async def import_config(payload: dict, db=Depends(get_db)):
                 getattr(link_model, playlist_id_col) == playlist_id,
                 getattr(link_model, source_id_col) == src_row.id))).scalar_one_or_none()
             if link is not None:
-                link.priority = int(s.get("priority") or link.priority)
-                applied["updated"] += 1
+                applied["skipped"].append(f"{label}: existing source link")
             else:
                 db.add(link_model(**{
                     playlist_id_col: playlist_id,
@@ -1068,19 +1075,20 @@ async def import_config(payload: dict, db=Depends(get_db)):
         if new_row:
             row = LivePlaylist(custom_name=name)
             db.add(row)
-        row.group_name = e.get("group_name")
-        row.number = e.get("number")
-        row.lock_number = bool(e.get("lock_number", False))
-        row.epg_id = e.get("epg_id")
-        row.logo = e.get("logo")
-        row.enabled = bool(e.get("enabled", True))
-        row.order = int(e.get("order") or 0)
-        row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
+        if new_row:
+            row.group_name = e.get("group_name")
+            row.number = e.get("number")
+            row.lock_number = bool(e.get("lock_number", False))
+            row.epg_id = e.get("epg_id")
+            row.logo = e.get("logo")
+            row.enabled = bool(e.get("enabled", True))
+            row.order = int(e.get("order") or 0)
+            row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
         await db.flush()
         await _restore_links(LivePlaylistSource, "live_playlist_id",
                              "live_source_id", row.id, e.get("sources"),
                              _resolve_live_source, f"live-link:{name[:40]}")
-        _bump("inserted" if new_row else "updated")
+        _bump("inserted" if new_row else "existing")
         await db.flush()
 
     for e in pls.get("vod", []):
@@ -1098,23 +1106,22 @@ async def import_config(payload: dict, db=Depends(get_db)):
             new_row = True
         else:
             new_row = False
-            if prim is not None and row.vod_source_id != prim.id:
-                row.vod_source_id = prim.id
-        row.group_name = e.get("group_name")
-        row.logo = e.get("logo")
-        row.tmdb_id = e.get("tmdb_id")
-        row.overview = e.get("overview")
-        row.poster = e.get("poster")
-        row.rating = e.get("rating")
-        row.year = e.get("year")
-        row.enabled = bool(e.get("enabled", True))
-        row.order = int(e.get("order") or 0)
-        row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
+        if new_row:
+            row.group_name = e.get("group_name")
+            row.logo = e.get("logo")
+            row.tmdb_id = e.get("tmdb_id")
+            row.overview = e.get("overview")
+            row.poster = e.get("poster")
+            row.rating = e.get("rating")
+            row.year = e.get("year")
+            row.enabled = bool(e.get("enabled", True))
+            row.order = int(e.get("order") or 0)
+            row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
         await db.flush()
         await _restore_links(VodPlaylistSource, "vod_playlist_id",
                              "vod_source_id", row.id, e.get("sources"),
                              _resolve_vod_source, f"vod-link:{name[:40]}")
-        _bump("inserted" if new_row else "updated")
+        _bump("inserted" if new_row else "existing")
         await db.flush()
 
     for e in pls.get("series", []):
@@ -1132,18 +1139,17 @@ async def import_config(payload: dict, db=Depends(get_db)):
             new_row = True
         else:
             new_row = False
-            if prim is not None and row.serie_source_id != prim.id:
-                row.serie_source_id = prim.id
-        row.group_name = e.get("group_name")
-        row.logo = e.get("logo")
-        row.tmdb_id = e.get("tmdb_id")
-        row.overview = e.get("overview")
-        row.poster = e.get("poster")
-        row.rating = e.get("rating")
-        row.year = e.get("year")
-        row.enabled = bool(e.get("enabled", True))
-        row.order = int(e.get("order") or 0)
-        row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
+        if new_row:
+            row.group_name = e.get("group_name")
+            row.logo = e.get("logo")
+            row.tmdb_id = e.get("tmdb_id")
+            row.overview = e.get("overview")
+            row.poster = e.get("poster")
+            row.rating = e.get("rating")
+            row.year = e.get("year")
+            row.enabled = bool(e.get("enabled", True))
+            row.order = int(e.get("order") or 0)
+            row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
         await db.flush()
         await _restore_links(SeriePlaylistSource, "serie_playlist_id",
                              "serie_source_id", row.id, e.get("sources"),
@@ -1170,14 +1176,13 @@ async def import_config(payload: dict, db=Depends(get_db)):
                 SeriePlaylistSeason.serie_playlist_id == row.id,
                 SeriePlaylistSeason.serie_season_id == sseason.id))).scalar_one_or_none()
             if link is not None:
-                link.enabled = bool(s.get("enabled", True))
-                applied["updated"] += 1
+                applied["skipped"].append(f"serie-season:{name}: existing season link")
             else:
                 db.add(SeriePlaylistSeason(serie_playlist_id=row.id,
                                            serie_season_id=sseason.id,
                                            enabled=bool(s.get("enabled", True))))
                 applied["imported"] += 1
-        _bump("inserted" if new_row else "updated")
+        _bump("inserted" if new_row else "existing")
         await db.flush()
 
     for e in pls.get("local", []):
@@ -1199,13 +1204,12 @@ async def import_config(payload: dict, db=Depends(get_db)):
             new_row = True
         else:
             new_row = False
-            if frow is not None and row.local_file_id != frow.id:
-                row.local_file_id = frow.id
-        row.group_name = e.get("group_name")
-        row.enabled = bool(e.get("enabled", True))
-        row.order = int(e.get("order") or 0)
-        row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
-        _bump("inserted" if new_row else "updated")
+        if new_row:
+            row.group_name = e.get("group_name")
+            row.enabled = bool(e.get("enabled", True))
+            row.order = int(e.get("order") or 0)
+            row.ffmpeg_template_id = _tpl_id(e.get("ffmpeg_template"))
+        _bump("inserted" if new_row else "existing")
         await db.flush()
 
     # ---- legacy `live_playlist` (files predating the `playlists` section):
@@ -1218,6 +1222,9 @@ async def import_config(payload: dict, db=Depends(get_db)):
                 continue
             row = await _first(select(LivePlaylist).where(LivePlaylist.custom_name == name))
             new_row = row is None
+            if not new_row:
+                applied["skipped"].append(f"live-playlist:{name}")
+                continue
             if new_row:
                 row = LivePlaylist(custom_name=name)
                 db.add(row)
@@ -1238,10 +1245,11 @@ async def import_config(payload: dict, db=Depends(get_db)):
 
     for k, v in (data.get("settings") or {}).items():
         row = await db.get(Setting, k)
-        if row is None:
-            row = Setting(key=k)
-            db.add(row)
-        row.value = json.dumps(v)
+        if row is not None:
+            applied["skipped"].append(f"setting:{k}")
+            continue
+        db.add(Setting(key=k, value=json.dumps(v)))
+        applied["imported"] += 1
 
     await db.commit()
     # a restored `favicon` row selects a different tab icon
