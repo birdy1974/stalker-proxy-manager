@@ -1,5 +1,12 @@
 {% extends "base.html" %}
 {% block content %}
+<div class="card mb-3" data-health-problems-only hidden>
+  <div class="card-header" id="playlist-health-heading">Playlist source health</div>
+  <span data-help="Playlist source health" data-help-for="playlist-health-heading">Checks enabled Live, VOD, Series and Local playlist items every 30 seconds. Missing links, empty commands, disabled portals, banned/expired accounts, missing episode fallbacks and missing/unreadable files are reported. Busy accounts and recorded connection failures are warnings. Unverified does not mean working. Recent media-probe/playback evidence lasts 15 minutes in this server process. Local availability checks do not verify decoding. Automatic checks never open streams; Probe source is an explicit, bounded check before FFmpeg. Input catalogue selection flags alone do not disable explicit playback links. Disabled playlist items are excluded.</span>
+  <div id="dashboard-playlist-health" class="card-body">Checking playlist sources…</div>
+</div>
+
+<div class="card mb-3" data-health-problems-only hidden><div class="card-header">EPG guide health</div><div id="dashboard-epg-health" class="card-body py-2">Checking guide coverage…</div></div>
 <div class="row g-3 mb-3" id="stats"><!-- stat cards injected --></div>
 
 <div class="row g-3">
@@ -43,7 +50,7 @@
         <div class="muted-label mt-2">Last requests</div>
         <div id="api-recent" class="small mono" style="max-height:150px;overflow:auto"></div>
       </div>
-      <div class="card-footer small text-muted">
+      <div class="card-footer small text-muted" data-help="API request logging">
         Every request is also written to stdout as <span class="mono">[spm.api]</span> —
         <span class="mono">docker logs stalker-proxy-manager | grep spm.api</span>
       </div>
@@ -64,7 +71,7 @@
         <a class="btn btn-sm btn-outline-secondary" href="/users"><i class="bi bi-person-plus"></i> Xtream users</a>
         <a class="btn btn-sm btn-outline-secondary" href="/settings"><i class="bi bi-download"></i> Backup / restore</a>
       </div>
-      <div class="card-footer small text-muted" id="mock-hint"></div>
+      <div class="card-footer small text-muted" id="mock-hint" data-help="Demo portal"></div>
     </div>
   </div>
 </div>
@@ -186,5 +193,9 @@ $("#kill-all").addEventListener("click", () => confirmDialog({ title: "Kill all 
 $("#reload-streams").addEventListener("click", refreshStats);
 refreshStats();
 setInterval(refreshStats, 10000);
+PlaylistHealth.mount($("#dashboard-playlist-health"), {compact:true});
+EpgControls.health($("#dashboard-epg-health"), true);
+const guideHealthPoll = setInterval(() => EpgControls.health($("#dashboard-epg-health"), true), 30000);
+window.addEventListener("pagehide", () => clearInterval(guideHealthPoll), {once:true});
 </script>
 {% endblock %}

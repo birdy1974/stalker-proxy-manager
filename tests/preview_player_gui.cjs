@@ -1,0 +1,77 @@
+/* node tests/preview_player_gui.cjs (requires jsdom). */
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const {JSDOM} = require('jsdom');
+const dom = new JSDOM('<body></body>', {runScripts:'outside-only'});
+const w = dom.window;
+const source = fs.readFileSync('app/static/js/app.js','utf8');
+w.eval(source.slice(source.indexOf('const $ ='),source.indexOf('/* ----------------------------------------------------- time formatting'))+'\nwindow.el=el;window.esc=esc;');
+w.fmtDur = n => `${n} seconds`;
+w.eval(source.slice(source.indexOf('const probeHtml ='),source.indexOf('const tmdbHtml ='))+'\nwindow.probeHtml=probeHtml;');
+const engines=[],modals=[],timers=new Map();
+let timer=0, probeCall, response, failProbe=false;
+w.setInterval = fn => {timers.set(++timer,fn);return timer;};
+w.clearInterval = id => timers.delete(id);
+w.HTMLMediaElement.prototype.pause = function(){this.wasPaused=true;};
+w.HTMLMediaElement.prototype.load = function(){};
+w.HTMLMediaElement.prototype.play = async function(){this.playCalled=true;};
+w.openModal = ({body,footer,onClose}) => {
+  const root=w.document.createElement('div');root.append(body,footer);w.document.body.append(root);
+  const m={root,footer,close:()=>{onClose();root.remove();}};modals.push(m);return m;
+};
+w.mBtn=(label,cls,fn)=>{const b=w.document.createElement('button');b.textContent=label;b.onclick=fn;return b;};
+w.api=async(url,opts={})=>{
+  if(url==='/api/ffmpeg')return {items:[{id:7,name:'H264 transcode'}]};
+  probeCall={url,opts};
+  if(failProbe)throw new Error('provider busy');
+  return await response;
+};
+w.mpegts={isSupported:()=>true,LoggingControl:{addLogListener:fn=>{w.logCallback=fn;}},
+  Events:{ERROR:'error',MEDIA_INFO:'media',STATISTICS_INFO:'stats',LOADING_COMPLETE:'complete'},
+  createPlayer:opts=>{const e={opts,handlers:{},destroyed:0,on:(event,fn)=>{e.handlers[event]=fn;},destroy:()=>{e.destroyed++;},attachMediaElement:v=>{e.video=v;},load:()=>{},play:async()=>{}};engines.push(e);return e;}};
+const start=source.indexOf('const MSE_OK_VIDEO');
+const end=source.indexOf('\n}',source.indexOf('function playInModal',start))+2;
+w.eval(source.slice(start,end)+'\nwindow.browserPlayable=browserPlayable;');
+const button=(m,text)=>[...m.footer.querySelectorAll('button')].find(b=>b.textContent===text);
+const tick=()=>new Promise(resolve=>setImmediate(resolve));
+(async()=>{
+  assert(w.browserPlayable('avc1.42c01f'));assert(w.browserPlayable('mp4a.40.2'));
+  assert(!w.browserPlayable('mpeg2video'));assert(!w.browserPlayable('ac3'));
+  const m=w.playInModal('/preview/live/123.ts?tpl=7','Test');await tick();
+  const e=engines.at(-1);
+  assert(e.video.muted && e.video.defaultMuted,'dynamic autoplay video must actually be muted');
+  button(m,'Enable sound').click();assert.equal(e.video.muted,false);
+  e.handlers.media({videoCodec:'avc1.42c01f',audioCodec:'mp4a.40.2',width:1920,height:1080});
+  assert(!m.root.textContent.includes('not playable'));
+  w.logCallback('verbose','real log text');assert(m.root.textContent.includes('verbose: real log text'));
+  response=new Promise(resolve=>{w.resolveProbe=resolve;});
+  button(m,'Probe stream').click();await tick();
+  assert.equal(e.destroyed,1);assert(e.video.wasPaused);assert.equal(timers.size,0);
+  assert(button(m,'Probe stream').disabled);assert(m.root.textContent.includes('Probing source'));
+  assert.equal(probeCall.url,'/api/playlist/probe?scope=source&kind=live&id=123');
+  w.resolveProbe({probe:{videos:[{codec:'h264',width:1920,height:1080}],audio:[{codec:'aac'},{codec:'ac3'}],technical:{streams:[{tag:'<img src=x onerror=alert(1)>'}]}}});await tick();
+  assert(!button(m,'Probe stream').disabled);assert(m.root.textContent.includes('before FFmpeg'));
+  assert(m.root.textContent.includes('ac3'));assert.equal(m.root.querySelectorAll('img').length,0);
+  assert(m.root.querySelector('details'));
+  failProbe=true;button(m,'Probe stream').click();await tick();
+  assert(m.root.textContent.includes('provider busy'));assert(!button(m,'Probe stream').disabled);
+  failProbe=false;response=Promise.resolve({probe:{error:'Stream unavailable'}});
+  button(m,'Probe stream').click();await tick();assert(m.root.textContent.includes('Stream unavailable'));
+  button(m,'Replay').click();await tick();assert.equal(engines.length,2);assert(!m.root.isConnected);
+  const replay=modals.at(-1);const select=replay.footer.querySelector('select');select.value='7';
+  [...replay.footer.querySelectorAll('button')].find(b=>b.textContent==='Retry with').click();await tick();
+  assert.equal(engines.at(-1).opts.url,'/preview/live/123.ts?tpl=7');
+  modals.at(-1).close();assert.equal(timers.size,0);assert.equal(w.__spmActiveDiag,null);
+  const playlist=w.playInModal('/preview-play/series/456.ts','Series');
+  response=new Promise(resolve=>{w.resolveProbe=resolve;});button(playlist,'Probe stream').click();await tick();
+  assert.equal(probeCall.url,'/api/playlist/probe?scope=playlist&kind=series&id=456');
+  playlist.close();assert(probeCall.opts.signal.aborted);
+  w.resolveProbe({probe:{error:'late result'}});await tick();assert(!playlist.root.textContent.includes('late result'));
+  w.mpegts.isSupported=()=>false;
+  const unsupported=w.playInModal('/preview-play/local/1.ts','Local');
+  assert(unsupported.root.textContent.includes('Not playing'));
+  assert(button(unsupported,'Probe stream'),'probe remains available without browser playback support');
+  unsupported.close();
+  dom.window.close();
+  console.log('Preview GUI passed: real mute state, codecs/logs, stop/probe/loading/error/retry, escaped metadata, replay/templates, cancellation and cleanup.');
+})().catch(e=>{console.error(e);dom.window.close();process.exitCode=1;});

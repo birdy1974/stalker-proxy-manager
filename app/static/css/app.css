@@ -130,3 +130,30 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
   white-space: nowrap;
 }
 .genre-cols .genre-empty { grid-column: 1 / -1; }
+
+/* Explanatory help is opt-in: operational status/errors are never hidden. */
+[data-help], [data-help-detail] { display: none !important; }
+.help-tip-button {
+  min-width: 1.5rem;
+  min-height: 1.5rem;
+  line-height: 1.2;
+  flex-shrink: 0;
+  text-decoration: none;
+}
+.help-tip-button[hidden] { display: none !important; }
+.help-tip-button:focus-visible { outline: 2px solid var(--bs-primary); outline-offset: 2px; }
+.help-tooltip { pointer-events: auto; z-index: 1100; }
+.help-tooltip .tooltip-inner {
+  max-width: min(420px, calc(100vw - 24px));
+  max-height: min(420px, 60vh);
+  overflow-y: auto;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  padding: .65rem .8rem;
+}
+
+/* Reorder progress is operational feedback, not a help tooltip. */
+.order-status { min-height: 1.5rem; }
+.table-host.order-saving { cursor: progress; }
+.table-host.order-saving .row-drag { cursor: progress; opacity: .5; }

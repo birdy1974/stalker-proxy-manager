@@ -129,7 +129,7 @@ async def test_page_budget_setting_caps_fetch_without_restart():
 async def test_output_base_url_setting_rewrites_playlist_and_user_urls():
     async with SessionLocal() as s:
         s.add(User(name="alice", password="pw", enabled=True,
-                   m3u_enabled=True, xtream_enabled=True))
+                   m3u_enabled=True, xtream_enabled=True, groups_json='{"live":["NL"]}'))
         s.add(LivePlaylist(custom_name="NPO 1", enabled=True, group_name="NL"))
         await s.commit()
 

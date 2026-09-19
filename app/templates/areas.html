@@ -14,10 +14,10 @@
     <div class="card">
       <div class="card-header d-flex justify-content-between align-items-center">
         <span id="ed-title">Playback area</span>
-        <span class="small text-muted">one playlist · different FFmpeg per room/device</span>
+        <span class="small text-muted" data-help="Playback areas" data-help-for="ed-title">one playlist · different FFmpeg per room/device</span>
       </div>
       <div class="card-body">
-        <p class="small text-muted">The Playlist is defined once. An area only chooses which FFmpeg template
+        <p class="small text-muted" data-help="Area defaults" data-help-for="a-name">The Playlist is defined once. An area only chooses which FFmpeg template
           the same channel plays with. Users keep their group whitelist (what they see) and pick an area here
           (how it is delivered). Empty kind defaults inherit the playlist column.</p>
         <div class="row g-2">
@@ -29,10 +29,10 @@
           <div class="col-12"><label class="muted-label">Notes</label>
             <input class="form-control form-control-sm" id="a-notes" placeholder="optional"></div>
         </div>
-        <div class="muted-label mt-3 mb-1">Kind defaults (empty = inherit playlist FFmpeg column)</div>
+        <div class="muted-label mt-3 mb-1" title="Empty defaults inherit the playlist FFmpeg column.">Kind defaults</div>
         <div class="row g-2" id="a-defaults"></div>
         <div class="d-flex align-items-center gap-2 mt-3 mb-1">
-          <div class="muted-label mb-0">Exceptions (this channel only)</div>
+          <div class="muted-label mb-0" title="Override the template for individual channels in this area only.">Exceptions</div>
           <button class="btn btn-xs btn-outline-secondary ms-auto" id="ex-add" type="button">
             <i class="bi bi-plus"></i> Add exception…</button>
         </div>
@@ -113,7 +113,7 @@ function paintEditor(row) {
 async function loadExceptions() {
   const host = $("#ex-table");
   if (!current) {
-    host.innerHTML = '<div class="small text-muted">Save the area first, then add per-channel exceptions.</div>';
+    host.innerHTML = '<div class="small text-muted">Area not saved.</div><span data-help="Area exceptions" data-help-for="ex-add">Save the area first, then add per-channel exceptions.</span>';
     exTable = null;
     return;
   }
@@ -210,7 +210,7 @@ $("#ex-add").addEventListener("click", () => {
   const list = el("div", { class: "list-group mt-2", style: "max-height:320px;overflow:auto" });
   const picked = new Set();
   const body = el("div", {},
-    el("p", { class: "small text-muted mb-2" },
+    el("p", { class: "small text-muted mb-2", "data-help":"Area exceptions" },
       "Pick playlist items. They keep their catalog row — only this area’s FFmpeg changes."),
     el("div", { class: "row g-2" },
       el("div", { class: "col-4" }, kindSel),

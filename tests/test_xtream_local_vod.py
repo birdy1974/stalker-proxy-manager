@@ -23,7 +23,8 @@ async def _seed(tmp_path):
     stat = path.stat()
     async with SessionLocal() as session:
         user = User(name="android", password="pw", enabled=True,
-                    m3u_enabled=False, xtream_enabled=True, max_connections=2)
+                    m3u_enabled=False, xtream_enabled=True, max_connections=2,
+                    groups_json='{"local":["My local movies"]}')
         source = LocalSource(directory=str(folder), enabled=True)
         session.add_all([user, source])
         await session.flush()

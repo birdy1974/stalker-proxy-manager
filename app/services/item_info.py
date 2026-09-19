@@ -80,7 +80,7 @@ def choose_mac(portal, macs, *, avoid_busy: bool):
         "streaming holds the panel's single connection slot, and a second "
         "concurrent media link on it is answered HTTP 456 (ffmpeg rc=8, no "
         "bytes). Stop the channel on the box (or wait for the lease to "
-        "expire) and run the demo again.")
+        "expire) and try again.")
 
 
 async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None,
@@ -105,6 +105,7 @@ async def playable_url(db, cmd: str, portal_id: int, kind: str, *, src=None,
         if mac:
             if used is not None:
                 used["mac"] = mac.mac
+                used["mac_id"] = mac.id
                 used["portal"] = portal.name
             flags = getattr(src, "link_flags", None) if src is not None else None
             force = bool(getattr(mac, "force_ch_link_check", False))
@@ -203,11 +204,14 @@ async def playlist_primary_input(db, kind: str, pid: int):
             season_links = (await db.execute(
                 select(SeriePlaylistSeason).where(
                     SeriePlaylistSeason.serie_playlist_id == pid,
-                    SeriePlaylistSeason.enabled.is_(True)))).scalars().all()
+                    SeriePlaylistSeason.enabled.is_(True))
+                .join(SerieSeason, SeriePlaylistSeason.serie_season_id == SerieSeason.id)
+                .order_by(SerieSeason.season_number, SeriePlaylistSeason.id))).scalars().all()
             for sl in season_links:
                 eps = (await db.execute(select(SerieEpisode).where(
-                    SerieEpisode.serie_season_id == sl.serie_season_id)
-                    .order_by(SerieEpisode.episode_number).limit(1))).scalars().all()
+                    SerieEpisode.serie_season_id == sl.serie_season_id,
+                    SerieEpisode.cmd.isnot(None), SerieEpisode.cmd != "")
+                    .order_by(SerieEpisode.episode_number, SerieEpisode.id).limit(1))).scalars().all()
                 if eps:
                     break
         if not eps or not eps[0].cmd:
@@ -256,6 +260,48 @@ async def resolve_playlist_input(db, kind: str, pid: int,
             raise ValueError(f"could not resolve a playable URL for '{name}'")
         return {"kind": kind, "id": pid, "name": name, "url": url, "is_url": True,
                 "source": src_name, "cmd": cmd, "mac": used.get("mac", ""),
-                "portal": used.get("portal", "")}
+                "portal": used.get("portal", ""), "mac_id": used.get("mac_id")}
     return {"kind": kind, "id": pid, "name": name, "url": cmd, "is_url": False,
             "source": src_name, "cmd": cmd, "mac": "", "portal": ""}
+
+
+async def resolve_preview_probe(db, scope: str, kind: str, ref_id: int) -> dict:
+    """Resolve the original input of a preview; series-source IDs are episode IDs."""
+    from .playlist_health import signature
+    if scope == 'playlist' and kind in PLAYLIST_KINDS:
+        resolved = await resolve_playlist_input(db, kind, ref_id, avoid_busy=True)
+        _, _, _, source = await playlist_primary_input(db, kind, ref_id)
+        if kind == 'local':
+            item = await db.get(LocalPlaylist, ref_id)
+            source = await db.get(LocalFile, item.local_file_id) if item else None
+        if source is not None:
+            resolved['_health_key'] = signature(source, resolved['url'] if kind == 'local' else None)
+        return resolved
+    if scope not in ('source', 'playlist'):
+        raise ValueError('scope must be source or playlist')
+    if kind in ('episode', 'series'):
+        src = await db.get(SerieEpisode, ref_id)
+        season = await db.get(SerieSeason, src.serie_season_id) if src else None
+        serie = await db.get(SerieSource, season.serie_source_id) if season else None
+        portal_id = serie.portal_id if serie else None
+        link_kind = 'series'
+    elif scope == 'source' and kind in ('live', 'vod'):
+        src = await db.get(LiveSource if kind == 'live' else VodSource, ref_id)
+        portal_id = src.portal_id if src else None
+        link_kind = kind
+    elif scope == 'source' and kind == 'local':
+        src = await db.get(LocalFile, ref_id)
+        directory = await db.get(LocalSource, src.local_source_id) if src else None
+        if not directory:
+            raise ValueError('local file not found')
+        path = local_file_path(directory.directory, src.relative_path)
+        return {'url':path, 'is_url':False, 'name':src.filename, '_health_key':signature(src, path)}
+    else:
+        raise ValueError('unsupported preview type')
+    if not src or not portal_id or not src.cmd:
+        raise ValueError('source not found or has no stream command')
+    used = {}
+    url = await playable_url(db, src.cmd, portal_id, link_kind, src=src, avoid_busy=True, used=used)
+    if not url:
+        raise ValueError('no playable source URL')
+    return {'url':url, 'is_url':True, 'name':getattr(src, 'original_name', None) or getattr(src, 'name', None), 'mac_id':used.get("mac_id"), '_health_key':signature(src)}

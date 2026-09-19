@@ -107,8 +107,8 @@ async def test_m3u_extension_follows_the_users_area():
                     ffmpeg_template_vod_id=names[E2_VOD_REMUX_PRESET_NAME])
         s.add(area)
         await s.flush()
-        user = User(name="e2", password="pw", m3u_enabled=True, area_id=area.id)
-        plain = User(name="vlc", password="pw", m3u_enabled=True)
+        user = User(name="e2", password="pw", m3u_enabled=True, area_id=area.id, groups_json='{"vod":["Action"]}')
+        plain = User(name="vlc", password="pw", m3u_enabled=True, groups_json='{"vod":["Action"]}')
         s.add_all([user, plain])
         await s.commit()
         u, p = user, plain

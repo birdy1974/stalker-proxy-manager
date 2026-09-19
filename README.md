@@ -17,6 +17,11 @@ docker compose up -d --build
 - GUI: **http://<host>:8880** (login admin / your password)
 - Postgres 16 runs in its own container next to the app (state in named volumes).
 - Quick Sync: `/dev/dri` is passed through by default (DS918+).
+- Optional TMDB metadata: set `SPM_TMDB_API_KEY` in `.env` before the first start.
+  `docker-compose.yml` passes it to the app to initialize **Settings → TMDB API key**.
+  Use your TMDB **API key (v3)**, not the API Read Access Token. Existing saved
+  settings, including an empty key, are never overwritten on restart; for an
+  existing installation, change the key in the GUI. Keep your real key out of Git.
 - Binding `./media` from the host? Set `PUID`/`PGID` in `.env` to that folder's owner, otherwise the app cannot list it — see [Permissions](#permissions-running-as-your-own-user-puid--pgid).
 
 Pre-built image (built by GitHub Actions on every release):
@@ -43,8 +48,10 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here �
 | `SPM_MEDIA_ROOT` | `/media` | local video files mount |
 | `SPM_DATABASE_URL` | sqlite | `postgresql+asyncpg://user:pass@host:5432/dbname` to switch to Postgres; if that Postgres cluster exists but `dbname` does not yet, the app creates it automatically when the credentials allow `CREATE DATABASE` |
 | `SPM_ADMIN_USERNAME` / `SPM_ADMIN_PASSWORD` | `admin` / *(required)* | GUI login |
+| `SPM_TMDB_API_KEY` | empty | Initial TMDB API key (v3) when the database setting is missing; saved GUI settings take precedence, including an explicitly empty value |
 | `SPM_VAAPI_DEVICE` | `/dev/dri/renderD128` | Intel Quick Sync render node |
-| `SPM_PROBE_TIMEOUT` | `30` | seconds a detail-popup stream probe may take before reporting a timeout (network streams are probed with the MAG identity) |
+| `SPM_PROBE_TIMEOUT` | `30` | seconds a stream probe may take before reporting a timeout (network streams use the MAG player identity) |
+| `SPM_FFPROBE_BIN` | companion to FFmpeg | Optional ffprobe executable override for detailed technical probes; included by the Docker image’s FFmpeg package |
 | `SPM_PORTAL_WARM_INTERVAL` | `600` | seconds between background pre-authentication passes for resolved portal/MAC sessions |
 | `SPM_ROUTE_AFFINITY_TTL` | `1800` | seconds to prefer the source/MAC that most recently produced stream bytes |
 | `SPM_STREAM_START_BUDGET` | `75` | seconds the fallback engine may spend looking for a first byte before it gives up (0 = no cap). Covers `candidates × SPM_STREAM_START_TIMEOUT × passes`; the output guard waits for this budget plus `SPM_START_BUDGET_SLACK` before answering 502, so the engine is never cut off mid-chain |
@@ -161,11 +168,134 @@ and, when the ids do not match:
    | `no-data` | the link was built but sent nothing: the slot is held mid-flight (a zap, another device, a panel timeout pending) |
    | `busy-ours` | this proxy is using the MAC — answered from local state without touching the panel |
 
+   In **Add/Edit portal**, **Resolve** enables as soon as a name, URL and valid MAC are entered. It tests the current (including unsaved) URL/MAC, proxy, TLS, identity and timezone settings without creating or updating the portal. **Save** remains explicit. The portal-list Resolve action still resolves and stores metadata for the saved portal.
+
    The test costs one portal request and a few seconds of that MAC's connection slot, which is why it is a button and never automatic; `POST /api/portals/{id}/macs/probe` runs it for every MAC of a portal (sequential on purpose — a panel that rate-limits dislikes four concurrent slot tests).
 2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season. In the **Edit portal** popup this is a two-step flow: *Fetch genres* loads the live/VOD/series genre lists (all disabled by default — including the synthetic *(All VOD)* / *(All series)* a portal without categories gets), you tick the genres you want (the filter box narrows the list as you type), and **Save** then fetches the items of exactly those enabled genres.
 3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels. The **channel number** of a live channel *is* its position in the final playlist, kept in sync both ways: saving a new "Channel number (opt)" in the Edit-channel popup moves the channel to that position (the others push down), and reordering, deleting or toggling channels re-derives every number from its position — so `tvg-chno` and the row order can never disagree. A live channel's number can also be **locked** (the lock toggle in the Live table's *Number* column, or *lock number* in the Edit-channel popup, which makes the number field read-only): a locked channel keeps that number through reordering, deletes, adds and toggles — the other channels renumber around it and skip the locked number — and its row is no longer draggable (the grip becomes a lock icon, other rows still drag past it). Clicking a **VOD** or **Series** row (or its ⓘ button) opens the same detail popup as Input Sources — stored portal metadata, a lazy **stream probe** (codec/resolution/bitrate) and **TMDB** enrichment. The ▶ *test stream* buttons (here and in Input Sources) open the preview player, which closes via its header **×** or the **Stop & Close** button.
 4. **Users** – each user gets `username/password` and can receive **M3U** and/or **Xtream** URLs (copy-buttons in the GUI). Per-user active-connection caps enforced.
 5. **Dashboard** – counters, active streams with kill buttons, quick actions (fetch, retry-busy), messages pane.
+
+### Web preview and technical stream information
+
+Use **▶ / Play test** to open a browser preview. Playlist previews stay on the
+same-origin proxy, including when Redirect is the configured default; Local
+files are remuxed instead of returning a raw MP4 under a `.ts` URL. Series
+previews select the first playable episode in the first enabled linked season.
+This does not change delivery to M3U/Xtream clients.
+
+**Probe stream** stops only this preview, releases its connection, and runs a
+fresh technical inspection. **Replay** resumes playback; **Enable sound**
+unmutes the initially muted player. The report includes all reported video,
+audio and subtitle tracks: codecs/profiles, resolution, frame rate, aspect
+ratio, bitrates, pixel format/bit depth, color information, sample rate,
+channel layout, container and duration. Expand **All technical metadata
+(JSON)** for the remaining ffprobe stream, format, program and chapter fields.
+Unavailable fields are marked *Not reported*, not estimated.
+
+The report describes the **original input before FFmpeg processing**, not the
+transcoded preview output. Playlist probes inspect the **primary source**, which
+may differ from a fallback used for playback. They skip occupied portal MACs,
+reserve the chosen MAC while probing and release it on completion, cancellation
+or timeout. With all connections busy, retry later; other viewers are not
+stopped. Browser help icons explain this without adding permanent help text.
+
+Detailed probing uses ffprobe (bundled in the Docker image); installations
+without it show an explicitly labelled FFmpeg summary instead. The authenticated
+`GET /api/playlist/probe?scope=source|playlist&kind=…&id=…` API accepts stored item
+IDs, not arbitrary URLs or paths. For source Series previews the ID identifies
+an **episode**; for playlist Series it identifies a **series playlist**. The
+raw input filename/URL field is omitted from the returned ffprobe format data.
+
+Browser playback still requires browser-supported codecs and an MPEG-TS preview
+template. H.264/AAC is the safest choice; unsupported source codecs require a
+transcode template rather than Copy. Source previews offer **Retry with** to test
+another template without changing the saved settings.
+
+### Playlist source health
+
+Only **Settings** always shows both **Playlist source health** (Live, VOD, Series
+and Local) and **EPG guide health**, refreshed every 30 seconds. On **Dashboard**
+and **Playlist**, each panel appears only when it has an alert or its health
+check fails, and disappears again when resolved. Unverified playlist inputs alone
+do not trigger an alert. Hidden panels keep checking in the background; both
+summaries remain visible in Settings even when everything is healthy. Only enabled playlist
+items are counted. Expand the Playlist details to filter by type/status/name or
+group, inspect individual source reasons, and open the relevant item editor—even
+when it is not on the current table page.
+
+- **No usable source:** missing playback links, empty commands, missing/disabled
+  portals, no eligible MAC accounts, missing local files, or recent unsuccessful
+  media probes on every otherwise eligible input.
+- **Needs attention:** a bad fallback, partial Series coverage, busy accounts,
+  recorded connection/authentication problems, or recent playback failures.
+  Playback failure can also be caused by output/FFmpeg settings; it is not proof
+  that the input is broken.
+- **Unverified:** structurally usable input without recent media evidence. A
+  successful redirect/link resolution alone is **not** proof of working media.
+- **Available / verified:** a readable, nonempty local file, or a portal input
+  recently confirmed by a media probe or actual FFmpeg output bytes. File
+  availability alone does not verify decoding or the output template.
+
+Automatic checks are **passive**: batched database reads and bounded, off-thread
+filesystem checks, with no stream opens or portal requests. **Source details →
+Probe source** explicitly checks that input before FFmpeg, respects busy MACs,
+and cancels when the dialog closes. Testing a primary does not test its fallbacks.
+Successful media evidence and explicit probe failures expire after 15 minutes;
+repeated playback failures are short-lived warnings using the playback breaker
+cooldown. Evidence is bounded and process-local (reset by a restart), not a new
+persistent setting or backup table. Failed checks are retryable, not permanent
+blacklists. Filesystem results are cached for up to 15 seconds; a stalled mount
+is reported as unverified rather than missing.
+
+Series checks cover **every exported episode** in enabled playlist seasons and
+match fallback sources by season/episode number. Detail dialogs show up to 40
+candidate inputs, prioritizing problems; totals cover all episodes. The checks
+follow the configured MAC-first/portal-first playback policy. Input-catalogue
+selection flags are warnings, not playback gates for explicit existing links.
+
+Admin API: `GET /api/playlist/health` (`kind`, `status`, `q`, `page`, `per_page`).
+No credentials, stream commands or raw probe errors are included in this report.
+
+### EPG setup and matching
+
+The three requested Rytec NL Basic feeds are enabled once on upgrade. Settings
+now includes **Check portal EPG**, **Use source portal EPG**, and a selectable
+refresh interval (1–168 hours; **0 pauses** automatic refresh). Portal guide
+checks use authenticated Stalker bulk/short EPG APIs, skip busy MACs and never
+open a video stream. Availability and guide horizon depend on the provider.
+
+Use **Edit channel → Match EPG** or **Settings → Match channels** for fuzzy
+matching. Ambiguous IDs open a chooser rather than being guessed; existing
+assignments are preserved unless explicitly approved. **Review existing EPG
+assignments too** includes already-matched channels. Matching distinguishes
+channel numbers and `+` variants, deduplicates mirror IDs, and reprocesses cached
+programmes after selections are saved.
+
+**Edit channel → Guide priority & timing** adds ordered per-source guide IDs,
+optional gap filling, and channel/per-mapping minute corrections. Apply stages
+changes; the channel's Save commits them. Each source now retains its own
+programmes, so refresh order cannot override priority.
+
+Each EPG source's **Schedule & timing** button selects an inherited interval, a custom
+1–168-hour interval, or manual-only mode, plus a stale threshold. Global **0**
+still pauses all automatic refreshes. **Dashboard → EPG guide health** and
+**Settings → Guide alerts** report missing/current-gap/stale guides and failed
+sources. Alerts use the same corrected, priority-resolved schedules as XMLTV.
+
+Source timing offers **Automatic**, **missing-offset timezone**, or **override
+supplied timezone** modes using named IANA zones with daylight-saving rules,
+plus a source-wide ±1440-minute correction. Corrections add to channel/mapping
+offsets without compounding. An offline preview shows original and corrected
+times before saving. Timezone changes reprocess cached originals; pending changes
+are flagged until the guide is successfully reinterpreted. Older portal caches
+need one fresh download to support timezone overrides.
+
+**Users → output URLs → Copy EPG URL** provides the authenticated XMLTV URL for
+external applications, filtered to that user's enabled Live channels/groups.
+M3U `tvg-id`, Xtream `epg_channel_id`, and XMLTV channel/programme IDs agree.
+See [EPG operation, verified-source research and improvement options](docs/EPG.md)
+for details, limitations and free Viaplay guide recommendations.
 
 ### Client URLs (per user)
 
@@ -188,6 +318,94 @@ transcoded container extension. They are not exposed as Series; native M3U and
 Enigma2 organization remain unchanged.
 
 Users only ever talk to port **8880** — GUI, streams, playlists and APIs share it.
+
+### Broader source matching in the channel editor
+
+In **Playlist Builder → Add/Edit channel**, **Less strict matching** widens the
+source-name search while keeping the closest matches first. Normal matching is
+the default each time the editor opens. When there are no matches, click
+**Try less strict matching** to turn it on. Both modes show up to 60 enabled
+sources; neither changes the custom channel name or existing fallback chain.
+For manual selection, turn on **Show all source channels** to ignore the custom
+channel name entirely (including sources already used in other channels).
+The separate **Filter source channels** field searches words in channel and
+portal names, ignoring case; every word must match. Leave it blank to browse all
+enabled sources, and use **Load more** to go beyond the first 60. Switching this
+mode off restores name matching and the previous less-strict setting. Neither
+search field nor browsing mode changes the channel name or chain automatically.
+Help icons explain each option.
+
+Regression tests: `pytest tests/test_playlist_suggest.py` and
+`node tests/playlist_matching_gui.cjs` (requires `jsdom`).
+
+### User group selections
+
+**Users → Add/Edit user** offers **Select all** and **Deselect all** separately
+for Live, VOD, Series, and Local, with a selected-count indicator. New users
+start with all **currently available** groups selected in all four lists.
+Only selected groups are included in their M3U/Xtream catalogues, XMLTV and
+assigned Enigma2 bouquets. Clearing a list hides that entire content type;
+clearing all four produces an empty catalogue. There is no empty-list wildcard.
+
+**Existing users:** empty or missing lists now mean no groups too. To retain
+visibility for a type previously using an empty list, edit the user, select all
+for that type, and save. New groups added later must be explicitly selected.
+Blank playlist group names are offered under Live, VOD, Series, or Local files.
+The separate optional Enigma2 *receiver* filter is unchanged; it cannot expand
+an assigned user's selections. This changes catalogue visibility, not the
+separate stream URL authentication mechanism.
+
+API creation without a `groups` field selects all current groups; an explicit
+`groups: {}` or empty per-type lists selects none. Updates without `groups`
+retain the user's existing selections.
+
+Regression tests: `pytest tests/test_user_group_selection.py tests/test_group_whitelist.py`
+and `node tests/user_groups_gui.cjs` (requires `jsdom`).
+
+### Bulk enabling and playlist order
+
+Enabling a selection in **Input Sources** appends new Live, VOD, Series, and
+Local entries with distinct increasing **Ord** values, following the submitted
+selection order. Existing entries keep their positions when re-enabled; Live
+sources with the same channel name still join that channel's fallback chain.
+Database transaction locks serialize concurrent additions, including across
+app workers (PostgreSQL advisory locks; SQLite write reservations).
+
+At startup, and before allocating new positions, historical duplicate or
+nonpositive order values are repaired in their existing `(order, id)` sequence.
+Disabled entries are included so their positions remain reserved. Names,
+groups, templates, fallback chains and locked Live channel numbers are retained.
+Drag reordering on later pages or filtered results reuses those rows' actual
+positions rather than restarting at 1.
+
+Drag/drop moves the row immediately and displays **Saving order…** with a
+spinner, then **Order saved.** once the transaction completes. Conflicting table
+controls are paused during the save. The response supplies confirmed order and
+Live channel numbers directly, avoiding a second enriched playlist reload.
+Failed saves restore the previous display with a visible retry message. Sort
+by **Ord ascending** to drag; locked Live channels remain protected.
+
+Regression tests: `pytest tests/test_bulk_source_order.py tests/test_playlist_order.py
+ tests/test_live_number_order_sync.py`, `node tests/playlist_order_gui.cjs`, and
+`node tests/playlist_drag_feedback_gui.cjs` (requires `jsdom`).
+
+### Fast group and template assignment
+
+In all four **Playlist** tabs, group and FFmpeg-template changes show **Saving…**,
+then **Saved**, directly beside the control. A failed save restores the previous
+displayed value and shows a retry/reload message. Bulk assignment dialogs show
+progress, prevent duplicate submissions and stay open on failure.
+
+Ordinary assignments update the visible row and its cached editor values without
+reloading the entire page. Group-sorted/filtered views still refresh when needed.
+Bulk group/template assignments use bounded SQL updates rather than loading each
+selected playlist row; channel order, numbers and number locks are unchanged.
+
+Group fields select their text on first focus/click, including keyboard focus.
+A second click places the caret normally, and mouse dragging can select text.
+Row dragging is disabled over editable controls; use the grip or non-editable
+part of the row to reorder. Reordering continues to show **Saving order…**, and
+is blocked while an assignment is being saved to avoid conflicting changes.
 
 ### Fast playlist and stream startup
 
@@ -227,6 +445,80 @@ Templates are full editable ffmpeg commands with GUI field ↔ command **2-way s
 * **Your flags win.** The resilience options (`-reconnect …`, `-rw_timeout`, `-fflags`, `-err_detect`) and the container options (`-mpegts_flags`, `-hls_time`, `-hls_list_size`, `-hls_flags`) are defaults, not policy: if the command already sets one, the renderer leaves it alone instead of adding a second occurrence — so `-reconnect 0` in the extra args means 0.
 * **Looking at a template does not change it.** Parsing is a fixed point (no flag piles up on the second pass), and it is deliberately *partial*: the editor sends the row's own fields along as the base, so a CQP command — which carries no bitrate by design — does not reset the template's tuning, and a command with no `-rc_mode` at all stays `AUTO` rather than inheriting the shipped default.
 
+### Help throughout the GUI
+
+Explanatory text on main pages and in dialogs is available through the **? help**
+icons instead of permanent paragraphs. Hover, focus with the keyboard, or tap/click
+an icon to read it. **Escape**, another tap, or clicking outside dismisses it without
+closing the dialog. Status, errors, results, destructive-action warnings and
+confirmation checkboxes remain visible. Help is refreshed for dynamically loaded
+forms and changing FFmpeg dependencies.
+
+GUI contributors: mark explanation nodes with `data-help="Subject"` and optionally
+`data-help-for="control-id"`; do not mark containers that contain controls, results
+or warnings. Existing field-label `title` hints are upgraded automatically. Source
+nodes are retained for updates and accessibility; tooltip content is rendered as
+plain text. Regression checks: `pytest -n 0 tests/test_help_tooltips.py` and
+`node tests/help_tooltips_gui.cjs` (requires `jsdom`).
+
+### Editing parameters
+
+Click a template (or **New**) to edit it directly in the main settings pane.
+There is no separate editor popup. Use **Save template** to save the draft.
+
+Use **Default template → Set default** above the template list to select the
+fallback for items without an explicit item/area template. A new installation
+starts with **Redirect (bypass ffmpeg)**; later choices (including built-in
+presets) survive restarts. Changing the default does not save or discard the
+current editor draft. The default must be enabled; select another default before
+disabling or deleting it.
+
+- Every form field has a keyboard/touch-accessible **? help** button with units,
+  scope, and relevant limitations.
+- Dropdowns provide sensible presets. **Custom value…** is available for device
+  paths, encoder names, bitrates, resolution/aspect, frame rate, GOP, profile/level,
+  quantizer, encoder queue depth, and audio parameters. Known app modes (hardware
+  path, filter preset, subtitle mode, output path and VAAPI rate-control mode)
+  retain fixed choices rather than pretending arbitrary values are supported.
+- Custom dimensions such as `1600x1000` or an even height such as `900p` work in
+  structured mode. Explicit dimensions override Aspect. Fractional frame rates
+  such as `23.976`, `29.97` and `59.94` are offered. Form and API range validation
+  catches invalid numeric settings before saving (for example CQP outside 0–51).
+- Controls that the current configuration ignores are **disabled**, with the reason in their help tooltip.
+  Both preset and custom inputs retain their saved values and become editable again
+  when relevant. This covers video/audio copy, CPU/device selection, resize/aspect,
+  codec-specific tuning, lossless audio bitrate, and all VAAPI rate-control modes.
+  CQP/ICQ disable bitrate/maxrate/buffer; AVBR disables maxrate/buffer; CBR disables
+  maxrate when an explicit buffer is set (otherwise maxrate can supply its buffer
+  fallback). Quality applies to CQP/ICQ/QVBR. Invalid inactive values do not block
+  saving another mode; they are validated on reactivation. Storage limits still apply.
+  Incompatible filter/subtitle and guided advanced choices are also disabled, without
+  locking the selector itself. Unknown custom codecs, runtime input protocols and
+  arbitrary raw extra flags are not guessed: raw flags remain an expert escape hatch
+  and are never automatically removed when changing modes.
+- **Advanced FFmpeg options** offers 26 common input/output parameters, including
+  read timeout, reconnect behavior, probe size, analysis duration, encoder preset,
+  CRF, threads, packet queues, mux delay, and HLS settings. Choose a suggested value
+  or type one. **Add / replace option** edits the corresponding extra flags; it
+  does not save until **Save template** is clicked. Remove a flag directly from
+  the extra-flags text to return to the generated default. The read timeout has
+  one owner (`-rw_timeout` in Extra input flags), so it is no longer silently
+  replaced by a second control.
+- **Other FFmpeg option…** accepts a build-specific flag, value and input/output
+  placement. For form-owned flags such as `-vf`, `-map` and codecs, or arbitrary
+  filter graphs, use the **full command**. FFmpeg has many codec/build-specific
+  parameters; the GUI suggestions are not an exhaustive list of FFmpeg features.
+  Quoted values, custom encoder presets and explicit dimensions are preserved
+  through command parsing; a manual command remains authoritative until you
+  explicitly switch back to fields mode.
+
+Preset suggestions and numeric checks do **not** guarantee encoder/hardware
+compatibility. The GUI warns about common CPU/VAAPI/QSV mismatches. Use **Validate
+syntax** and **Demo** on the actual host to check its FFmpeg build, drivers, codecs,
+container and player combination. No new database columns are required by this editor.
+Regression checks: `pytest -n 0 tests/test_ffmpeg_editor.py tests/test_ffmpeg_applicability.py tests/test_ffmpeg_defaults.py`; optional DOM checks:
+`node tests/ffmpeg_editor_gui.cjs` (install `jsdom` as described in the backup section).
+
 Shipped presets (stored as rows in the database and **re-seeded on every boot** — see below):
 
 | Template | Use |
@@ -239,7 +531,7 @@ Shipped presets (stored as rows in the database and **re-seeded on every boot** 
 | **Dreambox DM800se (Enigma2 / MPEG2-SD)** | downmix to an MPEG-2 transport stream the ancient Enigma2/openpli box can play (see below) |
 | **Enigma2 VOD - remux + subtitles (MKV)** | container swap only (`-c copy`) into **Matroska**, copying *every* subtitle track (SRT/ASS/PGS/DVB) — the way VOD & series get subtitles without any transcoding (see *Subtitles for VOD & series* below) |
 | **Enigma2 VOD - VAAPI 1080p H.264 + AC3 + subtitles (MKV)** | the 4K/HEVC rescue path: video re-encoded **on the GPU** to H.264 High@4.0 1080p with AC3 audio, subtitles copied through untouched |
-| **Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)** | live TV for a Vu+ Duo2: H.264 High@4.0 1080p + AC3 in MPEG-TS with DVB bitmap subtitles (service reference `1`/`4097`) |
+| **Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)** | live TV for a Vu+ Duo2: H.264 High@4.0 1080p, **VBR**, **source FPS (`src`)**, AC3 in MPEG-TS with DVB bitmap subtitles (service reference `1`/`4097`) |
 | **Redirect (bypass ffmpeg)** | not an ffmpeg command at all — the player is 302-redirected straight to the portal's CDN. **The default template**: any item without an explicit template assignment redirects (see below) |
 
 **Redirect (bypass ffmpeg) is the default.** The old global *proxy vs redirect* switch in Settings is gone: redirect is now a built-in template **and the default**. An item without an explicit template assignment is 302-redirected straight to the portal's CDN — instant start and zero CPU, but no transcode, no transport-stream rewriting and no mid-stream fallback. Assign any other template (inline *FFmpeg tpl* dropdown, the edit dialog, or bulk *Assign template…* in the Playlist Builder) to switch that channel back to ffmpeg proxying/transcoding. The `?mode=redirect` / `?mode=proxy` query parameter still works as a per-URL override.
@@ -257,7 +549,7 @@ item continues to use the template's `.ts` or `.mkv` output extension.
 * they survive deletion (delete one, restart → it is back),
 * they pick up fixes/tuning shipped in new releases,
 * your edits win — a built-in whose command you changed by hand keeps your text,
-* the built-in **default** (*Redirect (bypass ffmpeg)*) is reconciled on every boot, so upgrades switch over too; a default set on a *user-created* template is never overridden.
+* **Redirect (bypass ffmpeg)** is the initial default. The selected enabled default is retained on every boot, whether built-in or user-created; if no valid default remains, Redirect is preferred as the fallback.
 
 > Deleting a built-in template is therefore always safe — the next restart restores it, and the DS918+ reference preset stays available as a fallback.
 
@@ -383,7 +675,7 @@ Service references use the SPM playlist id as the SID (`4097:0:1:2A:…`), so re
 
 
 
-**The VAAPI presets ship on `-rc_mode CQP` — constant quantiser.** Quality is pinned at the QP beside the mode dropdown (default 26) and the bitrate floats with the content: a hard scene does not get smeared into mush to protect a rate target, and a static news card does not burn bandwidth it does not need. CQP is the price of that: the encoder ignores `-b:v`/`-maxrate`/`-bufsize` in this mode, so **the renderer leaves them out of the command entirely** (a command that carries flags the encoder ignores is a command that lies — this text is also what the GUI shows and what you paste into a shell). The numbers stay filled in the template's fields: switch the mode to `VBR` or `CBR` and the tuning below is what you get back. The QP field is only rendered for `CQP`, only for VAAPI encoders, and empty (`AUTO`) means "leave the flag out and let the driver choose".
+**Most VAAPI presets ship on `-rc_mode CQP` — constant quantiser.** The **Vu+ Duo2 live** preset instead ships with **VBR** and **source FPS (`src`)**. Quality is pinned at the QP beside the mode dropdown (default 26) and the bitrate floats with the content: a hard scene does not get smeared into mush to protect a rate target, and a static news card does not burn bandwidth it does not need. CQP is the price of that: the encoder ignores `-b:v`/`-maxrate`/`-bufsize` in this mode, so **the renderer leaves them out of the command entirely** (a command that carries flags the encoder ignores is a command that lies — this text is also what the GUI shows and what you paste into a shell). The numbers stay filled in the template's fields: switch the mode to `VBR` or `CBR` and the tuning below is what you get back. The quality field is rendered for `CQP`, `ICQ` and `QVBR`, only for VAAPI encoders, and empty (`AUTO`) means "leave the flag out and let the driver choose".
 
 **Bitrate numbers are tuned for external (internet) streaming** — that is, for the rate-driven modes. On a LAN the NAS uploads as fast as it likes; over the internet a bursty stream underruns the viewer's download link and stalls. Every transcode preset therefore caps spikes close to the target (`maxrate` ≈ bitrate + 10 %) and carries a ~2-second VBV buffer (`bufsize` = 2× bitrate) so short-lived congestion is absorbed by the encoder instead of freezing the player. The shipped values (used as-is by QSV/software and by the VAAPI presets once the mode is VBR/CBR):
 
@@ -396,7 +688,7 @@ Service references use the SPM playlist id as the SID (`4097:0:1:2A:…`), so re
 | Dreambox DM800se | 1200k | 1300k | 2400k |
 
 * `-low_power 1` selects the **fixed-function H.264 encoder** (`VAEntrypointEncSliceLP` in `vainfo`) instead of the EU/3D path — faster, lower power, and it leaves the GPU's shader units free for more concurrent streams. On this silicon it only exists for **H.264**, so the flag is emitted for `h264_vaapi` only (an HEVC low-power entrypoint would fail).
-* `-rc_mode CQP -global_quality 26` makes rate control **explicit** — VAAPI's implicit "auto" mode is driver-dependent, so the mode and its target are spelled out instead. `QVBR`/`VBR`/`CBR` are there when you need the rate instead of the quality (set *maxrate = bitrate* for true CBR); `ICQ` on the newer drivers behaves like CQP but keeps the rate flags it does honour.
+* `-rc_mode CQP -global_quality 26` makes rate control **explicit** — VAAPI's implicit "auto" mode is driver-dependent, so the mode and its target are spelled out instead. `QVBR`/`VBR`/`CBR` are available when you need a rate target; `QVBR` also takes quality. Explicit CBR uses the target bitrate, not a separate peak. `ICQ` targets quality and omits bitrate limits; `AVBR` keeps target bitrate but omits peak/buffer limits. Driver support varies.
 * `-global_quality` is ffmpeg's generic "encode at this quantiser" option; for `h264_vaapi`/`hevc_vaapi` in CQP it is the QP (0–51, lower = better picture and bigger stream). Live IPTV around 22–30 is the usable band — 26 is where a 720p downscale of broadcast material stops being visible at sane sizes.
 * `-async_depth 4` keeps more frames in flight → higher throughput and a faster time-to-first-frame.
 
@@ -426,7 +718,7 @@ Assign it to a channel/playlist in the Playlist Builder and point the Dreambox a
 
 Why the ladder instead of one hardcoded value: ffmpeg's own default `Lavf/61.x` (no referer) is refused with 403/405 by many panels, the browser UA is refused with **HTTP 456** by `play/live.php` origins and the anti-proxy WAFs in front of them ("redirect/direct plays, every ffmpeg template fails with rc=8 and 0 bytes"), and a few panels do the reverse and refuse any bare `Lavf` — the player→browser ladder plays all three. Set `SPM_STREAM_UA_LADDER=0` to restore the legacy browser-only behaviour; override the player value with `SPM_PLAYER_UA`. The detail-popup **stream probe**, the redirect liveness check and the FFmpeg-tab *playlist demo* walk the same ladder, so they report what the stream path actually gets. The *playlist demo* additionally resolves its link through a MAC that is **not streaming right now** (a MAC that holds a stream holds the panel's single connection slot and 456s a second concurrent link — running a demo beside a playing box used to end as a bare `rc=8, no output`): the result names the MAC it used (`mac=…`), and with no free MAC it says so instead of asking the busy one. A `-user_agent` you write into a template always wins and opts out of the ladder entirely.
 
-At boot the app performs a **hardware sanity check**: if the default template needs VAAPI/QSV but the device is absent, the default degrades to *Copy* with a warning in the log — streams never die silently. (The built-in default is *Redirect*, which needs no GPU, so this only matters once you pick a VAAPI/QSV template as default.)
+At boot the app performs a **hardware sanity check**: if the selected default needs VAAPI/QSV but its device is absent, a warning is logged. Your default selection is not silently changed. Map the GPU device or explicitly select *Redirect*/*Copy* in the FFmpeg tab before using that fallback.
 
 ---
 
@@ -643,6 +935,77 @@ primary/fallback badge) in the same `/api/sources/live` response — no extra ro
 
 ---
 
+## Backup, additive restore & data deletion
+
+Open **Settings → Backup & restore**:
+
+- **Download full backup** saves every column of all **31 database tables** in one
+  version-2 JSON file. This includes every stored setting key (not just the visible
+  form fields), EPG sources/channels/programmes, logs, and all catalog/configuration
+  tables and relationship tables.
+- **Choose tables & settings** supports any individual table, several selected tables,
+  or one stored setting. Referenced parent rows accompany a table automatically, so
+  foreign keys can be rebound on another installation with different database IDs.
+- **Restore**: select a JSON file, choose everything in it, one table, or one setting,
+  then click **Review restore**. The v2 dry run reports additions and existing records
+  per table without saving changes. Tick the required confirmation that **only
+  additional information is added**, then click **Add missing information**.
+  Existing identities and setting values are **never overwritten or deleted**;
+  missing child links can still be added. Repeating a restore does not duplicate
+  records. Invalid references or database conflicts roll back the entire v2 restore.
+- **Settings → Delete stored data** offers one table, one setting, or everything in
+  the database. **Review deletion** lists dependent rows that will also be deleted
+  and rows whose references will be cleared. Confirmation requires both a checkbox
+  and the exact phrase `DELETE SELECTED` or `DELETE EVERYTHING`. This clears data,
+  not the schema. Take a backup first; deletion is permanent.
+
+**Boundaries:** these are database backups, not a filesystem/container image. Media,
+custom uploaded favicon files, disk caches, Docker/environment configuration and the
+GUI admin credentials configured in the environment are not included. Back up those
+separately. Active-stream rows are exported for reference only and skipped on restore:
+processes/streams cannot be resumed from JSON. Stored paths and device settings may
+need adjusting after moving to a different host. The favicon *selection* is a stored
+setting; its uploaded image file is separate.
+
+**Maintenance:** stop streams and finish queued/running fetch jobs before deletion
+(the API refuses deletion while either is active). Avoid concurrent catalog edits,
+scans and refreshes during maintenance. Background tasks may repopulate logs/EPG data;
+built-in templates and default settings are seeded again at startup. Deleting a setting
+immediately makes its environment/application default apply. To restore a backed-up
+value over a current/default value, deliberately delete that setting first, then restore
+it—restore itself never overwrites it.
+
+**Compatibility:** the GUI still accepts old v1 section backups, with an explicit
+legacy warning. Their original omissions/non-portable references cannot be recovered
+from the file. The legacy `GET /api/export?section=...` format remains for older clients;
+use the new v2 interface for complete backups. `POST /api/import` now uses additive
+semantics for sources, playlists and settings too; the old overwrite behavior is gone.
+
+All data-management endpoints require the admin session. Backups contain **unmasked
+passwords, MAC identities and tokens**: do not share or commit them.
+
+| V2 endpoint | Purpose / JSON body |
+| --- | --- |
+| `GET /api/backup/catalog` | All table counts and stored setting keys (no setting values) |
+| `POST /api/backup/export` | `{}` for full backup; or `{"tables":["settings"],"setting_keys":["logo_country"]}` |
+| `POST /api/backup/preview` | `{"data": <backup>}`; optional `tables` / `setting_keys` narrow the scope |
+| `POST /api/backup/restore` | Same body plus `"confirm_add_only": true` |
+| `POST /api/backup/delete-preview` | `{"tables":["portals"]}`, individual settings, or `{"all":true}` |
+| `POST /api/backup/delete` | Same selection plus `"confirm_delete":true` and the exact `confirmation` phrase |
+
+Regression coverage: `tests/test_backup_complete.py` populates **every table and column**,
+round-trips onto a different ID space, tests every table individually, validates additive
+behavior and rollback, and checks deletion cascades and admin authorization. Run:
+
+```sh
+.venv/bin/python -m pytest -n 0 tests/test_backup_complete.py tests/test_backup_sources_playlists.py tests/test_favicon.py
+# Optional DOM integration checks (development only; does not change runtime dependencies):
+npm install --no-save --package-lock=false jsdom
+node tests/backup_gui.cjs
+```
+
+---
+
 ## Browser tab icon (favicon)
 
 Every page of the GUI — dashboard, portals, playlist, **and the login screen** — carries a tab
@@ -854,11 +1217,11 @@ every run red - run it by hand after touching `app/portal/`.
   → they are downloaded server-side, every `<channel>` is indexed, playlist
   channels get fuzzy-matched automatically (empty `epg_id` only — manual
   overrides in the channel editor are never touched), and programmes of matched
-  channels are ingested (now-6h … +7d window, pruned automatically).
+  channels/mappings are ingested (now-78h … +7d interpreted UTC window, pruned automatically).
 - **Merged XMLTV output**: `/xmltv.php?u=…&p=…` and `/epg.xml` now serve a real
   XMLTV document containing exactly the channels the authenticated user can see,
-  with `<icon>`s and all ingested programmes (+48h). The M3U `url-tvg` attribute
-  already points there.
+  with `<icon>`s and current/upcoming programmes (+48h). Use Users → Copy EPG
+  URL to configure it in a player; no automatic M3U EPG-fetch header is added.
 - **tv-logos matcher**: one GitHub tree call is cached as an index of the
   configured `logo_country` folder (+`countries/all` fallback); channel names are
   fuzzy-matched to logo filenames and the best raw.githubusercontent URL is
@@ -879,10 +1242,9 @@ every run red - run it by hand after touching `app/portal/`.
   season picks.
   Everything is written as NAME references (portal, genre, template,
   directory + path), so a backup restores onto another install. Importing
-  sources/playlists is a *restore*, not a plain merge: existing rows are
-  updated in place to the backup's values, missing rows are added, and
-  nothing is deleted - that is what brings back the `enabled` flags, custom
-  names and priorities a re-fetch would have flattened. Portal MACs (with
+  sources/playlists now uses **add-only** semantics: missing rows are added,
+  existing rows keep their current values, and nothing is deleted. Use the
+  v2 Settings backup interface above for complete table/column coverage. Portal MACs (with
   serial, device id and password) are imported too, so a moved install keeps
   speaking the same identity to the panel. Local files back up their catalog
   rows only; the media themselves live on disk under the media root.
@@ -891,8 +1253,8 @@ every run red - run it by hand after touching `app/portal/`.
   kind-default template picks and per-item exceptions by template name;
   Enigma2 profiles export every receiver setting plus the SPM user they
   carry (by name) and the opaque pull token, so a restored box keeps
-  talking to its existing install URL - while machine state (last build/push,
-  counters) stays out, like the MAC health state.
+  talking to its existing install URL. These legacy section exports omit some
+  machine-state columns; the v2 table format includes every database column.
 
 ---
 

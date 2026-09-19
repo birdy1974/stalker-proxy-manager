@@ -6,7 +6,7 @@ User model (Phase-1 decision): admins create users with a name/password pair.
 Each user has m3u_enabled / xtream_enabled, an optional expiry, a
 max_connections limit and a per-type group whitelist:
     {"live": ["News"], "vod": ["Action"], "series": [], "local": []}
-An EMPTY list for a type means "all groups of that type allowed".
+An EMPTY or missing list for a type means no groups of that type allowed.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from sqlalchemy import func, select
 import time
 
 from ..database import SessionLocal
+from .user_groups import clean_groups, group_name as effective_group
 from ..models import (
     Area, AreaItemTemplate, LivePlaylist, LocalFile, LocalPlaylist, LocalSource,
     SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource,
@@ -85,9 +86,7 @@ class UserAuth:
 def _groups(user: User) -> dict:
     try:
         g = json.loads(user.groups_json or "{}")
-        if isinstance(g, dict):
-            return {"live": list(g.get("live", [])), "vod": list(g.get("vod", [])),
-                    "series": list(g.get("series", [])), "local": list(g.get("local", []))}
+        return clean_groups(g)
     except (json.JSONDecodeError, TypeError):
         pass
     return {"live": [], "vod": [], "series": [], "local": []}
@@ -102,7 +101,7 @@ def _norm_group(value) -> str:
 
 def _allowed(group_name: str | None, whitelist: list[str]) -> bool:
     if not whitelist:
-        return True
+        return False
     # case-insensitive; whitespace-insensitive since the match decides whether
     # an entire category shows up at all
     return _norm_group(group_name) in {_norm_group(w) for w in whitelist}
@@ -134,7 +133,7 @@ async def _warn_if_blackholed(user: User, kind: str, items: list,
     if not whitelist or not items:
         _BLACKHOLE_WARNED.pop(key, None)
         return
-    have = {_norm_group(it.group_name) for it in items} - {""}
+    have = {_norm_group(effective_group(kind, it.group_name)) for it in items}
     if any(_norm_group(w) in have for w in whitelist):
         _BLACKHOLE_WARNED.pop(key, None)
         return
@@ -143,7 +142,7 @@ async def _warn_if_blackholed(user: User, kind: str, items: list,
     if _BLACKHOLE_WARNED.get(key) == signature:
         return
     _BLACKHOLE_WARNED[key] = signature
-    pretty = sorted({(it.group_name or "").strip() for it in items} - {""})
+    pretty = sorted({effective_group(kind, it.group_name) for it in items})
     await db_log(
         "WARNING", "playlist",
         f"user '{user.name}': the {kind} group whitelist "
@@ -220,6 +219,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
     it shows a single channel.
     """
     from .playback import template_map_for
+    from .epg import channel_epg_id
     groups = _groups(user)
     u, p = quote(user.name), quote(user.password)
     # No url-tvg / x-tvg-url: VLC (and several other players) block playlist
@@ -234,12 +234,12 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
                                  .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
         await _warn_if_blackholed(user, "live", items, groups["live"])
         for it in items:
-            if not _allowed(it.group_name, groups["live"]):
+            if not _allowed(effective_group("live", it.group_name), groups["live"]):
                 continue
             title = _extinf_title(best_title(it.custom_name))
             attrs = {
                 "tvg-chno": it.number if it.number is not None else it.order,
-                "tvg-id": m3u_attr(it.epg_id or ""), "tvg-name": m3u_attr(title),
+                "tvg-id": m3u_attr(channel_epg_id(it)), "tvg-name": m3u_attr(title),
                 "tvg-logo": m3u_attr(it.logo or ""), "group-title": m3u_attr(it.group_name or "Live"),
             }
             attr = " ".join(f'{k}="{v}"' for k, v in attrs.items())
@@ -256,7 +256,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
             for src in (await s.execute(select(VodSource).where(VodSource.id.in_(batch)))).scalars().all():
                 src_names[src.id] = src.original_name
         for it in vods:
-            if not _allowed(it.group_name, groups["vod"]):
+            if not _allowed(effective_group("vod", it.group_name), groups["vod"]):
                 continue
             # Prefer the longest non-year title: some portals store the year in
             # `name` and the full title in `o_name` (now original_name).
@@ -274,7 +274,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
         series = (await s.execute(select(SeriePlaylist).where(SeriePlaylist.enabled.is_(True))
                                   .order_by(SeriePlaylist.order, SeriePlaylist.id))).scalars().all()
         await _warn_if_blackholed(user, "series", series, groups["series"])
-        visible = [sp for sp in series if _allowed(sp.group_name, groups["series"])]
+        visible = [sp for sp in series if _allowed(effective_group("series", sp.group_name), groups["series"])]
 
         season_rows: list = []
         for batch in _chunked([sp.id for sp in visible]):
@@ -321,7 +321,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
                     LocalFile.id.in_(batch)))).scalars().all():
                 files[f.id] = f
         for it in locals_:
-            if not _allowed(it.group_name, groups["local"]):
+            if not _allowed(effective_group("local", it.group_name), groups["local"]):
                 continue
             lf = files.get(it.local_file_id)
             if not lf:
@@ -336,7 +336,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
             ext = (play_extension(lf.relative_path or lf.filename) if direct
                    else "." + resolved.container)
             lines.append(f'#EXTINF:{dur} tvg-name="{m3u_attr(name)}" '
-                         f'group-title="{m3u_attr(it.group_name or "vod-local")}",{name}')
+                         f'group-title="{m3u_attr(effective_group("local", it.group_name))}",{name}')
             if direct and local_cache_ms > 0:
                 lines.append(f"#EXTVLCOPT:network-caching={local_cache_ms}")
             lines.append(f"{base_url}/play/local/{it.id}{ext}?u={u}&p={p}")
@@ -394,13 +394,13 @@ async def xtream_categories(user: User, kind: str) -> list[dict]:
         if kind == "vod":
             local_rows = (await s.execute(select(LocalPlaylist.group_name).where(
                 LocalPlaylist.enabled.is_(True)).distinct())).scalars().all()
-    names = [n or kind.title() for n in rows
-             if _allowed(n or kind.title(), groups[kind])]
+    names = [effective_group(kind, n) for n in rows
+             if _allowed(effective_group(kind, n), groups[kind])]
     if kind == "vod":
         # Local files appear as Movies in Xtream, but retain their independent
         # Local group whitelist rather than inheriting VOD permissions.
-        names += [n or "Local files" for n in local_rows
-                  if _allowed(n or "Local files", groups["local"])]
+        names += [effective_group("local", n) for n in local_rows
+                  if _allowed(effective_group("local", n), groups["local"])]
     out, seen = [], set()
     for name in sorted(names, key=str.casefold):
         if name.lower() in seen:
@@ -412,6 +412,7 @@ async def xtream_categories(user: User, kind: str) -> list[dict]:
 
 
 async def xtream_live(user: User, base_url: str) -> list[dict]:
+    from .epg import channel_epg_id
     groups = _groups(user)
     cats = {c["category_name"]: c["category_id"] for c in await xtream_categories(user, "live")}
     async with SessionLocal() as s:
@@ -419,12 +420,12 @@ async def xtream_live(user: User, base_url: str) -> list[dict]:
                                  .order_by(LivePlaylist.order))).scalars().all()
     out = []
     for it in items:
-        if not _allowed(it.group_name, groups["live"]):
+        if not _allowed(effective_group("live", it.group_name), groups["live"]):
             continue
         out.append({
             "num": it.number or it.order, "name": it.custom_name, "stream_type": "live",
-            "stream_id": it.id, "stream_icon": it.logo or "", "epg_channel_id": it.epg_id or "",
-            "added": "0", "category_id": cats.get(it.group_name or "Live", "1"),
+            "stream_id": it.id, "stream_icon": it.logo or "", "epg_channel_id": channel_epg_id(it),
+            "added": "0", "category_id": cats.get(effective_group("live", it.group_name), "1"),
             "custom_sid": "", "tv_archive": 0, "direct_source": "",
             "tv_archive_duration": 0, "timeshift": "", "is_adult": 0,
         })
@@ -458,12 +459,12 @@ async def xtream_vod(user: User) -> list[dict]:
         "stream_type": "movie",
         "stream_id": it.id, "stream_icon": it.poster or it.logo or "",
         "rating": it.rating or "", "rating_5based": 0, "added": "0",
-        "category_id": cats.get(it.group_name or "VOD", "1"),
+        "category_id": cats.get(effective_group("vod", it.group_name), "1"),
         "container_extension": tmap.resolve("vod", it).container,
         "custom_sid": "", "direct_source": "",
-    } for it in items if _allowed(it.group_name, groups["vod"])]
+    } for it in items if _allowed(effective_group("vod", it.group_name), groups["vod"])]
     for it in locals_:
-        if not _allowed(it.group_name, groups["local"]):
+        if not _allowed(effective_group("local", it.group_name), groups["local"]):
             continue
         local_file = files.get(it.local_file_id)
         if not local_file:
@@ -476,7 +477,7 @@ async def xtream_vod(user: User) -> list[dict]:
             "name": best_title(it.custom_name, local_file.filename),
             "stream_type": "movie", "stream_id": xtream_local_id(it.id),
             "stream_icon": "", "rating": "", "rating_5based": 0, "added": "0",
-            "category_id": cats.get(it.group_name or "Local files", "1"),
+            "category_id": cats.get(effective_group("local", it.group_name), "1"),
             "container_extension": ext, "custom_sid": "", "direct_source": "",
         })
     return out
@@ -491,7 +492,7 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
         async with SessionLocal() as s:
             from .playback import template_map_for
             item = await s.get(LocalPlaylist, local_id)
-            if not item or not item.enabled or not _allowed(item.group_name, groups["local"]):
+            if not item or not item.enabled or not _allowed(effective_group("local", item.group_name), groups["local"]):
                 return None
             local_file = await s.get(LocalFile, item.local_file_id)
             if not local_file:
@@ -515,14 +516,14 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
         }
         return {"info": info, "movie_data": {
             "stream_id": xtream_local_id(item.id), "name": title, "added": "0",
-            "category_id": cats.get(item.group_name or "Local files", "1"),
+            "category_id": cats.get(effective_group("local", item.group_name), "1"),
             "container_extension": ext, "custom_sid": "", "direct_source": "",
         }}
 
     async with SessionLocal() as s:
         from .playback import template_map_for
         it = await s.get(VodPlaylist, vod_id)
-        if not it or not it.enabled or not _allowed(it.group_name, groups["vod"]):
+        if not it or not it.enabled or not _allowed(effective_group("vod", it.group_name), groups["vod"]):
             return None
         src = await s.get(VodSource, it.vod_source_id)
         ext = (await template_map_for(s, user)).resolve("vod", it).container
@@ -545,7 +546,7 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
     }
     return {"info": info,
             "movie_data": {"stream_id": it.id, "name": title, "added": "0",
-                           "category_id": cats.get(it.group_name or "VOD", "1"),
+                           "category_id": cats.get(effective_group("vod", it.group_name), "1"),
                            "container_extension": ext, "custom_sid": "", "direct_source": ""}}
 
 
@@ -561,10 +562,10 @@ async def xtream_series(user: User) -> list[dict]:
         "plot": it.overview or "", "cast": "", "director": "",
         "genre": it.group_name or "", "release_date": it.year or "",
         "rating": it.rating or "", "rating_5based": 0,
-        "category_id": cats.get(it.group_name or "Series", "1"),
+        "category_id": cats.get(effective_group("series", it.group_name), "1"),
         "backdrop_path": [], "youtube_trailer": "", "episode_run_time": "42",
         "last_modified": "0",
-    } for it in items if _allowed(it.group_name, groups["series"])]
+    } for it in items if _allowed(effective_group("series", it.group_name), groups["series"])]
 
 
 async def xtream_series_info(user: User, series_id: int) -> dict | None:
@@ -572,7 +573,7 @@ async def xtream_series_info(user: User, series_id: int) -> dict | None:
     async with SessionLocal() as s:
         from .playback import template_map_for
         sp = await s.get(SeriePlaylist, series_id)
-        if not sp or not _allowed(sp.group_name, groups["series"]):
+        if not sp or not _allowed(effective_group("series", sp.group_name), groups["series"]):
             return None
         src = await s.get(SerieSource, sp.serie_source_id)
         ep_ext = (await template_map_for(s, user)).resolve("series", sp).container

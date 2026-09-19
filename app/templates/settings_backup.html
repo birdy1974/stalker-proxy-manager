@@ -1,0 +1,102 @@
+<section class="card mt-3" aria-labelledby="backup-heading">
+  <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+    <span id="backup-heading"><i class="bi bi-database-check me-1"></i> Backup &amp; restore</span>
+    <span class="badge text-bg-light border">Add-only restore · existing data stays yours</span>
+  </div>
+  <div class="card-body">
+    <div class="alert alert-warning small mb-3"><i class="bi bi-shield-lock me-1"></i>
+      Backups contain passwords, MAC identities and access tokens. Keep them private.
+      <details class="mt-1" data-help="Backup contents" data-help-for="backup-heading"><summary>What is included?</summary>
+        <div class="mt-2">Every database table and column, including settings, portals, MACs, genres, sources,
+          playlists, fallback links, seasons, episodes, areas, users, Enigma2 profiles, FFmpeg templates,
+          EPG data and logs. Individual-table backups include referenced parent rows automatically.
+          Active-stream records are exported for reference, but are never restored as running streams.
+          Media files, uploaded favicon files, filesystem caches and environment/Docker configuration are not included.</div>
+      </details>
+    </div>
+    <div class="row g-4">
+      <div class="col-xl-6">
+        <h6><i class="bi bi-download me-1"></i> 1. Create a backup</h6>
+        <p class="small text-muted" data-help="Creating backups" data-help-for="backup-all">Save everything in one file, or choose individual tables and settings.</p>
+        <div class="d-flex flex-wrap gap-2 mb-3">
+          <button class="btn btn-accent" id="backup-all"><i class="bi bi-database-down me-1"></i> Download full backup</button>
+          <button class="btn btn-outline-secondary" id="backup-selected" disabled>Download selected</button>
+        </div>
+        <details class="border rounded p-3">
+          <summary class="fw-semibold small">Choose tables &amp; settings <span id="backup-count" class="text-muted fw-normal"></span></summary>
+          <div class="d-flex gap-3 my-2 small">
+            <button class="btn btn-link btn-sm p-0" id="backup-select-all">Select all</button>
+            <button class="btn btn-link btn-sm p-0" id="backup-select-none">Clear</button>
+          </div>
+          <div id="backup-tables" class="overflow-auto" style="max-height:280px" aria-label="Tables to back up">Loading tables…</div>
+          <label class="form-label small mt-3" for="backup-setting">Or back up one setting</label>
+          <div class="input-group input-group-sm">
+            <select class="form-select" id="backup-setting"><option value="">Choose a stored setting…</option></select>
+            <button class="btn btn-outline-secondary" id="backup-setting-download" disabled>Download setting</button>
+          </div>
+        </details>
+        <div id="backup-status" class="small mt-2" role="status" aria-live="polite"></div>
+      </div>
+      <div class="col-xl-6">
+        <h6><i class="bi bi-upload me-1"></i> 2. Restore missing information</h6>
+        <p class="small text-muted" data-help="Restoring backups" data-help-for="import-file">Select a file, review its contents, then confirm. Choosing a file does not restore it.</p>
+        <label class="form-label small" for="import-file">Backup JSON file</label>
+        <input class="form-control form-control-sm" type="file" id="import-file" accept=".json,application/json">
+        <div id="restore-options" class="mt-3" hidden>
+          <label class="form-label small" for="restore-scope">Restore scope</label>
+          <select class="form-select form-select-sm mb-2" id="restore-scope"></select>
+          <label class="form-label small" for="restore-setting" id="restore-setting-label" hidden>Setting to restore</label>
+          <select class="form-select form-select-sm mb-2" id="restore-setting" hidden></select>
+          <div class="small text-muted mb-2" data-help="Add-only restore" data-help-for="restore-scope">Referenced parent rows are included automatically. Existing rows and setting values are never overwritten, even if the backup differs.</div>
+          <button class="btn btn-sm btn-outline-secondary" id="restore-preview">Review restore</button>
+        </div>
+        <div id="restore-review" class="small mt-3" role="status" aria-live="polite"></div>
+        <div id="restore-confirm-panel" class="border rounded p-3 mt-3" hidden>
+          <div class="form-check mb-3">
+            <input class="form-check-input" type="checkbox" id="restore-confirm">
+            <label class="form-check-label small" for="restore-confirm">I confirm that <strong>only additional information is added</strong>.
+              Existing records and settings will not be changed or deleted.</label>
+          </div>
+          <button class="btn btn-accent btn-sm" id="restore-run" disabled><i class="bi bi-plus-circle me-1"></i> Add missing information</button>
+        </div>
+        <div class="small mt-2" id="import-result" role="status" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="card border-danger mt-3" aria-labelledby="delete-heading">
+  <div class="card-header text-danger" id="delete-heading"><i class="bi bi-exclamation-triangle me-1"></i> Delete stored data</div>
+  <div class="card-body">
+    <p class="small mb-2"><strong>Permanent and cannot be undone.</strong> Download a backup first. Deleting a parent table also removes dependent rows
+      or clears their references; the review below shows the impact. Stop streams and fetch jobs before continuing.</p>
+    <p class="small text-muted" data-help="Deletion scope" data-help-for="delete-scope">This deletes database contents, not the database schema, media files, uploaded favicon or environment configuration.
+      Deleted settings fall back to defaults. Built-in templates/default settings may be recreated at startup; background tasks can repopulate logs and EPG data.</p>
+    <div class="row g-2 align-items-end">
+      <div class="col-md-4">
+        <label class="form-label small" for="delete-scope">What do you want to delete?</label>
+        <select class="form-select form-select-sm" id="delete-scope">
+          <option value="table">An individual table</option>
+          <option value="setting">An individual setting</option>
+          <option value="all">Everything in the database</option>
+        </select>
+      </div>
+      <div class="col-md-5">
+        <label class="form-label small" for="delete-target" id="delete-target-label">Table</label>
+        <select class="form-select form-select-sm" id="delete-target"></select>
+      </div>
+      <div class="col-md-3"><button class="btn btn-sm btn-outline-danger" id="delete-preview">Review deletion</button></div>
+    </div>
+    <div id="delete-review" class="small mt-3" aria-live="polite"></div>
+    <div id="delete-confirm-panel" class="border border-danger rounded p-3 mt-3" hidden>
+      <label class="form-label small" for="delete-phrase">To confirm, type <strong id="delete-required">DELETE SELECTED</strong></label>
+      <input class="form-control form-control-sm mb-2" id="delete-phrase" autocomplete="off" spellcheck="false">
+      <div class="form-check mb-3">
+        <input class="form-check-input" type="checkbox" id="delete-confirm">
+        <label class="form-check-label small" for="delete-confirm">I understand that the listed data will be permanently deleted, including dependent rows.</label>
+      </div>
+      <button class="btn btn-danger btn-sm" id="delete-run" disabled>Delete permanently</button>
+    </div>
+    <div id="delete-status" class="small mt-2" role="status" aria-live="polite"></div>
+  </div>
+</section>

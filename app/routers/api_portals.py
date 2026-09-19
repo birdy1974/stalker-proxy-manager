@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, or_, select
@@ -339,6 +340,51 @@ async def _repoint_fallbacks(db, old_pid: int, new_pid: int) -> int:
 
 
 # ------------------------------------------------------------------ resolve/test
+@router.post("/resolve")
+async def resolve_draft(payload: dict, db=Depends(get_db)):
+    """Probe the editor's current values without creating/updating a portal.
+
+    Existing MAC credentials/pins are retained when the editor still uses that
+    MAC, but the connection uses the draft URL, proxy, TLS and identity settings.
+    No pooled playback session is changed by this temporary probe.
+    """
+    name, url = payload.get("name"), payload.get("base_url")
+    if not isinstance(name, str) or not name.strip() or not isinstance(url, str) or not url.strip():
+        raise HTTPException(400, "name and URL are required")
+    url = url.strip()
+    try:
+        parsed = urlparse(url if "://" in url else "http://" + url)
+        valid_url = parsed.scheme.lower() in ("http", "https") and bool(parsed.hostname)
+        parsed.port  # reject malformed ports before starting network requests
+    except ValueError:
+        valid_url = False
+    if not valid_url:
+        raise HTTPException(400, "enter an HTTP or HTTPS portal URL")
+    entries = parse_mac_entries(payload.get("macs", ""))
+    if not entries:
+        raise HTTPException(400, "enter at least one valid MAC address")
+    existing, saved_mac = None, None
+    pid = payload.get("portal_id")
+    if pid is not None:
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            raise HTTPException(400, "portal_id must be an integer")
+        existing = await db.get(Portal, pid)
+        if existing is None:
+            raise HTTPException(404, "portal not found")
+        saved_mac = (await db.scalars(select(MacAddress).where(
+            MacAddress.portal_id == pid, MacAddress.mac == entries[0]["mac"]))).first()
+    portal = Portal(name=name.strip(), base_url=url,
+                    proxy_url=payload.get("proxy_url") or None,
+                    tls_insecure=bool(payload.get("tls_insecure", False)),
+                    identity_mode=_identity_mode(payload.get("identity_mode", "minimal")),
+                    stb_timezone=str(payload.get("stb_timezone") or "").strip() or None)
+    entry = entries[0]
+    mac = MacAddress(mac=entry["mac"], password=getattr(saved_mac, "password", None),
+                     sn=entry["sn"] or getattr(saved_mac, "sn", None),
+                     device_id=entry["device_id"] or getattr(saved_mac, "device_id", None))
+    return {**await _resolve_details(portal, mac), "saved": False}
+
+
 @router.post("/{pid}/resolve")
 async def resolve(pid: int, db=Depends(get_db)):
     p = await db.get(Portal, pid)
@@ -346,6 +392,11 @@ async def resolve(pid: int, db=Depends(get_db)):
         raise HTTPException(404, "portal not found")
     first_mac = (await db.execute(select(MacAddress).where(MacAddress.portal_id == pid)
                                   .order_by(MacAddress.order))).scalars().first()
+    return await _resolve_details(p, first_mac, db)
+
+
+async def _resolve_details(p: Portal, first_mac, db=None) -> dict:
+    """Common saved/draft resolver; only a saved resolve writes metadata."""
     res = await resolve_portal(p.base_url, mac=first_mac.mac if first_mac else None,
                                proxy=p.proxy_url, tls_insecure=p.tls_insecure)
     for line in res.attempts:
@@ -356,7 +407,8 @@ async def resolve(pid: int, db=Depends(get_db)):
         if res.version.known:
             p.portal_version = res.version.label[:120]
         p.capabilities_at = datetime.now(timezone.utc)
-        await db.commit()
+        if db is not None:
+            await db.commit()
         await db_log("INFO", "resolve",
                      f"[{p.name}] resolved -> {res.portal_url}"
                      + (f" ({res.version.label})" if res.version.known else ""))
@@ -374,7 +426,7 @@ async def resolve(pid: int, db=Depends(get_db)):
 
 
 async def _probe_capabilities(p: Portal, mac_row, portal_url: str, db) -> dict:
-    """Ask the panel what it offers, and store the answer. Never fails a resolve.
+    """Ask the panel what it offers; persist only with a DB. Never fails a resolve.
 
     Both probes are one cheap GET, and both are *information*: `version.js` needs
     no token at all. That is the whole argument for doing it on Resolve - the
@@ -387,7 +439,8 @@ async def _probe_capabilities(p: Portal, mac_row, portal_url: str, db) -> dict:
         out["modules_error"] = "no MAC to ask with"
         return out
     try:
-        client = await POOL.get(PortalSession.from_rows(p, mac_row, portal_url=portal_url))
+        session = PortalSession.from_rows(p, mac_row, portal_url=portal_url)
+        client = await POOL.get(session) if db is not None else session.client()
         try:
             await client.ensure_auth()
             caps = await client.refresh_capabilities()
@@ -409,7 +462,8 @@ async def _probe_capabilities(p: Portal, mac_row, portal_url: str, db) -> dict:
     if version.get("label"):
         p.portal_version = str(version["label"])[:120]
     p.capabilities_at = datetime.now(timezone.utc)
-    await db.commit()
+    if db is not None:
+        await db.commit()
     if modules is None:
         await db_log("INFO", "resolve",
                      f"[{p.name}] get_modules said nothing ({caps.get('modules_error')})"

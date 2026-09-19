@@ -6,7 +6,7 @@ GUI's two-way sync between option fields and the full command text.
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 
 from ..database import get_db
 from ..models import (
@@ -22,6 +22,7 @@ from ..services.ffmpeg_templates import (FFmpegOptions, REDIRECT_COMMAND,
                                      option_warnings, parse_command,
                                      template_command_errors)
 from ..services.ffmpeg_validate import run_demo, syntax_check
+from ..services.ffmpeg_editor import disabled_parameters, field_errors, set_extra_option
 
 router = APIRouter(prefix="/api/ffmpeg", tags=["ffmpeg"], dependencies=[Depends(require_admin)])
 
@@ -35,6 +36,8 @@ def _row(t: FFmpegTemplate) -> dict:
 def _template_errors(t: FFmpegTemplate) -> list[str]:
     """Validate the stored command and raw extension fields before persistence."""
     errors = extra_option_warnings(_opts(t))
+    if t.command_source == "fields" and (t.command or "").strip() != REDIRECT_COMMAND:
+        errors.extend(field_errors(_opts(t)))
     errors.extend(template_command_errors(t.command or ""))
     return errors
 
@@ -74,6 +77,33 @@ def _source_from_payload(t: FFmpegTemplate, payload: dict) -> str:
     return t.command_source if t.command_source in ("fields", "manual") else "fields"
 
 
+def _requested_default(payload):
+    value = payload.get("is_default")
+    if "is_default" in payload and not isinstance(value, bool):
+        raise HTTPException(422, "is_default must be true or false")
+    return value
+
+
+async def _choose_default(db, template):
+    await db.flush()  # materialize defaults for newly-created templates
+    if not template.enabled:
+        raise HTTPException(422, "Enable the template before making it the default")
+    # A single UPDATE replaces the selection atomically instead of leaving
+    # multiple defaults behind when clients select different templates.
+    await db.execute(update(FFmpegTemplate).values(
+        is_default=(FFmpegTemplate.id == template.id)))
+
+
+@router.post("/{tid}/default")
+async def choose_default(tid: int, db=Depends(get_db)):
+    template = await db.get(FFmpegTemplate, tid)
+    if not template:
+        raise HTTPException(404, "template not found")
+    await _choose_default(db, template)
+    await db.commit()
+    return {"item": _row(template)}
+
+
 @router.get("")
 async def templates_list(db=Depends(get_db)):
     rows = (await db.execute(select(FFmpegTemplate).order_by(FFmpegTemplate.name))).scalars().all()
@@ -82,9 +112,10 @@ async def templates_list(db=Depends(get_db)):
 
 @router.post("")
 async def create_template(payload: dict, db=Depends(get_db)):
+    make_default = _requested_default(payload)
     t = FFmpegTemplate()
     for f in FIELDS:
-        if f in payload:
+        if f in payload and f != "is_default":
             setattr(t, f, payload[f])
     t.command_source = _source_from_payload(t, payload)
     if t.command_source == "fields":
@@ -92,6 +123,8 @@ async def create_template(payload: dict, db=Depends(get_db)):
                      and REDIRECT_COMMAND) or build_command(_opts(t))
     _reject_template(_template_errors(t))
     db.add(t)
+    if make_default:
+        await _choose_default(db, t)
     await db.commit()
     return {"item": _row(t)}
 
@@ -101,12 +134,17 @@ async def update_template(tid: int, payload: dict, db=Depends(get_db)):
     t = await db.get(FFmpegTemplate, tid)
     if not t:
         raise HTTPException(404, "template not found")
+    make_default = _requested_default(payload)
+    if t.is_default and (make_default is False or payload.get("enabled") is False):
+        raise HTTPException(409, "Choose another default before disabling or clearing this default")
     old_command = (t.command or "").strip()
     was_redirect = old_command == REDIRECT_COMMAND
     for f in FIELDS:
-        if f in payload:
+        if f in payload and f != "is_default":
             setattr(t, f, payload[f])
 
+    if t.is_default and not t.enabled:
+        raise HTTPException(409, "Choose another default before disabling this template")
     source = _source_from_payload(t, payload)
     supplied_command = str(payload.get("command", "") or "").strip()
     if "command" in payload:
@@ -133,6 +171,8 @@ async def update_template(tid: int, payload: dict, db=Depends(get_db)):
             t.command = build_command(_opts(t))
 
     _reject_template(_template_errors(t))
+    if make_default:
+        await _choose_default(db, t)
     await db.commit()
     return {"item": _row(t)}
 
@@ -142,6 +182,8 @@ async def delete_template(tid: int, db=Depends(get_db)):
     t = await db.get(FFmpegTemplate, tid)
     if not t:
         raise HTTPException(404, "template not found")
+    if t.is_default:
+        raise HTTPException(409, "Choose another default before deleting this template")
     await db.delete(t)
     await db.commit()
     return {"ok": True}
@@ -151,7 +193,23 @@ async def delete_template(tid: int, db=Depends(get_db)):
 async def build(payload: dict):
     """fields -> command (2-way sync, left side of the editor)."""
     opts = FFmpegOptions(**coerce_options(payload))
+    _reject_template(field_errors(opts))
     return {"command": build_command(opts), "warnings": option_warnings(opts)}
+
+
+@router.post("/extra-option")
+async def extra_option(payload: dict):
+    """Insert/replace an advanced option, preserving quoting and validating ranges."""
+    try:
+        if "options" in payload:
+            opts = FFmpegOptions(**coerce_options(payload["options"]))
+            reason = disabled_parameters(opts, "advanced").get(payload.get("flag"))
+            if reason:
+                raise ValueError(reason)
+        return {"extra": set_extra_option(payload.get("raw", ""), payload.get("side"),
+                                          payload.get("flag"), payload.get("value", ""))}
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, str(exc)) from None
 
 
 @router.post("/parse")

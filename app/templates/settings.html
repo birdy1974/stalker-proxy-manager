@@ -1,5 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
+<div class="card mb-3">
+  <div class="card-header" id="playlist-health-heading">Playlist source health</div>
+  <span data-help="Playlist source health" data-help-for="playlist-health-heading">Checks enabled Live, VOD, Series and Local playlist items every 30 seconds. Missing links, empty commands, disabled portals, banned/expired accounts, missing episode fallbacks and missing/unreadable files are reported. Busy accounts and recorded connection failures are warnings. Unverified does not mean working. Recent media-probe/playback evidence lasts 15 minutes in this server process. Local availability checks do not verify decoding. Automatic checks never open streams; Probe source is an explicit, bounded check before FFmpeg. Input catalogue selection flags alone do not disable explicit playback links. Disabled playlist items are excluded.</span>
+  <div id="settings-playlist-health" class="card-body">Checking playlist sources…</div>
+</div>
+
 <div class="row g-3">
   <div class="col-lg-6">
     <div class="card">
@@ -9,15 +15,24 @@
     </div>
 
     <div class="card mt-3">
-      <div class="card-header"><i class="bi bi-calendar3"></i> External EPG sources</div>
+      <div class="card-header"><i class="bi bi-calendar3"></i> EPG sources and matching</div>
       <div class="card-body p-2">
         <div class="input-group input-group-sm mb-2">
           <input class="form-control" id="epg-url" placeholder="http://www.xmltvepg.nl/rytecNL_Basic.xz">
           <button class="btn btn-outline-secondary" id="epg-add">Add</button>
         </div>
+        <div id="epg-schedule" class="small mb-2" role="status"></div>
         <div id="epg-list"></div>
+        <div class="border-top mt-2 pt-2"><b class="small">EPG guide health</b>
+          <span data-help="Guide alerts">Missing means no usable programme in the next 48 hours. A current gap means future data exists but nothing covers now. Stale means all contributing feeds are older than their stale threshold. Checks use the same priorities, gap filling and time corrections as XMLTV. Alerts refresh every 30 seconds and do not send email or browser notifications.</span>
+          <div id="epg-health" class="mt-1">Checking guide coverage…</div>
+        </div>
+        <div class="form-check mt-2"><input class="form-check-input" type="checkbox" id="epg-review-all"><label class="form-check-label small" for="epg-review-all">Review existing EPG assignments too</label></div>
+        <span data-help="EPG matching scope" data-help-for="epg-match">Only a single confident match is assigned automatically to an empty channel. Ambiguous matches and replacements open a review dialog; existing IDs are not silently overwritten. After changing IDs, cached guide data is reprocessed.</span>
+        <span data-help="External EPG URL">For external players, open Users → output URLs and copy EPG (xmltv). It includes enabled Live channels in that user's selected groups. Configure Public base URL override for access from other devices.</span>
         <div class="d-flex flex-wrap gap-2 mt-2">
           <button class="btn btn-sm btn-outline-secondary" id="epg-refresh"><i class="bi bi-arrow-repeat"></i> Refresh all</button>
+          <button class="btn btn-sm btn-outline-secondary" id="epg-portals">Check portal EPG</button>
           <button class="btn btn-sm btn-outline-secondary" id="epg-match"><i class="bi bi-magic"></i> Match channels</button>
           <span class="small text-muted align-self-center" id="epg-status"></span>
         </div>
@@ -27,7 +42,7 @@
     <div class="card mt-3">
       <div class="card-header"><i class="bi bi-image"></i> Channel logos (tv-logos)</div>
       <div class="card-body p-2">
-        <div class="small text-muted mb-2">
+        <div class="small text-muted mb-2" data-help="Channel logo matching" data-help-for="logo-auto">
           Matches live playlist channel names against the
           <a href="https://github.com/tv-logo/tv-logos" target="_blank">tv-logo/tv-logos</a>
           index of the configured <code>logo_country</code> folder.
@@ -45,7 +60,7 @@
     <div class="card">
       <div class="card-header"><i class="bi bi-browser-safari"></i> Browser tab icon (favicon)</div>
       <div class="card-body">
-        <div class="small text-muted mb-2">
+        <div class="small text-muted mb-2" data-help="Browser tab icon" data-help-for="favicon-file">
           Shown on the tab of every page of this GUI (dashboard, portals, login …).
           Pick one of the built-in pictures, or upload your own.
         </div>
@@ -63,39 +78,12 @@
     </div>
 
     <div class="card mt-3">
-      <div class="card-header"><i class="bi bi-download"></i> Backup / restore</div>
-      <div class="card-body">
-        <div class="d-flex flex-wrap gap-2 mb-1">
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=all"><i class="bi bi-download"></i> Full backup (all)</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=portals">Portals</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=sources">Sources (live / vod / series / local)</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=playlists">Playlists (live / vod / series / local)</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=areas">Areas</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=enigma2">Enigma2</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=ffmpeg">FFmpeg</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=users">Users</a>
-          <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=settings">Settings</a>
-        </div>
-        <div class="small text-muted mb-2">
-          Sources and playlists carry your curation - enabled flags, custom names, logos,
-          epg ids, FFmpeg-template picks and fallback priorities - as name references, so a
-          backup restores onto another install. Importing them <b>restores</b>: existing rows
-          are updated to the backup's values, missing rows are added, nothing is deleted.
-          (The local-file backup covers the catalog rows; the media files themselves live
-          on disk.)
-        </div>
-        <label class="muted-label">Import (merge; duplicates are skipped)</label>
-        <input class="form-control form-control-sm" type="file" id="import-file" accept="application/json">
-        <div class="small text-muted mt-1" id="import-result"></div>
-      </div>
-    </div>
-
-    <div class="card mt-3">
       <div class="card-header"><i class="bi bi-info-circle"></i> Runtime info</div>
       <div class="card-body small mono" id="runtime-info">loading…</div>
     </div>
   </div>
 </div>
+{% include "settings_backup.html" %}
 {% endblock %}
 
 {% block scripts %}
@@ -106,13 +94,16 @@ const SETTING_DEFS = [
   ["vlc_local_network_caching_ms", "VLC local-file network cache (ms, 0 = player default)", "number", 500],
   ["fallback_strategy", "Fallback order strategy", ["macs_first", "portal_first"], "macs_first"],
   ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
-  ["epg_refresh_hours", "EPG refresh interval (hours)", "number", 24],
+  ["epg_refresh_hours", "EPG refresh interval (hours; 0 = paused)", "number", 24],
+  ["epg_portal_enabled", "Use source portal EPG", ["true", "false"], "true"],
   ["mac_health_minutes", "Multi-MAC status refresh (minutes, 0 = off)", "number", 60],
   ["mac_health_multi_only", "Only portals with ≥2 MACs", ["true", "false"], "true"],
   ["logo_country", "Logo country folder (tv-logos)", "text", "netherlands"],
   ["tmdb_api_key", "TMDB API key (detail-popups enrichment)", "text", ""],
 ];
 const SETTING_HELP = {
+  epg_refresh_hours: "Automatic refresh of enabled external and portal guides. Choose an interval from the suggestions or enter 1–168 hours; 0 pauses all automatic refresh, including per-source overrides. Each source has its own Schedule &amp; timing button. Save applies within one minute without restarting. Refresh all still works when paused. Failed feeds retry at the next interval.",
+  epg_portal_enabled: "Check authenticated Stalker portal guide APIs. Use bulk guide data when available, otherwise up to 100 paced short-guide requests for enabled playlist inputs. Busy MACs are skipped. Coverage depends on the portal. Individual portal sources can also be disabled below.",
   vlc_local_network_caching_ms: "Written as #EXTVLCOPT:network-caching before each directly served local file. Lower starts faster; increase it on an unstable network. Takes effect when the playlist is reloaded.",
   fallback_strategy: "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately. Takes effect on the next play/fetch (no restart).",
   mac_health_minutes: "Background handshake of every MAC on multi-MAC portals (status + expire date). MACs holding a live stream are skipped. 0 pauses the scheduler.",
@@ -124,15 +115,15 @@ async function loadSettings() {
   host.innerHTML = SETTING_DEFS.map(([k, label, type, def]) => {
     let v = settings[k] ?? def;
     if (typeof v === "boolean") v = v ? "true" : "false";
-    const help = SETTING_HELP[k] ? `<div class="small text-muted">${SETTING_HELP[k]}</div>` : "";
+    const help = SETTING_HELP[k] ? `<span data-help="${esc(label)}" data-help-for="setting-${k}">${esc(SETTING_HELP[k])}</span>` : "";
     if (Array.isArray(type))
-      return `<div class="mb-2"><label class="muted-label">${label}</label>
-        <select class="form-select form-select-sm set-field" data-key="${k}" data-kind="str">
+      return `<div class="mb-2"><label class="muted-label" for="setting-${k}">${label}</label>
+        <select id="setting-${k}" class="form-select form-select-sm set-field" data-key="${k}" data-kind="str">
           ${type.map(o => `<option ${String(o) === String(v) ? "selected" : ""}>${o}</option>`).join("")}
         </select>${help}</div>`;
-    return `<div class="mb-2"><label class="muted-label">${label}</label>
-      <input class="form-control form-control-sm set-field" data-key="${k}" data-kind="${type === "number" ? "num" : "str"}"
-             type="${type}" value="${esc(v)}"></div>${help}`;
+    return `<div class="mb-2"><label class="muted-label" for="setting-${k}">${label}</label>
+      <input id="setting-${k}" class="form-control form-control-sm set-field" data-key="${k}" data-kind="${type === "number" ? "num" : "str"}"
+             type="${type}" ${k === "epg_refresh_hours" ? 'min="0" max="168" step="1" list="epg-hours"' : ""} value="${esc(v)}">${k === "epg_refresh_hours" ? '<datalist id="epg-hours"><option value="0"><option value="1"><option value="3"><option value="6"><option value="12"><option value="24"><option value="48"><option value="168"></datalist>' : ""}</div>${help}`;
   }).join("");
 }
 $("#set-save").addEventListener("click", async () => {
@@ -140,24 +131,38 @@ $("#set-save").addEventListener("click", async () => {
   $$(".set-field").forEach(n => {
     let v = n.dataset.kind === "num" ? +n.value : n.value;
     // booleans stored as true/false strings in the select → real bools
-    if (n.dataset.key === "mac_health_multi_only") v = String(v) === "true";
+    if (["mac_health_multi_only", "epg_portal_enabled"].includes(n.dataset.key)) v = String(v) === "true";
     payload[n.dataset.key] = v;
   });
   await api("/api/settings", { method: "POST", body: payload });
-  toast("settings saved", "ok");
+  toast("settings saved", "ok"); loadEpgStatus();
 });
+let epgEditorLoading = false;
+window.editEpgSource = async id => {
+  if (epgEditorLoading) return;
+  epgEditorLoading = true;
+  try {
+    const latest = await api("/api/epg");
+    const source = latest.sources.find(s => s.id === id);
+    if (source) EpgControls.editSource(source, async () => {await loadEpg(); await loadEpgStatus(); await EpgControls.health($("#epg-health"));});
+    else toast("That source was removed; reload the source list", "warn");
+  } catch(e) {toast(e.message, "error");}
+  finally {epgEditorLoading = false;}
+};
 async function loadEpg() {
   const d = await api("/api/epg");
   $("#epg-list").innerHTML = d.sources.length ? d.sources.map(e => `
-    <div class="d-flex align-items-center gap-2 border-bottom py-1">
+    <div class="d-flex flex-wrap align-items-center gap-2 border-bottom py-1">
       <div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${e.enabled ? "checked" : ""}
         onchange="api('/api/epg/sources/${e.id}',{method:'PATCH',body:{enabled:this.checked}}).then(loadEpg)"></div>
-      <span class="small mono flex-grow-1">${esc(e.url)}</span>
-      <span class="small text-muted">${e.status ? esc(e.status) : (e.last_fetch ? "fetched " + fmtTime(e.last_fetch, { seconds: false }) : "not fetched")}</span>
+      <span class="small mono flex-grow-1" style="min-width:0;overflow-wrap:anywhere">${e.portal_id ? "Portal: " : ""}${esc(e.name || e.url)}</span>
+      <span class="small text-muted">${e.status ? esc(e.status) : "not fetched"}${e.timing_pending ? '<br><span class="text-danger">Timezone change pending</span>' : ""}${e.last_fetch ? `<br>Last success: ${fmtTime(e.last_fetch, { seconds: false })}` : ""}</span>
+      <span class="small text-muted">${e.refresh_hours == null ? "Inherit" : e.refresh_hours === 0 ? "Manual" : `Every ${e.refresh_hours}h`}${e.next_refresh ? ` · next ${fmtTime(e.next_refresh, {seconds:false})}` : " · automatic paused"}</span>
+      <button class="btn btn-sm btn-outline-secondary" onclick="editEpgSource(${e.id})" title="Source schedule, timezone, correction and stale alerts">Schedule &amp; timing</button>
       <button class="btn btn-sm btn-outline-secondary" title="refresh now"
         onclick="api('/api/epg/sources/${e.id}/refresh',{method:'POST'}).then(loadEpg)"><i class="bi bi-arrow-repeat"></i></button>
       <button class="btn btn-sm btn-outline-danger" onclick="api('/api/epg/sources/${e.id}',{method:'DELETE'}).then(loadEpg)"><i class="bi bi-trash"></i></button>
-    </div>`).join("") : '<div class="small text-muted">No EPG sources. Try http://www.xmltvepg.nl/rytecNL_Basic.xz</div>';
+    </div>`).join("") : '<div class="small text-muted">No EPG sources.</div><span data-help="Adding EPG sources">Try http://www.xmltvepg.nl/rytecNL_Basic.xz</span>';
 }
 $("#epg-add").addEventListener("click", async () => {
   const url = $("#epg-url").value.trim(); if (!url) return;
@@ -166,11 +171,20 @@ $("#epg-add").addEventListener("click", async () => {
 });
 $("#epg-refresh").addEventListener("click", async () => {
   const r = await api("/api/epg/refresh", { method: "POST" });
+  await loadEpgStatus();
   toast(r.started ? "EPG refresh started (watch the logs/db)" : (r.error || "busy"), r.started ? "ok" : "warn");
 });
 $("#epg-match").addEventListener("click", async () => {
-  const r = await api("/api/epg/match", { method: "POST" });
-  toast(`auto-match done: ${r.matched} channels matched`, "ok"); loadEpgStatus();
+  const r = await api("/api/epg/match?review_all=" + $("#epg-review-all").checked, { method: "POST" });
+  toast(`${r.matched} matched · ${r.ambiguous.length} need selection · ${r.unmatched} without candidates`, "ok");
+  EpgMatching.review(r, loadEpgStatus); loadEpgStatus();
+});
+$("#epg-portals").addEventListener("click", async () => {
+  try {
+    const r = await api("/api/epg/portals/check", {method:"POST"});
+    toast(r.started ? "Portal EPG checks started" : r.error, r.started ? "ok" : "warn");
+    await loadEpgStatus();
+  } catch(e) {toast(e.message, "err");}
 });
 $("#logo-index").addEventListener("click", async () => {
   const r = await api("/api/playlist/logos/refresh-index", { method: "POST" });
@@ -181,30 +195,21 @@ $("#logo-auto").addEventListener("click", async () => {
   $("#logo-status").textContent = r.ok ? `${r.set}/${r.checked} channels got a logo` : (r.error || "failed");
   if (r.ok) toast(`auto-logo pass done: ${r.set} logos set`, "ok");
 });
+let epgWasRefreshing = false;
 async function loadEpgStatus() {
   try {
     const d = await api("/api/epg");
+    if (d.refresh_running || epgWasRefreshing) await loadEpg();
+    epgWasRefreshing = d.refresh_running;
+    $("#epg-schedule").textContent = d.schedule.enabled ? `Default interval ${d.schedule.hours} hour(s) · per-source overrides apply · checks each minute` : "Automatic EPG refresh paused";
+    $("#epg-refresh").disabled = d.refresh_running;
+    $("#epg-portals").disabled = d.refresh_running || !d.schedule.portal_enabled;
     $("#epg-status").textContent =
       `${d.epg_channels} EPG channels · ${d.programmes} programmes · ${d.matched}/${d.playlist_channels} matched` +
       (d.refresh_running ? " · refreshing…" : "");
   } catch (_) { /* keep silent */ }
 }
-$("#import-file").addEventListener("change", async (e) => {
-  const f = e.target.files[0]; if (!f) return;
-  try {
-    const data = JSON.parse(await f.text());
-    const r = await api("/api/import", { method: "POST", body: { mode: "merge", data } });
-    const parts = [`imported ${r.imported}`];
-    if (r.updated) parts.push(`updated ${r.updated}`);
-    $("#import-result").innerHTML =
-      `<span class="text-success">${parts.join(", ")}</span>` +
-      (r.skipped.length
-        ? `<span class="text-muted">, skipped ${r.skipped.length} ` +
-          `<span class="text-decoration-underline" title="${esc(r.skipped.join("\n"))}">details</span></span>`
-        : "");
-  } catch (err) { $("#import-result").textContent = "invalid file: " + err.message; }
-  e.target.value = "";
-});
+
 /* ---------------------------------------------------------------- favicon
    Tab icon picker. The choice is one settings row; /favicon.ico serves it to
    every page. Browsers cache favicons hard, so after a change the <link> tags
@@ -265,8 +270,14 @@ $("#favicon-clear").addEventListener("click", async () => {
   toast(r.removed ? "uploaded picture removed" : "there was no uploaded picture", r.removed ? "ok" : "warn");
   await loadFavicons();
 });
+PlaylistHealth.mount($("#settings-playlist-health"));
+EpgControls.health($("#epg-health"));
+const epgHealthPoll = setInterval(() => EpgControls.health($("#epg-health")), 30000);
+window.addEventListener("pagehide", () => clearInterval(epgHealthPoll), {once:true});
 (async () => {
   await loadSettings(); await loadEpg(); await loadEpgStatus(); await loadFavicons();
+  const epgPoll = setInterval(loadEpgStatus, 4000);
+  window.addEventListener("pagehide", () => clearInterval(epgPoll), {once:true});
   const d = await api("/api/dashboard");
   $("#runtime-info").innerHTML =
     `portals: ${d.stats.portals} · live ${d.stats.live_enabled}/${d.stats.live_available} · ` +
@@ -275,4 +286,5 @@ $("#favicon-clear").addEventListener("click", async () => {
     `<br>GUI phase: <b>3</b> (EPG ingest + /xmltv.php, tv-logos matching, TMDB popups)`;
 })();
 </script>
+<script src="/static/js/settings-backup.js?v={{ static_v.backup_js }}"></script>
 {% endblock %}

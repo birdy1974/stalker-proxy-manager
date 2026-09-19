@@ -137,7 +137,7 @@ async def xmltv(request: Request, u: str = "", p: str = "", username: str = "", 
     """Merged XMLTV: the user's visible live channels + programmes of all
     enabled EPG sources (auto-matched or manually assigned tvg-ids)."""
     from ..services import epg as epg_svc
-    user = await _authed(u or username, p or password, "xtream")
+    user = await _authed(u or username, p or password, "stream")
     xml = await epg_svc.build_xmltv(await base_url_of(request), user)
     return Response(xml, media_type="application/xml")
 
@@ -523,16 +523,24 @@ async def xseries_mkv(request: Request, sid: int, u: str, p: str, mode: str = ""
 
 # -------------------------------------------------- admin quick-play (GUI)
 @router.get("/preview-play/{kind}/{pid}.ts")
-async def admin_play(kind: str, pid: int, request: Request, mode: str = ""):
+async def admin_play(kind: str, pid: int, request: Request, mode: str = "", db=Depends(get_db)):
     """Play a PLAYLIST item from the GUI with the admin session (no user creds),
     through the *real* pipeline - template, fallback chain, MAC tracking."""
     from ..security import require_admin
     require_admin(request)
+    if kind == "series":
+        # The Playlist detail dialog passes a series playlist ID, not an
+        # episode ID. Pick its first enabled linked season's playable episode.
+        from ..services.item_info import playlist_primary_input
+        _, _, _, episode = await playlist_primary_input(db, "series", pid)
+        if episode is None:
+            raise HTTPException(404, "no playable episode in the enabled seasons")
+        kind, pid = "episode", episode.id
     if kind not in ("live", "vod", "episode", "local"):
-        raise HTTPException(400, "kind must be live|vod|episode|local")
-    if kind == "local":
-        return await _local_response(pid, None, request)
-    return await _stream_response(kind, pid, None, f"{kind} #{pid}", request, mode)
+        raise HTTPException(400, "kind must be live|vod|series|episode|local")
+    # Browser MSE needs same-origin bytes, not a redirect to a provider/CDN or
+    # a raw local MP4 mislabeled as .ts. Keep public player delivery unchanged.
+    return await _stream_response(kind, pid, None, f"{kind} #{pid}", request, "proxy")
 
 
 # ---------------------------------------------------------------- preview

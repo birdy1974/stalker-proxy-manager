@@ -121,7 +121,7 @@ async def access_log(request: Request, call_next):
                           request.method, path, qs[:120], status, ms)
 
 # --------------------------------------------------------------- sub-routers
-from .routers import (api_areas, api_branding, api_enigma2, api_ffmpeg, api_epg,  # noqa: E402
+from .routers import (api_areas, api_backup, api_branding, api_enigma2, api_ffmpeg, api_epg,  # noqa: E402
                       api_misc, api_playlist, api_portals, api_sources, api_users,
                       output, web)
 
@@ -130,7 +130,7 @@ app.include_router(output.router)
 for r in (api_portals.router, api_sources.router, api_playlist.router,
           api_ffmpeg.router, api_users.router, api_areas.router, api_misc.router,
           api_epg.router, api_enigma2.router, api_enigma2.public,
-          api_branding.router, api_branding.public):
+          api_branding.router, api_branding.public, api_backup.router):
     app.include_router(r)
 
 if MOCK_PORTAL_ENABLED:
@@ -166,6 +166,9 @@ async def startup() -> None:
     await MANAGER.purge_runtime_rows()
     await cleanup_logs()
     await _seed_defaults()
+    from .services.epg import ensure_default_sources
+    await ensure_default_sources()
+    await _repair_playlist_orders()
     # tab icon: prime the ?v= fingerprint the page templates stamp on <link>
     from .services.branding import refresh as refresh_favicon
     await refresh_favicon()
@@ -179,9 +182,10 @@ async def startup() -> None:
         await db_log("ERROR", "boot",
                      "*** LOGIN DISABLED (SPM_SKIP_LOGIN=1) - mockup/preview mode ***")
     # Phase 3: background EPG refresher (checks due sources hourly)
-    from .services.epg import epg_scheduler
+    from .services.epg import epg_scheduler, reindex_source_snapshots
     import asyncio  # noqa: PLC0415 - the task set is built at startup
-    asyncio.create_task(epg_scheduler())
+    _bg.add(asyncio.create_task(reindex_source_snapshots(), name="spm-epg-cache-upgrade"))
+    _bg.add(asyncio.create_task(epg_scheduler(), name="spm-epg"))
     # Multi-MAC portals: keep every MAC's status + expiry fresh in the background
     # so a secondary account that expires overnight is dropped from fallback
     # chains without anyone pressing Test. Interval is the GUI setting
@@ -256,31 +260,32 @@ async def _heal_season_links() -> None:
 
 
 async def _hardware_sanity() -> None:
-    """
-    If the default ffmpeg template needs a GPU device that is NOT mapped into
-    this container (no /dev/dri/renderD128), every item without an explicit
-    template would die instantly in ffmpeg. Degrade the default to the copy
-    template with a loud boot warning instead of silent broken streams. On the
-    DS918+ system /dev/dri exists and nothing changes.
-    """
+    """Warn about missing GPU hardware without overriding the user's default."""
     import os
     from .config import VAAPI_DEVICE
     async with SessionLocal() as s:
         default = (await s.execute(select(FFmpegTemplate).where(
-            FFmpegTemplate.is_default.is_(True)))).scalar_one_or_none()
+            FFmpegTemplate.is_default.is_(True)).order_by(FFmpegTemplate.id))).scalars().first()
         if default and ("-hwaccel vaapi" in (default.command or "")
+                        or "-hwaccel qsv" in (default.command or "")
                         or "hwaccel=qsv" in (default.command or "")) \
-                and not os.path.exists(VAAPI_DEVICE):
-            passthrough = (await s.execute(select(FFmpegTemplate).where(
-                FFmpegTemplate.name.like("%Copy%")))).scalars().first() or default
-            default.is_default = False
-            passthrough.is_default = True
-            await s.commit()
+                and not os.path.exists(default.device or VAAPI_DEVICE):
             await db_log("WARNING", "boot",
-                         f"VAAPI device {VAAPI_DEVICE} not present, but default template "
-                         f"'{default.name}' needs it -> default switched to "
-                         f"'{passthrough.name}'. Pass /dev/dri into the container and "
-                         "re-set the default in the FFmpeg tab to use Quick Sync.")
+                         f"GPU device {default.device or VAAPI_DEVICE} not found; "
+                         f"selected default '{default.name}' is unchanged. Map the device "
+                         "or choose Redirect/Copy as default in the FFmpeg tab.")
+
+
+async def _repair_playlist_orders() -> None:
+    """Heal historical duplicate order values without changing playlist sequence."""
+    from .services.playlist_order import ORDER_MODELS, repair_playlist_order
+    from .services.playlist_sync import renumber_live_numbers
+    async with SessionLocal() as db:
+        for kind, model in ORDER_MODELS.items():
+            changed = await repair_playlist_order(db, model)
+            if changed and kind == "live":
+                await renumber_live_numbers(db)
+        await db.commit()
 
 
 async def _seed_defaults() -> None:
@@ -289,16 +294,13 @@ async def _seed_defaults() -> None:
 
     These are the "default templates" the user can always rely on: they are
     (re)seeded on EVERY boot so they survive deletion and pick up updates
-    (e.g. the VAAPI/Dreambox tuning). Rows are matched by name, so a user who
-    edits a built-in keeps their edits; deleting one brings it back at the next
-    boot. The "Redirect (bypass ffmpeg)" preset is the built-in default:
-    reconciling it on every boot means items without an explicit template
-    assignment are redirected to the panel CDN (no ffmpeg), and streams never
-    fall back to nothing. Default settings rows are seeded alongside
-    (idempotent).
+    (e.g. the VAAPI/Dreambox tuning). Rows are matched by name: built-in
+    structured fields are refreshed, but manual command edits are preserved;
+    deleting a built-in brings it back at the next boot. Redirect is the INITIAL fallback default. Later choices, including
+    built-in templates, survive reseeding. Invalid/multiple legacy defaults
+    are reconciled to one enabled template. Settings are seeded idempotently.
     """
-    from .services.ffmpeg_templates import (FFmpegOptions, REDIRECT_PRESET_NAME,
-                                             REFERENCE_PRESET_NAME)
+    from .services.ffmpeg_templates import FFmpegOptions, REDIRECT_PRESET_NAME
     async with SessionLocal() as s:
         for p in default_presets():
             name = p.pop("name")
@@ -307,7 +309,7 @@ async def _seed_defaults() -> None:
             if row is None:
                 s.add(FFmpegTemplate(
                     name=name, is_builtin=True,
-                    is_default=(name == REDIRECT_PRESET_NAME),
+                    is_default=False,
                     **{k: p[k] for k in FFmpegOptions.__dataclass_fields__},
                     command=p["command"], command_source=p["command_source"],
                     enabled=True))
@@ -321,30 +323,14 @@ async def _seed_defaults() -> None:
             for k, v in p.items():
                 if k in FFmpegOptions.__dataclass_fields__ and k not in ("name",):
                     setattr(row, k, v)
-        # "Redirect (bypass ffmpeg)" is the built-in default. Reconcile it on
-        # every boot (like the other built-in fields), so installs that ran an
-        # earlier build - where "VAAPI 720p ~1M" was the fallback default -
-        # switch over too. A default that sits on a USER-created template
-        # (is_builtin=False) is a deliberate choice and is left untouched.
-        default = (await s.execute(select(FFmpegTemplate).where(
-            FFmpegTemplate.is_default.is_(True)))).scalar_one_or_none()
-        redir = (await s.execute(select(FFmpegTemplate).where(
-            FFmpegTemplate.name == REDIRECT_PRESET_NAME))).scalar_one_or_none()
-        if redir is not None and (default is None or default.is_builtin):
-            if default is not None and default.id != redir.id:
-                default.is_default = False
-            redir.is_default = True
-        elif default is None:
-            # redirect preset missing (cannot happen - it is re-seeded above,
-            # unless the user deleted it and the loop somehow skipped it): keep
-            # at least ONE enabled template default so streams never fall back
-            # to nothing.
-            ref = (await s.execute(select(FFmpegTemplate).where(
-                FFmpegTemplate.name == REFERENCE_PRESET_NAME))).scalar_one_or_none()
-            ref = ref or (await s.execute(select(FFmpegTemplate).where(
-                FFmpegTemplate.enabled.is_(True)).limit(1))).scalar_one_or_none()
-            if ref is not None:
-                ref.is_default = True
+        rows = (await s.execute(select(FFmpegTemplate).order_by(FFmpegTemplate.id))).scalars().all()
+        enabled = [row for row in rows if row.enabled]
+        chosen = next((row for row in enabled if row.is_default), None)
+        if chosen is None:
+            chosen = next((row for row in enabled if row.name == REDIRECT_PRESET_NAME),
+                          enabled[0] if enabled else None)
+        for row in rows:
+            row.is_default = row is chosen
         await s.commit()
 
     async with SessionLocal() as s:

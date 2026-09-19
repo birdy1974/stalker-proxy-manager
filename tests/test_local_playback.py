@@ -35,7 +35,7 @@ BASE = "http://testserver"
 async def _user() -> User:
     async with SessionLocal() as s:
         u = User(name="loc", password="pw", enabled=True, m3u_enabled=True,
-                 max_connections=4)
+                 max_connections=4, groups_json='{"local":["vod-local"]}')
         s.add(u)
         await s.commit()
         return u

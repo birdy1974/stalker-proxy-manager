@@ -245,12 +245,19 @@ class _RouteHealth:
         return sorted(macs, key=lambda mac: getattr(mac, "id", None) != mac_id)
 
     def failed(self, source) -> None:
+        from .playlist_health import record_playback
         key = self.source_key(source)
         count, _ = self.failures.get(key, (0, 0.0))
         self.failures[key] = (count + 1, time.monotonic())
+        if count + 1 >= SOURCE_BREAKER_FAILURES:
+            record_playback(source, failed=True, ttl=SOURCE_BREAKER_COOLDOWN)
 
-    def succeeded(self, route: tuple | None, source, mac) -> None:
+    def succeeded(self, route: tuple | None, source, mac, *, verified_media: bool = False) -> None:
+        from .playlist_health import record_playback
         key = self.source_key(source)
+        # A successful redirect only handed out a URL, not verified media.
+        if verified_media:
+            record_playback(source)
         self.failures.pop(key, None)
         if route:
             self.success[route] = (time.monotonic(), key, getattr(mac, "id", None))
@@ -2359,7 +2366,7 @@ class StreamManager:
                         if not registered:
                             await self._register(h)
                             registered = True
-                        self.route_health.succeeded(h.route_key, src, mac_row)
+                        self.route_health.succeeded(h.route_key, src, mac_row, verified_media=True)
                         await db_log("INFO", "stream",
                                      f"[{h.item_name}] playing via {portal.name}/"
                                      f"{mac_row.mac if mac_row is not None else 'xtream'} "

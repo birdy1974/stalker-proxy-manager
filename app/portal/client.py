@@ -825,6 +825,12 @@ class StalkerClient:
                 return creds, f"credentials in the {kind} link"
         return None, "no Xtream credentials in a portal link"
 
+    async def epg_info(self, days: int = 2):
+        """Bulk guide where supported; caller falls back to bounded short EPG."""
+        return await self._get({"type": "itv", "action": "get_epg_info",
+                               "period": str(max(1, min(days, 7))),
+                               "JsHttpRequest": "1-xml"})
+
     async def short_epg(self, ch_id: str, size: int = 10, *, tz=None) -> list[Programme]:
         """`type=itv&action=get_short_epg` for one channel: the next few programmes.
 

@@ -117,6 +117,12 @@ FETCH_PAGE_CONCURRENCY = max(1, int(os.environ.get("SPM_FETCH_PAGE_CONCURRENCY",
 FALLBACK_STRATEGY = os.environ.get("SPM_FALLBACK_STRATEGY", "macs_first")  # or portal_first
 
 # ---------------------------------------------------------------------------
+# Optional metadata enrichment
+# ---------------------------------------------------------------------------
+# Initial database setting only; later GUI edits (including clearing it) win.
+TMDB_API_KEY = os.environ.get("SPM_TMDB_API_KEY", "").strip()
+
+# ---------------------------------------------------------------------------
 # Feature toggles
 # ---------------------------------------------------------------------------
 # The built-in mock portal lets you test the full flow without a real portal.

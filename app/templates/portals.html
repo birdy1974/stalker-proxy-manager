@@ -97,7 +97,7 @@ function xtreamHtml(row, inModal) {
     `<button class="btn btn-sm ${cls} py-0" title="${esc(tip)}" onclick="xtreamAct('${what}')">${label}</button>`;
   if (!x.found) {
     const why = x.why || (inModal
-      ? "never looked — Detect asks the panel for one stream link and reads the credentials out of it"
+      ? "Not detected."
       : "not looked for");
     if (!inModal) return `<span class="small text-muted" title="${esc(why)}">—</span>`;
     return `<div class="small text-muted mb-1">${esc(why)}</div>
@@ -246,18 +246,18 @@ function renderJobs(jobs) {
 
 /* ============================= add / edit modal ============================= */
 async function editPortal(id) {
-  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false, identity_mode: "mag250", stb_timezone: "", direct_links: true };
+  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false, identity_mode: "minimal", stb_timezone: "", direct_links: true };
   const body = el("div");
   body.innerHTML = `
     <div>
       <div class="row g-2">
         <div class="col-md-6"><label class="muted-label">Portal name</label>
           <input class="form-control form-control-sm" id="p-name" value="${esc(p.name)}"></div>
-        <div class="col-md-6"><label class="muted-label">URL (any path style: /c/, /portal.php, /stalker_portal/c/…)</label>
+        <div class="col-md-6"><label class="muted-label" title="Any portal path style is accepted: /c/, /portal.php, /stalker_portal/c/…">URL</label>
           <div class="input-group input-group-sm"><input class="form-control" id="p-url" value="${esc(p.base_url)}" placeholder="http://host:port/c/">
-          <button class="btn btn-outline-secondary" id="p-resolve-btn" ${id ? `data-id="${id}"` : "disabled"}>Resolve</button></div>
+          <button class="btn btn-outline-secondary" id="p-resolve-btn" type="button" disabled>Resolve</button></div>
           <div class="small text-muted" id="p-resolve-out"></div></div>
-        <div class="col-12"><label class="muted-label">MAC addresses (comma, semicolon, space or one per line)</label>
+        <div class="col-12"><label class="muted-label" title="Separate MAC addresses with commas, semicolons, spaces or new lines.">MAC addresses</label>
           <textarea class="form-control mono" id="p-macs" rows="3">${esc(Array.isArray(p.macs) ? p.macs.map(m => m.mac).join(", ") : p.macs)}</textarea></div>
         <div class="col-md-4"><label class="muted-label">HTTP proxy (optional)</label>
           <input class="form-control form-control-sm" id="p-proxy" value="${esc(p.proxy_url || "")}" placeholder="http://ip:port"></div>
@@ -267,30 +267,30 @@ async function editPortal(id) {
         <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch">
           <input class="form-check-input" type="checkbox" id="p-tls" ${p.tls_insecure ? "checked" : ""}>
           <label class="form-check-label" for="p-tls">Allow broken TLS</label>
-          <div class="small text-muted">off by default - only for a panel with a self-signed /
+          <div class="small text-muted" data-help="TLS verification" data-help-for="p-tls">off by default - only for a panel with a self-signed /
             incomplete cert chain; it disables certificate verification for THIS portal only</div></div></div>
         <div class="col-md-4"><label class="muted-label" for="p-identity">Portal identity we advertise</label>
           <select class="form-select form-select-sm" id="p-identity">
             <option value="minimal"${(p.identity_mode || "minimal") === "minimal" ? " selected" : ""}>minimal, no fingerprint (default)</option>
             <option value="mag250"${(p.identity_mode || "") === "mag250" ? " selected" : ""}>MAG250 fingerprint</option>
           </select>
-          <div class="small text-muted">minimal sends only sn/timestamp (empty device id, no
+          <div class="small text-muted" data-help="Portal identity" data-help-for="p-identity">minimal sends only sn/timestamp (empty device id, no
             signature). Switch to the <b>MAG250 fingerprint</b> if a panel withholds data
             until it sees the box it enrolled</div></div>
         <div class="col-md-4"><label class="muted-label" for="p-tz">STB timezone cookie</label>
           <input class="form-control form-control-sm" id="p-tz" value="${esc(p.stb_timezone || "")}" placeholder="Europe/Amsterdam">
-          <div class="small text-muted">the <span class="mono">timezone</span> cookie a real box sends;
+          <div class="small text-muted" data-help="STB timezone" data-help-for="p-tz">the <span class="mono">timezone</span> cookie a real box sends;
             blank keeps the server default</div></div>
         <div class="col-md-4 d-flex align-items-end"><div class="form-check form-switch">
           <input class="form-check-input" type="checkbox" id="p-direct-links" ${p.direct_links === false ? "" : "checked"}>
-          <label class="form-check-label" for="p-direct-links">Play stored links when the panel allows</label>
-          <div class="small text-muted">on by default: a channel whose own flags say its link is
+          <label class="form-check-label" for="p-direct-links">Play stored links</label>
+          <div class="small text-muted" data-help="Stored stream links" data-help-for="p-direct-links">on by default: a channel whose own flags say its link is
             permanent is handed to the player as-is, with no <span class="mono">create_link</span>
             round trip. Turn it off for a panel whose flags lie — every stream then asks first,
             which is also the liveness check the fallback chain uses</div></div></div>
         <div class="col-12"><label class="muted-label">Xtream bridge</label>
           <div class="border rounded p-2" id="p-xtream"></div>
-          <div class="small text-muted mt-1">some panels are an Xtream account wearing a Stalker
+          <div class="small text-muted mt-1" data-help="Xtream bridge">some panels are an Xtream account wearing a Stalker
             portal: their <span class="mono">create_link</span> answer carries
             <span class="mono">/live/&lt;user&gt;/&lt;password&gt;/</span>. Detect reads it once
             (one request, read-only); <b>Adopt</b> is the only step that changes how you watch —
@@ -302,7 +302,7 @@ async function editPortal(id) {
           <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch genres</button>
         </div>
       </div>
-      <div class="small text-muted mt-2">Two API calls: <b>Fetch genres</b> loads the genre lists → enable/disable the genres you want per tab → <b>Save</b> fetches the channels of the enabled genres (live, VOD, series).</div>
+      <div class="small text-muted mt-2" data-help="Fetching genres and channels" data-help-for="p-fetch-btn">Two API calls: <b>Fetch genres</b> loads the genre lists → enable/disable the genres you want per tab → <b>Save</b> fetches the channels of the enabled genres (live, VOD, series).</div>
     </div>
     <ul class="nav nav-tabs nav-subtabs mt-3 mb-2">
       <li class="nav-item"><a class="nav-link active" data-tab="live">1 · Live</a></li>
@@ -318,14 +318,14 @@ async function editPortal(id) {
         <!-- multi-column genre band: a long list flows sideways into more
              columns instead of growing tall - scroll left/right only, never
              up/down (column sizing in .genre-cols, app/static/css/app.css) -->
-        <div class="border rounded p-2 genre-cols" id="genre-list-${k}"><div class="text-muted small p-1 genre-empty">No genres fetched yet — press “Fetch genres”.</div></div>
+        <div class="border rounded p-2 genre-cols" id="genre-list-${k}"><div class="text-muted small p-1 genre-empty">No genres fetched yet.</div></div>
       </div>`).join("")}`;
   const footer = el("div", { class: "d-flex gap-2 w-100" });
   const m = openModal({ title: id ? `Edit portal: ${p.name}` : "Add portal", body, footer, size: "xl" });
   /* Popup state: the portal id (existing, or assigned when a NEW portal is
      first saved / when "Fetch genres" creates it), a created-in-this-popup
      flag, and a double-submit guard. */
-  const state = { pid: id, createdHere: !id, saving: false };
+  const state = { pid: id, createdHere: !id, saving: false, resolving: false, resolveRevision: 0 };
   const portalPayload = () => ({
     name: $("#p-name", body).value.trim(), base_url: $("#p-url", body).value.trim(),
     macs: $("#p-macs", body).value, enabled: $("#p-enabled", body).checked,
@@ -386,7 +386,6 @@ async function editPortal(id) {
   }));
 
   if (state.pid) {
-    $("#p-resolve-btn", body).setAttribute("data-id", state.pid);
     loadGenres(state.pid, "live");
   }
 
@@ -404,24 +403,58 @@ async function editPortal(id) {
   $("#p-macs", body).addEventListener("input", updateFetchBtn);
   updateFetchBtn();
 
-  $("#p-resolve-btn", body).addEventListener("click", async () => {
-    const pid = $("#p-resolve-btn", body).dataset.id || state.pid;
-    if (!pid) { toast("Save the portal first, then resolve.", "warn"); return; }
-    $("#p-resolve-out", body).textContent = "probing paths…";
-    const r = await api(`/api/portals/${pid}/resolve`, { method: "POST" });
-    /* what the panel told us about itself, right under the URL it answered with:
-       version.js needs no token so it is nearly always available, while "no
-       module answer" is a fact worth seeing rather than a silent null */
-    const caps = (r.version || r.modules)
-      ? `<div class="small mt-1">
-           ${r.version && r.version.label ? `<span class="badge text-bg-info">${esc(r.version.label)}</span>` : `<span class="text-muted small">version.js: ${esc((r.version && r.version.error) || "nothing")}</span>`}
-           ${r.modules ? `<span class="mono small" title="modules the panel offers and has enabled">${esc(r.modules.join(", "))}</span>` : `<span class="text-muted small">no module answer (${esc(r.modules_error || "get_modules")})</span>`}
-           ${r.referer ? `<div class="text-muted mono" title="the Referer every request to this portal claims">${esc(r.referer)}</div>` : ""}
-         </div>` : "";
-    $("#p-resolve-out", body).innerHTML = r.ok
-      ? `<span class="text-success">OK → ${esc(r.resolved_url)}</span>${caps}`
-      : `<span class="text-danger">failed: ${esc(r.error)}</span>` +
-        `<details class="mt-1"><summary class="small">probe log</summary><pre class="mono small">${r.attempts.map(esc).join("\n")}</pre></details>`;
+  const resolveBtn = $("#p-resolve-btn", body);
+  const resolveOut = $("#p-resolve-out", body);
+  const updateResolveBtn = () => {
+    const data = portalPayload();
+    const ready = data.name && data.base_url && /\b(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}\b/i.test(data.macs);
+    resolveBtn.disabled = state.resolving || !ready;
+    resolveBtn.title = state.resolving ? "Probing current details…" : ready
+      ? "Test the current details without saving the portal"
+      : "Enter a portal name, URL and at least one valid MAC address";
+  };
+  state.updateResolveBtn = updateResolveBtn;
+  for (const field of ["name", "url", "macs", "proxy", "tls", "identity", "tz"]) {
+    const changed = () => {
+      ++state.resolveRevision;
+      if (resolveOut.textContent) resolveOut.textContent = "Details changed — Resolve again to test them.";
+      updateResolveBtn();
+    };
+    $("#p-" + field, body).addEventListener("input", changed);
+    $("#p-" + field, body).addEventListener("change", changed);
+  }
+  updateResolveBtn();
+  resolveBtn.addEventListener("click", async () => {
+    updateResolveBtn();
+    if (resolveBtn.disabled) return;
+    const revision = ++state.resolveRevision;
+    state.resolving = true;
+    updateResolveBtn();
+    resolveOut.textContent = "probing current details (not saved)…";
+    try {
+      const r = await api("/api/portals/resolve", { method: "POST",
+        body: { ...portalPayload(), portal_id: state.pid || null } });
+      if (revision !== state.resolveRevision || !body.isConnected) return;
+      /* what the panel told us about itself, right under the URL it answered with:
+         version.js needs no token so it is nearly always available, while "no
+         module answer" is a fact worth seeing rather than a silent null */
+      const caps = (r.version || r.modules)
+        ? `<div class="small mt-1">
+             ${r.version && r.version.label ? `<span class="badge text-bg-info">${esc(r.version.label)}</span>` : `<span class="text-muted small">version.js: ${esc((r.version && r.version.error) || "nothing")}</span>`}
+             ${r.modules ? `<span class="mono small" title="modules the panel offers and has enabled">${esc(r.modules.join(", "))}</span>` : `<span class="text-muted small">no module answer (${esc(r.modules_error || "get_modules")})</span>`}
+             ${r.referer ? `<div class="text-muted mono" title="the Referer every request to this portal claims">${esc(r.referer)}</div>` : ""}
+           </div>` : "";
+      $("#p-resolve-out", body).innerHTML = r.ok
+        ? `<span class="text-success">OK → ${esc(r.resolved_url)}</span><span class="small text-muted"> · not saved</span><span data-help="Resolve results">Tested current details without saving. Save to store portal changes.</span>${caps}`
+        : `<span class="text-danger">failed: ${esc(r.error)}</span>` +
+          `<details class="mt-1"><summary class="small">probe log</summary><pre class="mono small">${r.attempts.map(esc).join("\n")}</pre></details>`;
+    } catch (error) {
+      if (revision === state.resolveRevision && body.isConnected)
+        resolveOut.textContent = "Resolve failed: " + error.message;
+    } finally {
+      state.resolving = false;
+      updateResolveBtn();
+    }
   });
   fetchBtn.addEventListener("click", async () => {
     if (state.saving) return;
@@ -435,8 +468,6 @@ async function editPortal(id) {
            the popup (mere creation fires NO fetch API) */
         const r = await api("/api/portals", { method: "POST", body: data });
         state.pid = r.id;
-        $("#p-resolve-btn", body).removeAttribute("disabled");
-        $("#p-resolve-btn", body).setAttribute("data-id", r.id);
         table.reload();
         toast("portal saved — fetching genre lists…", "ok");
       }
@@ -502,7 +533,7 @@ async function loadGenres(pid, kind) {
         value="${g.id}" ${g.enabled ? "checked" : ""}></span>
       <span class="flex-grow-1 genre-item-name">${esc(g.name)}</span>
       <span class="text-muted">${g.item_count ?? "?"} items ${g.fetched ? "· fetched" : ""}</span>
-    </label>`).join("") : '<div class="text-muted small p-1 genre-empty">No genres fetched yet — press “Fetch genres”.</div>';
+    </label>`).join("") : '<div class="text-muted small p-1 genre-empty">No genres fetched yet.</div>';
   $$(`input[type=checkbox]`, host).forEach(cb => cb.addEventListener("change", async () => {
     await api(`/api/portals/${pid}/genres/toggle`, { method: "POST",
       body: { kind, ids: [+cb.value], enabled: cb.checked } });
@@ -538,8 +569,6 @@ async function savePortal(state, body, m) {
          Keep the popup open so that flow can continue. */
       const r = await api("/api/portals", { method: "POST", body: data });
       state.pid = r.id;
-      $("#p-resolve-btn", body).removeAttribute("disabled");
-      $("#p-resolve-btn", body).setAttribute("data-id", r.id);
       table.reload(); state.updateFetchBtn?.();
       toast("portal saved — press “Fetch genres” to load the genre lists, enable the genres you want, then Save again to fetch their channels", "ok");
       return;
@@ -601,7 +630,7 @@ async function deletePortal(id) {
     <div id="del-repl" class="mt-2 d-none"><label class="muted-label">Replacement portal</label>
       <select class="form-select form-select-sm" id="del-repl-id">
         ${chk.replacement_candidates.map(c => `<option value="${c.id}">${esc(c.name)}</option>`).join("")}
-      </select><div class="small text-muted">Best-effort case-insensitive name match.</div></div>`;
+      </select><div class="small text-muted" data-help="Replacement matching" data-help-for="del-repl-id">Best-effort case-insensitive name match.</div></div>`;
   const footer = el("div", { class: "d-flex gap-2" });
   const m = openModal({ title: `Portal in use: ${p.name}`, body, footer, size: "lg" });
   body.querySelector("#del-mode").addEventListener("change", (e) =>
@@ -640,7 +669,7 @@ window.compareGenres = async (pid) => {
   const macs = portal?.macs || [];
   const body = el("div");
   body.innerHTML = `
-    <p class="small text-muted">Choose at least two online MACs. Only the selected accounts are contacted.</p>
+    <p class="small text-muted" data-help="Comparing MACs">Choose at least two online MACs. Only the selected accounts are contacted.</p>
     <div class="d-flex gap-2 mb-2">
       <button class="btn btn-xs btn-outline-secondary" id="cmp-all">Select all online</button>
       <button class="btn btn-xs btn-outline-secondary" id="cmp-none">Clear</button>

@@ -21,9 +21,9 @@ from datetime import datetime, timezone
 
 from sqlalchemy import (
     Boolean, DateTime, Float, ForeignKey, Index, Integer, BigInteger, String, Text, SmallInteger,
-    UniqueConstraint,
+    UniqueConstraint, select,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import column_property, DeclarativeBase, Mapped, mapped_column, relationship
 
 
 def utcnow() -> datetime:
@@ -391,6 +391,10 @@ class LivePlaylist(Base):
     group_name: Mapped[str | None] = mapped_column(String(300), index=True)
     number: Mapped[int | None] = mapped_column(Integer)                    # optional custom channel number
     epg_id: Mapped[str | None] = mapped_column(String(200))                # tvg-id in final m3u
+    epg_sources_explicit: Mapped[bool] = mapped_column(Boolean, default=False)
+    epg_custom: Mapped[bool] = mapped_column(Boolean, default=False)
+    epg_gap_fill: Mapped[bool] = mapped_column(Boolean, default=True)
+    epg_offset_minutes: Mapped[int] = mapped_column(Integer, default=0)
     logo: Mapped[str | None] = mapped_column(String(600))                  # user-overridable (live only)
     ffmpeg_template_id: Mapped[int | None] = mapped_column(ForeignKey("ffmpeg_templates.id", ondelete="SET NULL"))
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
@@ -583,8 +587,19 @@ class EpgSource(Base):
     __tablename__ = "epg_sources"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    portal_id: Mapped[int | None] = mapped_column(ForeignKey("portals.id", ondelete="SET NULL"), nullable=True)
     url: Mapped[str] = mapped_column(String(600), unique=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    refresh_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)  # NULL=inherited, 0=manual
+    stale_hours: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    timezone_mode: Mapped[str] = mapped_column(String(16), default="auto")
+    timezone_name: Mapped[str | None] = mapped_column(String(64))
+    offset_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    # The timezone interpretation of the last successfully imported snapshot.
+    applied_timezone_mode: Mapped[str] = mapped_column(String(16), default="auto")
+    applied_timezone_name: Mapped[str | None] = mapped_column(String(64))
+    last_attempt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(String(500))
     last_fetch: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str | None] = mapped_column(String(120))
     channel_count: Mapped[int | None] = mapped_column(Integer)
@@ -602,12 +617,33 @@ class EpgChannel(Base):
     __table_args__ = (Index("ix_epg_channels_uniq", "epg_source_id", "tvg_id", unique=True),)
 
 
+class EpgChannelSource(Base):
+    """Ordered guide mappings, independent of the channel's playback fallbacks."""
+    __tablename__ = "epg_channel_sources"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    live_playlist_id: Mapped[int] = mapped_column(ForeignKey("live_playlist.id", ondelete="CASCADE"), index=True)
+    epg_source_id: Mapped[int] = mapped_column(ForeignKey("epg_sources.id", ondelete="CASCADE"), index=True)
+    tvg_id: Mapped[str] = mapped_column(String(200))
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    offset_minutes: Mapped[int] = mapped_column(Integer, default=0)
+    __table_args__ = (UniqueConstraint("live_playlist_id", "epg_source_id", "tvg_id", name="uq_epg_channel_source"),)
+
+
+# A mapping-table-only add-only restore can attach guides to an existing
+# automatic channel without modifying that channel's stored settings. Derive
+# its output identity from the actual mappings as well as the persisted mode.
+LivePlaylist.epg_has_mappings = column_property(
+    select(EpgChannelSource.id).where(EpgChannelSource.live_playlist_id == LivePlaylist.id)
+    .correlate_except(EpgChannelSource).exists(), expire_on_flush=False)
+
+
 class EpgProgramme(Base):
     """Programme rows for the channels we actually output (bounded on purpose:
-    only tvg_ids referenced by live_playlist.epg_id are ingested)."""
+    only tvg_ids referenced by live channels or guide mappings are ingested)."""
     __tablename__ = "epg_programmes"
 
     id: Mapped[int] = mapped_column(primary_key=True)
+    epg_source_id: Mapped[int | None] = mapped_column(ForeignKey("epg_sources.id", ondelete="SET NULL"), nullable=True, index=True)
     tvg_id: Mapped[str] = mapped_column(String(200), index=True)
     start_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     stop_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
@@ -618,7 +654,7 @@ class EpgProgramme(Base):
     icon: Mapped[str | None] = mapped_column(String(600))
     __table_args__ = (
         Index("ix_epg_prog_tvg_start", "tvg_id", "start_ts"),
-        UniqueConstraint("tvg_id", "start_ts", "title", name="uq_epg_prog_natural"),
+        UniqueConstraint("epg_source_id", "tvg_id", "start_ts", "title", name="uq_epg_prog_source"),
     )
 
 

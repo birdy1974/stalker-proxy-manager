@@ -8,7 +8,7 @@
         <button class="btn btn-sm btn-accent ms-auto" id="e2-add"><i class="bi bi-plus-lg"></i> Add</button>
       </div>
       <div class="card-body p-2" id="e2-list"></div>
-      <div class="card-footer small text-muted">
+      <div class="card-footer small text-muted" data-help="Receiver profiles">
         A profile turns the playlist into Enigma2 <code>userbouquet.*.tv</code> files.
         VOD &amp; series get <b>subtitles</b> only when their player is
         <b>5002</b> (ServiceApp/exteplayer3) and the container is <b>mkv</b>.
@@ -41,7 +41,7 @@
         </div>
 
         <hr class="my-3">
-        <div class="small text-muted mb-2"><b>Players &amp; containers.</b> The leading number of the service reference decides
+        <div class="small text-muted mb-2" data-help="Players and containers" data-help-for="f-player_live"><b>Players &amp; containers.</b> The leading number of the service reference decides
           which player the box uses; the container decides which URL alias it gets. MPEG-TS cannot carry text subtitles, so VOD and
           series need <code>mkv</code> + <code>5002</code>; live TV is best served as <code>ts</code> (native DVB subtitles).</div>
         <div class="row g-2">
@@ -76,7 +76,7 @@
         </div>
 
         <hr class="my-3">
-        <div class="small text-muted mb-2"><b>The receiver.</b> With transport <code>ftp</code> SPM uploads the bouquets itself
+        <div class="small text-muted mb-2" data-help="Receiver transport" data-help-for="f-transport"><b>The receiver.</b> With transport <code>ftp</code> SPM uploads the bouquets itself
           (atomic rename, <code>bouquets.tv</code> backed up as a restore point) and reloads the service list over OpenWebif;
           <code>download</code> means you use the installer one-liner below instead.</div>
         <div class="row g-2">
@@ -88,7 +88,7 @@
             <input class="form-control form-control-sm e2-field" type="number" id="f-ftp_port" value="21"></div>
           <div class="col-md-2"><label class="muted-label" title="the bouquet directory is root-owned, so a normal user cannot write it">FTP login</label>
             <input class="form-control form-control-sm mono e2-field" id="f-login" value="root"></div>
-          <div class="col-md-3"><label class="muted-label">FTP password <span class="text-muted" id="f-pass-hint"></span></label>
+          <div class="col-md-3"><label class="muted-label">FTP password <span data-help="Stored FTP password" data-help-for="f-password" id="f-pass-hint"></span></label>
             <input class="form-control form-control-sm e2-field" type="password" id="f-password" placeholder="unchanged"></div>
         </div>
         <div class="row g-2 mt-1">
@@ -98,7 +98,7 @@
             <select class="form-select form-select-sm e2-field" id="f-owif_auth"></select></div>
           <div class="col-md-2"><label class="muted-label">OpenWebif user</label>
             <input class="form-control form-control-sm mono e2-field" id="f-owif_user" placeholder="root"></div>
-          <div class="col-md-3"><label class="muted-label">OpenWebif password <span class="text-muted" id="f-owif-pass-hint"></span></label>
+          <div class="col-md-3"><label class="muted-label">OpenWebif password <span data-help="Stored OpenWebif password" data-help-for="f-owif_pass" id="f-owif-pass-hint"></span></label>
             <input class="form-control form-control-sm e2-field" type="password" id="f-owif_pass" placeholder="unchanged"></div>
           <div class="col-md-2 d-flex align-items-end">
             <label class="small"><input type="checkbox" class="e2-field" id="f-use_https"> HTTPS</label></div>
@@ -112,14 +112,14 @@
         <div class="small text-muted mt-1" id="e2-push-status"></div>
 
         <hr class="my-3">
-        <div class="muted-label">Install on the box (paste into telnet/SSH — re-run it any time to refresh)</div>
+        <div class="muted-label" id="e2-install-heading">Install on the box</div>
         <div class="input-group input-group-sm">
           <input class="form-control mono" id="e2-install" readonly>
           <button class="btn btn-outline-secondary" id="e2-copy">copy</button>
         </div>
-        <div class="small text-muted mt-1">The one-liner downloads the bouquets, backs up <code>bouquets.tv</code>, merges our
+        <div class="small text-muted mt-1" data-help="Receiver installer" data-help-for="e2-install-heading">Paste into telnet/SSH on the box; re-run any time to refresh. The one-liner downloads the bouquets, backs up <code>bouquets.tv</code>, merges our
           entries into it (yours are kept) and reloads the service list via OpenWebif. It carries a per-profile token, not your admin password.
-          <button class="btn btn-sm btn-link p-0 align-baseline" id="e2-rotate">rotate token</button></div>
+          </div><button class="btn btn-sm btn-link p-0 align-baseline" id="e2-rotate">rotate token</button>
       </div>
       <div class="card-footer d-flex gap-2">
         <button class="btn btn-sm btn-outline-danger" id="e2-delete"><i class="bi bi-trash"></i> Delete profile</button>
@@ -128,7 +128,7 @@
     <div class="card" id="e2-empty">
       <div class="card-body text-muted">
         <p class="mb-1">No receiver selected.</p>
-        <p class="small mb-0">Enigma2 boxes read plain text bouquet files. Create a profile, pick the players and containers for this
+        <p class="small mb-0" data-help="Enigma2 setup">Enigma2 boxes read plain text bouquet files. Create a profile, pick the players and containers for this
           box, preview what would be written, then either download the tarball or run the installer one-liner on the receiver.
           See <code>docs/ENIGMA2-INTEGRATION-OPTIONS.md</code> for the reasoning behind the defaults.</p>
       </div>

@@ -215,9 +215,9 @@ async function bulkLivePlaylistGroup(table) {
   const listId = `bulk-group-list-${Date.now()}`;
   const body = el("div");
   body.innerHTML = `
-    <div class="mb-2">Set the custom group for <b>${ids.length}</b> selected channel(s).
-    Disabled sources are skipped; fallback sources share their channel's group,
-    so a whole channel moves at once.</div>
+    <div class="mb-2">Set the custom group for <b>${ids.length}</b> selected channel(s).</div>
+    <span data-help="Bulk custom group" data-help-for="bulk-group-input">Disabled sources are skipped; fallback sources share their channel's group,
+    so a whole channel moves at once.</span>
     <label class="muted-label" for="bulk-group-input">Group \u2014 pick one or type a new name</label>
     <input id="bulk-group-input" class="form-control" list="${listId}"
       placeholder="custom group\u2026" autocomplete="off">
@@ -323,7 +323,7 @@ async function seriesDetail(row) {
             <input type="checkbox" class="src-season" data-id="${s.id}" ${s.enabled ? "checked" : ""} onchange="api('/api/sources/series/seasons/toggle',{method:'POST',body:{ids:[${s.id}],enabled:this.checked}}).then(()=>toast('season updated','ok'))">
             <span>${esc(s.name || "Season " + s.season_number)}</span>
             <span class="text-muted">${s.episode_count} episodes ${s.episodes_fetched ? "" : "· pending fetch"}</span>
-          </label>`).join("") : `<div class="small text-muted">${item.enabled ? "seasons are being fetched — close and reopen this popup in a moment" : "enable the series (switch in the list) to fetch seasons"}</div>`}
+          </label>`).join("") : `<div class="small text-muted">${item.enabled ? "Seasons pending." : "Series disabled."}</div><span data-help="Fetching seasons">${item.enabled ? "Close and reopen this popup in a moment to see fetched seasons." : "Enable the series using its switch in the list to fetch seasons."}</span>`}
         <div class="muted-label mt-2">Stream info (first episode probe)</div>
         <div class="probe-box"><span class="text-muted small">probing the first playable episode…</span></div>
         <div class="muted-label mt-2">TMDB</div>

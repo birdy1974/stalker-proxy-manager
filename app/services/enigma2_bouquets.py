@@ -37,6 +37,8 @@ else's are kept, because that file also lists the user's satellite bouquets.
 
 from __future__ import annotations
 
+from .user_groups import group_name as effective_group
+
 import json
 import re
 import secrets
@@ -351,11 +353,13 @@ def _profile_groups(profile: Enigma2Profile) -> dict:
     return {k: list(g.get(k, [])) for k in ("live", "vod", "series", "local")}
 
 
-def _visible(group_name: str | None, user_groups: list[str],
+def _visible(group_name: str | None, user_groups: list[str] | None,
              profile_groups: list[str]) -> bool:
     """Both filters apply: the user's whitelist (what that account may see) and
     the profile's own (what this box should carry)."""
-    return _allowed(group_name, user_groups) and _allowed(group_name, profile_groups)
+    # A receiver's optional extra filter remains unrestricted when empty;
+    # a USER's empty selection, however, must deny this content type.
+    return (user_groups is None or _allowed(group_name, user_groups)) and (not profile_groups or _allowed(group_name, profile_groups))
 
 
 async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
@@ -367,7 +371,10 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
         bundle.warnings.append("the profile's output user was deleted - the "
                                "generated URLs carry no credentials and will be "
                                "rejected with 403")
-    ugroups = _groups(user) if user else {k: [] for k in ("live", "vod", "series", "local")}
+    # Profiles without an assigned account are admin previews, not users with
+    # an empty whitelist. A deleted assigned account still fails closed.
+    ugroups = _groups(user) if user else {
+        k: ([] if profile.user_id else None) for k in ("live", "vod", "series", "local")}
     pgroups = _profile_groups(profile)
     prefix = profile.bouquet_prefix or "spm"
     layout = profile.layout if profile.layout in LAYOUTS else "group_markers"
@@ -428,7 +435,7 @@ async def _live_files(s, profile, base_url, user, ugroups, pgroups, prefix,
                       layout, mode, res: _Resolver, tmap) -> list[BouquetFile]:
     items = (await s.execute(select(LivePlaylist).where(LivePlaylist.enabled.is_(True))
                              .order_by(LivePlaylist.order, LivePlaylist.id))).scalars().all()
-    items = [it for it in items if _visible(it.group_name, ugroups["live"], pgroups["live"])]
+    items = [it for it in items if _visible(effective_group("live", it.group_name), ugroups["live"], pgroups["live"])]
     if not items:
         return []
     out: list[BouquetFile] = []
@@ -456,7 +463,7 @@ async def _vod_files(s, profile, base_url, user, ugroups, pgroups, prefix,
                      layout, mode, res: _Resolver, tmap) -> list[BouquetFile]:
     items = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
                              .order_by(VodPlaylist.order, VodPlaylist.id))).scalars().all()
-    items = [it for it in items if _visible(it.group_name, ugroups["vod"], pgroups["vod"])]
+    items = [it for it in items if _visible(effective_group("vod", it.group_name), ugroups["vod"], pgroups["vod"])]
     if not items:
         return []
     names: dict[int, str] = {}
@@ -503,7 +510,7 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
     series = (await s.execute(select(SeriePlaylist).where(SeriePlaylist.enabled.is_(True))
                               .order_by(SeriePlaylist.order, SeriePlaylist.id))).scalars().all()
     series = [sp for sp in series
-              if _visible(sp.group_name, ugroups["series"], pgroups["series"])]
+              if _visible(effective_group("series", sp.group_name), ugroups["series"], pgroups["series"])]
     if not series:
         return []
 
@@ -571,7 +578,7 @@ async def _local_files(s, profile, base_url, user, ugroups, pgroups, prefix,
     items = (await s.execute(select(LocalPlaylist).where(LocalPlaylist.enabled.is_(True))
                              .order_by(LocalPlaylist.order, LocalPlaylist.id))).scalars().all()
     items = [it for it in items
-             if _visible(it.group_name, ugroups["local"], pgroups["local"])]
+             if _visible(effective_group("local", it.group_name), ugroups["local"], pgroups["local"])]
     if not items:
         return []
     files: dict[int, LocalFile] = {}

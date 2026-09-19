@@ -221,7 +221,9 @@ def test_the_duo2_live_template_takes_a_deinterlacer():
               if k in FFmpegOptions.__dataclass_fields__}
     cmd = build_command(FFmpegOptions(**{**fields, "vf_preset": "deint-vaapi-frame"}))
     assert ("-vf deinterlace_vaapi=rate=frame,"
-            "scale_vaapi=w=1920:h=1080:format=nv12,fps=25,setsar=1" in cmd), cmd
+            "scale_vaapi=w=1920:h=1080:format=nv12,setsar=1" in cmd), cmd
+    assert "fps=" not in cmd and "-r " not in cmd
     back = parse_command(cmd)["options"]
+    assert back["fps"] == ""
     assert back["vf_preset"] == "deint-vaapi-frame"
     assert build_command(FFmpegOptions(**back)) == cmd

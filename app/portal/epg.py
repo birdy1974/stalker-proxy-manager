@@ -47,6 +47,8 @@ class Programme:
     description: str = ""
     has_archive: bool = False
     raw: dict = field(default_factory=dict, repr=False)
+    start_input: str | int | float | None = field(default=None, repr=False)
+    stop_input: str | int | float | None = field(default=None, repr=False)
 
     def public(self) -> dict:
         return {"title": self.title,
@@ -126,7 +128,8 @@ def parse_short_epg(payload, tz: timezone | None = None) -> list[Programme]:
         out.append(Programme(title=title or "(untitled)", start=start, stop=stop,
                              description=str(_first(row, _DESC_KEYS) or "").strip()[:1000],
                              has_archive=archive in ("1", "true", "yes", "on"),
-                             raw=row if len(str(row)) < 800 else {}))
+                             raw=row if len(str(row)) < 800 else {},
+                             start_input=_first(row, _TS_KEYS), stop_input=_first(row, _END_KEYS)))
     out.sort(key=lambda p: (p.start is None, p.start or datetime.min.replace(tzinfo=timezone.utc)))
     return out
 
