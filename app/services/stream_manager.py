@@ -515,6 +515,16 @@ def _orphan_ffmpeg_pids(root: str = "/proc") -> list[int]:
     return found
 
 
+#: First-byte windows per candidate. The first candidate gets the full
+#: STREAM_START_TIMEOUT - it is the source the engine believes in, and a panel
+#: can legitimately take its time to open the media path. After that, a silent
+#: candidate is much more likely to be a dead edge than a slow one, and waiting
+#: the full window for each of them is what turns a two-MAC chain into 24 s of
+#: black screen before the player sees an error. Measured on the demo instance:
+#: a candidate that produces bytes does so in ~550 ms, so a 5 s second window
+#: costs nothing real and caps the walk at a fraction of the old worst case.
+STREAM_START_TIMEOUT_REST = float(os.environ.get("SPM_STREAM_START_TIMEOUT_REST", "5"))
+
 #: A live stream that dies mid-play is restarted inside the SAME client response.
 #: The usual cause is not a dead channel but a dead *link*: panels invalidate the
 #: per-session URL after a while (and CDNs drop long-lived connections), so the
@@ -1321,18 +1331,23 @@ class StreamManager:
                       lambda m: " " + " ".join(add) + m.group(0),
                       cmd_text, count=1)
 
-    async def _first_bytes(self, proc) -> bytes:
+    async def _first_bytes(self, proc, timeout: float | None = None) -> bytes:
         """
         Wait for the first chunk - but only until ffmpeg dies, not until the
         start timeout expires. A process that exits before sending a byte will
         never send one, so falling back immediately is both faster (no 12 s
         wait per dead source) and honest in the log.
+
+        `timeout` is the per-candidate window (see STREAM_START_TIMEOUT_REST):
+        the caller spends the full window on the source it believes in and much
+        less on the ones after it.
         """
         read_t = asyncio.ensure_future(proc.stdout.read(CHUNK))
         exit_t = asyncio.ensure_future(proc.wait())
         try:
             done, _pending = await asyncio.wait(
-                {read_t, exit_t}, timeout=STREAM_START_TIMEOUT,
+                {read_t, exit_t},
+                timeout=STREAM_START_TIMEOUT if timeout is None else timeout,
                 return_when=asyncio.FIRST_COMPLETED)
         except Exception:  # noqa: BLE001 - never let the wait break the pump
             done = set()
@@ -1872,7 +1887,8 @@ class StreamManager:
         return out
 
     async def _open_with_identity(self, command: str, url: str, *,
-                                  title: str, pace: bool
+                                  title: str, pace: bool,
+                                  first_byte_timeout: float | None = None
                                   ) -> tuple[object | None, bytes, dict | None]:
         """Spawn ffmpeg for a network URL, walking the media-UA ladder.
 
@@ -1905,7 +1921,7 @@ class StreamManager:
                                      user_agent=ua)
             if proc is None:
                 return None, b"", None
-            first = await self._first_bytes(proc)
+            first = await self._first_bytes(proc, first_byte_timeout)
             if first:
                 if ua:
                     stream_identity.remember(url, ua)
@@ -2988,6 +3004,7 @@ class StreamManager:
                              + (f" - {h.trace}" if h.trace else "")
                              + " -> giving the player an answer instead of a hang")
 
+            tried_any = False
             while True:
               for pass_no in range(attempts):
                   if pass_no == 1:
@@ -3032,6 +3049,8 @@ class StreamManager:
                           if _budget_spent():
                               await _give_up()
                               return
+                          first_candidate = not tried_any
+                          tried_any = True
                           # Decided before the portal is touched, for the same reason the
                           # redirect path decides first: for a source the user adopted onto
                           # the panel's Xtream side (R7) there is no MAC to spend and no
@@ -3180,7 +3199,16 @@ class StreamManager:
                           try:
                               proc, first, open_fail = await self._open_with_identity(
                                   h.command, url, title=h.item_name,
-                                  pace=(kind != "live"))
+                                  pace=(kind != "live"),
+                                  # The first candidate gets the full window;
+                                  # after it, a silent source is far more likely
+                                  # to be dead than slow (measured: a live one
+                                  # answers in ~550 ms), and a whole chain of
+                                  # 12 s waits is what a player shows as a frozen
+                                  # screen. See STREAM_START_TIMEOUT_REST.
+                                  first_byte_timeout=(STREAM_START_TIMEOUT
+                                                      if first_candidate
+                                                      else STREAM_START_TIMEOUT_REST))
                           except FFmpegTemplateError as exc:
                               if locked is not None:
                                   self.unlock_mac(locked, h.id)

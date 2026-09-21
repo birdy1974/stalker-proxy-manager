@@ -166,7 +166,7 @@ async def test_a_zap_takes_the_free_mac_instead_of_waiting(monkeypatch):
     client = _BusyThenOkClient(refusals=0)
     monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
 
-    async def fake_open(self, command, url, *, title="", pace=False):
+    async def fake_open(self, command, url, *, title="", pace=False, first_byte_timeout=None):
         return _Proc(), b"\x47" * 188 * 4, None
 
     monkeypatch.setattr(type(MANAGER), "_open_with_identity", fake_open)

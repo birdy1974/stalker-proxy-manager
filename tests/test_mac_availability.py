@@ -201,7 +201,8 @@ async def _live_route(macs=("00:1A:79:00:00:01", "00:1A:79:00:00:02")):
         return pl.id, rows
 
 
-async def _never_data(self, command, url, *, title, pace):
+async def _never_data(self, command, url, *, title, pace,
+                      first_byte_timeout=None):
     """A spawn that never produces a byte: stalled, with a stderr tail."""
     return None, b"", {"rc": None, "tail": "[vaapi @ 0x1] Failed to initialise",
                        "stalled": True}

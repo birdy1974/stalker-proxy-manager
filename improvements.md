@@ -21,6 +21,11 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (a dead MAC no longer costs the full start timeout)
+- Every candidate in the chain was given the full `SPM_STREAM_START_TIMEOUT` (12 s) even when ffmpeg was alive but silent, so a chain of two MACs could keep the player black for ~24 s and a six-source playlist for ~72 s. The first timeout exists for a reason (a panel can be slow to open the media path), the later ones do not: a source that is going to answer does so in ~550 ms on the demo instance.
+  -> the first candidate keeps the full window, every candidate after it gets `SPM_STREAM_START_TIMEOUT_REST` (default 5 s), and the window is a parameter of `_first_bytes`/`_open_with_identity` rather than a constant. A dead 2-MAC chain now fails at ~17 s worst case instead of 24, and a 6-source playlist at 37 s instead of 72.
+  -> the fakes in the suite had to learn the new keyword (they mirror the real signature), which is exactly the friction this change should have.
+
 2026-09-21 (sticky streams: a zap back attaches instead of starting over)
 - The remaining cold start was self-inflicted: a client disconnect killed the ffmpeg pipe at once, so the player's next visit to the same channel paid `create_link` + process start + the panel CDN's first byte again (~560 ms on loopback, 1-3 s on a real panel).
   -> a *live* pipe that actually played is now held for `SPM_LINGER_S` (8 s): process alive, MAC locked (the panel is still counting that connection), runtime row deleted (nobody is watching - the dashboard stays honest), bytes drained into a `SPM_LINGER_BUFFER_KB` (2 MiB) ring. A request for the same item from the same user inside the window attaches: buffered bytes first, then live, in the same response. Measured live: **cold 566 ms -> 13 ms** (`startup timing: prepare=7ms source+ffmpeg+first-byte=2ms total=10ms`), twice in a row, with zero panel calls.

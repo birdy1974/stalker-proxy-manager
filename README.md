@@ -67,6 +67,7 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 | `SPM_LINK_CACHE_S` | `90` | seconds a resolved live link may be replayed for the next 302 (zap-back costs no `create_link`). `0` disables; `SPM_LINK_CACHE_KINDS` picks the kinds (default `live`) |
 | `SPM_FFMPEG_USE_STORED_LINK` | `1` | `0` restores "the ffmpeg path always asks for a link", even for a channel whose flags say its link is permanent |
 | `SPM_STREAMS_PER_MAC` | `1` | default concurrent streams per MAC for portals whose row says nothing (the GUI setting is per portal) |
+| `SPM_STREAM_START_TIMEOUT_REST` | `5` | first-byte window for every candidate *after* the first. The first one gets the full `SPM_STREAM_START_TIMEOUT` (a panel may legitimately be slow to open the media path); after that a silent source is usually dead, not slow, and waiting the full window for each MAC is how a two-MAC chain became 24 s of black screen. Measured: a source that produces bytes does so in ~550 ms |
 | `SPM_LINGER_S` | `8` | how long a live pipe is *held* after its client disappears, so a zap back attaches to the running stream instead of paying `create_link` + ffmpeg start + first byte again. `0` disables (the pipe is killed on disconnect, as before) |
 | `SPM_LINGER_BUFFER_KB` | `2048` | bytes of the parked stream kept for the returning client (handed over first, so the player sees no gap) |
 | `SPM_LINGER_KINDS` | `live` | kinds that may be parked; a VOD that ended is finished, not held |

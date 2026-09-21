@@ -137,7 +137,7 @@ def _wire(monkeypatch, pipes: list[_Pipe]):
     monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
     monkeypatch.setattr(stream_manager, "link_is_alive", lambda *a, **k: True)
 
-    async def fake_open(self, command, url, *, title="", pace=False):
+    async def fake_open(self, command, url, *, title="", pace=False, first_byte_timeout=None):
         pipe = pipes.pop(0)
         pipe.feed(b"first-chunk")
         return pipe, b"first-chunk", None
