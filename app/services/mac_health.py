@@ -35,7 +35,8 @@ from sqlalchemy import select
 from ..database import SessionLocal
 from ..models import LiveGenre, MacAddress, Portal, SerieGenre, VodGenre
 from ..portal.account import mac_status
-from ..portal.client import PortalError, status_for_error
+from ..portal.client import (RATE_LIMITED_CODE, PortalError,
+                             status_for_error)
 from ..portal.pool import POOL, PortalSession
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
@@ -119,6 +120,23 @@ async def refresh_mac(portal: Portal, mac: MacAddress, *, url: str) -> dict:
             code = verdict.status
     except PortalError as exc:
         code = exc.code
+        if exc.code == RATE_LIMITED_CODE:
+            # A portal-wide pause says nothing about this MAC: the panel is
+            # refusing *traffic*, not this account. Demoting it (or bumping its
+            # fail_count) would take a healthy MAC out of the pool for a day
+            # because somebody else's play tripped a rate limiter.
+            detail = exc.detail()
+            mac.last_error = detail[:200]
+            mac.last_checked = datetime.now(timezone.utc)
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return {"mac": mac.mac, "status": mac.status, "online": mac.online,
+                    "expire_date": mac.expire_date, "code": code,
+                    "detail": detail, "skipped": "portal rate limited",
+                    "last_checked": mac.last_checked.isoformat()
+                    if mac.last_checked else None}
         mac.status = status_for_error(exc)
         mac.online = False
         mac.fail_count = (mac.fail_count or 0) + 1

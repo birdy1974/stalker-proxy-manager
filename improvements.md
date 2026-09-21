@@ -21,6 +21,12 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (a 429 pauses the portal, not just the MAC that asked)
+- A portal that answers HTTP 429 was treated like any other error: the chain walked on to the next MAC, EPG fetches kept going, the health check kept probing - all from the same IP, at the moment the panel was explicitly asking us to stop. That is how "slow down" becomes a banned IP, and the ban applies to every MAC on the portal.
+  -> one 429 now pauses the *host* for `SPM_RATE_LIMIT_COOLDOWN` (30 s, or the panel's own `Retry-After`, capped at `SPM_RATE_LIMIT_COOLDOWN_MAX`), shared by every client and every path: playback stops trying before it opens a socket (`PortalError(code="rate_limited")`), so does the handshake, so do EPG/health/account calls.
+  -> a pause is not evidence about a MAC, so `refresh_mac()` no longer writes `offline`/`error` and bumps the fail counter for it (`{"skipped": "portal rate limited"}` instead) - one user's streaming cannot take a healthy MAC out of the pool for a day.
+  -> the mock portal grew the two knobs this needs: `http_status` (it was listed in `_TOGGLE_KEYS` but never applied - a knob that cannot be turned is not a knob), `retry_after`. `tests/test_rate_limit_cooldown.py` pins the contract: the pause is per host, honours Retry-After, lifts by itself, and a sibling MAC on the same portal is held back too.
+
 2026-09-21 (a dead MAC no longer costs the full start timeout)
 - Every candidate in the chain was given the full `SPM_STREAM_START_TIMEOUT` (12 s) even when ffmpeg was alive but silent, so a chain of two MACs could keep the player black for ~24 s and a six-source playlist for ~72 s. The first timeout exists for a reason (a panel can be slow to open the media path), the later ones do not: a source that is going to answer does so in ~550 ms on the demo instance.
   -> the first candidate keeps the full window, every candidate after it gets `SPM_STREAM_START_TIMEOUT_REST` (default 5 s), and the window is a parameter of `_first_bytes`/`_open_with_identity` rather than a constant. A dead 2-MAC chain now fails at ~17 s worst case instead of 24, and a 6-source playlist at 37 s instead of 72.

@@ -173,6 +173,7 @@ PORTAL_ERROR_HINTS = {
     "max_connections": "the panel reports max connections reached",
     "nothing_to_play": "the portal has nothing to play for this item",
     "link_fault": "portal/CDN fault while building the link",
+    "rate_limited": "the portal is refusing traffic for a while (HTTP 429) - all MACs on it are paused",
     "access_denied": "the MAC is not enrolled/authorized on this portal",
     "unauthorized": "the portal refused the credentials",
     "not_authorized": "the portal refused the credentials",
@@ -206,6 +207,80 @@ MAC_SUSPECT_CODES = frozenset({"limit", "account_is_in_use", "max_connections",
 # It is also the one refusal that must NOT trigger a re-handshake: the bearer is
 # fine, and a fresh handshake can kick the session the box is still using.
 SLOT_BUSY_CODES = frozenset({"limit", "account_is_in_use", "max_connections"})
+
+# --------------------------------------------------------------------------- #
+# Portal-side rate limiting (HTTP 429 / Retry-After)
+# --------------------------------------------------------------------------- #
+#: A panel that answers 429 is telling *every* caller on that host to stop for a
+#: while. Walking into it again - the next MAC in the chain, the next EPG page,
+#: the next health check - is how a proxy turns "slow down" into "your IP is
+#: banned", and a ban hits all the MACs on that portal, not just the one that
+#: asked. So the pause is per portal host and global: one 429 stops playback
+#: attempts, EPG fetches and health probes on that host alike, until the window
+#: (the panel's own Retry-After when it sent one) has passed.
+RATE_LIMIT_COOLDOWN_S = float(os.environ.get("SPM_RATE_LIMIT_COOLDOWN", "30"))
+RATE_LIMIT_COOLDOWN_MAX_S = float(os.environ.get("SPM_RATE_LIMIT_COOLDOWN_MAX", "600"))
+RATE_LIMITED_CODE = "rate_limited"
+
+#: host -> (monotonic deadline, why) - module-level on purpose: the pool creates
+#: a client per (portal, MAC, tls) key and every one of them must see the pause.
+_rate_limit_until: dict[str, tuple[float, str]] = {}
+
+
+def portal_host(portal_url: str) -> str:
+    """The key the pause is shared under (a portal's MACs are one host)."""
+    try:
+        return (urlsplit(portal_url).netloc or portal_url or "").lower()
+    except Exception:  # noqa: BLE001 - a malformed URL is not worth a crash
+        return str(portal_url or "").lower()
+
+
+def retry_after_seconds(response) -> float:
+    """`Retry-After` in seconds (0.0 when there is none / it is a date).
+
+    Only the delta-seconds form is honoured: the HTTP-date form needs a clock
+    the panel and the proxy agree on, and guessing here would be worse than
+    falling back to the default window.
+    """
+    raw = ""
+    try:
+        raw = (response.headers.get("retry-after") or "").strip()
+    except Exception:  # noqa: BLE001
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
+def rate_limit_left(portal_url: str) -> float:
+    """Seconds the portal host is still paused for (0.0 = go ahead)."""
+    entry = _rate_limit_until.get(portal_host(portal_url))
+    if not entry:
+        return 0.0
+    left = entry[0] - time.monotonic()
+    if left <= 0:
+        _rate_limit_until.pop(portal_host(portal_url), None)
+        return 0.0
+    return left
+
+
+def note_rate_limit(portal_url: str, *, retry_after: float = 0.0,
+                    reason: str = "") -> float:
+    """Pause this portal host; returns how long the pause will last."""
+    wait = retry_after if retry_after > 0 else RATE_LIMIT_COOLDOWN_S
+    wait = max(1.0, min(wait, RATE_LIMIT_COOLDOWN_MAX_S))
+    key = portal_host(portal_url)
+    deadline = time.monotonic() + wait
+    prev = _rate_limit_until.get(key)
+    if not prev or deadline > prev[0]:
+        _rate_limit_until[key] = (deadline, reason or "HTTP 429")
+    return wait
+
+
+def reset_rate_limits() -> None:
+    """Forget every pause (tests, and a `clear` from the GUI)."""
+    _rate_limit_until.clear()
 
 # Refusals that can mean "you asked with the wrong FORM of the right item"
 # rather than "this item is gone" - the only codes for which a second attempt
@@ -513,6 +588,12 @@ class StalkerClient:
         carry `{"error":0}` or an informational `msg` on perfectly good genre
         and channel lists, so we only fail when the answer is also empty.
         """
+        left = rate_limit_left(self.portal_url)
+        if left > 0:
+            # No socket is opened: the whole point is to not touch the panel.
+            raise PortalError(
+                f"portal is rate limiting us ({left:.0f}s of cooldown left)",
+                code=RATE_LIMITED_CODE)
         http = await self._http()
         if self._token is None or self._token_stale():
             async with self._lock:
@@ -527,6 +608,15 @@ class StalkerClient:
         except Exception as exc:  # noqa: BLE001 - any transport error means "unreachable"
             raise PortalError(f"request failed: {type(exc).__name__}: {exc}",
                               code="transport") from exc
+        if r.status_code == 429:
+            wait = note_rate_limit(self.portal_url, retry_after=retry_after_seconds(r),
+                                   reason="HTTP 429")
+            log.warning("portal %s answered 429 -> pausing this portal for %.0fs "
+                        "(every MAC on it, not just this one)",
+                        portal_host(self.portal_url), wait)
+            raise PortalError(
+                f"portal rate limited us (HTTP 429, pausing {wait:.0f}s)",
+                code=RATE_LIMITED_CODE)
         if r.status_code in (401, 403) and self._may_reauth(retry_on_auth, retried):
             # Read the refusal before reacting to the status code. A 403 whose
             # body says "the MAC is already streaming" is not an auth failure:
@@ -617,6 +707,10 @@ class StalkerClient:
         except Exception as exc:  # noqa: BLE001 - unreachable is a verdict, not a bug
             log.debug("handshake transport error: %s", exc)
             return {}, "", "transport"
+        if r.status_code == 429:
+            note_rate_limit(self.portal_url, retry_after=retry_after_seconds(r),
+                            reason="HTTP 429 (handshake)")
+            return {}, "", RATE_LIMITED_CODE
         if r.status_code != 200:
             return {}, "", ("unauthorized" if r.status_code in (401, 403)
                             else f"http_{r.status_code}")
@@ -648,6 +742,11 @@ class StalkerClient:
         it is invisible in the logs of a client that does not do it: the panel
         does not say "you forgot the prehash", it just returns nothing.
         """
+        left = rate_limit_left(self.portal_url)
+        if left > 0:
+            raise PortalError(
+                f"portal is rate limiting us ({left:.0f}s of cooldown left)",
+                code=RATE_LIMITED_CODE)
         http = await self._http()
         if self._handshaking:                      # see _may_reauth
             raise PortalError("handshake already in progress", code="no_token")
