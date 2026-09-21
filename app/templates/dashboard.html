@@ -57,6 +57,22 @@
     </div>
 
     <div class="card mt-3">
+      <div class="card-header"><i class="bi bi-stopwatch"></i> Zapping & panel answers</div>
+      <div class="card-body py-2">
+        <div class="row small g-1" id="diag-summary"></div>
+        <div class="muted-label mt-2">Refusals the panel sent</div>
+        <div id="diag-refusals" class="small"></div>
+        <div class="muted-label mt-2">Last starts</div>
+        <div id="diag-recent" class="small mono" style="max-height:140px;overflow:auto"></div>
+      </div>
+      <div class="card-footer small text-muted" data-help="Zapping latency">
+        Phase timings of the last starts (this process only). <b>proxy</b> = panel link + ffmpeg + first byte;
+        <b>redirect</b> = panel link + one liveness probe, no ffmpeg. A parked pipe is a live stream whose player
+        left and that is held for a moment so a zap back attaches instead of restarting.
+      </div>
+    </div>
+
+    <div class="card mt-3">
       <div class="card-header"><i class="bi bi-list-task"></i> Background jobs</div>
       <div class="card-body p-2"><div id="jobs-box" class="p-2 small"></div></div>
     </div>
@@ -105,12 +121,53 @@ async function refreshStats() {
     card("Active streams", d.streams.length);
   $("#mock-hint").innerHTML = {% if mock_enabled %}`<b>Demo tip:</b> add portal <span class="mono">{{ mock_portal_url }}</span> with MAC <span class="mono">{{ mock_macs }}</span> to try the full flow without a real portal. The Mock Control there simulates offline/busy portals so you can watch fallback work.`{% else %}""{% endif %};
   renderApi(d.api);
+  renderDiag(d.diag);
   renderJobs(d.jobs);
   if (!window._streamsTable) makeStreamsTable(); else window._streamsTable.reload();
 }
 function fmtUptime(sec) {
   const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60);
   return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m ${sec % 60}s`;
+}
+function renderDiag(g) {
+  const box = $("#diag-summary");
+  if (!g) { box.innerHTML = '<span class="text-muted">no data yet</span>'; return; }
+  const t = g.timing || {}, modes = t.modes || {};
+  const cell = (v, l, cls="") => `<div class="col-6 ${cls}"><b>${v}</b> <span class="text-muted">${l}</span></div>`;
+  const ms = v => v == null ? "–" : `${Math.round(v)} ms`;
+  let html = "";
+  for (const [mode, m] of Object.entries(modes)) {
+    html += cell(`p50 ${ms(m.total.p50)}`, `${mode} · n=${m.total.n}`) +
+            cell(`p90 ${ms(m.total.p90)}`, `${mode} slow tail`);
+  }
+  const fails = Object.entries(t.failures || {}).map(([k, v]) => `${k} ${v}`).join(" · ");
+  if (fails) html += cell(fails, "failed starts");
+  const p = g.probe || {};
+  if ((p.probes || 0) + (p.cache_hits || 0) > 0) {
+    const saved = Math.round(100 * (p.cache_hits || 0) / Math.max(1, (p.probes || 0) + (p.cache_hits || 0)));
+    html += cell(`${saved}%`, "link probes saved by the cache");
+  }
+  const paced = Object.values((g.pace || {}).paced || {}).reduce((a, b) => a + b, 0);
+  if (paced) html += cell(paced, "background requests yielded to a play");
+  if (g.parked) html += cell(g.parked, "parked pipe(s) waiting for a zap back");
+  for (const q of g.paused || []) html += cell(`${q.seconds}s`, `paused (rate limited): ${esc(q.name)}`);
+  box.innerHTML = html || '<span class="text-muted">no starts recorded yet</span>';
+
+  const codes = ((g.refusals || {}).codes || []);
+  $("#diag-refusals").innerHTML = codes.length
+    ? codes.map(c => `<div class="d-flex justify-content-between border-bottom">` +
+        `<span class="mono">${esc(c.code)}</span>` +
+        `<span class="text-muted">${c.count}× <span class="mono">${esc(c.host)}</span></span></div>`).join("")
+    : '<span class="text-muted">none</span>';
+
+  const rows = ((g.timing || {}).recent || []).slice().reverse();
+  $("#diag-recent").innerHTML = rows.map(r => {
+    const when = new Date(r.at * 1000).toTimeString().slice(0, 8);
+    const detail = r.fail ? `<b class="log-WARNING">${esc(r.fail)}</b>`
+      : `${Math.round(r.total_ms)} ms${r.first_ms != null ? ` (first byte ${Math.round(r.first_ms)} ms)` : ""}`;
+    return `<div class="text-nowrap"><span class="text-muted">${when}</span> ${esc(r.mode)} ` +
+           `${esc(r.item || "")} ${r.portal ? `<span class="text-muted">${esc(r.portal)}/${esc(r.mac || "")}</span>` : ""} — ${detail}</div>`;
+  }).join("") || '<span class="text-muted">none yet</span>';
 }
 function renderApi(a) {
   if (!a) return;

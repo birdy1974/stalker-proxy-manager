@@ -35,9 +35,11 @@ from sqlalchemy import select
 from ..database import SessionLocal
 from ..models import LiveGenre, MacAddress, Portal, SerieGenre, VodGenre
 from ..portal.account import mac_status
-from ..portal.client import PortalError, status_for_error
+from ..portal.client import (RATE_LIMITED_CODE, PortalError,
+                             status_for_error)
 from ..portal.pool import POOL, PortalSession
 from ..portal.resolver import resolve_portal
+from .portal_pace import pace_for_playback
 from .db_logging import db_log
 from .runtime_settings import get_setting
 from .stream_manager import MANAGER
@@ -119,6 +121,23 @@ async def refresh_mac(portal: Portal, mac: MacAddress, *, url: str) -> dict:
             code = verdict.status
     except PortalError as exc:
         code = exc.code
+        if exc.code == RATE_LIMITED_CODE:
+            # A portal-wide pause says nothing about this MAC: the panel is
+            # refusing *traffic*, not this account. Demoting it (or bumping its
+            # fail_count) would take a healthy MAC out of the pool for a day
+            # because somebody else's play tripped a rate limiter.
+            detail = exc.detail()
+            mac.last_error = detail[:200]
+            mac.last_checked = datetime.now(timezone.utc)
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return {"mac": mac.mac, "status": mac.status, "online": mac.online,
+                    "expire_date": mac.expire_date, "code": code,
+                    "detail": detail, "skipped": "portal rate limited",
+                    "last_checked": mac.last_checked.isoformat()
+                    if mac.last_checked else None}
         mac.status = status_for_error(exc)
         mac.online = False
         mac.fail_count = (mac.fail_count or 0) + 1
@@ -181,6 +200,10 @@ async def refresh_portal_macs(portal_id: int, *, skip_busy: bool = True) -> dict
         results = []
         skipped = 0
         for m in macs:
+            # A health sweep is cheap per MAC and there may be many: while a
+            # play is running on this portal, the sweep takes its time instead
+            # of competing for the panel's connection budget.
+            await pace_for_playback(portal_id)
             if m.id in busy:
                 skipped += 1
                 results.append({"mac": m.mac, "status": m.status, "online": m.online,

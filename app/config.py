@@ -107,6 +107,16 @@ VAAPI_DEVICE = next((d for d in VAAPI_DEVICE_CANDIDATES if Path(d).exists()), VA
 STREAM_START_TIMEOUT = float(os.environ.get("SPM_STREAM_START_TIMEOUT", "12"))
 # Max time allowed for a single portal HTTP request.
 PORTAL_HTTP_TIMEOUT = float(os.environ.get("SPM_PORTAL_HTTP_TIMEOUT", "10"))
+# How long a pooled portal session keeps its HTTP connection alive while idle.
+# httpx's own default is 5 s: a create_link after a quiet moment then pays a
+# fresh TCP (+TLS) handshake, which is 2 round trips on a WAN panel - a large
+# part of "zapping feels slow" that has nothing to do with the portal's own
+# answer time. A real set-top box keeps its connection open; so do we. 0 or
+# less = never expire (the session outlives long idle spells by design).
+PORTAL_KEEPALIVE_S = float(os.environ.get("SPM_PORTAL_KEEPALIVE_S", "90"))
+# Connections per portal session (one session = one portal + MAC). Playback and
+# background fetches share it; 4 concurrent fetches + a play fits comfortably.
+PORTAL_MAX_CONNECTIONS = int(os.environ.get("SPM_PORTAL_MAX_CONNECTIONS", "32"))
 # Pages fetched per genre per batch (portal pages are ~14 items; 30 pages ~= 420 items).
 FETCH_PAGE_BUDGET = int(os.environ.get("SPM_FETCH_PAGE_BUDGET", "30"))
 # Pages fetched at once once the portal has told us the total. Portals answer
@@ -115,6 +125,16 @@ FETCH_PAGE_BUDGET = int(os.environ.get("SPM_FETCH_PAGE_BUDGET", "30"))
 FETCH_PAGE_CONCURRENCY = max(1, int(os.environ.get("SPM_FETCH_PAGE_CONCURRENCY", "4")))
 # Global fallback strategy (spec): try all MACs of a portal first, or hop portals directly.
 FALLBACK_STRATEGY = os.environ.get("SPM_FALLBACK_STRATEGY", "macs_first")  # or portal_first
+# A zap (or any start) prefers a MAC nothing holds yet over one this user just
+# used. On a portal with several MACs the second one usually has a free slot at
+# the panel *now*, while the one that just played is still counted there for a
+# few seconds - so taking the free one is what makes zapping instant (it is also
+# what the reference STB-Proxy does: walk the MAC list, take the first free one).
+# Set to 0 for the older rule, "take back the MAC this box just left": better
+# when the other MACs of the portal are the unreliable ones (the reported case
+# where the fallback MAC produced no data). GUI setting overrides this.
+PREFER_FREE_MAC = os.environ.get("SPM_PREFER_FREE_MAC", "1").strip().lower() not in (
+    "0", "off", "no", "false")
 
 # ---------------------------------------------------------------------------
 # Optional metadata enrichment

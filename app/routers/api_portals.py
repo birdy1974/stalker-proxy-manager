@@ -97,6 +97,7 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
             "identity_mode": p.identity_mode or "minimal",
             "stb_timezone": p.stb_timezone or "",
             "direct_links": bool(getattr(p, "direct_links", True)),
+            "streams_per_mac": getattr(p, "streams_per_mac", None),
             # R6: what the panel said about itself. `modules` is None until a
             # resolve asked, and the GUI has to tell that apart from "the panel
             # has nothing" - a tab greyed out for a reason nobody can explain is
@@ -157,7 +158,10 @@ async def create_portal(payload: dict, db=Depends(get_db)):
                tls_insecure=bool(payload.get("tls_insecure", False)),
                identity_mode=_identity_mode(payload.get("identity_mode", "minimal")),
                stb_timezone=(str(payload.get("stb_timezone") or "").strip() or None),
-               direct_links=bool(payload.get("direct_links", True)))
+               direct_links=bool(payload.get("direct_links", True)),
+               streams_per_mac=(max(1, int(payload["streams_per_mac"]))
+                                if str(payload.get("streams_per_mac") or "").strip().isdigit()
+                                else None))
     db.add(p)
     await db.flush()
     for i, entry in enumerate(parse_mac_entries(payload.get("macs", ""))):
@@ -176,11 +180,20 @@ async def update_portal(pid: int, payload: dict, db=Depends(get_db)):
     # URLs, and a boolean flipped on its own would put the portal in a state where
     # playback depends on data this endpoint cannot maintain. Use /xtream/adopt.
     for f in ("name", "base_url", "enabled", "proxy_url", "tls_insecure",
-              "stb_timezone", "direct_links"):
+              "stb_timezone", "direct_links", "streams_per_mac"):
         if f in payload:
             val = bool(payload[f]) if f in ("tls_insecure", "direct_links") else payload[f]
             if f == "stb_timezone":
                 val = str(val or "").strip() or None
+            elif f == "streams_per_mac":
+                # NULL/"" = inherit the global default. Clamped to >= 1: a 0
+                # would mean "no stream may use this MAC", which is never what
+                # an operator means (STB-Proxy reads its 0 as "unlimited", we
+                # do not inherit that trap).
+                try:
+                    val = None if val in (None, "", "null") else max(1, int(val))
+                except (TypeError, ValueError):
+                    raise HTTPException(400, "streams_per_mac must be an integer >= 1") from None
             setattr(p, f, val)
     if "identity_mode" in payload:
         # validated separately: a typo here must say so, not silently change what

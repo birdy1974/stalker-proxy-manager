@@ -369,6 +369,7 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         "identity_mode": ("VARCHAR(12)", "'minimal'"),
         "stb_timezone": ("VARCHAR(64)", "NULL"),
         "direct_links": ("BOOLEAN", "1"),
+        "streams_per_mac": ("INTEGER", "NULL"),
         "portal_version": ("VARCHAR(120)", "NULL"),
         "modules": ("TEXT", "NULL"),
         "capabilities_at": ("TIMESTAMP", "NULL"),

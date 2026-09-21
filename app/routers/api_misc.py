@@ -11,7 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 
-from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL, TMDB_API_KEY
+from ..config import (
+    FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL, PREFER_FREE_MAC, TMDB_API_KEY,
+)
 from ..database import get_db
 from ..models import (
     Area, AreaItemTemplate, EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre,
@@ -29,6 +31,29 @@ from ..services.fetch_jobs import list_jobs
 from ..services.stream_manager import MANAGER
 
 router = APIRouter(prefix="/api", tags=["misc"], dependencies=[Depends(require_admin)])
+
+
+def _diagnostics() -> dict:
+    """Why zapping is fast or slow - the numbers the log only shows one at a time.
+
+    Everything here is in-memory and bounded: the last starts with their phase
+    timings, the refusal codes the panel answered with, what the redirect probe
+    cache saved, how often background jobs yielded, and when the janitor last
+    ran. Nothing touches the database on purpose - this is rendered on the same
+    polling loop as the rest of the dashboard.
+    """
+    from ..portal.client import rate_limit_left, refusal_stats
+    from ..services import janitor, portal_pace, redirect_guard
+
+    diag = {"timing": MANAGER.timing_summary(),
+            "refusals": refusal_stats(),
+            "probe": redirect_guard.probe_stats(),
+            "pace": portal_pace.stats(),
+            "janitor": janitor.stats(),
+            "parked": sum(1 for h in MANAGER.streams.values() if h.parked),
+            # filled in by the endpoint below, which has the DB session
+            "paused": []}
+    return diag
 
 
 # ------------------------------------------------------------------ dashboard
@@ -65,7 +90,16 @@ async def dashboard(db=Depends(get_db)):
     api["portal_sessions"] = POOL.stats()
     api["streams_per_user"] = [{"user": k, "streams": v}
                                for k, v in sorted(per_user.items(), key=lambda kv: -kv[1])]
-    return {"stats": stats, "streams": streams, "jobs": list_jobs()[:5], "api": api}
+    diag = _diagnostics()
+    from ..portal.client import rate_limit_left
+    portals = list((await db.execute(select(Portal))).scalars().all())
+    diag["paused"] = [
+        {"name": p.name, "seconds": round(rate_limit_left(p.resolved_url or p.base_url), 1)}
+        for p in portals
+        if rate_limit_left(p.resolved_url or p.base_url) > 0
+    ]
+    return {"stats": stats, "streams": streams, "jobs": list_jobs()[:5], "api": api,
+            "diag": diag}
 
 
 @router.get("/streams")
@@ -111,6 +145,7 @@ DEFAULT_SETTINGS = {
     "playlist_url_format": "{base}/play/{type}/{id}.ts?u={u}&p={p}",
     # Seed from env so a first boot honours docker-compose; later GUI edits win.
     "fallback_strategy": FALLBACK_STRATEGY,     # macs_first | portal_first
+    "prefer_free_mac": "true" if PREFER_FREE_MAC else "false",
     "epg_refresh_hours": 24,
     "epg_portal_enabled": True,
     "logo_country": "netherlands",

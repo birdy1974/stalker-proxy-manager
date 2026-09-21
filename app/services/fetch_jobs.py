@@ -36,6 +36,7 @@ from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, StalkerClient, truthy
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
+from .portal_pace import pace_for_playback
 from .titles import portal_item_title
 
 
@@ -74,6 +75,22 @@ _WORKER_STARTED = False
 
 def get_job(job_id: str) -> Job | None:
     return JOBS.get(job_id)
+
+
+def prune_jobs(keep: int = 100) -> int:
+    """Drop finished jobs beyond the newest `keep` (running ones are never touched).
+
+    One entry per sync/press accumulates for as long as the process lives; the
+    GUI only ever shows the latest few. See services/janitor.py.
+    """
+    finished = sorted(
+        (j for j in JOBS.values() if j.status in ("done", "error", "cancelled")),
+        key=lambda j: j.ended or j.started or 0.0, reverse=True)
+    dropped = 0
+    for job in finished[max(0, keep):]:
+        if JOBS.pop(job.id, None) is not None:
+            dropped += 1
+    return dropped
 
 
 def list_jobs() -> list[dict]:
@@ -406,6 +423,10 @@ async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
         for start in range(0, len(remaining), FETCH_PAGE_CONCURRENCY):
             if job._cancel.is_set():
                 break
+            # A sync walking thousands of pages is the single biggest consumer of
+            # a panel's rate budget. It can take a few seconds longer; the play
+            # starting next to it cannot take a refusal.
+            await pace_for_playback(job.portal_id)
             batch = remaining[start:start + FETCH_PAGE_CONCURRENCY]
             job.detail = f"{genre_name}: pages {batch[0]}-{batch[-1]}"
             got = await asyncio.gather(*(fetch_page(pg) for pg in batch),
@@ -427,6 +448,7 @@ async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
         for page in range(2, budget + 1):
             if job._cancel.is_set():
                 break
+            await pace_for_playback(job.portal_id)
             job.detail = f"{genre_name}: page {page}"
             try:
                 data = await fetch_page(page)

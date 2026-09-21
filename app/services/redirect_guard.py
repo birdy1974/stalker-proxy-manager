@@ -64,11 +64,64 @@ from . import stream_identity
 
 VALIDATE_ENABLED = os.environ.get("SPM_REDIRECT_VALIDATE", "1") == "1"
 VALIDATE_TIMEOUT = float(os.environ.get("SPM_REDIRECT_VALIDATE_TIMEOUT", "2.0"))
+#: How long a probe verdict is trusted (0 disables the cache).
+#:
+#: The probe sits on the hottest path we have - the round trip the player waits
+#: for before it is sent to the CDN - and it costs a full TLS handshake plus RTT
+#: to a *media host*, not to our own server. A verdict is a fact about the URL
+#: right now, and the zap-back case replays exactly the same URL (LINK_CACHE_S
+#: hands the cached link back), so without a cache the cheapest zap we can serve
+#: still pays a probe. Dead verdicts get a much shorter window: a link that is
+#: dead now may be re-minted by the panel a moment later.
+PROBE_TTL_S = float(os.environ.get("SPM_LINK_PROBE_TTL", "20.0"))
+PROBE_DEAD_TTL_S = float(os.environ.get("SPM_LINK_PROBE_DEAD_TTL", "3.0"))
+PROBE_CACHE_MAX = int(os.environ.get("SPM_LINK_PROBE_CACHE_MAX", "500"))
 DEMOTE_ENABLED = os.environ.get("SPM_REOPEN_DEMOTE", "1") == "1"
 DEMOTE_WINDOW = float(os.environ.get("SPM_REOPEN_DEMOTE_WINDOW", "300.0"))
 
 # route_key -> (source_key, mac_id, monotonic time of the last 302)
 _handed: dict[tuple, tuple[tuple, int | None, float]] = {}
+
+# url -> (monotonic time, verdict); see PROBE_TTL_S
+_probe_cache: dict[str, tuple[float, ProbeResult]] = {}
+_PROBE_STATS = {"probes": 0, "cache_hits": 0}
+
+
+def probe_stats() -> dict:
+    """Counting probes vs cache hits - the diagnostics view reads this."""
+    return dict(_PROBE_STATS)
+
+
+def _cached_probe(url: str) -> ProbeResult | None:
+    """The verdict for this URL, while it is still inside its window."""
+    entry = _probe_cache.get(url)
+    if not entry:
+        return None
+    at, verdict = entry
+    ttl = PROBE_TTL_S if verdict.alive else PROBE_DEAD_TTL_S
+    if ttl <= 0 or (time.monotonic() - at) > ttl:
+        _probe_cache.pop(url, None)
+        return None
+    _PROBE_STATS["cache_hits"] += 1
+    return ProbeResult(verdict.alive,
+                       f"{verdict.detail} (probed {time.monotonic() - at:.1f}s ago)")
+
+
+def _remember_probe(url: str, verdict: ProbeResult) -> None:
+    if PROBE_TTL_S <= 0:
+        return
+    now = time.monotonic()
+    if len(_probe_cache) >= max(16, PROBE_CACHE_MAX):
+        # Cheap bound: drop expired entries, oldest first, until we are back
+        # under the cap. The cache only ever holds one entry per URL, so the
+        # worst case is a busy proxy touching many distinct links an hour.
+        for key, (at, v) in sorted(_probe_cache.items(), key=lambda kv: kv[1][0]):
+            if len(_probe_cache) < max(16, PROBE_CACHE_MAX):
+                break
+            if now - at > (PROBE_TTL_S if v.alive else PROBE_DEAD_TTL_S) or \
+                    len(_probe_cache) >= max(16, PROBE_CACHE_MAX):
+                _probe_cache.pop(key, None)
+    _probe_cache[url] = (now, verdict)
 
 
 def _source_key(source) -> tuple:
@@ -108,10 +161,33 @@ def demote_recently_handed(route, chain: list) -> list:
     return out
 
 
+def prune() -> int:
+    """Drop expired handoffs and stale probe verdicts (see services/janitor.py).
+
+    Both are pruned lazily on access too, but a route nobody asks for again
+    keeps its entry forever that way - and a big playlist produces plenty of
+    routes.
+    """
+    now = time.monotonic()
+    gone = 0
+    for key, (_source, _mac, at) in list(_handed.items()):
+        if not DEMOTE_ENABLED or now - at > DEMOTE_WINDOW:
+            _handed.pop(key, None)
+            gone += 1
+    for url, (at, verdict) in list(_probe_cache.items()):
+        ttl = PROBE_TTL_S if verdict.alive else PROBE_DEAD_TTL_S
+        if ttl <= 0 or now - at > ttl:
+            _probe_cache.pop(url, None)
+            gone += 1
+    return gone
+
+
 def reset() -> None:
     """Tests only."""
     _handed.clear()
     _shrug_reported.clear()
+    _probe_cache.clear()
+    _PROBE_STATS["probes"] = _PROBE_STATS["cache_hits"] = 0
 
 
 # HEAD answers that do NOT settle the question on HEAD alone: confirm with a
@@ -195,6 +271,10 @@ async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
     if client is not None:
         # Explicit test client: one attempt with whatever identity it carries.
         return await _probe(url, timeout, client)
+    hit = _cached_probe(url)
+    if hit is not None:
+        return hit                      # a zap back to a link we just proved
+    _PROBE_STATS["probes"] += 1
     verdict = ProbeResult(True, "")
     uas = stream_identity.ladder(url)
     # The URL is handed to the END PLAYER after the 302, so the probe must
@@ -208,7 +288,7 @@ async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
             verdict = await _probe(url, timeout, own)
         if verdict.alive:
             stream_identity.remember(url, ua)
-            return verdict
+            break
         # A policy 4xx as the FINAL verdict may be identity-shaped (the 456
         # case above); spend the one other identity the ladder offers. A
         # proved 410, a connect-level error or an inconclusive "alive" verdict
@@ -217,7 +297,8 @@ async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
         if tail.isdigit() and int(tail) in stream_identity.UA_POLICY_4XX \
                 and idx + 1 < len(uas):
             continue
-        return verdict
+        break
+    _remember_probe(url, verdict)
     return verdict
 
 

@@ -171,6 +171,7 @@ PAGE_SIZE = 14  # exactly what real portals use
 #                        "flaky" (503 twice, then answers - the retry discipline)
 _STATE = {"usage": {}, "offline": False, "slow": False, "max_per_mac": 1, "note": "",
           "create_link_error": "", "token_rejects": 0, "mac_placeholder": False,
+          "http_status": 0, "retry_after": "",
           "require_prehash": False, "require_mac_param": False,
           "fingerprint_required": False, "profile_mode": "full", "not_valid": False,
           "handshakes": 0, "profile_calls": 0, "profile_seen": {}, "handshake_seen": [],
@@ -378,9 +379,20 @@ async def version_js(request: Request):
 
 
 async def _guard(request: Request):
-    """Common behaviour toggles: offline + latency simulation."""
+    """Common behaviour toggles: offline + latency simulation + forced status."""
     if _STATE["offline"]:
         return PlainTextResponse("offline (mock control)", status_code=503)
+    if _STATE["http_status"]:
+        # A rate-limited panel answers 429 with `Retry-After`; that is the answer
+        # a proxy must not walk into twice, so the mock has to be able to send it
+        # (the knob used to be listed but never applied).
+        status = int(_STATE["http_status"])
+        headers = {}
+        if _STATE.get("retry_after"):
+            headers["Retry-After"] = str(_STATE["retry_after"])
+        log.warning("mock portal: forced HTTP %s (control)", status)
+        return PlainTextResponse(f"forced HTTP {status} (mock control)",
+                                 status_code=status, headers=headers)
     if _STATE["slow"]:
         await asyncio.sleep(3)
     return None
@@ -912,7 +924,7 @@ async def xtream_media(request: Request, user: str, pw: str, name: str):
 _TOGGLE_KEYS = ("offline", "slow", "max_per_mac", "create_link_error",
                 "token_rejects", "mac_placeholder", "require_prehash",
                 "require_mac_param", "fingerprint_required", "profile_mode",
-                "not_valid", "http_status", "js_error", "empty_reply",
+                "not_valid", "http_status", "retry_after", "js_error", "empty_reply",
                 "corrupt_stream", "reject_no_cookie", "reject_no_referer",
                 "require_host", "require_tls", "note", "version_mode", "modules",
                 "modules_disabled", "no_modules", "xtream_mode", "xtream_user",

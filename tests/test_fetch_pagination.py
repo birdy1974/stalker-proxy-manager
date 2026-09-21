@@ -36,7 +36,9 @@ LATENCY = 0.02
 class _Job:
     """Just enough of the Job shape for _paged_upsert."""
 
-    def __init__(self) -> None:
+    def __init__(self, portal_id: int = 1) -> None:
+        #: the real Job carries this; the playback gate reads it per page batch
+        self.portal_id = portal_id
         self._cancel = asyncio.Event()
         self.detail = ""
         self.done_items = 0

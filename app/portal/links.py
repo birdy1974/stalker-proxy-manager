@@ -30,6 +30,7 @@ on rows the panel *did* describe, not a substitute for it.
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -49,6 +50,22 @@ LINK_FLAGS = (FLAG_TMP_LINK, FLAG_LOAD_BALANCING, FLAG_DISABLE_AD)
 
 #: flags that make a stored link unusable until the panel rebuilds it
 REBUILD_FLAGS = (FLAG_TMP_LINK, FLAG_LOAD_BALANCING)
+
+#: R2b: the ffmpeg path may play a stored link too, when the channel's own flags
+#: say it is permanent.
+#:
+#: The proxy path used to answer `ffmpeg=True` with an unconditional "ask",
+#: because ffmpeg "wants a fresh token and the liveness answer". True for the
+#: channels that need it - and those are still caught by the rules below
+#: (`use_http_tmp_link`, `use_load_balancing`, a volatile token in the URL, a
+#: template cmd, no URL at all). For a permanent link it cost a portal round
+#: trip and a slot allocation on *every* play, which is exactly the difference
+#: against STB-Proxy (it plays any cmd that is not `http://localhost/...`) and
+#: is what made a fast zap collide with the panel's connection table. Measured
+#: on the mock: 302 with no panel call at all vs. a create_link + pipe.
+#: Kill switch, for a panel that publishes permanent-looking links it refuses.
+FFMPEG_STORED_LINK = os.environ.get(
+    "SPM_FFMPEG_USE_STORED_LINK", "1").strip().lower() not in ("0", "off", "no", "false")
 
 # VOLATILE_PARAMS (defined with the link helpers above) doubles as the policy's
 # "this URL is session-bound" test, deliberately: `strip_volatile` removes those
@@ -216,7 +233,7 @@ def link_policy(*, url: str, link_flags: str | None = None,
     belongs in the stream log.
     """
     known = flags_known(link_flags)
-    if ffmpeg:
+    if ffmpeg and not FFMPEG_STORED_LINK:
         return LinkPolicy(True, "ffmpeg owns this stream: the request gives us a fresh "
                                 "token *and* the liveness answer the fallback chain needs",
                           known)
@@ -238,7 +255,8 @@ def link_policy(*, url: str, link_flags: str | None = None,
     if blocker:
         return LinkPolicy(True, f"asking the panel for a link: {blocker}", True)
     return LinkPolicy(False, "playing the stored link: the channel flags say nothing needs "
-                             "rebuilding and the URL needs no token", True)
+                             "rebuilding and the URL needs no token"
+                             + (" (ffmpeg plays it directly)" if ffmpeg else ""), True)
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,7 @@ import logging
 import shlex
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -44,7 +45,7 @@ from ..models import (
 )
 from ..portal.account import mac_is_usable
 from ..portal.pool import POOL, PortalSession
-from ..portal.client import PortalError, is_hls
+from ..portal.client import SLOT_BUSY_CODES, PortalError, is_hls
 from ..portal.links import plan_adopted, plan_for
 from . import stream_identity
 from .db_logging import db_log
@@ -159,7 +160,15 @@ async def _store_media_cmd(src, repair, item_name: str = "") -> None:
                      "catalogue cmd worked - cleared it from the source row")
 
 
-STREAM_STALL_TIMEOUT = 25.0   # seconds without a single byte => dead stream
+# Seconds without a single byte before the pipe counts as finished. 25 s is the
+# tolerance for a source that is *starting* (panel-side buffering, a slow CDN
+# edge, a NAS that spins up). Once a live stream has been flowing, the same
+# silence means something different - the source dropped - and the response can
+# be continued by re-resolving (MIDSTREAM_RESTARTS), so waiting 25 s only makes
+# the picture freeze for 25 s. See _stall_window().
+STREAM_STALL_TIMEOUT = float(os.environ.get("SPM_STREAM_STALL_TIMEOUT", "25.0"))
+STREAM_STALL_TIMEOUT_LIVE = float(os.environ.get(
+    "SPM_STREAM_STALL_TIMEOUT_LIVE", "10.0"))
 CHUNK = 64 * 1024
 # input options that only exist for network protocols (stripped for file://)
 _NETONLY_OPTS = re.compile(
@@ -244,6 +253,26 @@ class _RouteHealth:
         mac_id = preferred[2]
         return sorted(macs, key=lambda mac: getattr(mac, "id", None) != mac_id)
 
+    def prune(self) -> int:
+        """Forget what has expired: stale route affinity and cooled-down breakers.
+
+        Both tables are keyed by (route, source) pairs that history keeps
+        producing; nothing else ever removes an entry whose key is never asked
+        for again (an item deleted from the playlist, a source removed, a
+        one-off route). See services/janitor.py.
+        """
+        now = time.monotonic()
+        gone = 0
+        for route, entry in list(self.success.items()):
+            if now - entry[0] > ROUTE_AFFINITY_TTL:
+                self.success.pop(route, None)
+                gone += 1
+        for key, state in list(self.failures.items()):
+            if now - state[1] > SOURCE_BREAKER_COOLDOWN:
+                self.failures.pop(key, None)
+                gone += 1
+        return gone
+
     def failed(self, source) -> None:
         from .playlist_health import record_playback
         key = self.source_key(source)
@@ -285,6 +314,9 @@ class StreamHandle:
     command: str                   # rendered ffmpeg command with url placeholder
     started: float = field(default_factory=time.time)
     portal_name: str = ""
+    #: Which portal row this stream is playing from. The dashboard does not need
+    #: it (the name is readable); the playback gate does - see portal_pace.py.
+    portal_id: int | None = None
     mac: str = ""
     url: str = ""
     bytes_sent: int = 0
@@ -304,6 +336,24 @@ class StreamHandle:
     #: Set when a redirect lease held by a *different* play of the same user was
     #: taken over (a zap), so the log can say why the "busy" MAC was used.
     took_over_lease: bool = False
+    #: Set when the reason this stream could not start is *our own* occupancy or
+    #: the panel's connection slot - not a dead source. The output route turns
+    #: that into 503 + Retry-After instead of 404, which is the honest answer to
+    #: "come back in a second" and the one players retry (STB-Proxy answers 503
+    #: for the same case; a 404 tells the player the channel does not exist).
+    busy: bool = False
+    #: Set while the pipe is being HELD after its client left (see LINGER_S):
+    #: the process keeps running, its MAC stays locked (the panel still counts
+    #: the connection), and the bytes keep being drained into `ring` so a zap
+    #: back can attach to a live stream instead of starting a new one.
+    parked: bool = False
+    #: Bytes of the parked stream, oldest dropped (LINGER_BUFFER_KB). Dropped on
+    #: attach, handed to the returning client first so it sees no gap.
+    ring: bytearray = field(default_factory=bytearray)
+    #: The task draining the parked pipe - cancelled when a client attaches.
+    parker: asyncio.Task | None = None
+    #: How often this pipe was re-used by a returning client (park/attach wins).
+    reattaches: int = 0
 
     def public(self) -> dict:
         return {"id": self.id, "kind": self.kind, "item_name": self.item_name,
@@ -331,6 +381,252 @@ class StreamHandle:
 # Must exceed STREAM_START_TIMEOUT + the stall window, otherwise the reaper
 # would kill a stream that is legitimately walking its fallback chain.
 REAP_GRACE = 45.0
+
+
+# --------------------------------------------------------------------------- #
+#  per-process zap memory: (kind, item, MAC) -> link, and -> recent failure
+# --------------------------------------------------------------------------- #
+#: (kind, ref_id, mac_id, user) -> (url, monotonic when resolved)
+_LINK_CACHE: dict[tuple, tuple[str, float]] = {}
+#: (route_key, source_key, mac_id) -> monotonic of the last failed attempt
+_CANDIDATE_FAILURES: dict[tuple, float] = {}
+
+
+def note_link(kind: str, ref_id: int, mac_id: int | None, url: str,
+              user: str | None = None) -> None:
+    """Remember a link that just worked well enough to hand out (LINK_CACHE_S)."""
+    if LINK_CACHE_S <= 0 or not url or mac_id is None or kind not in LINK_CACHE_KINDS:
+        return
+    _LINK_CACHE[_link_key(kind, ref_id, mac_id, user)] = (str(url), time.monotonic())
+    if len(_LINK_CACHE) > 256:
+        oldest = min(_LINK_CACHE, key=lambda k: _LINK_CACHE[k][1])
+        _LINK_CACHE.pop(oldest, None)
+
+
+def _link_key(kind: str, ref_id: int, mac_id: int, user: str | None) -> tuple:
+    """One cached link: item + MAC + the user it was resolved for.
+
+    The user belongs in the key. The URL itself carries only the panel's MAC
+    session, so it *would* work for somebody else - but handing user B the link
+    user A asked for is a sharing decision this cache has no business making,
+    and the case the cache exists for (a zap away and back) is always the same
+    user anyway. `user or ""` keeps the admin/preview plays (no user) together.
+    """
+    return (kind, int(ref_id), int(mac_id), user or "")
+
+
+def cached_link(kind: str, ref_id: int, mac_id: int | None,
+                *, user_name: str | None = None) -> tuple[str, float] | None:
+    """(url, age in seconds) for a link resolved recently enough to replay.
+
+    A zap back inside the window costs one 302 and no portal call at all (see
+    `_link_key` for why the user is part of the key).
+    """
+    if LINK_CACHE_S <= 0 or mac_id is None or kind not in LINK_CACHE_KINDS:
+        return None
+    got = _LINK_CACHE.get(_link_key(kind, ref_id, mac_id, user_name))
+    if not got:
+        return None
+    url, at = got
+    age = time.monotonic() - at
+    if age > LINK_CACHE_S:
+        _LINK_CACHE.pop(_link_key(kind, ref_id, mac_id, user_name), None)
+        return None
+    return url, age
+
+
+def drop_link(kind: str, ref_id: int, mac_id: int | None,
+              user: str | None = None) -> None:
+    """Forget a cached link (it just failed, or the MAC changed hands)."""
+    if mac_id is None:
+        return
+    _LINK_CACHE.pop(_link_key(kind, ref_id, mac_id, user), None)
+
+
+def note_candidate_failure(route, source, mac) -> None:
+    """Remember that (route, source, MAC) just failed, for the demotion below."""
+    if route is None or mac is None:
+        return
+    _CANDIDATE_FAILURES[(route, _RouteHealth.source_key(source),
+                         getattr(mac, "id", None))] = time.monotonic()
+    if len(_CANDIDATE_FAILURES) > 512:
+        for key, at in sorted(_CANDIDATE_FAILURES.items(), key=lambda kv: kv[1])[:128]:
+            _CANDIDATE_FAILURES.pop(key, None)
+
+
+def clear_candidate_failures(route) -> None:
+    """Forget every recent failure for a route (called when a play succeeds)."""
+    if route is None:
+        return
+    for key in [k for k in _CANDIDATE_FAILURES if k[0] == route]:
+        _CANDIDATE_FAILURES.pop(key, None)
+
+
+def _failed_recently(route, source, mac) -> bool:
+    if route is None or mac is None:
+        return False
+    at = _CANDIDATE_FAILURES.get((route, _RouteHealth.source_key(source),
+                                  getattr(mac, "id", None)))
+    return at is not None and (time.monotonic() - at) <= FAILURE_DEMOTE_S
+
+
+def demote_macs(route, source, macs: list) -> list:
+    """Push MACs that recently failed on this route behind the others."""
+    if not macs or FAILURE_DEMOTE_S <= 0 or route is None:
+        return macs
+    return sorted(macs, key=lambda m: _failed_recently(route, source, m))
+
+
+def demote_failed_candidates(route, chain: list) -> list:
+    """Reorder one chain so a (source, MAC) that just failed is tried last.
+
+    Runs after the health ordering on purpose: route affinity says "this worked
+    last time" (recorded at handoff), a failure says "this did not work now" -
+    and now outranks last time. Stable within groups, so playlist priority and
+    the breaker's half-open choice both survive.
+    """
+    if not chain or FAILURE_DEMOTE_S <= 0 or route is None:
+        return chain
+    out = []
+    for src, portal, macs in chain:
+        if macs:
+            macs = demote_macs(route, src, list(macs))
+        out.append((src, portal, macs))
+    out.sort(key=lambda step: bool(step[2]) and all(
+        _failed_recently(route, step[0], m) for m in step[2]))
+    return out
+
+
+#: env var every spawned ffmpeg carries (see `_spawn` and `sweep_orphans`)
+_STREAM_ENV_MARKER = "SPM_STREAM_ID"
+
+
+def _orphan_ffmpeg_pids(root: str = "/proc") -> list[int]:
+    """PIDs of ffmpeg pipes spawned by an SPM that is no longer running.
+
+    Matched on two things together: the executable is our configured
+    `FFMPEG_BIN`, and the process carries `_STREAM_ENV_MARKER` in its
+    environment. A user's own ffmpeg (a manual transcode, another container on
+    the same host) fails at least one of those, so this cannot kill work it did
+    not start. Linux-only by nature; on a platform without `/proc` it returns
+    nothing and the caller does nothing.
+    """
+    if not os.path.isdir(root):
+        return []
+    want = os.path.basename(FFMPEG_BIN)
+    me = os.getpid()
+    found: list[int] = []
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        base = os.path.join(root, entry)
+        try:
+            with open(os.path.join(base, "cmdline"), "rb") as fh:
+                cmdline = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if not cmdline or not cmdline[0]:
+            continue
+        exe = os.path.basename(cmdline[0].decode("utf-8", "replace"))
+        if exe != want:
+            continue
+        try:
+            with open(os.path.join(base, "environ"), "rb") as fh:
+                environ = fh.read()
+        except OSError:
+            continue
+        if _STREAM_ENV_MARKER.encode() + b"=" in environ:
+            found.append(pid)
+    return found
+
+
+#: First-byte windows per candidate. The first candidate gets the full
+#: STREAM_START_TIMEOUT - it is the source the engine believes in, and a panel
+#: can legitimately take its time to open the media path. After that, a silent
+#: candidate is much more likely to be a dead edge than a slow one, and waiting
+#: the full window for each of them is what turns a two-MAC chain into 24 s of
+#: black screen before the player sees an error. Measured on the demo instance:
+#: a candidate that produces bytes does so in ~550 ms, so a 5 s second window
+#: costs nothing real and caps the walk at a fraction of the old worst case.
+STREAM_START_TIMEOUT_REST = float(os.environ.get("SPM_STREAM_START_TIMEOUT_REST", "5"))
+
+#: When a chain has at least this many candidates that are free to play, a silent
+#: candidate is given only `SPM_HEDGE_AFTER_S` (2 s) before the walk moves on.
+#:
+#: The measured reality is that a candidate which is going to answer does so in
+#: well under a second (a live start on the demo instance: ~550 ms end to end,
+#: panel RTT included), while a candidate that is silent at 2 s is nearly always
+#: a dead edge or a refused media path. The old shape gave every candidate the
+#: full window, so a two-MAC chain could sit black for up to 24 s before the
+#: player saw anything - the single most-visible symptom the stability work is
+#: about. With an alternative in the chain there is no reason to pay that: the
+#: fence is only lowered while another MAC is actually free, so a single-MAC
+#: portal (nothing to fall back to) keeps the patient windows.
+#:
+#: 0 disables it. Deliberately *not* a parallel race: two simultaneous
+#: create_links would hold two panel slots for one zap, and on the panels this
+#: was measured against a second slot is exactly what answers `limit`.
+HEDGE_AFTER_S = float(os.environ.get("SPM_HEDGE_AFTER_S", "2.0"))
+#: How many free candidates must exist before the fence is lowered.
+HEDGE_MIN_CANDIDATES = max(2, int(os.environ.get("SPM_HEDGE_MIN_CANDIDATES", "2")))
+
+#: A live stream that dies mid-play is restarted inside the SAME client response.
+#: The usual cause is not a dead channel but a dead *link*: panels invalidate the
+#: per-session URL after a while (and CDNs drop long-lived connections), so the
+#: pipe ends while the channel is healthy. Without this the chain walk stops at
+#: the first candidate that fails to produce data again and the response ends -
+#: players either freeze or reconnect, and the user reports "it stops after a
+#: while". 0 disables the restarts.
+MIDSTREAM_RESTARTS = int(os.environ.get("SPM_MIDSTREAM_RESTARTS", "3"))
+MIDSTREAM_RESTART_DELAY = float(os.environ.get("SPM_MIDSTREAM_RESTART_DELAY", "1.5"))
+#: kinds allowed to restart (a VOD that ended was *finished*, not dropped)
+MIDSTREAM_RESTART_KINDS = {k.strip() for k in
+                           os.environ.get("SPM_MIDSTREAM_RESTART_KINDS", "live").split(",")
+                           if k.strip()}
+
+#: How long a live pipe is kept alive after its client disappeared, so a zap
+#: away-and-back attaches to the stream that is still running instead of asking
+#: the panel for a new link and starting ffmpeg again (measured: ~560 ms cold on
+#: this instance, vs ~20-50 ms to attach). This is what makes channel flipping
+#: feel instant in the reference proxy - the difference being that STB-Proxy
+#: keeps nothing at all and pays the cold start every time.
+#:
+#: The parked pipe keeps its MAC lock (the panel is still sending us that
+#: stream), it is NOT counted against the user's connection limit, and it is
+#: preemptible: the moment anybody actually wants that MAC (the same user
+#: zapping to another channel, or another user with nothing else free) it is
+#: killed immediately. 0 disables parking entirely.
+LINGER_S = float(os.environ.get("SPM_LINGER_S", "8"))
+LINGER_BUFFER_KB = int(os.environ.get("SPM_LINGER_BUFFER_KB", "2048"))
+LINGER_KINDS = {k.strip() for k in os.environ.get("SPM_LINGER_KINDS", "live").split(",")
+                if k.strip()}
+
+#: portal ids already told about `portal_first` (once per process, not per play)
+_PORTAL_FIRST_NOTED: set[int] = set()
+
+
+def _warn_portal_first_once(portal_id: int, macs: int) -> None:
+    if portal_id in _PORTAL_FIRST_NOTED:
+        return
+    _PORTAL_FIRST_NOTED.add(portal_id)
+    log.warning("fallback strategy 'portal_first' uses 1 of this portal's %d MAC(s) "
+                "(%s): a zap then asks the same MAC every time, which a panel that "
+                "counts connections per MAC refuses until its slot frees. Use "
+                "'macs_first' to walk them all", macs, f"portal {portal_id}")
+
+
+def reset_zap_state() -> None:
+    """Tests only: forget the link cache and the failure demotions."""
+    _LINK_CACHE.clear()
+    _CANDIDATE_FAILURES.clear()
+    _PORTAL_FIRST_NOTED.clear()
 
 
 # After a 302 redirect we no longer hold the socket, so we cannot know when the
@@ -371,10 +667,74 @@ START_BUDGET_SLACK = float(os.environ.get("SPM_START_BUDGET_SLACK", "10"))
 ATTEMPT_TRACE = 6
 
 
+# --------------------------------------------------------------------------- #
+#  zap robustness: our own occupancy is a hint, never a veto
+# --------------------------------------------------------------------------- #
+# The rule these four constants encode came from the reference implementation
+# whose zaps nobody complains about (STB-Proxy): it keeps no session, no link
+# and no lock across requests, so a zap can never lose against its own
+# bookkeeping - at worst it answers 503 after rotating. SPM keeps state on
+# purpose (pooled sessions, per-user quotas, redirect leases), so it has to
+# *behave* as if it did not: wait instead of refusing, take back our own
+# previous stream, retry the same MAC when the panel is the busy one, and never
+# let a candidate that just failed be the first one tried again.
+#: How long a start waits for a MAC that our own bookkeeping says is busy.
+#: The old shape answered 404 in ~13 ms when every MAC was occupied - and a
+#: player that zaps fast (Enigma2 stops the old service as it opens the new
+#: one) hits exactly that: our own pipe or lease on the channel it just left.
+#:
+#: 7 s, not 3: on the real panel measured for this, a slot is still counted for
+#: ~6.5 s after the previous connection dies. Waiting less than that buys
+#: nothing - the wait is spent and the player still gets 503 - while the user
+#: sees a *channel error* on a zap that would have played 3 s later. Waiting
+#: longer than the panel needs is free by comparison: `start_budget` still caps
+#: the whole start, and the wait ends the moment the slot frees.
+BUSY_WAIT_S = float(os.environ.get("SPM_BUSY_WAIT_S", "7.0"))
+BUSY_POLL_S = float(os.environ.get("SPM_BUSY_POLL_S", "0.25"))
+#: Retry ladder for a panel that answers "this MAC is already streaming"
+#: (`limit`, `account_is_in_use`, 456). The panel frees the slot seconds after
+#: the previous connection dies, so the same MAC is worth re-asking before
+#: walking to a worse one - and on a single-MAC portal it is the only candidate
+#: there is. Values are the waits *between* attempts.
+BUSY_BACKOFF = tuple(float(x) for x in os.environ.get(
+    "SPM_BUSY_BACKOFF", "0.5,1.0,2.0").split(",") if str(x).strip())
+#: How many stream starts the diagnostics view keeps (see note_timing).
+TIMING_HISTORY = int(os.environ.get("SPM_TIMING_HISTORY", "200"))
+
+#: A candidate that just failed (no data, panel refusal) is pushed behind the
+#: ones that did not, for this long - STB-Proxy's `moveMac`, without persisting
+#: a global order. Applied AFTER route affinity, so a fresh failure always
+#: outranks "this one worked 20 minutes ago".
+FAILURE_DEMOTE_S = float(os.environ.get("SPM_FAILURE_DEMOTE_S", "120"))
+#: How long a resolved link may be replayed for the next zap (0 = off). Live
+#: zapping is the case this exists for: away and back inside the window costs
+#: one 302 and no create_link at all. Only the redirect path uses it - a stale
+#: token handed to ffmpeg would burn a whole STREAM_START_TIMEOUT before the
+#: chain moves on, while the redirect path's liveness probe answers in ~150 ms.
+LINK_CACHE_S = float(os.environ.get("SPM_LINK_CACHE_S", "90"))
+#: Which kinds may replay a cached link. Live only, deliberately: the cache is
+#: the zap-back fast path, and a VOD/episode link is held for a whole movie -
+#: nobody re-opens one inside the window, while the redirect path's liveness
+#: probe would have to vet it first anyway.
+LINK_CACHE_KINDS = tuple(x.strip() for x in os.environ.get(
+    "SPM_LINK_CACHE_KINDS", "live").split(",") if x.strip())
+#: Default concurrent streams per MAC for portals whose row says nothing
+#: (see Portal.streams_per_mac, and STB-Proxy's "streams per mac" setting).
+STREAMS_PER_MAC = max(1, int(os.environ.get("SPM_STREAMS_PER_MAC", "1")))
+
+
 class StreamManager:
     def __init__(self) -> None:
         self.streams: dict[str, StreamHandle] = {}
-        self.mac_locks: dict[int, str] = {}                 # mac_id -> stream_id (ffmpeg pipes)
+        # mac_id -> the stream ids of the ffmpeg pipes we own on it. A set, not
+        # a single id, because a panel may allow more than one concurrent
+        # stream per MAC (Portal.streams_per_mac, default 1 = the historical
+        # behaviour). See is_mac_busy.
+        self.mac_locks: dict[int, set[str]] = {}
+        # mac_id -> how many concurrent pipes this MAC's portal allows. Filled
+        # from the chain being walked (_note_chain_limits), because is_mac_busy
+        # only ever has a mac_id to work with.
+        self.mac_limits: dict[int, int] = {}
         # Soft occupancy for redirect/direct plays: mac_id -> monotonic expiry.
         # See REDIRECT_LEASE_S. Expired entries are dropped lazily on read.
         self.redirect_leases: dict[int, float] = {}
@@ -386,6 +746,11 @@ class StreamManager:
         self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
         self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
         self.route_health = _RouteHealth()
+        #: The last TIMING_HISTORY starts (and start failures) with their phase
+        #: timings - what the diagnostics view answers "why is zapping slow, and
+        #: on which portal" with. Bounded on purpose: a ring of 200 tells a panel
+        #: got slow without being a database.
+        self.timings: deque[dict] = deque(maxlen=TIMING_HISTORY)
 
     # ------------------------------------------------------------- occupancy
     def _expire_lease(self, mac_id: int | None) -> None:
@@ -428,13 +793,252 @@ class StreamManager:
         """
         if mac_id is None:
             return False
-        if mac_id in self.mac_locks:
+        if len(self._lock_set(mac_id)) >= self._mac_limit(mac_id):
             return True
         self._expire_lease(mac_id)
         if mac_id not in self.redirect_leases:
             return False
         holder = (self.lease_meta.get(mac_id) or {}).get("holder")
         return not (requester and holder and holder == requester)
+
+    def _lock_set(self, mac_id: int | None) -> set[str]:
+        """The stream ids holding pipes on this MAC (never shared with anyone).
+
+        A set, not a single id, since a portal may allow several streams per MAC
+        (Portal.streams_per_mac). Plain-string values are accepted and upgraded
+        on the spot: the attribute is poked directly by tools and stand-ins that
+        predate the set, and silently dropping them would report a MAC as free
+        while an ffmpeg pipe is streaming on it.
+        """
+        held = self.mac_locks.get(mac_id) if mac_id is not None else None
+        if held is None:
+            return set()
+        if isinstance(held, str):                 # legacy single-id assignment
+            held = {held}
+            self.mac_locks[mac_id] = held
+        return held
+
+    def _mac_limit(self, mac_id: int | None) -> int:
+        """How many concurrent pipes this MAC allows (>= 1)."""
+        if mac_id is None:
+            return STREAMS_PER_MAC
+        return max(1, int(self.mac_limits.get(mac_id, STREAMS_PER_MAC) or 1))
+
+    def note_mac_limit(self, mac_id: int | None, limit: int | None) -> None:
+        """Remember the concurrency limit of one MAC (per-portal setting)."""
+        if mac_id is None:
+            return
+        self.mac_limits[mac_id] = max(1, int(limit or STREAMS_PER_MAC))
+
+    def lock_mac(self, mac_id: int | None, stream_id: str) -> None:
+        """Take one pipe slot on a MAC (see is_mac_busy for the limit)."""
+        if mac_id is None:
+            return
+        self.mac_locks.setdefault(mac_id, set()).add(stream_id)
+
+    def unlock_mac(self, mac_id: int | None, stream_id: str) -> None:
+        """Release one pipe slot; the MAC is free again when the set empties."""
+        if mac_id is None:
+            return
+        held = self._lock_set(mac_id)
+        if not held:
+            return
+        held.discard(stream_id)
+        if not held:
+            self.mac_locks.pop(mac_id, None)
+
+    async def preempt_own(self, mac_id: int | None, requester: str | None) -> bool:
+        """Kill a pipe of the SAME user on this MAC - a zap, not a conflict.
+
+        The redirect path has allowed exactly this since the lease existed (the
+        channel a box just zapped away from is not "someone else's stream"). A
+        live ffmpeg pipe used to be untouchable instead, which is why changing
+        channel could answer 404 while the player was still tearing the old
+        socket down - the one thing that made a .ts -> .ts zap fail where a
+        redirect zap worked. Same rule as the lease: only the same user, never
+        another, and never an anonymous stream.
+        """
+        if mac_id is None or not requester:
+            return False
+        killed = False
+        for sid in list(self._lock_set(mac_id)):
+            h = self.streams.get(sid)
+            if h is None or h.user_name != requester:
+                continue
+            await db_log("INFO", "stream",
+                         f"[{h.item_name}] taking over the ffmpeg pipe on this MAC "
+                         f"held by {requester} (the channel this zap left)")
+            await self.kill(sid)
+            killed = True
+        return killed
+
+    # ------------------------------------------------- parking (see LINGER_S)
+    def _lock_of(self, h: StreamHandle) -> int | None:
+        """The MAC this handle holds, if any."""
+        for mac_id, sids in self.mac_locks.items():
+            if h.id in self._lock_set(mac_id):
+                return mac_id
+        return None
+
+    def _can_park(self, h: StreamHandle) -> bool:
+        """May this pipe be held open for a client that just left?
+
+        Only a live stream that actually played (bytes flowed - parking a pipe
+        that never started would hold a panel slot for nothing), still running,
+        and not deliberately killed (a zap takeover, the dashboard, the
+        reaper all set `dead`).
+        """
+        return (LINGER_S > 0 and not h.parked and not h.dead
+                and h.kind in LINGER_KINDS and h.bytes_sent > 0
+                and h.proc is not None and h.proc.returncode is None)
+
+    async def client_left(self, h: StreamHandle) -> None:
+        """The player's socket is gone - hold the pipe briefly, or kill it.
+
+        Both the disconnect watchdog and the pump's own teardown reach this for
+        the same disconnect; whichever arrives second must not undo the
+        decision - a parked pipe is never killed here.
+        """
+        if h.parked:
+            return
+        if self._can_park(h):
+            await self._park(h)
+            return
+        await self.kill(h.id)
+
+    async def _park(self, h: StreamHandle) -> None:
+        """Keep the pipe alive (and draining) for LINGER_S."""
+        if h.parked or not self._can_park(h):
+            return
+        h.parked = True
+        h.parker = asyncio.get_running_loop().create_task(
+            self._park_proc(h, h.proc), name=f"park-{h.id[:8]}")
+        self._watchers.add(h.parker)
+        h.parker.add_done_callback(self._watchers.discard)
+        # The dashboard shows what somebody is watching, and nobody is: drop the
+        # runtime row while the pipe is only being held (`_adopt` puts it back).
+        try:
+            await run_uncancelled(self._delete_row(h.id), what="parked row delete")
+        except Exception:  # noqa: BLE001
+            log.exception("active_streams delete (park) failed")
+        await db_log("INFO", "stream",
+                     f"[{h.item_name}] client left -> holding the pipe for "
+                     f"{LINGER_S:.0f}s so a zap back is instant "
+                     f"({h.bytes_sent / 1e6:.1f} MB so far)")
+
+    async def _park_proc(self, h: StreamHandle, proc) -> None:
+        """Drain a parked pipe into `ring` until it is wanted, dies, or expires.
+
+        Draining matters: ffmpeg blocks on a full stdout pipe, and a blocked
+        ffmpeg would stall the panel's stream - the parked pipe has to keep
+        consuming for the attach to be worth anything.
+        """
+        deadline = time.monotonic() + LINGER_S
+        cap = max(1, LINGER_BUFFER_KB) * 1024
+        try:
+            while h.parked and not h.dead and time.monotonic() < deadline:
+                left = max(0.05, min(1.0, deadline - time.monotonic()))
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(CHUNK), left)
+                except asyncio.TimeoutError:
+                    continue
+                if not chunk:
+                    break
+                ring = h.ring
+                ring += chunk
+                if len(ring) > cap:
+                    del ring[:len(ring) - cap]
+        except asyncio.CancelledError:
+            # A returning client took the pipe over (see `_adopt`): the
+            # response generator owns the process from here on.
+            raise
+        except Exception:  # noqa: BLE001 - never let the parker die silently
+            log.exception("parked stream %s failed", h.id)
+        if not h.parked:
+            return                       # attached while we were reading
+        h.parked = False
+        h.parker = None
+        gone = proc.returncode is not None
+        await self._kill_quiet(proc)
+        await self._deregister(h)
+        await db_log("INFO", "stream",
+                     f"[{h.item_name}] parked stream expired after {LINGER_S:.0f}s"
+                     + (" (the source had ended)" if gone else "")
+                     + " -> releasing the MAC")
+
+    def _find_parked(self, kind: str, ref_id: int,
+                     user_name: str | None) -> StreamHandle | None:
+        """A still-running pipe of this user + item (the zap-back case)."""
+        if LINGER_S <= 0 or kind not in LINGER_KINDS:
+            return None
+        key = (kind, ref_id)
+        who = user_name or "-"
+        for h in self.streams.values():
+            if (h.parked and h.route_key == key and (h.user_name or "-") == who
+                    and h.proc is not None and h.proc.returncode is None):
+                return h
+        return None
+
+    async def _adopt(self, h: StreamHandle) -> None:
+        """Stop parking so the caller's generator can read the pipe itself."""
+        h.parked = False
+        parker, h.parker = h.parker, None
+        if parker is not None and parker is not asyncio.current_task():
+            parker.cancel()
+            try:
+                await parker
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        h.reattaches += 1
+        try:
+            await run_uncancelled(self._insert_row(h), what="parked row re-insert")
+        except Exception:  # noqa: BLE001 - the stream works; only the row is late
+            log.exception("active_streams re-insert (attach) failed")
+
+    async def _drop_parked(self, chain: list) -> bool:
+        """Kill parked pipes that stand in the way of somebody who wants to play.
+
+        Parking is a courtesy, never a reservation: the pipe was held for a
+        client that might come back, and it must never make another request wait
+        (or answer 503) while it idles.
+        """
+        mac_ids = {m.id for (_s, _p, macs) in chain for m in (macs or ())}
+        dropped = False
+        for mac_id in mac_ids:
+            for sid in list(self._lock_set(mac_id)):
+                h = self.streams.get(sid)
+                if h is not None and h.parked:
+                    await db_log("INFO", "stream",
+                                 f"[{h.item_name}] giving up the parked pipe on "
+                                 f"{h.mac or mac_id} - somebody wants to play")
+                    await self.kill(sid)
+                    dropped = True
+        return dropped
+
+    async def wait_for_mac(self, mac_row, requester: str | None,
+                           budget: float | None = None) -> bool:
+        """Wait until a MAC can be used, preempting our own stream if needed.
+
+        Returns False when the MAC stays unusable inside the budget - which the
+        caller answers with "next candidate", not with an immediate 404 (see
+        BUSY_WAIT_S). A lease held by *another* user is not worth waiting for:
+        it lasts REDIRECT_LEASE_S, not seconds, so the caller should move on.
+        """
+        if mac_row is None:
+            return True
+        if not self.is_mac_busy(mac_row.id, requester=requester):
+            return True
+        budget = BUSY_WAIT_S if budget is None else max(0.0, budget)
+        deadline = time.monotonic() + budget
+        while True:
+            if await self.preempt_own(mac_row.id, requester):
+                if not self.is_mac_busy(mac_row.id, requester=requester):
+                    return True
+            if self.lease_remaining(mac_row.id) > BUSY_POLL_S:
+                return False                     # another user's lease: minutes
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(min(BUSY_POLL_S, max(0.0, deadline - time.monotonic())))
 
     def lease_mac(self, mac_id: int | None, *, seconds: float = REDIRECT_LEASE_S,
                   holder: str | None = None, item: str = "", kind: str = "",
@@ -468,10 +1072,16 @@ class StreamManager:
             self.release_mac(mid)
 
     def busy_mac_ids(self) -> set[int]:
-        """mac_ids currently locked by ffmpeg or holding a live redirect lease."""
+        """mac_ids with an ffmpeg pipe or a live redirect lease (any count).
+
+        Deliberately conservative even when a MAC allows several streams: the
+        callers are health probes and playlist checks, and handing a MAC to a
+        *probe* while a viewer is on it is what kicks the viewer. The play path
+        uses is_mac_busy, which honours the per-portal limit.
+        """
         for mid in list(self.redirect_leases):
             self._expire_lease(mid)
-        return set(self.mac_locks) | set(self.redirect_leases)
+        return {mid for mid in self.mac_locks if self._lock_set(mid)} | set(self.redirect_leases)
 
     def mac_occupancy(self, mac_id: int | None) -> dict | None:
         """Why a MAC is (not) usable right now, for the GUI and the logs.
@@ -487,10 +1097,11 @@ class StreamManager:
         if mac_id is None:
             return None
         holder = self.lease_holder(mac_id)
-        stream_id = self.mac_locks.get(mac_id)
-        if stream_id:
-            h = self.streams.get(stream_id)
-            return {"busy": True, "reason": "pipe", "stream_id": stream_id,
+        stream_ids = sorted(self._lock_set(mac_id))
+        if stream_ids and len(stream_ids) >= self._mac_limit(mac_id):
+            h = self.streams.get(stream_ids[0])
+            return {"busy": True, "reason": "pipe", "stream_id": stream_ids[0],
+                    "streams": len(stream_ids),
                     "holder": (h.user_name if h else None),
                     "item": (h.item_name if h else ""),
                     "remaining_s": 0.0}
@@ -544,7 +1155,12 @@ class StreamManager:
         container was restarted. A derived count cannot drift.
         """
         key = username or "-"
-        return sum(1 for h in self.streams.values() if (h.user_name or "-") == key)
+        # A parked pipe does not count: it exists only so this same user can
+        # come back to it, and their next request either attaches to it or makes
+        # it give way (see LINGER_S). Counting it would answer "max connections
+        # reached" to the very request the parking exists for.
+        return sum(1 for h in self.streams.values()
+                   if (h.user_name or "-") == key and not h.parked)
 
     def can_open_for(self, username: str | None, max_conn: int | None) -> bool:
         if max_conn is None or max_conn <= 0:
@@ -581,8 +1197,10 @@ class StreamManager:
         h.dead = True
         self.streams.pop(h.id, None)
         self._proc_gone_since.pop(h.id, None)
-        for mac_id, sid in list(self.mac_locks.items()):
-            if sid == h.id:
+        for mac_id in list(self.mac_locks):
+            sids = self._lock_set(mac_id)
+            sids.discard(h.id)
+            if not sids:
                 del self.mac_locks[mac_id]
         # The DELETE is what removes the dashboard row, and deregistration
         # normally runs from the pump's finally - i.e. inside the request task
@@ -601,6 +1219,13 @@ class StreamManager:
         if h.dead:
             return True
         h.dead = True
+        if h.parker is not None and not h.parker.done():
+            # A parked pipe is drained by its own task; killing the process is
+            # enough for it to end, but cancelling it now frees the buffer and
+            # the watcher slot deterministically.
+            h.parker.cancel()
+            h.parker = None
+            h.parked = False          # it is not being held any more, it is gone
         if h.proc and h.proc.returncode is None:
             try:
                 h.proc.kill()
@@ -622,6 +1247,31 @@ class StreamManager:
         for sid in list(self.streams):
             await self.kill(sid)
         return n
+
+    async def sweep_orphans(self, where: str = "boot") -> int:
+        """Kill ffmpeg pipes this process did not spawn (see `_orphan_ffmpeg_pids`).
+
+        Called at boot (a previous run may have died hard - SIGKILL, OOM, a
+        container restart - and its pipes hold panel slots that nothing in the
+        GUI can release) and at shutdown (kill them ourselves instead of leaving
+        them for the next boot to clean up).
+        """
+        import signal as _signal
+
+        pids = _orphan_ffmpeg_pids()
+        killed: list[int] = []
+        for pid in pids:
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                killed.append(pid)
+            except OSError:
+                continue
+        if killed:
+            await db_log("WARNING", "stream",
+                         f"{len(killed)} orphaned ffmpeg pipe(s) killed at {where} - "
+                         f"they would have kept their panel slot counted "
+                         f"(pids {', '.join(str(p) for p in killed)})")
+        return len(killed)
 
     def watch(self, request, handle: StreamHandle) -> asyncio.Task:
         """
@@ -694,9 +1344,10 @@ class StreamManager:
                 elif registered:                               # deregistered -> normal end
                     return
                 if registered and await request.is_disconnected():
-                    await db_log("INFO", "stream",
-                                 f"client left '{handle.item_name}' -> killing stream")
-                    await self.kill(handle.id)
+                    # `client_left`, not `kill`: a live pipe that played is held
+                    # for LINGER_S first so a zap back attaches to it (see
+                    # LINGER_S). Everything else is killed as before.
+                    await self.client_left(handle)
                     return
                 await asyncio.sleep(interval)
         except Exception:  # noqa: BLE001 - watchdog must never crash the app
@@ -747,18 +1398,23 @@ class StreamManager:
                       lambda m: " " + " ".join(add) + m.group(0),
                       cmd_text, count=1)
 
-    async def _first_bytes(self, proc) -> bytes:
+    async def _first_bytes(self, proc, timeout: float | None = None) -> bytes:
         """
         Wait for the first chunk - but only until ffmpeg dies, not until the
         start timeout expires. A process that exits before sending a byte will
         never send one, so falling back immediately is both faster (no 12 s
         wait per dead source) and honest in the log.
+
+        `timeout` is the per-candidate window (see STREAM_START_TIMEOUT_REST):
+        the caller spends the full window on the source it believes in and much
+        less on the ones after it.
         """
         read_t = asyncio.ensure_future(proc.stdout.read(CHUNK))
         exit_t = asyncio.ensure_future(proc.wait())
         try:
             done, _pending = await asyncio.wait(
-                {read_t, exit_t}, timeout=STREAM_START_TIMEOUT,
+                {read_t, exit_t},
+                timeout=STREAM_START_TIMEOUT if timeout is None else timeout,
                 return_when=asyncio.FIRST_COMPLETED)
         except Exception:  # noqa: BLE001 - never let the wait break the pump
             done = set()
@@ -1298,7 +1954,8 @@ class StreamManager:
         return out
 
     async def _open_with_identity(self, command: str, url: str, *,
-                                  title: str, pace: bool
+                                  title: str, pace: bool,
+                                  first_byte_timeout: float | None = None
                                   ) -> tuple[object | None, bytes, dict | None]:
         """Spawn ffmpeg for a network URL, walking the media-UA ladder.
 
@@ -1331,7 +1988,7 @@ class StreamManager:
                                      user_agent=ua)
             if proc is None:
                 return None, b"", None
-            first = await self._first_bytes(proc)
+            first = await self._first_bytes(proc, first_byte_timeout)
             if first:
                 if ua:
                     stream_identity.remember(url, ua)
@@ -1416,7 +2073,15 @@ class StreamManager:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE)
+                stderr=asyncio.subprocess.PIPE,
+                # The marker (uuid per stream) is how a later SPM process
+                # recognises OUR ffmpeg children: after a crash, `kill -9`, or a
+                # container restart the pipes survive their parent, keep reading
+                # the panel stream, and the panel keeps counting the MAC's slot -
+                # visible only as `limit` / "account is in use" with an empty
+                # dashboard. `sweep_orphans()` matches on this and on nothing
+                # else, so a user's own ffmpeg is never touched.
+                env={**os.environ, _STREAM_ENV_MARKER: uuid.uuid4().hex})
             # parked on the process so a failed identity-ladder rung can wait
             # for ffmpeg's final stderr (the HTTP 4xx line drives the retry)
             proc.spm_stderr_task = asyncio.get_running_loop().create_task(
@@ -1504,6 +2169,12 @@ class StreamManager:
             if portal_id in used_portals:
                 return None
             picked = list(macs[:1])
+            if len(macs) > 1:
+                # Worth one line per portal: with several MACs on it, this
+                # strategy answers a zap with the *same* MAC every time -
+                # exactly the thing a panel's one-connection slot refuses.
+                # `macs_first` walks them all, like the reference proxy does.
+                _warn_portal_first_once(portal_id, len(macs))
         else:
             picked = list(macs)
         used_portals.add(portal_id)
@@ -1790,6 +2461,146 @@ class StreamManager:
         raw = passes * candidates * STREAM_START_TIMEOUT + (passes - 1) * ZAP_RETRY_DELAY
         return min(raw, STREAM_START_BUDGET) if STREAM_START_BUDGET > 0 else raw
 
+    def _note_chain_limits(self, chain: list) -> None:
+        """Remember each MAC's concurrency limit before anything asks is_mac_busy."""
+        for _src, portal, macs in chain or ():
+            for m in macs or ():
+                self.note_mac_limit(getattr(m, "id", None),
+                                    getattr(portal, "streams_per_mac", None))
+
+    def _any_free(self, chain: list, requester: str | None) -> bool:
+        """Is there a MAC in this chain nothing holds right now?
+
+        The question STB-Proxy's `/play` loop asks per MAC (`isMacFree()`) and
+        the reason a zap lands on a multi-MAC portal: with one free MAC there is
+        no reason to wait for, or take over, any busy one.
+        """
+        for _src, portal, macs in chain or ():
+            for m in self._macs_for(portal, _src, macs) or ():
+                if m is None or not self.is_mac_busy(getattr(m, "id", None),
+                                                     requester=requester):
+                    return True
+        return False
+
+    def order_by_free(self, route, source, macs: list,
+                      requester: str | None) -> list:
+        """Untouched MACs first, then ones this user just used, then the rest.
+
+        Route affinity (`ordered_macs`) answers "which MAC worked last" - and on
+        a zap that can be exactly the MAC the player is still leaving, whose
+        panel slot is not free yet. So the ranking is:
+
+          0  nothing holds it (no pipe, no lease) - the one a player should get
+          1  only *this user's* post-302 lease: usable (the lease may be taken
+             back), but the panel probably still counts it
+          2  somebody else's stream or lease
+
+        Stable within a rank, so affinity still decides between equals - which is
+        what keeps the zap-back cache working (both MACs rank 1, and the one that
+        played the channel keeps its link).
+        """
+        if not macs:
+            return macs
+
+        def rank(m):
+            mid = getattr(m, "id", None)
+            if not self._lock_set(mid) and self.lease_remaining(mid) <= 0:
+                return 0
+            if not self._lock_set(mid) and requester \
+                    and self.lease_holder(mid) == requester:
+                return 1
+            return 2
+
+        return sorted(macs, key=rank)
+
+    async def _first_free_mac(self, chain: list, requester: str | None):
+        """(source, portal, mac) of the first MAC this start may use, or None.
+
+        Waiting is bounded for the whole chain, not per MAC (BUSY_WAIT_S in
+        total): three busy MACs must not turn a zap into a nine-second hang.
+        """
+        deadline = time.monotonic() + BUSY_WAIT_S
+        for step in chain or ():
+            src, portal, macs = step
+            for mac in macs or ():
+                left = max(0.0, deadline - time.monotonic())
+                if await self.wait_for_mac(mac, requester, budget=left):
+                    return src, portal, mac
+        return None
+
+    # ------------------------------------------------------------ diagnostics
+    def note_timing(self, *, kind: str, mode: str, item: str = "", portal: str = "",
+                    mac: str = "", total_ms: float = 0.0,
+                    prepare_ms: float | None = None, first_ms: float | None = None,
+                    fail: str = "") -> None:
+        """Remember one play's phase timings (or why it never played)."""
+        self.timings.append({
+            "at": time.time(), "kind": kind, "mode": mode, "item": item,
+            "portal": portal, "mac": mac, "fail": fail,
+            "total_ms": round(float(total_ms or 0.0), 1),
+            "prepare_ms": None if prepare_ms is None else round(float(prepare_ms), 1),
+            "first_ms": None if first_ms is None else round(float(first_ms), 1),
+        })
+
+    @staticmethod
+    def _percentiles(values: list[float]) -> dict:
+        if not values:
+            return {"n": 0, "p50": None, "p90": None, "max": None}
+        ordered = sorted(values)
+        def at(p: float) -> float:
+            idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * p))))
+            return round(ordered[idx], 1)
+        return {"n": len(ordered), "p50": at(0.5), "p90": at(0.9), "max": at(1.0)}
+
+    def timing_summary(self) -> dict:
+        """Percentiles per path, failures by reason, and a per-portal view.
+
+        This is the answer to "why does zapping feel slow": it separates the
+        302 path (panel + one probe) from the proxy path (panel + ffmpeg + the
+        source's first byte) and names the portal and MAC that were slow.
+        """
+        rows = list(self.timings)
+        modes: dict[str, dict] = {}
+        for mode in ("proxy", "redirect", "local"):
+            ok = [r for r in rows if r["mode"] == mode and not r["fail"]]
+            if not ok:
+                continue
+            modes[mode] = {
+                "total": self._percentiles([r["total_ms"] for r in ok]),
+                "first_byte": self._percentiles(
+                    [r["first_ms"] for r in ok if r["first_ms"] is not None]),
+                "prepare": self._percentiles(
+                    [r["prepare_ms"] for r in ok if r["prepare_ms"] is not None]),
+            }
+        fails: dict[str, int] = {}
+        for r in rows:
+            if r["fail"]:
+                fails[r["fail"]] = fails.get(r["fail"], 0) + 1
+        portals: dict[str, dict] = {}
+        for r in rows:
+            if not r["portal"]:
+                continue
+            entry = portals.setdefault(r["portal"], {"starts": 0, "fails": 0,
+                                                     "total_ms": []})
+            if r["fail"]:
+                entry["fails"] += 1
+            else:
+                entry["starts"] += 1
+                entry["total_ms"].append(r["total_ms"])
+        for name, entry in portals.items():
+            entry["p50_ms"] = self._percentiles(entry.pop("total_ms"))["p50"]
+        return {"window": len(rows), "modes": modes, "failures": fails,
+                "portals": portals, "recent": rows[-12:]}
+
+    def _free_candidates(self, chain: list, requester: str | None) -> int:
+        """How many MACs in this chain could be played right now (see HEDGE_AFTER_S)."""
+        free = 0
+        for _src, _portal, macs in chain or ():
+            for mac in macs or ():
+                if not self.is_mac_busy(getattr(mac, "id", None), requester=requester):
+                    free += 1
+        return free
+
     def _occupied_note(self, mac_row) -> str:
         """One MAC's occupancy as a phrase for a log line ('' when free)."""
         info = self.mac_occupancy(getattr(mac_row, "id", None))
@@ -1840,9 +2651,39 @@ class StreamManager:
         return plan_for(src, mac_row, ffmpeg=ffmpeg,
                         allow_direct=bool(getattr(portal, "direct_links", True)))
 
+    async def _create_link_with_backoff(self, client, plan, link_kind: str,
+                                        item_name: str, mac_row):
+        """create_link, re-asking the same MAC while the panel says "busy".
+
+        A panel refuses a second link on a MAC that is still streaming with
+        `limit` / `account_is_in_use` / HTTP 456, and frees the slot seconds
+        after the old connection dies. Moving on at the first refusal is what
+        turned a fast zap into "switching channel does not work" - on a
+        single-MAC portal there is no next candidate, and even with several the
+        panel's own answer is a moment away, not a MAC problem. The ladder is
+        deliberately short (BUSY_BACKOFF): it sits inside the start budget, and
+        a MAC that is genuinely in use elsewhere must not cost seconds before
+        the walk moves on.
+        """
+        for idx, wait in enumerate((0.0,) + BUSY_BACKOFF):
+            if wait:
+                await asyncio.sleep(wait)
+            try:
+                return await client.create_link(plan.cmd, link_kind,
+                                                **plan.request_kwargs())
+            except PortalError as exc:
+                if exc.code not in SLOT_BUSY_CODES or idx >= len(BUSY_BACKOFF):
+                    raise
+                await db_log("INFO", "stream",
+                             f"[{item_name}] {getattr(mac_row, 'mac', '?')}: the panel still "
+                             f"counts the previous connection ({exc.code}) - asking again in "
+                             f"{BUSY_BACKOFF[idx]:.1f}s")
+        raise AssertionError("unreachable")   # pragma: no cover
+
     # ------------------------------------------------------------ the pump
     async def resolve(self, kind: str, ref_id: int,
-                      requester: str | None = None) -> tuple[str | None, str]:
+                      requester: str | None = None,
+                      out: dict | None = None) -> tuple[str | None, str]:
         """
         Resolve a playable portal URL WITHOUT starting ffmpeg.
 
@@ -1854,7 +2695,12 @@ class StreamManager:
         stream, and a link that dies mid-playback is not retried (the player
         sees EOF instead of our fallback chain).
 
-        Returns (url, item_name); url is None when nothing resolved.
+        Returns (url, item_name); url is None when nothing resolved. `out`, when
+        given, receives {"busy": bool} - True when every candidate was refused by
+        *our own* occupancy or by the panel's connection slot rather than by a
+        dead source. The route answers 503 + Retry-After for that instead of a
+        502 "no source produced a link", because it is the one failure a player
+        wins by asking again a second later.
         """
         if kind == "live":
             chain, item_name, _item = await self._live_chain(ref_id)
@@ -1870,10 +2716,14 @@ class StreamManager:
             raise ValueError(f"kind {kind!r} cannot be redirected (no portal URL)")
 
         route_key = (kind, ref_id)
+        self._note_chain_limits(chain)
         chain = self.route_health.ordered_chain(route_key, chain)
         # >>> redirect-guard (feature 2; delete with app/services/redirect_guard.py)
         chain = demote_recently_handed(route_key, chain)
         # <<< redirect-guard
+        from .runtime_settings import prefer_free_mac
+        prefer_free = await prefer_free_mac()
+        every_candidate_busy = True
         attempts = 2 if (ZAP_RETRY and chain) else 1
         for pass_no in range(attempts):
             if pass_no == 1:
@@ -1881,9 +2731,15 @@ class StreamManager:
                              f"[{item_name}] redirect: first pass found no link "
                              f"-> retrying once in {ZAP_RETRY_DELAY:.1f}s (zap overlap?)")
                 await asyncio.sleep(ZAP_RETRY_DELAY)
+            # A (source, MAC) that failed a moment ago goes last (see
+            # demote_failed_candidates): affinity must not re-pick it first.
+            chain = demote_failed_candidates(route_key, chain)
             for _src, portal, macs in chain:
                 candidates = self._macs_for(portal, _src, macs)
                 candidates = self.route_health.ordered_macs(route_key, _src, candidates)
+                candidates = demote_macs(route_key, _src, candidates)
+                if prefer_free:
+                    candidates = self.order_by_free(route_key, _src, candidates, requester)
                 for mac_row in candidates:
                     # ffmpeg lock OR a recent redirect lease — both mean "leave this
                     # MAC alone". Redirects never enter mac_locks (we no longer hold
@@ -1891,8 +2747,33 @@ class StreamManager:
                     # The same user's own lease is exempt: that is the channel this
                     # box just zapped away from (see is_mac_busy), not another
                     # viewer, and skipping it sends the zap to a worse MAC.
+                    hit = cached_link(kind, ref_id, getattr(mac_row, "id", None),
+                                      user_name=requester) if pass_no == 0 else None
+                    if hit and not self.is_mac_busy(getattr(mac_row, "id", None),
+                                                    requester=requester):
+                        cached_url, age = hit
+                        # The link was good minutes ago, not now: probe before
+                        # replaying it (same probe the fresh link gets below).
+                        # <<< redirect-guard note: link_is_alive is the guard's
+                        if await link_is_alive(cached_url):
+                            await db_log("INFO", "stream",
+                                         f"[{item_name}] redirect: replaying the link resolved "
+                                         f"{age:.0f}s ago on {mac_row.mac} (no create_link)")
+                            if mac_row is not None:
+                                self.lease_mac(mac_row.id, holder=requester,
+                                               item=item_name, kind=kind, ref=ref_id)
+                            self.route_health.succeeded(route_key, _src, mac_row)
+                            return cached_url, item_name
+                        drop_link(kind, ref_id, getattr(mac_row, "id", None), requester)
+                        await db_log("INFO", "stream",
+                                     f"[{item_name}] redirect: the link from {age:.0f}s ago is "
+                                     "gone -> resolving a fresh one")
                     if mac_row is not None and self.is_mac_busy(mac_row.id,
                                                                 requester=requester):
+                        # Not a failure of the source: our own pipe/lease (or
+                        # another user's) holds the MAC. Leaves the "every
+                        # candidate was busy" flag alone, which is what turns
+                        # the answer into 503 + Retry-After.
                         await db_log("INFO", "stream",
                                      f"[{item_name}] redirect: mac {mac_row.mac} busy "
                                      "(ffmpeg pipe or redirect lease) -> skip")
@@ -1921,13 +2802,21 @@ class StreamManager:
                             await db_log("WARNING", "stream",
                                          f"[{item_name}] redirect: stored link dead "
                                          f"({portal.name}; {_probe.detail}) -> next candidate")
+                            note_candidate_failure(route_key, _src, mac_row)
+                            every_candidate_busy = False
                             continue
                         note_handed_out(route_key, _src, mac_row)
                         # <<< redirect-guard
+                        note_link(kind, ref_id, getattr(mac_row, "id", None),
+                                  plan.direct_url, requester)
+                        clear_candidate_failures(route_key)
                         if mac_row is not None:
                             self.lease_mac(mac_row.id, holder=requester,
                                            item=item_name, kind=kind, ref=ref_id)
                         self.route_health.succeeded(route_key, _src, mac_row)
+                        if out is not None:
+                            out["portal"] = portal.name
+                            out["mac"] = getattr(mac_row, "mac", "") or ""
                         return plan.direct_url, item_name
                     client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                     repair = None
@@ -1944,8 +2833,8 @@ class StreamManager:
                                 client.portal_url = res.portal_url
                                 client.invalidate()   # token was for the old URL
                         await client.ensure_auth()
-                        url = await client.create_link(plan.cmd, link_kind,
-                                                       **plan.request_kwargs())
+                        url = await self._create_link_with_backoff(client, plan, link_kind,
+                                                                   item_name, mac_row)
                         # getattr, not the attribute: a stand-in client (the test
                         # doubles, and anything else that grows into this slot)
                         # owes us a URL, not this hand-off field.
@@ -1954,6 +2843,10 @@ class StreamManager:
                         await db_log("WARNING", "stream",
                                      f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
                                      f"{exc.detail()} -> next")
+                        note_candidate_failure(route_key, _src, mac_row)
+                        if exc.code in SLOT_BUSY_CODES:
+                            continue          # busy stays "busy" for the 503
+                        every_candidate_busy = False
                         if exc.mac_suspect:
                             continue
                         self.route_health.failed(_src)
@@ -1962,6 +2855,8 @@ class StreamManager:
                         await db_log("WARNING", "stream",
                                      f"[{item_name}] redirect: {portal.name}/{mac_row.mac}: "
                                      f"{type(exc).__name__}: {exc} -> next")
+                        note_candidate_failure(route_key, _src, mac_row)
+                        every_candidate_busy = False
                         # Transport errors are source failures too. Keep trying
                         # other MACs/sources for this request, but make subsequent
                         # starts skip a source that just timed out.
@@ -1977,6 +2872,8 @@ class StreamManager:
                                          f"[{item_name}] redirect: fresh link dead "
                                          f"({portal.name}/{mac_row.mac}; {_probe.detail}) "
                                          f"-> next candidate")
+                            note_candidate_failure(route_key, _src, mac_row)
+                            every_candidate_busy = False
                             continue
                         note_handed_out(route_key, _src, mac_row)
                         _note = shrug_note(url, _probe)
@@ -1986,6 +2883,9 @@ class StreamManager:
                         # <<< redirect-guard
                         if repair is not None:
                             await _store_media_cmd(_src, repair, item_name)
+                        note_link(kind, ref_id, getattr(mac_row, "id", None), url,
+                                  requester)
+                        clear_candidate_failures(route_key)
                         await db_log("INFO", "stream",
                                      f"[{item_name}] redirecting to {portal.name}/{mac_row.mac} "
                                      f"(no ffmpeg)")
@@ -1993,9 +2893,21 @@ class StreamManager:
                             self.lease_mac(mac_row.id, holder=requester,
                                            item=item_name, kind=kind, ref=ref_id)
                         self.route_health.succeeded(route_key, _src, mac_row)
+                        if out is not None:
+                            out["portal"] = portal.name
+                            out["mac"] = getattr(mac_row, "mac", "") or ""
                         return url, item_name
+                    # A portal that answered with no URL at all is not a busy
+                    # slot: this source has nothing to play, and the answer must
+                    # say that (502) rather than "retry in a second" (503).
+                    note_candidate_failure(route_key, _src, mac_row)
+                    every_candidate_busy = False
+        if out is not None:
+            out["busy"] = bool(chain) and every_candidate_busy
+        busy_note = (" (every candidate was busy - not a dead source)"
+                     if (out is not None and out.get("busy")) else "")
         await db_log("ERROR", "stream",
-                     f"[{item_name}] redirect failed: no source produced a link")
+                     f"[{item_name}] redirect failed: no source produced a link{busy_note}")
         return None, item_name
 
     async def open(self, kind: str, ref_id: int, user_name: str | None,
@@ -2049,6 +2961,20 @@ class StreamManager:
         # shorter than the chain it guards turns "walking the fallbacks" into a
         # 502 while the engine is still working.
         handle.start_budget = self.start_budget(chain, kind=kind)
+        # A zap back inside LINGER_S: this user's previous pipe for this very
+        # item may still be running, holding its MAC. Attaching to it skips the
+        # create_link, the process start and the panel's slot accounting - the
+        # bytes are already flowing. Deliberately before every "is the MAC free"
+        # check: the MAC is not free, it is OURS.
+        parked = self._find_parked(kind, ref_id, user_name)
+        if parked is not None and kind != "local":
+            # The mechanical attach happens in the pump (it owns the reader);
+            # here it is only announced.
+            await db_log("INFO", "stream",
+                         f"[{parked.item_name}] zap back within {LINGER_S:.0f}s -> "
+                         f"attaching to the pipe that is still running "
+                         f"(no create_link, no ffmpeg start)")
+            return parked, self._pump(parked, chain, kind, adopt=True)
         # Pre-check: empty chain or EVERY mac currently occupied -> fail fast
         # with 404 instead of hanging a client with a 200 + empty body.
         if kind == "local":
@@ -2057,17 +2983,35 @@ class StreamManager:
                              f"[{item_name}] local file missing on disk -> 404")
                 handle.dead = True
         else:
+            self._note_chain_limits(chain)
             # `requester=user_name`: a lease this same user took is the channel
             # the box just left, not somebody else's stream (see is_mac_busy).
+            #
+            # Never veto a zap with our own bookkeeping (see BUSY_WAIT_S): wait
+            # for a MAC and take back this user's previous stream if that is
+            # what is holding it. Only when nothing frees within the budget does
+            # this fail - and then it fails as *busy* (503 + Retry-After), not
+            # as "no source" (404), because the source is fine.
             free = any(not self.is_mac_busy(m.id, requester=user_name)
                        for (_s, _p, macs) in chain for m in macs)
+            if chain and not free:
+                # Courtesy, not reservation: a pipe we parked for its own client
+                # cannot make this one wait (or answer 503) while it idles.
+                if await self._drop_parked(chain):
+                    free = any(not self.is_mac_busy(m.id, requester=user_name)
+                               for (_s, _p, macs) in chain for m in macs)
+            if chain and not free:
+                got = await self._first_free_mac(chain, user_name)
+                free = got is not None
             if not chain or not free:
                 if chain and not free:
                     busy = "; ".join(self._occupied_note(m) for (_s, _p, macs) in chain
                                      for m in macs)
                     await db_log("WARNING", "stream",
-                                 f"[{item_name}] all MACs occupied -> 404 (try again later)"
+                                 f"[{item_name}] every MAC still busy after "
+                                 f"{BUSY_WAIT_S:.1f}s -> 503 (retry shortly)"
                                  + (f" | {busy}" if busy else ""))
+                    handle.busy = True
                 if not chain:
                     await db_log("ERROR", "stream",
                                  f"[{item_name}] no usable sources (empty fallback chain / portal disabled / no MAC)")
@@ -2082,9 +3026,35 @@ class StreamManager:
         gen = self._pump(handle, chain, kind)
         return handle, gen
 
-    async def _pump(self, h: StreamHandle, chain: list, kind: str):
+    async def _pump(self, h: StreamHandle, chain: list, kind: str,
+                    adopt: bool = False):
         registered = False
         try:
+            if adopt and h.proc is not None and h.proc.returncode is None:
+                # Attach: the pipe is still running (see LINGER_S). Buffered
+                # bytes first, so the player sees no gap, then live bytes. On
+                # EOF the normal machinery below takes over - the chain is
+                # re-walked and the stream restarts in this same response.
+                proc = h.proc
+                await self._adopt(h)
+                await db_log("INFO", "stream",
+                             f"[{h.item_name}] attached to the running pipe "
+                             f"({h.bytes_sent / 1e6:.1f} MB streamed so far)")
+                buffered = bytes(h.ring)
+                h.ring.clear()
+                if buffered:
+                    h.bytes_sent += len(buffered)
+                    yield buffered
+                async for chunk in self._read_proc(h, proc):
+                    yield chunk
+                locked = self._lock_of(h)
+                if locked is not None:
+                    self.unlock_mac(locked, h.id)
+                await self._kill_quiet(proc)
+                if not h.dead:
+                    await db_log("WARNING", "stream",
+                                 f"[{h.item_name}] attached stream ended"
+                                 f" -> re-resolving")
             if kind == "local":
                 if not chain:
                     return
@@ -2153,8 +3123,15 @@ class StreamManager:
                 await db_log("INFO", "stream",
                              f"[{h.item_name}] circuit breaker skipped "
                              f"{configured_count - len(chain)} cooling source(s)")
+            from .runtime_settings import prefer_free_mac
+            prefer_free = await prefer_free_mac()
             yielded_any = False
+            ref_id = h.route_key[1] if h.route_key else 0   # for the link cache
+            busy_skips = 0            # candidates refused by occupancy alone
+            other_failures = 0        # candidates that failed for a real reason
             attempts = 2 if (ZAP_RETRY and chain) else 1
+            restarts = MIDSTREAM_RESTARTS if kind in MIDSTREAM_RESTART_KINDS else 0
+            last_used: tuple | None = None      # (src, mac_row) that was playing
             # The engine's own deadline: STREAM_START_TIMEOUT per candidate is
             # only honest while the whole walk fits in one budget. Past it the
             # request answers "no data" promptly and the output guard turns that
@@ -2173,225 +3150,353 @@ class StreamManager:
                              + (f" - {h.trace}" if h.trace else "")
                              + " -> giving the player an answer instead of a hang")
 
-            for pass_no in range(attempts):
-                if pass_no == 1:
-                    if _budget_spent():
-                        await _give_up()
-                        return
-                    await db_log("INFO", "stream",
-                                 f"[{h.item_name}] first pass produced no data "
-                                 f"-> retrying once in {ZAP_RETRY_DELAY:.1f}s (zap overlap?)")
-                    await asyncio.sleep(ZAP_RETRY_DELAY)
-                for idx, (src, portal, macs) in enumerate(chain, 1):
-                    if h.dead:
-                        return
-                    candidates = self._macs_for(portal, src, macs)
-                    candidates = self.route_health.ordered_macs(h.route_key, src, candidates)
-                    for mac_row in candidates:
-                        if h.dead:
-                            return
-                        if _budget_spent():
-                            await _give_up()
-                            return
-                        # Decided before the portal is touched, for the same reason the
-                        # redirect path decides first: for a source the user adopted onto
-                        # the panel's Xtream side (R7) there is no MAC to spend and no
-                        # session to open, and reaching for a client "just in case"
-                        # would put the portal back in the loop we removed.
-                        plan = self._plan(src, mac_row, portal, ffmpeg=True)
-                        adopted = plan.adopted
-                        # `requester=h.user_name`: this user's own post-302 lease is
-                        # the channel the box just zapped away from, not another
-                        # viewer - taking it back is what keeps a single-MAC zap on
-                        # the MAC that actually works instead of a worse one.
-                        if not adopted and self.is_mac_busy(mac_row.id,
-                                                            requester=h.user_name):
-                            h.note_attempt(f"{mac_row.mac}: busy "
-                                           f"({self._occupied_note(mac_row) or 'unknown'})")
-                            await db_log("INFO", "stream",
-                                         f"[{h.item_name}] mac {mac_row.mac} busy -> skip "
-                                         f"(fallback step {idx}/{len(chain)})")
-                            continue
-                        if not adopted and self.lease_holder(mac_row.id) == h.user_name \
-                                and h.user_name:
-                            h.took_over_lease = True
-                            await db_log("INFO", "stream",
-                                         f"[{h.item_name}] taking over the redirect lease "
-                                         f"on {mac_row.mac} held by {h.user_name} "
-                                         "(the channel this zap left)")
-                        await db_log("INFO", "stream",
-                                     f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
-                                     + (f"portal '{portal.name}' - {plan.policy.reason}" if adopted
-                                        else f"portal '{portal.name}' mac {mac_row.mac}"))
-                        url = None
-                        if adopted:
-                            url = plan.direct_url
-                        else:
-                            client = await POOL.get(PortalSession.from_rows(portal, mac_row))
-                            repair = None
-                            try:
-                                if not portal.resolved_url:
-                                    from ..portal.resolver import resolve_portal  # local import: avoids cycle
-                                    res = await resolve_portal(portal.base_url, mac=mac_row.mac,
-                                                               proxy=portal.proxy_url,
-                                                               tls_insecure=portal.tls_insecure)
-                                    if res.ok:
-                                        portal.resolved_url = res.portal_url
-                                        portal.resolved_path = res.path
-                                        await _store_resolved_portal(portal.id, res.portal_url, res.path)
-                                        client.portal_url = res.portal_url
-                                        client.invalidate()   # token was for the old URL
-                                await client.ensure_auth()
-                                link_kind = "live" if kind == "live" else "vod"
-                                # ffmpeg owns this stream, so the plan is always "ask"
-                                # (fresh token + the liveness answer); the flags still
-                                # decide what we tell the panel about ads and re-checks
-                                url = await client.create_link(plan.cmd, link_kind,
-                                                               **plan.request_kwargs())
-                                repair = getattr(client, "last_cmd_repair", None)
-                            except PortalError as exc:
-                                # The code decides what this means for the rest of the
-                                # chain: `limit` is "this MAC is busy over there", so
-                                # the next MAC is the right move, while `nothing_to_play`
-                                # is "this source is dead", so hopping MACs is pointless.
-                                h.note_attempt(f"{portal.name}/{mac_row.mac}: {exc.code or exc}")
-                                await db_log("WARNING", "stream",
-                                             f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
-                                             f"{exc.detail()}"
-                                             f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
-                                if exc.mac_suspect:
-                                    continue
-                                self.route_health.failed(src)
-                                break  # source-specific failure: another MAC cannot repair it
-                            except Exception as exc:  # noqa: BLE001
-                                h.note_attempt(f"{portal.name}/{mac_row.mac}: "
-                                               f"{type(exc).__name__}")
-                                await db_log("WARNING", "stream",
-                                             f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
-                                             f"unexpected {type(exc).__name__}: {exc} -> next")
-                                continue
-                            finally:
-                                await client.close()
-                        if not url:
-                            # An Xtream URL that will not open is not a MAC problem:
-                            # the next MAC would be handed exactly the same URL, so
-                            # move on to the next source instead of walking the list.
-                            h.note_attempt(f"{portal.name}/{mac_row.mac}: no URL")
-                            if adopted:
-                                break
-                            continue
-                        if repair is not None:
-                            # A form the panel accepted is worth keeping BEFORE the
-                            # pipe is opened: if ffmpeg then fails on the bytes, the
-                            # next attempt still starts from the cmd that got a link.
-                            await _store_media_cmd(src, repair, h.item_name)
+            tried_any = False
+            while True:
+              for pass_no in range(attempts):
+                  if pass_no == 1:
+                      if _budget_spent():
+                          await _give_up()
+                          return
+                      await db_log("INFO", "stream",
+                                   f"[{h.item_name}] first pass produced no data "
+                                   f"-> retrying once in {ZAP_RETRY_DELAY:.1f}s (zap overlap?)")
+                      await asyncio.sleep(ZAP_RETRY_DELAY)
+                  # A (source, MAC) that failed a moment ago goes last: route
+                  # affinity must not re-pick the candidate the player just saw
+                  # fail (STB-Proxy's `moveMac`, per route and per process).
+                  chain = demote_failed_candidates(h.route_key, chain)
+                  # Walk the MACs and take the first FREE one (STB-Proxy's
+                  # `isMacFree()` loop): waiting per busy MAC would cost
+                  # BUSY_WAIT_S for every MAC that is not free - on a two-MAC
+                  # portal with the first one busy that is seconds of nothing
+                  # while a working MAC sits in the same chain. Only when nothing
+                  # is free (or the free ones already failed on the first pass)
+                  # is waiting worth anything - and only then is our own previous
+                  # stream taken back. See BUSY_WAIT_S / preempt_own.
+                  if not (prefer_free and pass_no == 0
+                          and self._any_free(chain, h.user_name)):
+                      if await self._first_free_mac(chain, h.user_name) is None:
+                          await db_log("INFO", "stream",
+                                       f"[{h.item_name}] every MAC is held (by this user's "
+                                       f"previous play or by somebody else) - waited "
+                                       f"{BUSY_WAIT_S:.0f}s for one to free")
+                  for idx, (src, portal, macs) in enumerate(chain, 1):
+                      if h.dead:
+                          return
+                      candidates = self._macs_for(portal, src, macs)
+                      candidates = self.route_health.ordered_macs(h.route_key, src, candidates)
+                      candidates = demote_macs(h.route_key, src, candidates)
+                      if prefer_free:
+                          candidates = self.order_by_free(h.route_key, src, candidates,
+                                                          h.user_name)
+                      for mac_row in candidates:
+                          if h.dead:
+                              return
+                          if _budget_spent():
+                              await _give_up()
+                              return
+                          first_candidate = not tried_any
+                          tried_any = True
+                          # Hedge by patience, not by a parallel race: with a free
+                          # alternative in the chain, a candidate that has said
+                          # nothing after HEDGE_AFTER_S is not "slow", it is
+                          # probably dead - so do not sit on it for the full
+                          # window. See HEDGE_AFTER_S.
+                          window = (STREAM_START_TIMEOUT if first_candidate
+                                    else STREAM_START_TIMEOUT_REST)
+                          if HEDGE_AFTER_S > 0 and self._free_candidates(chain, h.user_name) \
+                                  >= HEDGE_MIN_CANDIDATES:
+                              window = min(window, HEDGE_AFTER_S)
+                          # Decided before the portal is touched, for the same reason the
+                          # redirect path decides first: for a source the user adopted onto
+                          # the panel's Xtream side (R7) there is no MAC to spend and no
+                          # session to open, and reaching for a client "just in case"
+                          # would put the portal back in the loop we removed.
+                          plan = self._plan(src, mac_row, portal, ffmpeg=True)
+                          adopted = plan.adopted
+                          # `requester=h.user_name`: this user's own post-302 lease is
+                          # the channel the box just zapped away from, not another
+                          # viewer - taking it back is what keeps a single-MAC zap on
+                          # the MAC that actually works instead of a worse one.
+                          if not adopted and self.is_mac_busy(mac_row.id,
+                                                              requester=h.user_name):
+                              # Occupancy never vetoes a start (see BUSY_WAIT_S and
+                              # `preempt_own`): the chain was walked for a free MAC
+                              # above, our own previous stream was taken back if
+                              # nothing was free, and this candidate is what is
+                              # left. Move on to the next one - never block here.
+                              h.note_attempt(f"{mac_row.mac}: busy "
+                                             f"({self._occupied_note(mac_row) or 'unknown'})")
+                              note_candidate_failure(h.route_key, src, mac_row)
+                              busy_skips += 1
+                              await db_log("INFO", "stream",
+                                           f"[{h.item_name}] mac {mac_row.mac} busy -> next "
+                                           f"(fallback step {idx}/{len(chain)})")
+                              continue
+                          if not adopted and self.lease_holder(mac_row.id) == h.user_name \
+                                  and h.user_name:
+                              h.took_over_lease = True
+                              await db_log("INFO", "stream",
+                                           f"[{h.item_name}] taking over the redirect lease "
+                                           f"on {mac_row.mac} held by {h.user_name} "
+                                           "(the channel this zap left)")
+                          await db_log("INFO", "stream",
+                                       f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
+                                       + (f"portal '{portal.name}' - {plan.policy.reason}" if adopted
+                                          else f"portal '{portal.name}' mac {mac_row.mac}"))
+                          url = None
+                          repair = None      # set only when the panel answered
+                          if adopted:
+                              url = plan.direct_url
+                          elif plan.policy.direct:
+                              # R2b: the channel's own flags say its link is
+                              # permanent, so ffmpeg gets the stored URL - no
+                              # handshake, no create_link, no panel slot. That is
+                              # what STB-Proxy does for every channel whose cmd is
+                              # not `http://localhost/...`, and it is why a zap
+                              # there never collides with the panel's connection
+                              # table. `link_policy` has already refused this path
+                              # for tmp/load-balanced links, templates and URLs
+                              # that still carry a session token.
+                              url = plan.direct_url
+                              await db_log("INFO", "stream",
+                                           f"[{h.item_name}] playing the stored link via "
+                                           f"{portal.name}/{mac_row.mac if mac_row else 'xtream'}"
+                                           f" (ffmpeg): {plan.policy.reason}")
+                          else:
+                              client = await POOL.get(PortalSession.from_rows(portal, mac_row))
+                              repair = None
+                              try:
+                                  if not portal.resolved_url:
+                                      from ..portal.resolver import resolve_portal  # local import: avoids cycle
+                                      res = await resolve_portal(portal.base_url, mac=mac_row.mac,
+                                                                 proxy=portal.proxy_url,
+                                                                 tls_insecure=portal.tls_insecure)
+                                      if res.ok:
+                                          portal.resolved_url = res.portal_url
+                                          portal.resolved_path = res.path
+                                          await _store_resolved_portal(portal.id, res.portal_url, res.path)
+                                          client.portal_url = res.portal_url
+                                          client.invalidate()   # token was for the old URL
+                                  await client.ensure_auth()
+                                  link_kind = "live" if kind == "live" else "vod"
+                                  # The plan asked for a link (the flags say the URL
+                                  # is not permanent, or the stored cmd is a template
+                                  # the panel must finish). `_create_link_with_backoff`
+                                  # keeps asking the SAME MAC while the panel reports
+                                  # a busy slot instead of burning the candidate: that
+                                  # is the zap overlap, and on a single-MAC portal it
+                                  # is the only candidate there is.
+                                  url = await self._create_link_with_backoff(
+                                      client, plan, link_kind, h.item_name, mac_row)
+                                  repair = getattr(client, "last_cmd_repair", None)
+                              except PortalError as exc:
+                                  # The code decides what this means for the rest of the
+                                  # chain: `limit` is "this MAC is busy over there", so
+                                  # the next MAC is the right move, while `nothing_to_play`
+                                  # is "this source is dead", so hopping MACs is pointless.
+                                  h.note_attempt(f"{portal.name}/{mac_row.mac}: {exc.code or exc}")
+                                  note_candidate_failure(h.route_key, src, mac_row)
+                                  if exc.code in SLOT_BUSY_CODES:
+                                      busy_skips += 1
+                                  else:
+                                      other_failures += 1
+                                  await db_log("WARNING", "stream",
+                                               f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
+                                               f"{exc.detail()}"
+                                               f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
+                                  if exc.mac_suspect:
+                                      continue
+                                  self.route_health.failed(src)
+                                  break  # source-specific failure: another MAC cannot repair it
+                              except Exception as exc:  # noqa: BLE001
+                                  h.note_attempt(f"{portal.name}/{mac_row.mac}: "
+                                                 f"{type(exc).__name__}")
+                                  note_candidate_failure(h.route_key, src, mac_row)
+                                  other_failures += 1
+                                  await db_log("WARNING", "stream",
+                                               f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
+                                               f"unexpected {type(exc).__name__}: {exc} -> next")
+                                  continue
+                              finally:
+                                  await client.close()
+                          if not url:
+                              # An Xtream URL that will not open is not a MAC problem:
+                              # the next MAC would be handed exactly the same URL, so
+                              # move on to the next source instead of walking the list.
+                              h.note_attempt(f"{portal.name}/{mac_row.mac}: no URL")
+                              note_candidate_failure(h.route_key, src, mac_row)
+                              other_failures += 1
+                              if adopted:
+                                  break
+                              continue
+                          if repair is not None:
+                              # A form the panel accepted is worth keeping BEFORE the
+                              # pipe is opened: if ffmpeg then fails on the bytes, the
+                              # next attempt still starts from the cmd that got a link.
+                              await _store_media_cmd(src, repair, h.item_name)
 
-                        # lock the MAC BEFORE starting ffmpeg so parallel requests
-                        # see it as occupied immediately. An adopted play owns no MAC,
-                        # and `locked` is what keeps the three release sites below from
-                        # popping a slot that a *different* stream on this MAC is holding.
-                        locked = None
-                        if not adopted:
-                            self.mac_locks[mac_row.id] = h.id
-                            locked = mac_row.id
-                        # VOD/episode links are FILES (mkv/mp4 over the CDN): pace
-                        # them to real time like local files, or the player hits
-                        # EOF early. Live is paced by its own encoder - never -re.
-                        # The opener walks the media-UA ladder (player identity
-                        # first, one browser-UA retry on an HTTP 4xx open error):
-                        # play/live.php origins answer the portal browser UA with
-                        # HTTP 456/403 and zero bytes while a player-shaped request
-                        # plays the very same play_token - see stream_identity.
-                        try:
-                            proc, first, open_fail = await self._open_with_identity(
-                                h.command, url, title=h.item_name,
-                                pace=(kind != "live"))
-                        except FFmpegTemplateError as exc:
-                            if locked is not None:
-                                self.mac_locks.pop(locked, None)
-                            h.dead = True
-                            h.fail_note = f"invalid FFmpeg template: {exc}"
-                            h.note_attempt(f"template: {exc}")
-                            await db_log("ERROR", "stream",
-                                         f"[{h.item_name}] {h.fail_note} -> no MAC/source fallback")
-                            return
-                        if proc is None:
-                            if _is_template_output_failure(open_fail):
-                                tail = (open_fail.get("tail") or "").strip()
-                                detail = tail[-500:] if tail else f"rc={open_fail.get('rc')}"
-                                if locked is not None:
-                                    self.mac_locks.pop(locked, None)
-                                h.dead = True
-                                h.fail_note = ("FFmpeg template/output initialization failed "
-                                               f"(rc={open_fail.get('rc')})")
-                                h.note_attempt("template: " + h.fail_note)
-                                await db_log(
-                                    "ERROR", "stream",
-                                    f"[{h.item_name}] {h.fail_note} -> no MAC/source fallback | "
-                                    f"ffmpeg's last words: {detail}")
-                                return
-                            if open_fail is not None:
-                                who = portal.name + ("/xtream"
-                                                     if adopted
-                                                     else f"/{mac_row.mac}")
-                                # The stderr tail is the *only* evidence for a silent
-                                # stall (rc == -9 because we killed it, which is
-                                # deliberately not logged on its own): without it the
-                                # log says "no data within 12s" and leaves the real
-                                # reason - VAAPI init, a 4xx on the media request, a
-                                # panel slot check - to guesswork.
-                                tail = (open_fail.get("tail") or "").strip()
-                                words = f" | ffmpeg's last words: {tail[:400]}" if tail else ""
-                                if open_fail["stalled"]:
-                                    h.note_attempt(f"{who}: silent {STREAM_START_TIMEOUT:.0f}s")
-                                    await db_log("WARNING", "stream",
-                                                 f"[{h.item_name}] no data within {STREAM_START_TIMEOUT:.0f}s from "
-                                                 f"{who} -> fallback{words}")
-                                else:
-                                    # ffmpeg is gone and will never send a byte: say so
-                                    # (the [ffmpeg] log line has the stderr tail)
-                                    h.note_attempt(f"{who}: ffmpeg rc={open_fail['rc']}")
-                                    await db_log("WARNING", "stream",
-                                                 f"[{h.item_name}] ffmpeg exited rc={open_fail['rc']} before sending "
-                                                 f"data ({who}) -> fallback{words}")
-                            if locked is not None:
-                                self.mac_locks.pop(locked, None)
-                            self.route_health.failed(src)
-                            if adopted:
-                                break
-                            continue
-                        h.portal_name, h.mac, h.url, h.proc = (
-                            f"{portal.name} (xtream)" if adopted else portal.name,
-                            "" if adopted else mac_row.mac, url, proc)
-                        if not registered:
-                            await self._register(h)
-                            registered = True
-                        self.route_health.succeeded(h.route_key, src, mac_row, verified_media=True)
-                        await db_log("INFO", "stream",
-                                     f"[{h.item_name}] playing via {portal.name}/"
-                                     f"{mac_row.mac if mac_row is not None else 'xtream'} "
-                                     f"({'transcode' if ' -c:v copy' not in h.command else 'copy'})")
-                        yielded_any = True
-                        yield first
-                        async for chunk in self._read_proc(h, proc):
-                            yield chunk
-                        # EOF: stream ended/died -> move to next fallback silently
-                        if locked is not None:
-                            self.mac_locks.pop(locked, None)
-                        await self._kill_quiet(proc)
-                        if not h.dead:
-                            await db_log("WARNING", "stream",
-                                         f"[{h.item_name}] stream ended from {portal.name}/{mac_row.mac}"
-                                         f" -> trying next fallback")
-                    # next portal in chain
-                if yielded_any:
-                    break
+                          # lock the MAC BEFORE starting ffmpeg so parallel requests
+                          # see it as occupied immediately. An adopted play owns no MAC,
+                          # and `locked` is what keeps the three release sites below from
+                          # popping a slot that a *different* stream on this MAC is holding.
+                          locked = None
+                          if not adopted:
+                              self.lock_mac(mac_row.id, h.id)
+                              locked = mac_row.id
+                          # VOD/episode links are FILES (mkv/mp4 over the CDN): pace
+                          # them to real time like local files, or the player hits
+                          # EOF early. Live is paced by its own encoder - never -re.
+                          # The opener walks the media-UA ladder (player identity
+                          # first, one browser-UA retry on an HTTP 4xx open error):
+                          # play/live.php origins answer the portal browser UA with
+                          # HTTP 456/403 and zero bytes while a player-shaped request
+                          # plays the very same play_token - see stream_identity.
+                          try:
+                              proc, first, open_fail = await self._open_with_identity(
+                                  h.command, url, title=h.item_name,
+                                  pace=(kind != "live"),
+                                  # The first candidate gets the full window;
+                                  # after it, a silent source is far more likely
+                                  # to be dead than slow (measured: a live one
+                                  # answers in ~550 ms), and a whole chain of
+                                  # 12 s waits is what a player shows as a frozen
+                                  # screen. See STREAM_START_TIMEOUT_REST.
+                                  first_byte_timeout=window)
+                          except FFmpegTemplateError as exc:
+                              if locked is not None:
+                                  self.unlock_mac(locked, h.id)
+                              h.dead = True
+                              h.fail_note = f"invalid FFmpeg template: {exc}"
+                              h.note_attempt(f"template: {exc}")
+                              await db_log("ERROR", "stream",
+                                           f"[{h.item_name}] {h.fail_note} -> no MAC/source fallback")
+                              return
+                          if proc is None:
+                              if _is_template_output_failure(open_fail):
+                                  tail = (open_fail.get("tail") or "").strip()
+                                  detail = tail[-500:] if tail else f"rc={open_fail.get('rc')}"
+                                  if locked is not None:
+                                      self.unlock_mac(locked, h.id)
+                                  h.dead = True
+                                  h.fail_note = ("FFmpeg template/output initialization failed "
+                                                 f"(rc={open_fail.get('rc')})")
+                                  h.note_attempt("template: " + h.fail_note)
+                                  await db_log(
+                                      "ERROR", "stream",
+                                      f"[{h.item_name}] {h.fail_note} -> no MAC/source fallback | "
+                                      f"ffmpeg's last words: {detail}")
+                                  return
+                              if open_fail is not None:
+                                  who = portal.name + ("/xtream"
+                                                       if adopted
+                                                       else f"/{mac_row.mac}")
+                                  # The stderr tail is the *only* evidence for a silent
+                                  # stall (rc == -9 because we killed it, which is
+                                  # deliberately not logged on its own): without it the
+                                  # log says "no data within 12s" and leaves the real
+                                  # reason - VAAPI init, a 4xx on the media request, a
+                                  # panel slot check - to guesswork.
+                                  tail = (open_fail.get("tail") or "").strip()
+                                  words = f" | ffmpeg's last words: {tail[:400]}" if tail else ""
+                                  note_candidate_failure(h.route_key, src, mac_row)
+                                  other_failures += 1
+                                  if open_fail["stalled"]:
+                                      # Name the window that actually expired: it is
+                                      # `window`, not the full start timeout, when a
+                                      # free alternative was waiting (HEDGE_AFTER_S).
+                                      h.note_attempt(f"{who}: silent {window:g}s")
+                                      await db_log("WARNING", "stream",
+                                                   f"[{h.item_name}] no data within {window:g}s from "
+                                                   f"{who} -> fallback{words}")
+                                  else:
+                                      # ffmpeg is gone and will never send a byte: say so
+                                      # (the [ffmpeg] log line has the stderr tail)
+                                      h.note_attempt(f"{who}: ffmpeg rc={open_fail['rc']}")
+                                      await db_log("WARNING", "stream",
+                                                   f"[{h.item_name}] ffmpeg exited rc={open_fail['rc']} before sending "
+                                                   f"data ({who}) -> fallback{words}")
+                              if locked is not None:
+                                  self.unlock_mac(locked, h.id)
+                              self.route_health.failed(src)
+                              if adopted:
+                                  break
+                              continue
+                          h.portal_name, h.mac, h.url, h.proc = (
+                              f"{portal.name} (xtream)" if adopted else portal.name,
+                              "" if adopted else mac_row.mac, url, proc)
+                          h.portal_id = getattr(portal, "id", None)
+                          if not registered:
+                              await self._register(h)
+                              registered = True
+                          self.route_health.succeeded(h.route_key, src, mac_row, verified_media=True)
+                          note_link(kind, ref_id, getattr(mac_row, "id", None), url,
+                                    h.user_name)
+                          clear_candidate_failures(h.route_key)
+                          await db_log("INFO", "stream",
+                                       f"[{h.item_name}] playing via {portal.name}/"
+                                       f"{mac_row.mac if mac_row is not None else 'xtream'} "
+                                       f"({'transcode' if ' -c:v copy' not in h.command else 'copy'})")
+                          yielded_any = True
+                          last_used = (src, mac_row)
+                          yield first
+                          async for chunk in self._read_proc(h, proc):
+                              yield chunk
+                          # EOF: stream ended/died -> move to next fallback silently
+                          if locked is not None:
+                              self.unlock_mac(locked, h.id)
+                          await self._kill_quiet(proc)
+                          if not h.dead:
+                              await db_log("WARNING", "stream",
+                                           f"[{h.item_name}] stream ended from {portal.name}/{mac_row.mac}"
+                                           f" -> trying next fallback")
+                      # next portal in chain
+                  if yielded_any:
+                      break
+              # ---- the chain is exhausted after a stream that WAS playing ----
+              if not (yielded_any and not h.dead and restarts > 0) or _budget_spent():
+                  break
+              restarts -= 1
+              # The link we were playing is the one that died, so replaying it
+              # from the cache would restart the same corpse: forget every cached
+              # link of this route and ask the panel again (that is the point).
+              for _s, _p, _macs in chain:
+                  for _m in self._macs_for(_p, _s, _macs) or ():
+                      drop_link(kind, ref_id, getattr(_m, "id", None), h.user_name)
+              if last_used is not None:
+                  # A dropped *stream* is a reason to prefer another MAC next time
+                  # (STB-Proxy moves the MAC when a stream dies): the panel may
+                  # still count the old one's connection for a few seconds.
+                  note_candidate_failure(h.route_key, last_used[0], last_used[1])
+              await db_log("INFO", "stream",
+                           f"[{h.item_name}] live stream ended after "
+                           f"{h.bytes_sent / 1e6:.1f} MB -> re-resolving "
+                           f"(restart {MIDSTREAM_RESTARTS - restarts}/{MIDSTREAM_RESTARTS})")
+              await asyncio.sleep(MIDSTREAM_RESTART_DELAY)
+              chain = self.route_health.ordered_chain(h.route_key, chain)
+              yielded_any = False
+              busy_skips = 0
+              other_failures = 0
             if not h.fail_note:
                 h.fail_note = (f"{len(h.attempts)} attempt(s) without data"
                                if h.attempts else "no candidate source could be tried")
-            await db_log("ERROR", "stream",
-                         f"[{h.item_name}] all fallbacks exhausted - {h.fail_note}"
-                         + (f" | {h.trace}" if h.trace else ""))
+            if busy_skips and not other_failures:
+                # Nothing failed for a real reason: every candidate was refused
+                # by occupancy (our pipe/lease) or by the panel's own slot. The
+                # route turns this into 503 + Retry-After - the truth is "come
+                # back in a second", and a 404 told the player the channel was
+                # gone (and made players stop retrying).
+                h.busy = True
+                h.fail_note += f" (all {busy_skips} refusal(s) were busy slots)"
+            if not h.dead:
+                # `h.dead` here means somebody killed this stream on purpose
+                # (a zap taking over our pipe, the client disconnecting, the
+                # dashboard) - that is not "we could not start a stream", and
+                # logging it as an exhausted fallback chain made a healthy zap
+                # look like a failure in the log.
+                await db_log("ERROR", "stream",
+                             f"[{h.item_name}] all fallbacks exhausted - {h.fail_note}"
+                             + (f" | {h.trace}" if h.trace else ""))
         except asyncio.CancelledError:
             pass
         except Exception as exc:  # noqa: BLE001
@@ -2409,19 +3514,44 @@ class StreamManager:
 
     async def _finish(self, h: StreamHandle) -> None:
         """Complete stream teardown, run outside the dying request's scope."""
+        if h.parked:
+            # The parker owns the process now (a client may attach to it); the
+            # watchdog already saw the disconnect, and the parker reaps it.
+            return
+        if self._can_park(h):
+            # The client left mid-stream: hold the pipe instead of killing it,
+            # so the same player's zap back costs no create_link and no ffmpeg
+            # start (LINGER_S). `client_left` is the same decision, reached
+            # without a watchdog.
+            await run_uncancelled(self._park(h), what="stream parking")
+            return
         await self._kill_quiet(h.proc)
         await self._deregister(h)
         await db_log("INFO", "stream",
                      f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
 
+    def _stall_window(self, h: StreamHandle) -> float:
+        """Seconds of silence this stream tolerates before it counts as over.
+
+        A live stream that is *restartable* (the mid-stream re-resolve is on
+        for its kind) gets the shorter window: a drop can be continued in the
+        same response, so the old 25 s of black screen buys nothing. Anything
+        else keeps the generous one - the wait is for a source that is
+        starting or buffering, not for a stream we can replace.
+        """
+        if MIDSTREAM_RESTARTS > 0 and h.kind in MIDSTREAM_RESTART_KINDS:
+            return STREAM_STALL_TIMEOUT_LIVE
+        return STREAM_STALL_TIMEOUT
+
     async def _read_proc(self, h: StreamHandle, proc):
         """Yield bytes with stall detection until EOF/death/kill."""
         while not h.dead:
+            window = self._stall_window(h)
             try:
-                chunk = await asyncio.wait_for(proc.stdout.read(CHUNK), STREAM_STALL_TIMEOUT)
+                chunk = await asyncio.wait_for(proc.stdout.read(CHUNK), window)
             except asyncio.TimeoutError:
                 await db_log("WARNING", "stream",
-                             f"[{h.item_name}] stalled >{STREAM_STALL_TIMEOUT}s without data")
+                             f"[{h.item_name}] stalled >{window:.0f}s without data")
                 break
             if not chunk:
                 break

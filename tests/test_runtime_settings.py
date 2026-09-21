@@ -116,6 +116,7 @@ async def test_page_budget_setting_caps_fetch_without_restart():
     class _Job:
         def __init__(self):
             import asyncio
+            self.portal_id = 1          # the gate reads this per page batch
             self._cancel = asyncio.Event()
             self.detail = ""
             self.done_items = 0

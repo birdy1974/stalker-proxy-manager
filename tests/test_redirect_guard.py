@@ -5,6 +5,7 @@ Self-contained: if the feature is deleted, delete this file with it.
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import httpx
@@ -560,3 +561,53 @@ def test_shrug_note_is_reported_once_per_origin_and_trace():
     # another origin, or another trace from the same one, is news again
     assert shrug_note("http://other/play/live.php?stream=1", probe) != ""
     assert shrug_note("http://panel/x.ts", ProbeResult(True, "HEAD 502 -> GET 206")) != ""
+
+
+# ------------------------------------------------------- probe verdict cache
+def _counting_probe(monkeypatch, verdict):
+    """Patch the rung-level probe, so the cache is exercised without a network."""
+    calls = []
+
+    async def fake(url, timeout, client):
+        calls.append(url)
+        return verdict
+
+    monkeypatch.setattr(redirect_guard, "_probe", fake)
+    return calls
+
+
+async def test_a_proven_link_is_not_probed_again(monkeypatch):
+    """The zap-back case: same URL, seconds later, no second probe.
+
+    Without this the cheapest zap we can serve (link cache hit, no create_link)
+    still paid a TLS + RTT to the media host before the 302.
+    """
+    calls = _counting_probe(monkeypatch, redirect_guard.ProbeResult(True, "HEAD 200"))
+    first = await link_is_alive("http://cdn/zap.ts")
+    second = await link_is_alive("http://cdn/zap.ts")
+    assert first.alive and second.alive
+    assert calls == ["http://cdn/zap.ts"], "the second play must not probe"
+    assert "probed" in second.detail and "ago" in second.detail
+    stats = redirect_guard.probe_stats()
+    assert stats["probes"] == 1 and stats["cache_hits"] == 1
+
+
+async def test_a_dead_verdict_is_forgotten_quickly(monkeypatch):
+    """A dead link may be re-minted by the panel a moment later."""
+    monkeypatch.setattr(redirect_guard, "PROBE_DEAD_TTL_S", 0.05)
+    # 410, not 404: a policy 4xx would spend the second identity of the UA
+    # ladder and double the probe count in this test.
+    calls = _counting_probe(monkeypatch, redirect_guard.ProbeResult(False, "HEAD 410"))
+    assert (await link_is_alive("http://cdn/gone.ts")).alive is False
+    assert len(calls) == 1
+    await asyncio.sleep(0.08)
+    assert (await link_is_alive("http://cdn/gone.ts")).alive is False
+    assert len(calls) == 2, "a stale dead verdict must not stick"
+
+
+async def test_the_cache_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(redirect_guard, "PROBE_TTL_S", 0.0)
+    calls = _counting_probe(monkeypatch, redirect_guard.ProbeResult(True, "HEAD 200"))
+    await link_is_alive("http://cdn/again.ts")
+    await link_is_alive("http://cdn/again.ts")
+    assert len(calls) == 2

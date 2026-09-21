@@ -246,7 +246,7 @@ function renderJobs(jobs) {
 
 /* ============================= add / edit modal ============================= */
 async function editPortal(id) {
-  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false, identity_mode: "minimal", stb_timezone: "", direct_links: true };
+  const p = id ? table.items.find(x => x.id === id) : { name: "", base_url: "", enabled: true, macs: "", proxy_url: "", tls_insecure: false, identity_mode: "minimal", stb_timezone: "", direct_links: true, streams_per_mac: null };
   const body = el("div");
   body.innerHTML = `
     <div>
@@ -288,6 +288,14 @@ async function editPortal(id) {
             permanent is handed to the player as-is, with no <span class="mono">create_link</span>
             round trip. Turn it off for a panel whose flags lie — every stream then asks first,
             which is also the liveness check the fallback chain uses</div></div></div>
+        <div class="col-md-4"><label class="muted-label" for="p-streams-per-mac">Streams per MAC</label>
+          <input class="form-control form-control-sm" type="number" min="1" step="1" id="p-streams-per-mac"
+                 value="${p.streams_per_mac == null ? "" : esc(String(p.streams_per_mac))}" placeholder="1">
+          <div class="small text-muted" data-help="Streams per MAC" data-help-for="p-streams-per-mac">how many concurrent streams one of this portal's
+            MACs may carry (blank = 1). Panels answer a second concurrent link on one MAC with
+            <span class="mono">456</span> / "account is in use" — but some allow two or three, and
+            serialising those to one means a failed zap on every channel change. Raise it only if the
+            panel really allows it</div></div>
         <div class="col-12"><label class="muted-label">Xtream bridge</label>
           <div class="border rounded p-2" id="p-xtream"></div>
           <div class="small text-muted mt-1" data-help="Xtream bridge">some panels are an Xtream account wearing a Stalker
@@ -334,6 +342,8 @@ async function editPortal(id) {
     identity_mode: $("#p-identity", body).value,
     stb_timezone: $("#p-tz", body).value.trim() || null,
     direct_links: $("#p-direct-links", body).checked,
+    streams_per_mac: ($("#p-streams-per-mac", body).value || "").trim() === ""
+      ? null : Number($("#p-streams-per-mac", body).value),
   });
   /* ONE builder for "what a portal's fields are". `savePortal` used to assemble
      its own shorter list, so pressing Save dropped the identity and timezone

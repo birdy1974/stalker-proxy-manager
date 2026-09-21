@@ -164,6 +164,12 @@ async def unauthorized(request: Request, exc):  # noqa: ANN001
 async def startup() -> None:
     await init_db()
     await MANAGER.purge_runtime_rows()
+    # A previous run may have died hard (SIGKILL, OOM, container restart); its
+    # ffmpeg pipes outlive it, keep reading the panel stream, and the panel keeps
+    # counting those MAC slots - the only symptom is `limit` / "account is in
+    # use" with nothing in the dashboard to kill. Clean them up first, before any
+    # portal session is opened.
+    await MANAGER.sweep_orphans("boot")
     await cleanup_logs()
     await _seed_defaults()
     from .services.epg import ensure_default_sources
@@ -200,6 +206,12 @@ async def startup() -> None:
     # first link; periodic refresh also keeps healthy sessions ahead of expiry.
     from .services.portal_warmup import portal_warmup_scheduler
     _bg.add(asyncio.create_task(portal_warmup_scheduler(), name="spm-portal-warmup"))
+    # Long-run hygiene: the job registry, the route-affinity/breaker tables and
+    # the log table are bounded by *history*, not by configuration. One pass an
+    # hour (SPM_JANITOR_MINUTES=0 disables). Everything else in SPM bounds
+    # itself - see services/janitor.py.
+    from .services.janitor import janitor_scheduler
+    _bg.add(asyncio.create_task(janitor_scheduler(), name="spm-janitor"))
 
 
 async def _reap_sessions(interval: float = 300.0) -> None:
@@ -237,6 +249,10 @@ async def shutdown() -> None:
     _bg.clear()
     # Log rows live on a queue drained by a writer task; the pool is torn down
     # right after this, so anything still queued has to be committed now.
+    # Kill the pipes ourselves: a graceful stop otherwise leaves them running
+    # with their panel slots held until some later boot sweeps them.
+    await MANAGER.kill_all()
+    await MANAGER.sweep_orphans("shutdown")
     await stop_log_writer()
     from .portal.pool import POOL
     await POOL.close_all()
