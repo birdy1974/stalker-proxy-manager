@@ -21,6 +21,13 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (a dropped stream re-resolves itself inside the same response)
+- The other half of "intermittent": panels invalidate the per-session link after a while (and CDNs drop long-lived connections), so the ffmpeg pipe ends *while the channel is healthy*. What the pump did with that was walk the remaining candidates as if the source were dead, and when none produced data, end the HTTP response - the player saw a stopped stream and either froze or reconnected. The user's report reads as "it stops after a while".
+  -> after a live stream that had been playing ends and the chain is exhausted, the chain is re-walked with a **fresh** `create_link`, up to `SPM_MIDSTREAM_RESTARTS` (3) times, `SPM_MIDSTREAM_RESTART_DELAY` (1.5 s) apart, inside the same response. The cached link for the route is dropped first - it is the thing that died - and the (route, source, MAC) that was playing is demoted so a different MAC is preferred if the portal still counts the old slot (the same reason STB-Proxy moves the MAC when a stream dies).
+  -> only for kinds in `SPM_MIDSTREAM_RESTART_KINDS` (default `live`): a VOD that reached its end is *finished*, not dropped, and must not replay.
+  -> bounded by the existing start budget as well, so a dead channel cannot hold a player in a retry loop.
+- Test-hygiene find while doing this: `monkeypatch.setattr(MANAGER, "_spawn", fake)` restores a **class** function onto the *instance*, so the shadow stays after the test and hides every later class-level patch (`type(MANAGER)`); the symptom is a later test spawning the real ffmpeg and failing for unrelated reasons (it made `test_zap_retry::test_proxy_retries_a_stillborn_link_once` fail only in a full run). New `tests/conftest.py` autouse fixture drops those shadows after every test, and the new tests patch at class level like `test_zap_retry.py` already documented.
+
 2026-09-21 (ghost pipes: the failure a restart used to hide)
 - Verified in the sandbox before writing any code: start a stream, `kill -9` the SPM process, and **the ffmpeg pipe keeps running** - still reading the panel stream, still holding that MAC's connection at the panel, and invisible to the dashboard (the runtime rows are purged at boot, the process is not). The next restart then answers `limit` / "account is in use" for no visible reason until the panel times the ghost out; a NAS or container restart does this on every upgrade.
   -> every spawn now carries `SPM_STREAM_ID=<uuid>` in the child's environment (`_spawn`), and `MANAGER.sweep_orphans()` looks for processes that (a) run our `FFMPEG_BIN` and (b) carry that marker - so a user's own ffmpeg or another app's is never touched.

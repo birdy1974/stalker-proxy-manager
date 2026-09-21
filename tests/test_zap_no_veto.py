@@ -166,10 +166,10 @@ async def test_a_zap_takes_the_free_mac_instead_of_waiting(monkeypatch):
     client = _BusyThenOkClient(refusals=0)
     monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
 
-    async def fake_open(command, url, *, title="", pace=False):
+    async def fake_open(self, command, url, *, title="", pace=False):
         return _Proc(), b"\x47" * 188 * 4, None
 
-    monkeypatch.setattr(MANAGER, "_open_with_identity", fake_open)
+    monkeypatch.setattr(type(MANAGER), "_open_with_identity", fake_open)
 
     started = time.monotonic()
     handle, gen = await MANAGER.open("live", pl, "box")
@@ -584,8 +584,123 @@ async def test_every_spawn_carries_the_marker(monkeypatch):
         return _P()
 
     monkeypatch.setattr(stream_manager.asyncio, "create_subprocess_exec", fake_exec)
-    monkeypatch.setattr(MANAGER, "_drain_stderr", lambda proc: asyncio.sleep(0))
+    monkeypatch.setattr(type(MANAGER), "_drain_stderr",
+                        lambda self, proc: asyncio.sleep(0))
     await MANAGER._spawn("ffmpeg -i <url> -c copy -f mpegts pipe:1", "http://h/x.ts", "Ch")
     env = seen.get("env") or {}
     assert env.get("SPM_STREAM_ID"), "the child is identifiable"
     assert "PATH" in env, "and still sees the environment a template may need"
+
+
+# =========================================================================== #
+# mid-stream: the link died, not the channel
+# =========================================================================== #
+class _DyingProc:
+    """ffmpeg that sends a burst and then ends - a stream the panel dropped."""
+
+    def __init__(self, chunks: int = 2):
+        self.returncode = None
+        self.pid = 5150
+        self.stdout = self
+        self.stderr = self
+        self._left = chunks
+
+    async def read(self, n):
+        if self._left <= 0:
+            self.returncode = 0
+            return b""
+        self._left -= 1
+        return b"\x47" * 188 * 10
+
+    async def wait(self):
+        return self.returncode
+
+    def kill(self):
+        self.returncode = -9
+
+
+async def test_a_live_stream_that_dies_is_restarted_in_the_same_response(monkeypatch):
+    """The panel invalidated the URL - the channel is fine.
+
+    Before this, the pump walked the remaining candidates and ended the response,
+    so the player saw a dead stream until it decided to reconnect. Now the chain
+    is re-walked with a *fresh* create_link (the cached link is dropped - it is
+    the thing that died) and the bytes keep coming on the same HTTP response.
+    """
+    import app.services.stream_manager as sm
+    monkeypatch.setattr(sm, "MIDSTREAM_RESTART_DELAY", 0.01)
+    pl, (mac,) = await _route()
+    client = _BusyThenOkClient(refusals=0)
+    monkeypatch.setattr(sm, "POOL", _Pool(client))
+    monkeypatch.setattr(sm, "link_is_alive", _always_alive())
+    spawned = []
+
+    async def fake_spawn(*a, **kw):
+        spawned.append(1)
+        return _DyingProc(chunks=2 if len(spawned) == 1 else 3)
+
+    monkeypatch.setattr(type(MANAGER), "_spawn", fake_spawn)
+    monkeypatch.setattr(type(MANAGER), "_drain_stderr",
+                        lambda self, proc: asyncio.sleep(0))
+
+    handle, gen = await MANAGER.open("live", pl, "box")
+    got = 0
+    async for chunk in gen:
+        got += len(chunk)
+
+    assert got >= 188 * 10 * 4, "bytes from both the first and the restarted stream"
+    assert len(spawned) >= 2, "a second ffmpeg was started instead of giving up"
+    assert client.calls >= 2, "and it asked the panel for a fresh link"
+
+
+async def test_the_restart_is_bounded(monkeypatch):
+    """Every restart ends the same way here: the chain must not loop forever."""
+    import app.services.stream_manager as sm
+    monkeypatch.setattr(sm, "MIDSTREAM_RESTARTS", 2)
+    monkeypatch.setattr(sm, "MIDSTREAM_RESTART_DELAY", 0.01)
+    pl, (mac,) = await _route()
+    client = _BusyThenOkClient(refusals=0)
+    monkeypatch.setattr(sm, "POOL", _Pool(client))
+    monkeypatch.setattr(sm, "link_is_alive", _always_alive())
+    spawned = []
+
+    async def fake_spawn(*a, **kw):
+        spawned.append(1)
+        return _DyingProc(chunks=1)
+
+    monkeypatch.setattr(type(MANAGER), "_spawn", fake_spawn)
+    monkeypatch.setattr(type(MANAGER), "_drain_stderr",
+                        lambda self, proc: asyncio.sleep(0))
+
+    handle, gen = await MANAGER.open("live", pl, "box")
+    async for _chunk in gen:
+        pass
+    assert len(spawned) == 1 + 2, "one start plus exactly MIDSTREAM_RESTARTS retries"
+
+
+async def test_a_finished_movie_is_not_restarted(monkeypatch):
+    """A VOD that reached its end is *finished*, not dropped - and a kind that
+    is not on the list is never restarted, whatever the reason it ended."""
+    import app.services.stream_manager as sm
+    assert "live" in sm.MIDSTREAM_RESTART_KINDS
+    assert "vod" not in sm.MIDSTREAM_RESTART_KINDS, "a finished movie must not replay"
+    monkeypatch.setattr(sm, "MIDSTREAM_RESTART_DELAY", 0.01)
+    monkeypatch.setattr(sm, "MIDSTREAM_RESTART_KINDS", set())   # nothing may restart
+    pl, (mac,) = await _route()
+    client = _BusyThenOkClient(refusals=0)
+    monkeypatch.setattr(sm, "POOL", _Pool(client))
+    monkeypatch.setattr(sm, "link_is_alive", _always_alive())
+    spawned = []
+
+    async def fake_spawn(*a, **kw):
+        spawned.append(1)
+        return _DyingProc(chunks=2)
+
+    monkeypatch.setattr(type(MANAGER), "_spawn", fake_spawn)
+    monkeypatch.setattr(type(MANAGER), "_drain_stderr",
+                        lambda self, proc: asyncio.sleep(0))
+
+    handle, gen = await MANAGER.open("live", pl, "box")
+    async for _chunk in gen:
+        pass
+    assert len(spawned) == 1, "no replay of a stream that simply ended"

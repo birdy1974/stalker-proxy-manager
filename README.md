@@ -67,6 +67,9 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 | `SPM_LINK_CACHE_S` | `90` | seconds a resolved live link may be replayed for the next 302 (zap-back costs no `create_link`). `0` disables; `SPM_LINK_CACHE_KINDS` picks the kinds (default `live`) |
 | `SPM_FFMPEG_USE_STORED_LINK` | `1` | `0` restores "the ffmpeg path always asks for a link", even for a channel whose flags say its link is permanent |
 | `SPM_STREAMS_PER_MAC` | `1` | default concurrent streams per MAC for portals whose row says nothing (the GUI setting is per portal) |
+| `SPM_MIDSTREAM_RESTARTS` | `3` | how many times a live stream that died mid-play is restarted inside the same client response (fresh `create_link`, MAC rotation); `0` disables. A VOD that finished is never restarted |
+| `SPM_MIDSTREAM_RESTART_DELAY` | `1.5` | seconds between those restarts |
+| `SPM_MIDSTREAM_RESTART_KINDS` | `live` | kinds allowed to restart after a mid-stream end |
 | `SPM_PORTAL_KEEPALIVE_S` | `90` | how long a pooled portal session keeps its HTTP connection while idle. httpx's own default (5 s) meant every `create_link` after a quiet moment paid a fresh TCP+TLS handshake â€” pure zap latency the portal never asked for. `0` = never expire |
 | `SPM_PORTAL_MAX_CONNECTIONS` | `32` | connections per portal session (one session = one portal + MAC), shared by playback and background fetches |
 | `SPM_PREFER_FREE_MAC` | `1` | a start takes the first MAC nothing holds (walking the chain) instead of taking back the MAC this user just used. `0` = prefer the MAC that just played; GUI setting **Zap takes a free MAC first** overrides this |

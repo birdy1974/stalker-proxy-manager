@@ -189,6 +189,25 @@ async def _reset_portal_pool():
 
 
 @pytest.fixture(autouse=True)
+def _no_shadowed_manager_methods():
+    """A method patched on the INSTANCE leaves a shadow behind.
+
+    `monkeypatch.setattr(MANAGER, "_spawn", fake)` records the *class* function
+    as the old value and restores it with setattr on the instance - so after the
+    test `MANAGER.__dict__["_spawn"]` exists and hides every later class-level
+    patch (`monkeypatch.setattr(type(MANAGER), "_spawn", ...)`, the pattern
+    tests/test_zap_retry.py documents). The visible symptom is a later test
+    spawning the real ffmpeg and failing for reasons that have nothing to do with
+    it. Drop the shadows after every test; the class stays untouched.
+    """
+    yield
+    from app.services.stream_manager import MANAGER
+    for name in ("_spawn", "_open_with_identity", "_drain_stderr", "_read_proc"):
+        if name in MANAGER.__dict__:
+            del MANAGER.__dict__[name]
+
+
+@pytest.fixture(autouse=True)
 async def _reset_playlist_health_evidence():
     from app.services import playlist_health as health
     health._OBSERVATIONS.clear()
