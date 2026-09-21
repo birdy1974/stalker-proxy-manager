@@ -453,6 +453,56 @@ def demote_failed_candidates(route, chain: list) -> list:
     return out
 
 
+#: env var every spawned ffmpeg carries (see `_spawn` and `sweep_orphans`)
+_STREAM_ENV_MARKER = "SPM_STREAM_ID"
+
+
+def _orphan_ffmpeg_pids(root: str = "/proc") -> list[int]:
+    """PIDs of ffmpeg pipes spawned by an SPM that is no longer running.
+
+    Matched on two things together: the executable is our configured
+    `FFMPEG_BIN`, and the process carries `_STREAM_ENV_MARKER` in its
+    environment. A user's own ffmpeg (a manual transcode, another container on
+    the same host) fails at least one of those, so this cannot kill work it did
+    not start. Linux-only by nature; on a platform without `/proc` it returns
+    nothing and the caller does nothing.
+    """
+    if not os.path.isdir(root):
+        return []
+    want = os.path.basename(FFMPEG_BIN)
+    me = os.getpid()
+    found: list[int] = []
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            continue
+        base = os.path.join(root, entry)
+        try:
+            with open(os.path.join(base, "cmdline"), "rb") as fh:
+                cmdline = fh.read().split(b"\0")
+        except OSError:
+            continue
+        if not cmdline or not cmdline[0]:
+            continue
+        exe = os.path.basename(cmdline[0].decode("utf-8", "replace"))
+        if exe != want:
+            continue
+        try:
+            with open(os.path.join(base, "environ"), "rb") as fh:
+                environ = fh.read()
+        except OSError:
+            continue
+        if _STREAM_ENV_MARKER.encode() + b"=" in environ:
+            found.append(pid)
+    return found
+
+
 #: portal ids already told about `portal_first` (once per process, not per play)
 _PORTAL_FIRST_NOTED: set[int] = set()
 
@@ -922,6 +972,31 @@ class StreamManager:
         for sid in list(self.streams):
             await self.kill(sid)
         return n
+
+    async def sweep_orphans(self, where: str = "boot") -> int:
+        """Kill ffmpeg pipes this process did not spawn (see `_orphan_ffmpeg_pids`).
+
+        Called at boot (a previous run may have died hard - SIGKILL, OOM, a
+        container restart - and its pipes hold panel slots that nothing in the
+        GUI can release) and at shutdown (kill them ourselves instead of leaving
+        them for the next boot to clean up).
+        """
+        import signal as _signal
+
+        pids = _orphan_ffmpeg_pids()
+        killed: list[int] = []
+        for pid in pids:
+            try:
+                os.kill(pid, _signal.SIGKILL)
+                killed.append(pid)
+            except OSError:
+                continue
+        if killed:
+            await db_log("WARNING", "stream",
+                         f"{len(killed)} orphaned ffmpeg pipe(s) killed at {where} - "
+                         f"they would have kept their panel slot counted "
+                         f"(pids {', '.join(str(p) for p in killed)})")
+        return len(killed)
 
     def watch(self, request, handle: StreamHandle) -> asyncio.Task:
         """
@@ -1716,7 +1791,15 @@ class StreamManager:
             proc = await asyncio.create_subprocess_exec(
                 *args, stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE)
+                stderr=asyncio.subprocess.PIPE,
+                # The marker (uuid per stream) is how a later SPM process
+                # recognises OUR ffmpeg children: after a crash, `kill -9`, or a
+                # container restart the pipes survive their parent, keep reading
+                # the panel stream, and the panel keeps counting the MAC's slot -
+                # visible only as `limit` / "account is in use" with an empty
+                # dashboard. `sweep_orphans()` matches on this and on nothing
+                # else, so a user's own ffmpeg is never touched.
+                env={**os.environ, _STREAM_ENV_MARKER: uuid.uuid4().hex})
             # parked on the process so a failed identity-ladder rung can wait
             # for ffmpeg's final stderr (the HTTP 4xx line drives the retry)
             proc.spm_stderr_task = asyncio.get_running_loop().create_task(

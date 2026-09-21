@@ -21,6 +21,12 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (ghost pipes: the failure a restart used to hide)
+- Verified in the sandbox before writing any code: start a stream, `kill -9` the SPM process, and **the ffmpeg pipe keeps running** - still reading the panel stream, still holding that MAC's connection at the panel, and invisible to the dashboard (the runtime rows are purged at boot, the process is not). The next restart then answers `limit` / "account is in use" for no visible reason until the panel times the ghost out; a NAS or container restart does this on every upgrade.
+  -> every spawn now carries `SPM_STREAM_ID=<uuid>` in the child's environment (`_spawn`), and `MANAGER.sweep_orphans()` looks for processes that (a) run our `FFMPEG_BIN` and (b) carry that marker - so a user's own ffmpeg or another app's is never touched.
+  -> called at boot *before* the first portal session (`sweep_orphans("boot")`) and at shutdown (`kill_all()` + `sweep_orphans("shutdown")`, so a clean stop does not leave work for the next boot).
+  -> live: killed the server with SIGKILL mid-stream, restarted, and the boot log said `1 orphaned ffmpeg pipe(s) killed at boot ... (pids 18616)`; the process was gone afterwards. Tests use a fake `/proc` tree (`tests/test_zap_no_veto.py`) for the matcher and the kill path.
+
 2026-09-21 (the connection a zap finds is already open)
 - httpx closes an idle connection after **5 s** by default (`httpx.Limits()`), and a pooled portal session idles exactly like that between plays. Every `create_link` after a quiet moment therefore paid a fresh TCP (+TLS) handshake first - two round trips on a WAN panel, before the panel saw the request at all. That is pure added zap latency, and it is invisible in any portal-side timing.
   -> pooled portal clients now use `httpx.Limits(keepalive_expiry=SPM_PORTAL_KEEPALIVE_S, max_keepalive_connections=8, max_connections=SPM_PORTAL_MAX_CONNECTIONS)`, default 90 s (0 = never expire) - what a real set-top box does, and it costs the panel nothing (one idle socket instead of a socket per zap).

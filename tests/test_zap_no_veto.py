@@ -518,3 +518,74 @@ def _always_alive():
         from app.services.redirect_guard import ProbeResult
         return ProbeResult(True, "fake")
     return probe
+
+
+# =========================================================================== #
+# ghost pipes: what a hard restart leaves behind
+# =========================================================================== #
+def _fake_proc_tree(tmp_path, procs):
+    """A `/proc` stand-in: {pid: (exe, environ, cmdline_extra)}."""
+    for pid, (exe, environ) in procs.items():
+        d = tmp_path / str(pid)
+        d.mkdir()
+        (d / "cmdline").write_bytes(exe.encode() + b"\0-i\0http://x\0")
+        (d / "environ").write_bytes(environ.encode() + b"\0")
+    return str(tmp_path)
+
+
+def test_the_sweep_finds_only_our_own_orphans(tmp_path, monkeypatch):
+    """Verified live before this existed: `kill -9` the server and the ffmpeg
+    pipe keeps running, still reading the panel stream - so the panel keeps
+    counting that MAC's connection while the dashboard shows nothing. After a
+    crash/container restart only a marker-based sweep can find them, and it must
+    never touch an ffmpeg that is not ours."""
+    import os as _os
+
+    mine = _os.path.basename(stream_manager.FFMPEG_BIN)
+    root = _fake_proc_tree(tmp_path, {
+        11: (mine, "PATH=/usr/bin SPM_STREAM_ID=abc"),          # ours, orphaned
+        12: (mine, "PATH=/usr/bin"),                            # ffmpeg, not ours
+        13: ("/usr/bin/python3", "SPM_STREAM_ID=abc"),          # marked, not ffmpeg
+        14: (mine, "SPM_STREAM_ID=no-prefix"),                  # ours
+    })
+    monkeypatch.setattr(stream_manager, "_orphan_ffmpeg_pids", stream_manager._orphan_ffmpeg_pids)
+    found = stream_manager._orphan_ffmpeg_pids(root)
+    assert sorted(found) == [11, 14]
+
+
+async def test_the_sweep_kills_them_and_says_so(tmp_path, monkeypatch):
+    import os as _os
+
+    mine = _os.path.basename(stream_manager.FFMPEG_BIN)
+    root = _fake_proc_tree(tmp_path, {21: (mine, "SPM_STREAM_ID=x")})
+    real = stream_manager._orphan_ffmpeg_pids
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(stream_manager.os, "kill",
+                        lambda pid, sig: killed.append((pid, sig)))
+    # the real scanner against the fake tree, then the same list handed to the
+    # manager (which must SIGKILL it and report the count)
+    assert real(root) == [21]
+    monkeypatch.setattr(stream_manager, "_orphan_ffmpeg_pids",
+                        lambda root="/proc": real(root) if root != "/proc" else [21])
+    n = await MANAGER.sweep_orphans("boot")
+    assert n == 1 and killed and killed[0][0] == 21
+
+
+async def test_every_spawn_carries_the_marker(monkeypatch):
+    """Without the marker on the child there is nothing to sweep by."""
+    seen: dict = {}
+
+    class _P:
+        pid = 4242
+        returncode = None
+
+    async def fake_exec(*args, **kwargs):
+        seen.update(kwargs)
+        return _P()
+
+    monkeypatch.setattr(stream_manager.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(MANAGER, "_drain_stderr", lambda proc: asyncio.sleep(0))
+    await MANAGER._spawn("ffmpeg -i <url> -c copy -f mpegts pipe:1", "http://h/x.ts", "Ch")
+    env = seen.get("env") or {}
+    assert env.get("SPM_STREAM_ID"), "the child is identifiable"
+    assert "PATH" in env, "and still sees the environment a template may need"
