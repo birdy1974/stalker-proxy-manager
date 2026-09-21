@@ -21,6 +21,13 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (zap polish: the probe, the busy wait, the stall window)
+Three numbers on the critical path, all taken from measurements rather than taste:
+
+- **The liveness probe was paid on every redirect, including the zap-back.** `link_is_alive()` is a TLS + RTT to the *media host*, and the redirect path runs it before every 302 - even when `LINK_CACHE_S` handed back the very URL we proved a moment ago. Verdicts are now cached (`SPM_LINK_PROBE_TTL`, 20 s; dead ones for 3 s, since a link can be re-minted), and `probe_stats()` counts probes vs hits for the diagnostics view.
+- **The busy wait was shorter than the panel's own handoff.** `BUSY_WAIT_S` was 3 s; on the real panel measured for this a slot stays counted for ~6.5 s after the previous connection dies. So the wait was spent and the player still got 503 - the user saw a channel error on a zap that would have played 3 s later. Now 7 s: `start_budget` still caps the whole start, and the wait ends the moment the slot frees.
+- **A live stall was tolerated like a start.** 25 silent seconds is right for a source that is starting; once a live stream has been flowing, they mean the source dropped - and the response now continues by re-resolving. SPM lowered the window for restartable kinds to 10 s (`SPM_STREAM_STALL_TIMEOUT_LIVE`) so a drop is a ~2 s hiccup instead of a 25 s frozen picture. Kinds that cannot be restarted keep the long window (`_stall_window`), pinned in tests/test_stream_patience.py.
+
 2026-09-21 (a 429 pauses the portal, not just the MAC that asked)
 - A portal that answers HTTP 429 was treated like any other error: the chain walked on to the next MAC, EPG fetches kept going, the health check kept probing - all from the same IP, at the moment the panel was explicitly asking us to stop. That is how "slow down" becomes a banned IP, and the ban applies to every MAC on the portal.
   -> one 429 now pauses the *host* for `SPM_RATE_LIMIT_COOLDOWN` (30 s, or the panel's own `Retry-After`, capped at `SPM_RATE_LIMIT_COOLDOWN_MAX`), shared by every client and every path: playback stops trying before it opens a socket (`PortalError(code="rate_limited")`), so does the handshake, so do EPG/health/account calls.

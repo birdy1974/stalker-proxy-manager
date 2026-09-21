@@ -159,7 +159,15 @@ async def _store_media_cmd(src, repair, item_name: str = "") -> None:
                      "catalogue cmd worked - cleared it from the source row")
 
 
-STREAM_STALL_TIMEOUT = 25.0   # seconds without a single byte => dead stream
+# Seconds without a single byte before the pipe counts as finished. 25 s is the
+# tolerance for a source that is *starting* (panel-side buffering, a slow CDN
+# edge, a NAS that spins up). Once a live stream has been flowing, the same
+# silence means something different - the source dropped - and the response can
+# be continued by re-resolving (MIDSTREAM_RESTARTS), so waiting 25 s only makes
+# the picture freeze for 25 s. See _stall_window().
+STREAM_STALL_TIMEOUT = float(os.environ.get("SPM_STREAM_STALL_TIMEOUT", "25.0"))
+STREAM_STALL_TIMEOUT_LIVE = float(os.environ.get(
+    "SPM_STREAM_STALL_TIMEOUT_LIVE", "10.0"))
 CHUNK = 64 * 1024
 # input options that only exist for network protocols (stripped for file://)
 _NETONLY_OPTS = re.compile(
@@ -630,7 +638,14 @@ ATTEMPT_TRACE = 6
 #: The old shape answered 404 in ~13 ms when every MAC was occupied - and a
 #: player that zaps fast (Enigma2 stops the old service as it opens the new
 #: one) hits exactly that: our own pipe or lease on the channel it just left.
-BUSY_WAIT_S = float(os.environ.get("SPM_BUSY_WAIT_S", "3.0"))
+#:
+#: 7 s, not 3: on the real panel measured for this, a slot is still counted for
+#: ~6.5 s after the previous connection dies. Waiting less than that buys
+#: nothing - the wait is spent and the player still gets 503 - while the user
+#: sees a *channel error* on a zap that would have played 3 s later. Waiting
+#: longer than the panel needs is free by comparison: `start_budget` still caps
+#: the whole start, and the wait ends the moment the slot frees.
+BUSY_WAIT_S = float(os.environ.get("SPM_BUSY_WAIT_S", "7.0"))
 BUSY_POLL_S = float(os.environ.get("SPM_BUSY_POLL_S", "0.25"))
 #: Retry ladder for a panel that answers "this MAC is already streaming"
 #: (`limit`, `account_is_in_use`, 456). The panel frees the slot seconds after
@@ -3372,14 +3387,28 @@ class StreamManager:
         await db_log("INFO", "stream",
                      f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
 
+    def _stall_window(self, h: StreamHandle) -> float:
+        """Seconds of silence this stream tolerates before it counts as over.
+
+        A live stream that is *restartable* (the mid-stream re-resolve is on
+        for its kind) gets the shorter window: a drop can be continued in the
+        same response, so the old 25 s of black screen buys nothing. Anything
+        else keeps the generous one - the wait is for a source that is
+        starting or buffering, not for a stream we can replace.
+        """
+        if MIDSTREAM_RESTARTS > 0 and h.kind in MIDSTREAM_RESTART_KINDS:
+            return STREAM_STALL_TIMEOUT_LIVE
+        return STREAM_STALL_TIMEOUT
+
     async def _read_proc(self, h: StreamHandle, proc):
         """Yield bytes with stall detection until EOF/death/kill."""
         while not h.dead:
+            window = self._stall_window(h)
             try:
-                chunk = await asyncio.wait_for(proc.stdout.read(CHUNK), STREAM_STALL_TIMEOUT)
+                chunk = await asyncio.wait_for(proc.stdout.read(CHUNK), window)
             except asyncio.TimeoutError:
                 await db_log("WARNING", "stream",
-                             f"[{h.item_name}] stalled >{STREAM_STALL_TIMEOUT}s without data")
+                             f"[{h.item_name}] stalled >{window:.0f}s without data")
                 break
             if not chunk:
                 break
