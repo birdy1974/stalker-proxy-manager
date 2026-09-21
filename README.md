@@ -67,6 +67,7 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 | `SPM_LINK_CACHE_S` | `90` | seconds a resolved live link may be replayed for the next 302 (zap-back costs no `create_link`). `0` disables; `SPM_LINK_CACHE_KINDS` picks the kinds (default `live`) |
 | `SPM_FFMPEG_USE_STORED_LINK` | `1` | `0` restores "the ffmpeg path always asks for a link", even for a channel whose flags say its link is permanent |
 | `SPM_STREAMS_PER_MAC` | `1` | default concurrent streams per MAC for portals whose row says nothing (the GUI setting is per portal) |
+| `SPM_TIMING_HISTORY` | `200` | starts kept in memory for the dashboard's timing view (phase timings per play, failures by reason, per-portal latency) |
 | `SPM_JANITOR_MINUTES` | `60` | how often the janitor drops expired in-memory state (route affinity/breaker tables, redirect handoffs, probe verdicts) and trims the log table. `0` disables. Everything else in SPM is bounded by configuration; these three grow with history |
 | `SPM_JOB_HISTORY` | `100` | finished fetch jobs kept visible in the GUI |
 | `SPM_PLAYBACK_PACE` | `1` | while a stream is live on a portal, background jobs (catalogue sync, MAC health sweep, the per-channel EPG fallback) slow down instead of competing for the same panel budget. `0` disables |

@@ -33,6 +33,29 @@ from ..services.stream_manager import MANAGER
 router = APIRouter(prefix="/api", tags=["misc"], dependencies=[Depends(require_admin)])
 
 
+def _diagnostics() -> dict:
+    """Why zapping is fast or slow - the numbers the log only shows one at a time.
+
+    Everything here is in-memory and bounded: the last starts with their phase
+    timings, the refusal codes the panel answered with, what the redirect probe
+    cache saved, how often background jobs yielded, and when the janitor last
+    ran. Nothing touches the database on purpose - this is rendered on the same
+    polling loop as the rest of the dashboard.
+    """
+    from ..portal.client import rate_limit_left, refusal_stats
+    from ..services import janitor, portal_pace, redirect_guard
+
+    diag = {"timing": MANAGER.timing_summary(),
+            "refusals": refusal_stats(),
+            "probe": redirect_guard.probe_stats(),
+            "pace": portal_pace.stats(),
+            "janitor": janitor.stats(),
+            "parked": sum(1 for h in MANAGER.streams.values() if h.parked),
+            # filled in by the endpoint below, which has the DB session
+            "paused": []}
+    return diag
+
+
 # ------------------------------------------------------------------ dashboard
 @router.get("/dashboard")
 async def dashboard(db=Depends(get_db)):
@@ -67,7 +90,16 @@ async def dashboard(db=Depends(get_db)):
     api["portal_sessions"] = POOL.stats()
     api["streams_per_user"] = [{"user": k, "streams": v}
                                for k, v in sorted(per_user.items(), key=lambda kv: -kv[1])]
-    return {"stats": stats, "streams": streams, "jobs": list_jobs()[:5], "api": api}
+    diag = _diagnostics()
+    from ..portal.client import rate_limit_left
+    portals = list((await db.execute(select(Portal))).scalars().all())
+    diag["paused"] = [
+        {"name": p.name, "seconds": round(rate_limit_left(p.resolved_url or p.base_url), 1)}
+        for p in portals
+        if rate_limit_left(p.resolved_url or p.base_url) > 0
+    ]
+    return {"stats": stats, "streams": streams, "jobs": list_jobs()[:5], "api": api,
+            "diag": diag}
 
 
 @router.get("/streams")

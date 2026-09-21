@@ -29,6 +29,7 @@ import logging
 import shlex
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -677,6 +678,9 @@ BUSY_POLL_S = float(os.environ.get("SPM_BUSY_POLL_S", "0.25"))
 #: there is. Values are the waits *between* attempts.
 BUSY_BACKOFF = tuple(float(x) for x in os.environ.get(
     "SPM_BUSY_BACKOFF", "0.5,1.0,2.0").split(",") if str(x).strip())
+#: How many stream starts the diagnostics view keeps (see note_timing).
+TIMING_HISTORY = int(os.environ.get("SPM_TIMING_HISTORY", "200"))
+
 #: A candidate that just failed (no data, panel refusal) is pushed behind the
 #: ones that did not, for this long - STB-Proxy's `moveMac`, without persisting
 #: a global order. Applied AFTER route affinity, so a fresh failure always
@@ -722,6 +726,11 @@ class StreamManager:
         self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
         self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
         self.route_health = _RouteHealth()
+        #: The last TIMING_HISTORY starts (and start failures) with their phase
+        #: timings - what the diagnostics view answers "why is zapping slow, and
+        #: on which portal" with. Bounded on purpose: a ring of 200 tells a panel
+        #: got slow without being a database.
+        self.timings: deque[dict] = deque(maxlen=TIMING_HISTORY)
 
     # ------------------------------------------------------------- occupancy
     def _expire_lease(self, mac_id: int | None) -> None:
@@ -2499,6 +2508,70 @@ class StreamManager:
                     return src, portal, mac
         return None
 
+    # ------------------------------------------------------------ diagnostics
+    def note_timing(self, *, kind: str, mode: str, item: str = "", portal: str = "",
+                    mac: str = "", total_ms: float = 0.0,
+                    prepare_ms: float | None = None, first_ms: float | None = None,
+                    fail: str = "") -> None:
+        """Remember one play's phase timings (or why it never played)."""
+        self.timings.append({
+            "at": time.time(), "kind": kind, "mode": mode, "item": item,
+            "portal": portal, "mac": mac, "fail": fail,
+            "total_ms": round(float(total_ms or 0.0), 1),
+            "prepare_ms": None if prepare_ms is None else round(float(prepare_ms), 1),
+            "first_ms": None if first_ms is None else round(float(first_ms), 1),
+        })
+
+    @staticmethod
+    def _percentiles(values: list[float]) -> dict:
+        if not values:
+            return {"n": 0, "p50": None, "p90": None, "max": None}
+        ordered = sorted(values)
+        def at(p: float) -> float:
+            idx = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * p))))
+            return round(ordered[idx], 1)
+        return {"n": len(ordered), "p50": at(0.5), "p90": at(0.9), "max": at(1.0)}
+
+    def timing_summary(self) -> dict:
+        """Percentiles per path, failures by reason, and a per-portal view.
+
+        This is the answer to "why does zapping feel slow": it separates the
+        302 path (panel + one probe) from the proxy path (panel + ffmpeg + the
+        source's first byte) and names the portal and MAC that were slow.
+        """
+        rows = list(self.timings)
+        modes: dict[str, dict] = {}
+        for mode in ("proxy", "redirect", "local"):
+            ok = [r for r in rows if r["mode"] == mode and not r["fail"]]
+            if not ok:
+                continue
+            modes[mode] = {
+                "total": self._percentiles([r["total_ms"] for r in ok]),
+                "first_byte": self._percentiles(
+                    [r["first_ms"] for r in ok if r["first_ms"] is not None]),
+                "prepare": self._percentiles(
+                    [r["prepare_ms"] for r in ok if r["prepare_ms"] is not None]),
+            }
+        fails: dict[str, int] = {}
+        for r in rows:
+            if r["fail"]:
+                fails[r["fail"]] = fails.get(r["fail"], 0) + 1
+        portals: dict[str, dict] = {}
+        for r in rows:
+            if not r["portal"]:
+                continue
+            entry = portals.setdefault(r["portal"], {"starts": 0, "fails": 0,
+                                                     "total_ms": []})
+            if r["fail"]:
+                entry["fails"] += 1
+            else:
+                entry["starts"] += 1
+                entry["total_ms"].append(r["total_ms"])
+        for name, entry in portals.items():
+            entry["p50_ms"] = self._percentiles(entry.pop("total_ms"))["p50"]
+        return {"window": len(rows), "modes": modes, "failures": fails,
+                "portals": portals, "recent": rows[-12:]}
+
     def _occupied_note(self, mac_row) -> str:
         """One MAC's occupancy as a phrase for a log line ('' when free)."""
         info = self.mac_occupancy(getattr(mac_row, "id", None))
@@ -2712,6 +2785,9 @@ class StreamManager:
                             self.lease_mac(mac_row.id, holder=requester,
                                            item=item_name, kind=kind, ref=ref_id)
                         self.route_health.succeeded(route_key, _src, mac_row)
+                        if out is not None:
+                            out["portal"] = portal.name
+                            out["mac"] = getattr(mac_row, "mac", "") or ""
                         return plan.direct_url, item_name
                     client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                     repair = None
@@ -2788,6 +2864,9 @@ class StreamManager:
                             self.lease_mac(mac_row.id, holder=requester,
                                            item=item_name, kind=kind, ref=ref_id)
                         self.route_health.succeeded(route_key, _src, mac_row)
+                        if out is not None:
+                            out["portal"] = portal.name
+                            out["mac"] = getattr(mac_row, "mac", "") or ""
                         return url, item_name
                     # A portal that answered with no URL at all is not a busy
                     # slot: this source has nothing to play, and the answer must

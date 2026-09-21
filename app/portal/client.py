@@ -282,6 +282,34 @@ def reset_rate_limits() -> None:
     """Forget every pause (tests, and a `clear` from the GUI)."""
     _rate_limit_until.clear()
 
+
+#: (host, code) -> how often the panel answered with it, this process.
+#:
+#: Refusal *codes* are what tell two very different problems apart: a `limit`
+#: on one MAC is a busy slot (wait), an `access_denied` is a dead account (move
+#: on), and a wall of `http_429` is a portal that wants us to stop. The
+#: diagnostics view shows the distribution; the log shows the single event.
+_refusals: dict[tuple[str, str], int] = {}
+
+
+def note_refusal(portal_url: str, code: str) -> None:
+    if not code:
+        return
+    key = (portal_host(portal_url), str(code))
+    _refusals[key] = _refusals.get(key, 0) + 1
+
+
+def refusal_stats(limit: int = 12) -> dict:
+    """The busiest refusal codes, in the shape the GUI wants."""
+    top = sorted(_refusals.items(), key=lambda kv: -kv[1])[:max(1, limit)]
+    return {"total": sum(_refusals.values()),
+            "codes": [{"host": host, "code": code, "count": n}
+                      for (host, code), n in top]}
+
+
+def reset_refusals() -> None:
+    _refusals.clear()
+
 # Refusals that can mean "you asked with the wrong FORM of the right item"
 # rather than "this item is gone" - the only codes for which a second attempt
 # with another cmd form is worth a request (S-B). Everything else (`limit`,
@@ -609,6 +637,7 @@ class StalkerClient:
             raise PortalError(f"request failed: {type(exc).__name__}: {exc}",
                               code="transport") from exc
         if r.status_code == 429:
+            note_refusal(self.portal_url, "http_429")
             wait = note_rate_limit(self.portal_url, retry_after=retry_after_seconds(r),
                                    reason="HTTP 429")
             log.warning("portal %s answered 429 -> pausing this portal for %.0fs "
@@ -625,6 +654,7 @@ class StalkerClient:
             # it - a short wait and the same MAC (see SLOT_BUSY_CODES).
             busy = refusal_code(r)
             if busy in SLOT_BUSY_CODES:
+                note_refusal(self.portal_url, busy)
                 log.info("portal answered %s with %s -> busy slot, not re-handshaking",
                          r.status_code, busy)
                 raise PortalError(f"portal said {busy} (HTTP {r.status_code})", code=busy)
@@ -634,6 +664,7 @@ class StalkerClient:
                 await self.handshake()
             return await self._get(params, retried=True, retry_on_auth=retry_on_auth)
         if r.status_code != 200:
+            note_refusal(self.portal_url, f"http_{r.status_code}")
             raise PortalError(f"HTTP {r.status_code}", code=f"http_{r.status_code}")
         if not r.content:
             raise PortalError("empty reply (portal dropped connection or IP is blocked)",
@@ -645,6 +676,7 @@ class StalkerClient:
                               code="bad_json") from exc
         code = js_error(data)
         if code:
+            note_refusal(self.portal_url, code)
             if js_has_payload(data):
                 log.debug("portal reported %r alongside a usable payload - ignoring it", code)
             elif code in TOKEN_ERROR_CODES and self._may_reauth(retry_on_auth, retried):
@@ -708,6 +740,7 @@ class StalkerClient:
             log.debug("handshake transport error: %s", exc)
             return {}, "", "transport"
         if r.status_code == 429:
+            note_refusal(self.portal_url, "http_429")
             note_rate_limit(self.portal_url, retry_after=retry_after_seconds(r),
                             reason="HTTP 429 (handshake)")
             return {}, "", RATE_LIMITED_CODE

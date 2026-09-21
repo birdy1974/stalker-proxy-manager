@@ -21,6 +21,13 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (a timing / refusal view: why a zap is slow, on the dashboard)
+- The log knew all of it, one event at a time: the phase timings of every start, what the panel refused us with, how much the probe cache saved, how often background work yielded. Answering "why does zapping feel slow tonight" meant grepping container logs.
+  -> the manager keeps the last `SPM_TIMING_HISTORY` (200) starts with their phase timings (`note_timing`), split by path - **proxy** (panel link + ffmpeg + first byte) vs **redirect** (panel link + one probe, no ffmpeg) - with p50/p90/max, failures by reason (`busy`, `no-source`, `no-link`), and a per-portal p50. The output router records every success *and* every failed start, so "half our zaps are 503s" is visible as a number.
+  -> the portal client counts the refusal codes the panel actually sent (`limit`, `access_denied`, `http_429`, ...) per host, with the 429 cooldown shown per portal as "paused".
+  -> `/api/dashboard` now carries a `diag` block (timings, refusals, probe cache hit rate, paced background requests, parked pipes, paused portals, last janitor sweep) and the dashboard renders it in a "Zapping & panel answers" card, right above the jobs list.
+  -> tests/test_diagnostics.py pins the percentiles, the bounded ring, the per-host refusal counters, and that a real 429 through the client lands in them.
+
 2026-09-21 (a janitor, because SPM is meant to run for months)
 - Most of SPM's state is bounded by *configuration* - the pool by the portal/MAC rows, the UA ladder by 512 origins, the link cache by 256 entries, parked pipes by `LINGER_S`, probe verdicts by `SPM_LINK_PROBE_CACHE_MAX`. Three structures are bounded by *history* instead, and history is unbounded: the finished job registry (one entry per sync, forever, each holding its detail strings), the route-affinity/source-breaker tables (one entry per (route, source) pair ever played or failed - and a deleted playlist item never asks again), and the log table (trimmed at boot, never again while the process stays up).
   -> `app/services/janitor.py`, one pass an hour (`SPM_JANITOR_MINUTES`, 0 disables, cancelled at shutdown with the other schedulers): `prune_jobs()` keeps the newest `SPM_JOB_HISTORY` finished jobs and never touches running ones, `route_health.prune()` drops affinity older than `ROUTE_AFFINITY_TTL` and breakers that have cooled down, `redirect_guard.prune()` drops expired handoffs and probe verdicts, and `cleanup_logs()` trims the log table. Each step is wrapped: a janitor that can break the app is worse than the leak.
