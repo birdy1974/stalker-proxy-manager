@@ -21,6 +21,12 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (the connection a zap finds is already open)
+- httpx closes an idle connection after **5 s** by default (`httpx.Limits()`), and a pooled portal session idles exactly like that between plays. Every `create_link` after a quiet moment therefore paid a fresh TCP (+TLS) handshake first - two round trips on a WAN panel, before the panel saw the request at all. That is pure added zap latency, and it is invisible in any portal-side timing.
+  -> pooled portal clients now use `httpx.Limits(keepalive_expiry=SPM_PORTAL_KEEPALIVE_S, max_keepalive_connections=8, max_connections=SPM_PORTAL_MAX_CONNECTIONS)`, default 90 s (0 = never expire) - what a real set-top box does, and it costs the panel nothing (one idle socket instead of a socket per zap).
+  -> measured in the sandbox: with the mock portal on loopback there is no handshake to save (plain HTTP, ~0 ms), so no local number is quoted here; the saving is the TCP+TLS setup on a real WAN panel, 2 RTT plus the TLS exchange.
+  -> `tests/test_portal_tls_and_errors.py`: the session asks for the window (and `None` when switched off).
+
 2026-09-21 (multi-MAC portals: take the free MAC, like the reference proxy does)
 - "multiple MACs per portal, streams per MAC = 1 - how come zapping works in STB-Proxy?" -> because its `/play` loop walks the MAC list and plays the first one `isMacFree()` calls free: the zap lands on the *other* MAC, whose panel slot is free right now, while the MAC it left is still counted by the panel. SPM walked its chain in affinity order and took back the MAC that just played (a deliberate earlier decision, from a log where the *other* MAC produced no data).
   -> new `Settings -> Zap takes a free MAC first` (`prefer_free_mac`, default **on**, env `SPM_PREFER_FREE_MAC`): candidates are ranked untouched MACs -> this user's own post-302 lease -> somebody else's stream, stable within a rank, so affinity still decides between equals and the zap-back link cache keeps working. Off restores the older rule (both `tests/test_mac_availability.py` tests that pin it now run in that mode).

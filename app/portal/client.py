@@ -30,7 +30,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
-from ..config import PORTAL_HTTP_TIMEOUT
+from ..config import PORTAL_HTTP_TIMEOUT, PORTAL_KEEPALIVE_S, PORTAL_MAX_CONNECTIONS
 from ..services.http_client import outbound_client
 from .account import AccountVerdict, account_verdict
 from .capabilities import (FEATURE_MODULES, PortalVersion, enabled_modules,
@@ -464,6 +464,15 @@ class StalkerClient:
                                        timezone=self.timezone, adid=self.identity.adid),
                 "timeout": self.timeout,
                 "follow_redirects": True,
+                # Keep the pooled connection alive between plays. httpx's default
+                # (5 s) closes it, so every create_link after a quiet moment paid
+                # a fresh TCP+TLS handshake - pure added zap latency that the
+                # portal never sees as traffic (see PORTAL_KEEPALIVE_S).
+                "limits": httpx.Limits(
+                    keepalive_expiry=(PORTAL_KEEPALIVE_S if PORTAL_KEEPALIVE_S > 0
+                                      else None),
+                    max_keepalive_connections=8,
+                    max_connections=max(4, PORTAL_MAX_CONNECTIONS)),
             }
             if self.proxy:
                 kwargs["proxy"] = self.proxy

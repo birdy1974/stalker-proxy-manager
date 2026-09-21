@@ -107,6 +107,16 @@ VAAPI_DEVICE = next((d for d in VAAPI_DEVICE_CANDIDATES if Path(d).exists()), VA
 STREAM_START_TIMEOUT = float(os.environ.get("SPM_STREAM_START_TIMEOUT", "12"))
 # Max time allowed for a single portal HTTP request.
 PORTAL_HTTP_TIMEOUT = float(os.environ.get("SPM_PORTAL_HTTP_TIMEOUT", "10"))
+# How long a pooled portal session keeps its HTTP connection alive while idle.
+# httpx's own default is 5 s: a create_link after a quiet moment then pays a
+# fresh TCP (+TLS) handshake, which is 2 round trips on a WAN panel - a large
+# part of "zapping feels slow" that has nothing to do with the portal's own
+# answer time. A real set-top box keeps its connection open; so do we. 0 or
+# less = never expire (the session outlives long idle spells by design).
+PORTAL_KEEPALIVE_S = float(os.environ.get("SPM_PORTAL_KEEPALIVE_S", "90"))
+# Connections per portal session (one session = one portal + MAC). Playback and
+# background fetches share it; 4 concurrent fetches + a play fits comfortably.
+PORTAL_MAX_CONNECTIONS = int(os.environ.get("SPM_PORTAL_MAX_CONNECTIONS", "32"))
 # Pages fetched per genre per batch (portal pages are ~14 items; 30 pages ~= 420 items).
 FETCH_PAGE_BUDGET = int(os.environ.get("SPM_FETCH_PAGE_BUDGET", "30"))
 # Pages fetched at once once the portal has told us the total. Portals answer

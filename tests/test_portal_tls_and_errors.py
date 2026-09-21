@@ -31,6 +31,7 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport
 
+from app.config import PORTAL_KEEPALIVE_S
 from app.portal.client import (PortalError, StalkerClient, apply_mac_placeholder,
                                is_hls, js_error, js_has_payload, normalize_error,
                                status_for_error)
@@ -417,3 +418,35 @@ async def test_stream_log_says_what_the_portal_meant(monkeypatch):
         await control(**{"create_link_error": ""})
         await c._aclose()
     assert got.value.detail().endswith("portal/CDN fault while building the link")
+
+
+# --------------------------------------------------------------------------- #
+# the connection a zap finds: kept open, not rebuilt every time
+# --------------------------------------------------------------------------- #
+async def test_a_pooled_portal_session_keeps_its_connection(monkeypatch):
+    """httpx drops an idle connection after 5 s by default.
+
+    A create_link then pays a fresh TCP (+TLS) handshake - two round trips on a
+    WAN panel, and a visible part of "zapping feels slow" that no portal call
+    can explain. The pooled session therefore asks for a long keepalive window.
+    """
+    wired = Wired(monkeypatch)
+    client = StalkerClient(PORTAL, MAC)
+    await client.handshake()
+    limits = wired.kwargs[-1]["limits"]
+    assert isinstance(limits, httpx.Limits)
+    assert limits.keepalive_expiry == PORTAL_KEEPALIVE_S
+    assert limits.keepalive_expiry > 5.0, \
+        "longer than httpx's 5 s default, or the connection dies between zaps"
+    assert limits.max_connections >= 4
+    await client.close()
+
+
+async def test_keepalive_can_be_switched_off(monkeypatch):
+    """0 = never expire explicitly; a negative value must not break the client."""
+    monkeypatch.setattr("app.portal.client.PORTAL_KEEPALIVE_S", -1.0)
+    wired = Wired(monkeypatch)
+    client = StalkerClient(PORTAL, MAC)
+    await client.handshake()
+    assert wired.kwargs[-1]["limits"].keepalive_expiry is None
+    await client.close()
