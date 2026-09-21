@@ -557,6 +557,26 @@ def _orphan_ffmpeg_pids(root: str = "/proc") -> list[int]:
 #: costs nothing real and caps the walk at a fraction of the old worst case.
 STREAM_START_TIMEOUT_REST = float(os.environ.get("SPM_STREAM_START_TIMEOUT_REST", "5"))
 
+#: When a chain has at least this many candidates that are free to play, a silent
+#: candidate is given only `SPM_HEDGE_AFTER_S` (2 s) before the walk moves on.
+#:
+#: The measured reality is that a candidate which is going to answer does so in
+#: well under a second (a live start on the demo instance: ~550 ms end to end,
+#: panel RTT included), while a candidate that is silent at 2 s is nearly always
+#: a dead edge or a refused media path. The old shape gave every candidate the
+#: full window, so a two-MAC chain could sit black for up to 24 s before the
+#: player saw anything - the single most-visible symptom the stability work is
+#: about. With an alternative in the chain there is no reason to pay that: the
+#: fence is only lowered while another MAC is actually free, so a single-MAC
+#: portal (nothing to fall back to) keeps the patient windows.
+#:
+#: 0 disables it. Deliberately *not* a parallel race: two simultaneous
+#: create_links would hold two panel slots for one zap, and on the panels this
+#: was measured against a second slot is exactly what answers `limit`.
+HEDGE_AFTER_S = float(os.environ.get("SPM_HEDGE_AFTER_S", "2.0"))
+#: How many free candidates must exist before the fence is lowered.
+HEDGE_MIN_CANDIDATES = max(2, int(os.environ.get("SPM_HEDGE_MIN_CANDIDATES", "2")))
+
 #: A live stream that dies mid-play is restarted inside the SAME client response.
 #: The usual cause is not a dead channel but a dead *link*: panels invalidate the
 #: per-session URL after a while (and CDNs drop long-lived connections), so the
@@ -2572,6 +2592,15 @@ class StreamManager:
         return {"window": len(rows), "modes": modes, "failures": fails,
                 "portals": portals, "recent": rows[-12:]}
 
+    def _free_candidates(self, chain: list, requester: str | None) -> int:
+        """How many MACs in this chain could be played right now (see HEDGE_AFTER_S)."""
+        free = 0
+        for _src, _portal, macs in chain or ():
+            for mac in macs or ():
+                if not self.is_mac_busy(getattr(mac, "id", None), requester=requester):
+                    free += 1
+        return free
+
     def _occupied_note(self, mac_row) -> str:
         """One MAC's occupancy as a phrase for a log line ('' when free)."""
         info = self.mac_occupancy(getattr(mac_row, "id", None))
@@ -3168,6 +3197,16 @@ class StreamManager:
                               return
                           first_candidate = not tried_any
                           tried_any = True
+                          # Hedge by patience, not by a parallel race: with a free
+                          # alternative in the chain, a candidate that has said
+                          # nothing after HEDGE_AFTER_S is not "slow", it is
+                          # probably dead - so do not sit on it for the full
+                          # window. See HEDGE_AFTER_S.
+                          window = (STREAM_START_TIMEOUT if first_candidate
+                                    else STREAM_START_TIMEOUT_REST)
+                          if HEDGE_AFTER_S > 0 and self._free_candidates(chain, h.user_name) \
+                                  >= HEDGE_MIN_CANDIDATES:
+                              window = min(window, HEDGE_AFTER_S)
                           # Decided before the portal is touched, for the same reason the
                           # redirect path decides first: for a source the user adopted onto
                           # the panel's Xtream side (R7) there is no MAC to spend and no
@@ -3323,9 +3362,7 @@ class StreamManager:
                                   # answers in ~550 ms), and a whole chain of
                                   # 12 s waits is what a player shows as a frozen
                                   # screen. See STREAM_START_TIMEOUT_REST.
-                                  first_byte_timeout=(STREAM_START_TIMEOUT
-                                                      if first_candidate
-                                                      else STREAM_START_TIMEOUT_REST))
+                                  first_byte_timeout=window)
                           except FFmpegTemplateError as exc:
                               if locked is not None:
                                   self.unlock_mac(locked, h.id)
@@ -3365,9 +3402,12 @@ class StreamManager:
                                   note_candidate_failure(h.route_key, src, mac_row)
                                   other_failures += 1
                                   if open_fail["stalled"]:
-                                      h.note_attempt(f"{who}: silent {STREAM_START_TIMEOUT:.0f}s")
+                                      # Name the window that actually expired: it is
+                                      # `window`, not the full start timeout, when a
+                                      # free alternative was waiting (HEDGE_AFTER_S).
+                                      h.note_attempt(f"{who}: silent {window:g}s")
                                       await db_log("WARNING", "stream",
-                                                   f"[{h.item_name}] no data within {STREAM_START_TIMEOUT:.0f}s from "
+                                                   f"[{h.item_name}] no data within {window:g}s from "
                                                    f"{who} -> fallback{words}")
                                   else:
                                       # ffmpeg is gone and will never send a byte: say so

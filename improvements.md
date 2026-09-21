@@ -21,6 +21,13 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (a silent candidate no longer costs the whole window when there is an alternative)
+- Every candidate got the full `SPM_STREAM_START_TIMEOUT` (12 s) to produce a first byte, so a two-MAC chain could leave the screen black for up to 24 s before the player saw anything. The measurement that decides this: a candidate that *is* going to answer does so in well under a second (a live start on the demo instance is ~550 ms end to end, panel RTT included) - 12 s of patience is for a source that is starting, 12 s of silence is a dead edge.
+  -> `SPM_HEDGE_AFTER_S` (2 s): while at least `SPM_HEDGE_MIN_CANDIDATES` (2) MACs in the chain are *free*, a candidate that is silent that long is dropped and the walk moves on. A single-MAC portal has nothing to fall back to, so it keeps the patient windows - patience is the only thing that helps there.
+  -> the attempt note and the log name the window that actually expired (`silent 2s`, not the old `silent 12s`): a report that overstates what we waited costs somebody an afternoon.
+  -> deliberately *not* a parallel race of two candidates: that holds two panel slots for one zap, and on the panels this was measured against a second slot is exactly what answers `limit`. `min()` keeps the hedge from ever *raising* a window (tests that pin shorter ones are unaffected).
+  -> tests/test_hedge_patience.py pins all three halves: dropped early with a free MAC, patient with only one, and off via `SPM_HEDGE_AFTER_S=0`.
+
 2026-09-21 (a timing / refusal view: why a zap is slow, on the dashboard)
 - The log knew all of it, one event at a time: the phase timings of every start, what the panel refused us with, how much the probe cache saved, how often background work yielded. Answering "why does zapping feel slow tonight" meant grepping container logs.
   -> the manager keeps the last `SPM_TIMING_HISTORY` (200) starts with their phase timings (`note_timing`), split by path - **proxy** (panel link + ffmpeg + first byte) vs **redirect** (panel link + one probe, no ffmpeg) - with p50/p90/max, failures by reason (`busy`, `no-source`, `no-link`), and a per-portal p50. The output router records every success *and* every failed start, so "half our zaps are 503s" is visible as a number.
