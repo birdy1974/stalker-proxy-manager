@@ -1,0 +1,400 @@
+"""Occupancy must never veto a zap.
+
+The rule these tests pin down came from the reference implementation whose zaps
+nobody complains about (STB-Proxy): it keeps no state across requests, so a zap
+can never lose against its own bookkeeping. SPM keeps state on purpose (pooled
+sessions, per-user quotas, redirect leases), so it has to *behave* as if it did
+not:
+
+* a busy MAC is waited for (BUSY_WAIT_S) instead of refused in 13 ms;
+* the same user's own pipe is taken over - a zap, not a conflict;
+* a panel that reports "already streaming" is asked again a moment later
+  (BUSY_BACKOFF) instead of burning the candidate;
+* a candidate that just failed is tried last on the retry pass;
+* the final answer for "everything was busy" is 503 + Retry-After, not 404.
+
+See docs/STREAM-FETCH-ANALYSIS.md ("What to implement") and Appendix C for the
+comparison this encodes.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import time
+
+import pytest
+
+from app.database import SessionLocal
+from app.models import (
+    LivePlaylist, LivePlaylistSource, LiveSource, MacAddress, Portal,
+)
+from app.portal.client import PortalError
+from app.portal.links import plan_for
+from app.services import stream_manager
+from app.services.stream_manager import (
+    MANAGER, StreamHandle, cached_link, demote_failed_candidates, demote_macs,
+    drop_link, note_candidate_failure, note_link, reset_zap_state,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_manager():
+    """MANAGER is a process-global singleton; so is the zap memory."""
+    MANAGER.mac_locks.clear()
+    MANAGER.mac_limits.clear()
+    MANAGER.redirect_leases.clear()
+    MANAGER.lease_meta.clear()
+    MANAGER.streams.clear()
+    reset_zap_state()
+    yield
+    MANAGER.mac_locks.clear()
+    MANAGER.mac_limits.clear()
+    MANAGER.redirect_leases.clear()
+    MANAGER.lease_meta.clear()
+    MANAGER.streams.clear()
+    reset_zap_state()
+
+
+async def _route(*, macs=1, link_flags="use_http_tmp_link"):
+    """One portal + N MACs + one live item; ids of (playlist, [mac ids])."""
+    async with SessionLocal() as s:
+        portal = Portal(name="p", base_url="http://127.0.0.1:1/c/",
+                        resolved_url="http://127.0.0.1:1/c/")
+        s.add(portal)
+        await s.flush()
+        ids = []
+        for i in range(macs):
+            m = MacAddress(portal_id=portal.id, mac=f"00:1A:79:00:00:{i + 1:02d}",
+                           status="online", order=i)
+            s.add(m)
+            await s.flush()
+            ids.append(m.id)
+        src = LiveSource(portal_id=portal.id, portal_channel_id="1",
+                         original_name="Ch", cmd="ffmpeg http://cdn/x.ts",
+                         enabled=True, link_flags=link_flags)
+        s.add(src)
+        await s.flush()
+        pl = LivePlaylist(custom_name="Ch", enabled=True)
+        s.add(pl)
+        await s.flush()
+        s.add(LivePlaylistSource(live_playlist_id=pl.id, live_source_id=src.id,
+                                 priority=1))
+        await s.commit()
+        return pl.id, ids
+
+
+def _fake_stream(name: str, mac_id: int, user: str) -> StreamHandle:
+    """A registered pipe of `user` on `mac_id` (no process: nothing to kill)."""
+    h = StreamHandle(id=f"sid-{name}", kind="live", item_name=name,
+                     user_name=user, template_name="t", command="ffmpeg")
+    MANAGER.streams[h.id] = h
+    MANAGER.lock_mac(mac_id, h.id)
+    return h
+
+
+# --------------------------------------------------------------------------- #
+#  the wait, and the takeover
+# --------------------------------------------------------------------------- #
+async def test_another_users_pipe_is_waited_for_then_answered_as_busy(monkeypatch):
+    """Not an instant 404: wait the budget, then say "busy"."""
+    monkeypatch.setattr(stream_manager, "BUSY_WAIT_S", 0.3)
+    monkeypatch.setattr(stream_manager, "BUSY_POLL_S", 0.05)
+    pl, (mid,) = await _route()
+    _fake_stream("someone-else", mid, "other-user")
+
+    started = time.monotonic()
+    handle, _gen = await MANAGER.open("live", pl, "box")
+    waited = time.monotonic() - started
+
+    assert handle.dead, "the MAC really is busy - this open must not claim it"
+    assert handle.busy, "and the reason is occupancy, not a dead source"
+    assert waited >= 0.25, f"it waited for the MAC (waited {waited:.2f}s)"
+    # logging in the log: not needed here, but the note must name the holder
+    assert "other-user" in (MANAGER._occupied_note(_StubMac(mid)) or "")
+
+
+class _StubMac:
+    def __init__(self, mid):
+        self.id = mid
+        self.mac = "00:1A:79:00:00:01"
+
+
+async def test_our_own_pipe_is_taken_over_instead_of_refusing_the_zap(monkeypatch):
+    """The channel this box just left is not somebody else's stream.
+
+    Before this, a .ts -> .ts zap answered 404 while the player was still
+    tearing the old socket down - the one asymmetry against the redirect path,
+    which has allowed the same takeover since the lease existed.
+    """
+    monkeypatch.setattr(stream_manager, "BUSY_WAIT_S", 0.3)
+    pl, (mid,) = await _route()
+    old = _fake_stream("Ch1", mid, "box")
+
+    handle, _gen = await MANAGER.open("live", pl, "box")
+
+    assert old.dead, "the old pipe was killed"
+    assert not handle.dead, "the zap got the MAC"
+    assert MANAGER.is_mac_busy(mid, requester="box") is False or handle.dead
+
+
+async def test_a_different_user_never_gets_the_pipe_taken_away(monkeypatch):
+    monkeypatch.setattr(stream_manager, "BUSY_WAIT_S", 0.2)
+    monkeypatch.setattr(stream_manager, "BUSY_POLL_S", 0.05)
+    pl, (mid,) = await _route()
+    other = _fake_stream("Ch1", mid, "other-user")
+
+    handle, _gen = await MANAGER.open("live", pl, "box")
+
+    assert not other.dead, "another viewer's stream is untouched"
+    assert handle.dead and handle.busy
+
+
+async def test_a_second_stream_is_allowed_when_the_portal_says_so():
+    """Portal.streams_per_mac - the knob STB-Proxy calls "streams per mac"."""
+    async with SessionLocal() as s:
+        p = Portal(name="p", base_url="http://x/c/", resolved_url="http://x/c/",
+                   streams_per_mac=2)
+        s.add(p)
+        await s.flush()
+        s.add(MacAddress(portal_id=p.id, mac="00:1A:79:00:00:09", status="online"))
+        await s.commit()
+        pid, mid = p.id, (await s.execute(
+            __import__("sqlalchemy").select(MacAddress).where(
+                MacAddress.portal_id == p.id))).scalars().first().id
+    MANAGER.note_mac_limit(mid, 2)
+    _fake_stream("first", mid, "box")
+    assert MANAGER.is_mac_busy(mid) is False, "one of two slots is free"
+    _fake_stream("second", mid, "box2")
+    assert MANAGER.is_mac_busy(mid) is True, "the second slot is the limit"
+
+
+# --------------------------------------------------------------------------- #
+#  the panel's own slot
+# --------------------------------------------------------------------------- #
+class _BusyThenOkClient:
+    """create_link answers `limit` a few times, then a URL - the panel letting
+    go of the connection the previous zap left behind."""
+
+    def __init__(self, refusals: int, url="http://cdn/x.ts?play_token=fresh"):
+        self.refusals, self.calls, self.url = refusals, 0, url
+        self.portal_url = "http://127.0.0.1:1/c/"
+
+    async def ensure_auth(self):
+        return None
+
+    def invalidate(self):
+        pass
+
+    async def close(self):
+        return None
+
+    async def create_link(self, cmd, kind="live", **kw):
+        self.calls += 1
+        if self.calls <= self.refusals:
+            raise PortalError("portal said limit", code="limit")
+        return self.url
+
+
+async def test_the_same_mac_is_asked_again_while_the_panel_is_busy(monkeypatch):
+    """A busy slot is a moment, not a MAC problem - on one MAC it is the only
+    candidate there is."""
+    monkeypatch.setattr(stream_manager, "BUSY_BACKOFF", (0.01, 0.01, 0.01))
+    pl, _ = await _route()
+    client = _BusyThenOkClient(refusals=2)
+    monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
+
+    url, _name = await MANAGER.resolve("live", pl)
+
+    assert url == client.url
+    assert client.calls == 3, "asked again instead of burning the candidate"
+
+
+async def test_a_busy_panel_becomes_503_not_404(monkeypatch):
+    """`out["busy"]` is what the route turns into 503 + Retry-After."""
+    monkeypatch.setattr(stream_manager, "BUSY_BACKOFF", (0.01,))
+    monkeypatch.setattr(stream_manager, "ZAP_RETRY_DELAY", 0.01)
+    pl, _ = await _route()
+    client = _BusyThenOkClient(refusals=99)
+    monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
+
+    out: dict = {}
+    url, _name = await MANAGER.resolve("live", pl, out=out)
+
+    assert url is None and out["busy"] is True
+
+
+async def test_a_dead_source_is_not_reported_as_busy(monkeypatch):
+    monkeypatch.setattr(stream_manager, "ZAP_RETRY_DELAY", 0.01)
+    pl, _ = await _route()
+    client = _BusyThenOkClient(refusals=0,
+                               url=None)      # a portal that answers no URL
+    monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
+
+    out: dict = {}
+    url, _name = await MANAGER.resolve("live", pl, out=out)
+
+    assert url is None and out.get("busy") is False
+
+
+class _Pool:
+    def __init__(self, client):
+        self._client = client
+
+    async def get(self, session):
+        return self._client
+
+
+async def test_the_output_guard_turns_busy_into_503(monkeypatch):
+    """The proxy path's answer for "everything was busy" is 503 + Retry-After.
+
+    The engine only knows it after walking the chain, so the verdict arrives
+    while the response is being built - `_guarded` is where it has to be read.
+    A 404 there told the player the channel does not exist, and a 502 tells it
+    the same thing with a different number.
+    """
+    from fastapi import HTTPException
+
+    from app.routers.output import _guarded
+
+    busy = StreamHandle(id="s", kind="live", item_name="Ch", user_name="box",
+                        template_name="t", command="ffmpeg")
+    busy.dead = True
+    busy.busy = True
+    busy.fail_note = "2 attempt(s) without data (all 2 refusal(s) were busy slots)"
+
+    async def empty():
+        return
+        yield b""                                   # pragma: no cover
+
+    monkeypatch.setattr("app.routers.output._guard_wait", lambda handle: 0.05)
+    with pytest.raises(HTTPException) as err:
+        await _guarded(empty(), "live #1", "Ch", handle=busy)
+    assert err.value.status_code == 503
+    assert err.value.headers["Retry-After"] == "2"
+
+
+async def test_the_output_guard_still_says_502_for_a_dead_source(monkeypatch):
+    from fastapi import HTTPException
+
+    from app.routers.output import _guarded
+
+    dead = StreamHandle(id="s", kind="live", item_name="Ch", user_name="box",
+                        template_name="t", command="ffmpeg")
+    dead.dead = True                      # not busy: the source really is dead
+
+    async def empty():
+        return
+        yield b""                                   # pragma: no cover
+
+    monkeypatch.setattr("app.routers.output._guard_wait", lambda handle: 0.05)
+    with pytest.raises(HTTPException) as err:
+        await _guarded(empty(), "live #1", "Ch", handle=dead)
+    assert err.value.status_code == 502
+
+
+# --------------------------------------------------------------------------- #
+#  rotation, not affinity
+# --------------------------------------------------------------------------- #
+class _Src:
+    def __init__(self, ident):
+        self.id = ident
+
+
+class _Mac:
+    def __init__(self, ident):
+        self.id = ident
+
+
+def test_a_candidate_that_just_failed_is_tried_last():
+    route = ("live", 1)
+    a, b = _Src(1), _Src(2)
+    mac_a, mac_b = _Mac(10), _Mac(11)
+    chain = [(a, None, [mac_a]), (b, None, [mac_b])]
+
+    assert demote_failed_candidates(route, chain)[0][0] is a
+    note_candidate_failure(route, a, mac_a)
+    assert demote_failed_candidates(route, chain)[0][0] is b, "affinity must not win"
+    assert demote_macs(route, a, [mac_a, mac_b])[0] is mac_b
+
+
+def test_the_demotion_expires(monkeypatch):
+    route = ("live", 2)
+    src, mac = _Src(1), _Mac(10)
+    note_candidate_failure(route, src, mac)
+    monkeypatch.setattr(stream_manager, "FAILURE_DEMOTE_S", -1.0)   # already expired
+    assert demote_macs(route, src, [mac]) == [mac]
+    assert demote_failed_candidates(route, [(src, None, [mac])]) == [(src, None, [mac])]
+
+
+def test_a_failure_on_another_route_does_not_leak():
+    src, mac = _Src(1), _Mac(10)
+    note_candidate_failure(("live", 1), src, mac)
+    assert demote_macs(("live", 2), src, [mac]) == [mac]
+
+
+# --------------------------------------------------------------------------- #
+#  the zap-back cache
+# --------------------------------------------------------------------------- #
+def test_the_link_cache_remembers_live_and_forgets_the_rest():
+    note_link("live", 7, 3, "http://cdn/x.ts")
+    assert cached_link("live", 7, 3)[0] == "http://cdn/x.ts"
+    note_link("vod", 7, 3, "http://cdn/movie.mp4")
+    assert cached_link("vod", 7, 3) is None, "a movie link is not a zap"
+
+
+def test_the_link_cache_expires(monkeypatch):
+    note_link("live", 7, 3, "http://cdn/x.ts")
+    monkeypatch.setattr(stream_manager, "LINK_CACHE_S", 0.01)
+    time.sleep(0.02)
+    assert cached_link("live", 7, 3) is None
+
+
+def test_a_cached_link_is_per_item_and_mac():
+    note_link("live", 1, 1, "http://cdn/one.ts")
+    assert cached_link("live", 2, 1) is None
+    assert cached_link("live", 1, 2) is None
+    drop_link("live", 1, 1)
+    assert cached_link("live", 1, 1) is None
+
+
+async def test_a_zap_back_replays_the_link_without_asking_the_panel(monkeypatch):
+    """The whole point: away and back inside LINK_CACHE_S costs one 302."""
+    pl, _ = await _route()
+    client = _BusyThenOkClient(refusals=0)
+    monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
+    fake_alive = _always_alive()
+    monkeypatch.setattr(stream_manager, "link_is_alive", fake_alive)
+
+    first, _ = await MANAGER.resolve("live", pl)
+    MANAGER.redirect_leases.clear()                    # the box zapped away
+    second, _ = await MANAGER.resolve("live", pl)
+
+    assert first == second
+    assert client.calls == 1, "no second create_link for the zap back"
+
+
+async def test_a_dead_cached_link_is_dropped_and_replaced(monkeypatch):
+    pl, _ = await _route()
+    client = _BusyThenOkClient(refusals=0)
+    monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
+
+    note_link("live", pl, MANAGER.mac_locks and 0 or 1, "http://cdn/stale.ts")
+    alive = {"calls": 0}
+
+    async def probe(url, **kw):
+        from app.services.redirect_guard import ProbeResult
+        alive["calls"] += 1
+        return ProbeResult("/stale" not in url, "fake")
+
+    monkeypatch.setattr(stream_manager, "link_is_alive", probe)
+    url, _name = await MANAGER.resolve("live", pl)
+
+    assert url == client.url, "the stale link was not handed out"
+    assert alive["calls"] >= 2, "the cached link was probed before being trusted"
+
+
+def _always_alive():
+    async def probe(url, **kw):
+        from app.services.redirect_guard import ProbeResult
+        return ProbeResult(True, "fake")
+    return probe

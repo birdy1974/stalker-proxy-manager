@@ -214,6 +214,18 @@ async def _guarded(gen, label: str, item_name: str = "", handle=None):
             note = getattr(handle, "fail_note", "") or ""
             trace = getattr(handle, "trace", "") or ""
             detail = " | ".join(part for part in (note, trace) if part)
+        if handle is not None and getattr(handle, "busy", False):
+            # Everything the engine tried was refused by occupancy - our own
+            # pipe/lease, or the panel's connection slot. That is "come back in
+            # a second", and it is the one failure players retry; 502 would tell
+            # the box the channel is broken (and Enigma2 shows "no signal").
+            await db_log("ERROR", "output",
+                         f"[{item_name or label}] produced no data within "
+                         f"{wait:.0f}s -> 503 + Retry-After (every candidate busy)"
+                         + (f" - {detail}" if detail else ""))
+            raise HTTPException(503, f"{label}: every MAC is busy right now"
+                                     + (f" ({detail})" if detail else ""),
+                                headers={"Retry-After": "2"})
         await db_log("ERROR", "output",
                      f"[{item_name or label}] produced no data within "
                      f"{wait:.0f}s -> 502 (not a silent 200)"
@@ -297,8 +309,10 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
             kind, ref_id, mode, user.name if user else None):
         from fastapi.responses import RedirectResponse
         resolve_started = time.perf_counter()
+        info: dict = {}
         url, item_name = await MANAGER.resolve(kind, ref_id,
-                                               requester=user.name if user else None)
+                                               requester=user.name if user else None,
+                                               out=info)
         resolve_ms = (time.perf_counter() - resolve_started) * 1000
         if url:
             total_ms = (time.perf_counter() - started) * 1000
@@ -308,6 +322,13 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
             return RedirectResponse(url, status_code=302, headers={
                 "Server-Timing": f"resolve;dur={resolve_ms:.1f}, total;dur={total_ms:.1f}",
             })
+        if info.get("busy"):
+            # Every candidate was refused by occupancy (our pipe/lease, or the
+            # panel's own connection slot), not by a dead source. That is a
+            # "retry in a second", and players do retry a 503 - a 502 "no
+            # source produced a link" reads as "this channel is broken".
+            raise HTTPException(503, f"{label}: every MAC is busy right now",
+                                headers={"Retry-After": "2"})
         raise HTTPException(502, f"{label}: no source produced a link to redirect to")
 
     await _ensure_slot(user)
@@ -316,6 +337,12 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
                                      force_proxy=(mode == "proxy"))
     open_ms = (time.perf_counter() - open_started) * 1000
     if handle.dead:
+        if handle.busy:
+            # Same reasoning as the redirect path above, and the one answer that
+            # used to be wrong: a 404 in 13 ms for "my own previous stream still
+            # holds the MAC" tells an Enigma2 box the channel does not exist.
+            raise HTTPException(503, f"{label}: every MAC is busy right now",
+                                headers={"Retry-After": "2"})
         raise HTTPException(404, f"{label}: no available source (all busy or unreachable)")
     # watchdog lives until the stream deregisters (normal end) or the client
     # disappears (then it kills the stream; see watch_disconnect). watch() keeps

@@ -98,6 +98,12 @@ async def _schema_and_flush():
 
     await flush_logs()
     clear_m3u_cache()                  # the schema reset zeros ids; cached M3Us must die
+    # The zap memory (resolved links, recently failed candidates) is keyed on
+    # (kind, item id, MAC id) and, like the M3U cache, would otherwise survive
+    # the id reset: the *next* test's item 1 would "already have a link" on the
+    # same MAC. Process-local by design - clear it, do not let it leak.
+    from app.services.stream_manager import reset_zap_state
+    reset_zap_state()
     last: Exception | None = None
     for attempt in range(6):
         try:

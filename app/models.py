@@ -69,6 +69,13 @@ class Portal(Base):
     #: switch exists because a panel that answers `use_http_tmp_link=0` and then
     #: 403s the URL is worth one checkbox, not a code change.
     direct_links: Mapped[bool] = mapped_column(Boolean, default=True)
+    #: How many concurrent streams one of this portal's MACs may carry
+    #: (NULL = inherit SPM_STREAMS_PER_MAC, default 1). Panels answer a second
+    #: concurrent media link on one MAC with 456/"account is in use" - but some
+    #: allow two or three, and serialising those to one means a failed zap on
+    #: every channel change for no reason. The STB-Proxy knob ("streams per
+    #: mac"; there, 0 = unlimited), read by StreamManager.is_mac_busy.
+    streams_per_mac: Mapped[int | None] = mapped_column(Integer, nullable=True)
     portal_version: Mapped[str | None] = mapped_column(String(120))
     modules: Mapped[str | None] = mapped_column(Text)        # JSON list, NULL = unknown
     capabilities_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

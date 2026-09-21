@@ -155,13 +155,33 @@ def test_a_session_token_from_fetch_time_always_asks():
 
 
 @pytest.mark.parametrize("kwargs,expect", [
-    ({"ffmpeg": True}, "ffmpeg owns this stream"),
     ({"force_ch_link_check": True}, "force_ch_link_check"),
     ({"allow_direct": False}, "ask for every link"),
 ])
-def test_the_three_overrides_come_before_the_fast_path(kwargs, expect):
+def test_the_overrides_come_before_the_fast_path(kwargs, expect):
     pol = link_policy(url=CLEAN, link_flags="", **kwargs)
     assert pol.create_link and expect in pol.reason
+
+
+def test_ffmpeg_takes_the_shortcut_for_a_permanent_link(monkeypatch):
+    """R2b: the pipe plays a stored permanent link instead of asking.
+
+    `ffmpeg=True` used to mean "ask, unconditionally" - the request doubled as
+    the liveness probe and the fresh token. For a channel whose own flags say
+    the link is permanent that is a portal round trip and a slot allocation on
+    every play, which is what a fast zap then trips over (see
+    docs/STREAM-FETCH-ANALYSIS.md). The rules that protect the shortcut are
+    unchanged and asserted right below.
+    """
+    pol = link_policy(url=CLEAN, link_flags="", ffmpeg=True)
+    assert not pol.create_link and "playing the stored link" in pol.reason
+    assert "ffmpeg plays it directly" in pol.reason
+    # ... and the kill switch restores the old rule for a panel that publishes
+    # permanent-looking links it then refuses.
+    from app.portal import links
+    monkeypatch.setattr(links, "FFMPEG_STORED_LINK", False)
+    pol = link_policy(url=CLEAN, link_flags="", ffmpeg=True)
+    assert pol.create_link and "ffmpeg owns this stream" in pol.reason
 
 
 def test_a_template_cmd_asks_even_when_the_flags_are_clean():
@@ -255,6 +275,30 @@ async def test_force_ch_link_check_is_forwarded_not_just_stored(monkeypatch):
     assert seen["force_ch_link_check"] == "true"
 
 
+class _OneShotProc:
+    """Enough of an ffmpeg process for the pump: one chunk, then EOF."""
+
+    def __init__(self):
+        self.returncode = None
+        self.pid = 4242
+        self.stdout = self
+        self.stderr = self
+        self._sent = False
+
+    async def read(self, n):
+        if self._sent:
+            return b""
+        self._sent = True
+        return b"\x47" * 188 * 4
+
+    async def wait(self):
+        self.returncode = 0
+        return 0
+
+    def kill(self):
+        self.returncode = -9
+
+
 # =========================================================================== #
 # the stream paths consult the policy
 # =========================================================================== #
@@ -332,6 +376,50 @@ async def test_a_mac_flag_overrides_a_clean_channel(monkeypatch):
     await flush_logs()
 
 
+async def test_the_pipe_plays_a_permanent_stored_link_without_asking(monkeypatch):
+    """R2b end to end, on the ffmpeg path: no create_link, no handshake.
+
+    Before this the pipe always asked (the request doubled as the liveness
+    probe), which cost a portal round trip *and* a slot allocation on the panel
+    for a channel the panel had already declared permanent - the thing a fast
+    zap then collides with. Same article as the redirect path, same rules.
+    """
+    from app.services import stream_manager
+
+    w = Wired(monkeypatch)
+    pl = await _channel("")                      # permanent: empty flags
+    monkeypatch.setattr(stream_manager, "STREAM_START_TIMEOUT", 0.2)
+    monkeypatch.setattr(stream_manager, "STREAM_STALL_TIMEOUT", 0.2)
+
+    mgr = stream_manager.StreamManager()
+    mgr.mac_locks.clear()
+
+    async def fake_open_with_identity(command, url, *, title="", pace=False):
+        _fake_open["url"] = url
+        return _OneShotProc(), b"\x47" * 188 * 4, None
+
+    _fake_open = {}
+    monkeypatch.setattr(mgr, "_open_with_identity", fake_open_with_identity)
+    # register/deregister touch the database; the pipe's own lifecycle is not
+    # what this test is about
+    async def noop(*_a, **_kw):
+        return None
+    monkeypatch.setattr(mgr, "_register", noop)
+    monkeypatch.setattr(mgr, "_deregister", noop)
+
+    handle, gen = await mgr.open("live", pl, "box")
+    assert not handle.dead
+    first = await gen.__anext__()
+    assert first
+
+    assert _fake_open["url"] == CLEAN, "ffmpeg got the stored URL"
+    state = await w.state()
+    assert state["counters"]["create_links"] == 0, "no create_link for a permanent link"
+    assert state["counters"]["handshakes"] == 0, "not even a handshake"
+    await gen.aclose()
+    await flush_logs()
+
+
 async def test_a_stale_token_in_the_url_overrides_clean_flags(monkeypatch):
     """The guard that makes the fast path safe enough to be the default."""
     w = Wired(monkeypatch)
@@ -342,10 +430,28 @@ async def test_a_stale_token_in_the_url_overrides_clean_flags(monkeypatch):
 
 
 def test_the_transcode_path_never_takes_the_shortcut():
-    """An ffmpeg pipe needs the request for its own sake: it is the liveness
-    probe the fallback chain is built on, and it hands ffmpeg a fresh token."""
-    plan = plan_for(_Src(f"ffmpeg {CLEAN}", link_flags=""), _Mac(), ffmpeg=True)
-    assert plan.policy.create_link and "ffmpeg" in plan.policy.reason
+    """What the shortcut must NEVER swallow, on the pipe exactly as on the 302.
+
+    A tmp/load-balanced channel, a template cmd, a stored session token and a
+    cmd with no URL are the four ways a stored URL is not playable as it
+    stands - all of them still ask, `ffmpeg=True` or not.
+    """
+    def plan(src):
+        return plan_for(src, _Mac(), ffmpeg=True)
+
+    assert not plan(_Src(f"ffmpeg {CLEAN}", link_flags="")).policy.create_link
+
+    tmp = plan(_Src(f"ffmpeg {CLEAN}", link_flags="use_http_tmp_link"))
+    assert tmp.policy.create_link and "not permanent" in tmp.policy.reason
+
+    stale = plan(_Src(f"ffmpeg {CLEAN}?play_token=from-the-fetch", link_flags=""))
+    assert stale.policy.create_link and "session token" in stale.policy.reason
+
+    tpl = plan(_Src("ffmpeg http://h/stalker_portal/c/ch/1.ts", link_flags=""))
+    assert tpl.policy.create_link and "template" in tpl.policy.reason
+
+    empty = plan(_Src("ffmpeg ", link_flags=""))
+    assert empty.policy.create_link and "no URL" in empty.policy.reason
 
 
 async def test_the_reason_reaches_the_stream_log(monkeypatch):

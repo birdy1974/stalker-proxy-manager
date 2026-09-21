@@ -198,6 +198,15 @@ MAC_SUSPECT_CODES = frozenset({"limit", "account_is_in_use", "max_connections",
                                "access_denied", "unauthorized", "not_authorized",
                                "no_token", "http_401", "http_403", "blocked"})
 
+# Codes that mean "the panel counts a connection on this MAC and one is still
+# open" - a subset of MAC_SUSPECT_CODES with a different *reaction*. A blocked
+# MAC wants the next MAC; a busy slot wants a short wait and the SAME MAC again,
+# because a panel frees the slot seconds after the previous connection dies
+# (measured ~6.5 s on a real panel) - the fast-zap overlap, not a real conflict.
+# It is also the one refusal that must NOT trigger a re-handshake: the bearer is
+# fine, and a fresh handshake can kick the session the box is still using.
+SLOT_BUSY_CODES = frozenset({"limit", "account_is_in_use", "max_connections"})
+
 # Refusals that can mean "you asked with the wrong FORM of the right item"
 # rather than "this item is gone" - the only codes for which a second attempt
 # with another cmd form is worth a request (S-B). Everything else (`limit`,
@@ -288,6 +297,29 @@ class PortalError(RuntimeError):
     def detail(self) -> str:
         """Message plus the human explanation of the code - for logs and GUI."""
         return f"{self}: {self.hint}" if self.hint else str(self)
+
+
+def refusal_code(response) -> str:
+    """The normalized code behind a refused HTTP reply ('' = nothing readable).
+
+    A panel says no in three shapes: a JSON body with `js.error`, one whose only
+    content is `js.msg`, or an HTML/text page from the WAF in front of it. Only
+    the first two carry something we can act on - and this is the whole point of
+    the function: an HTTP 403 from a panel whose *body* says `account_is_in_use`
+    is a busy slot, not a broken bearer, and the caller must not answer it with
+    a re-handshake (that is what used to invalidate the session the box was
+    still streaming on, and cost two extra round trips per failed zap).
+    """
+    try:
+        data = response.json()
+    except Exception:  # noqa: BLE001 - not JSON: a WAF page, an empty body
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    js = data.get("js") if isinstance(data.get("js"), dict) else data
+    if not isinstance(js, dict):
+        return ""
+    return normalize_error(js.get("error")) or normalize_error(js.get("msg"))
 
 
 def status_for_error(exc: PortalError) -> str:
@@ -487,6 +519,16 @@ class StalkerClient:
             raise PortalError(f"request failed: {type(exc).__name__}: {exc}",
                               code="transport") from exc
         if r.status_code in (401, 403) and self._may_reauth(retry_on_auth, retried):
+            # Read the refusal before reacting to the status code. A 403 whose
+            # body says "the MAC is already streaming" is not an auth failure:
+            # re-handshaking cannot help, changes the session under a box that
+            # is still playing, and throws away the one thing that *would* fix
+            # it - a short wait and the same MAC (see SLOT_BUSY_CODES).
+            busy = refusal_code(r)
+            if busy in SLOT_BUSY_CODES:
+                log.info("portal answered %s with %s -> busy slot, not re-handshaking",
+                         r.status_code, busy)
+                raise PortalError(f"portal said {busy} (HTTP {r.status_code})", code=busy)
             log.info("portal answered %s -> re-handshaking once", r.status_code)
             async with self._lock:
                 self._token = None
