@@ -488,8 +488,15 @@ async def _redirect_route(n_macs: int = 2, *, name: str = "Ch2"):
 async def test_a_zap_reuses_the_mac_it_left_instead_of_a_worse_one(monkeypatch):
     """Reported chain, verbatim: Npo 1 was playing via a 302 (mac 6D leased),
     the box zapped to Ch2, and the log said "mac 00:1A:79:00:20:6D busy -> skip"
-    before falling to mac 6F, which produced no data."""
+    before falling to mac 6F, which produced no data.
+
+    This is the *opt-out* mode (`prefer_free_mac` off): the MAC that just played
+    is taken back instead of the free one, which is right when the portal's
+    other MACs are the unreliable ones. The default is the opposite walk - see
+    tests/test_zap_no_veto.py::test_a_redirect_zap_prefers_the_untouched_mac.
+    """
     Wired(monkeypatch)
+    monkeypatch.setattr("app.config.PREFER_FREE_MAC", False)
     pl, (first, second) = await _redirect_route()
     MANAGER.lease_mac(first, seconds=180, holder="bert", item="Npo 1")
 
@@ -514,8 +521,9 @@ async def test_another_users_mac_is_still_skipped(monkeypatch):
 
 async def test_the_ffmpeg_path_takes_over_its_own_lease_too(monkeypatch):
     """The same rule on the transcode path - the pump's busy check is where the
-    reported skip happened."""
+    reported skip happened. Opt-out mode, as above."""
     Wired(monkeypatch)
+    monkeypatch.setattr("app.config.PREFER_FREE_MAC", False)
     pl, (first, second) = await _redirect_route()
     MANAGER.lease_mac(first, seconds=180, holder="bert", item="Npo 1")
     monkeypatch.setattr(StreamManager, "_open_with_identity", _never_data)

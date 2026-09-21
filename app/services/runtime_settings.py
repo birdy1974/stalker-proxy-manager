@@ -42,6 +42,19 @@ async def fallback_strategy() -> str:
     return FALLBACK_STRATEGY if FALLBACK_STRATEGY in VALID_STRATEGIES else "macs_first"
 
 
+async def prefer_free_mac() -> bool:
+    """Zap takes the first FREE MAC instead of the one this user just used.
+
+    GUI setting (`prefer_free_mac`), then `SPM_PREFER_FREE_MAC`, default on -
+    see config.PREFER_FREE_MAC and StreamManager.order_by_free.
+    """
+    val = await get_setting("prefer_free_mac", None)
+    if isinstance(val, str) and val.strip().lower() in ("true", "false"):
+        return val.strip().lower() == "true"
+    from ..config import PREFER_FREE_MAC
+    return bool(PREFER_FREE_MAC)
+
+
 async def fetch_page_budget() -> int:
     """Pages per genre. GUI setting, then SPM_FETCH_PAGE_BUDGET, then 30."""
     from ..config import FETCH_PAGE_BUDGET

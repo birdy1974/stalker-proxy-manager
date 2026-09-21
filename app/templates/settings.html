@@ -93,6 +93,7 @@ const SETTING_DEFS = [
   ["output_base_url", "Public base URL override (reverse proxy/NAT)", "text", ""],
   ["vlc_local_network_caching_ms", "VLC local-file network cache (ms, 0 = player default)", "number", 500],
   ["fallback_strategy", "Fallback order strategy", ["macs_first", "portal_first"], "macs_first"],
+  ["prefer_free_mac", "Zap takes a free MAC first", ["true", "false"], "true"],
   ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
   ["epg_refresh_hours", "EPG refresh interval (hours; 0 = paused)", "number", 24],
   ["epg_portal_enabled", "Use source portal EPG", ["true", "false"], "true"],
@@ -106,6 +107,7 @@ const SETTING_HELP = {
   epg_portal_enabled: "Check authenticated Stalker portal guide APIs. Use bulk guide data when available, otherwise up to 100 paced short-guide requests for enabled playlist inputs. Busy MACs are skipped. Coverage depends on the portal. Individual portal sources can also be disabled below.",
   vlc_local_network_caching_ms: "Written as #EXTVLCOPT:network-caching before each directly served local file. Lower starts faster; increase it on an unstable network. Takes effect when the playlist is reloaded.",
   fallback_strategy: "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately. Takes effect on the next play/fetch (no restart).",
+  prefer_free_mac: "On: a channel change plays on the MAC nothing is using yet, instead of taking back the MAC the box just left (its panel slot is usually still counted, which costs a refused create_link or a short wait). This is what a multi-MAC portal wants. Off: prefer the MAC that just played — better when the portal's other MACs are the unreliable ones.",
   mac_health_minutes: "Background handshake of every MAC on multi-MAC portals (status + expire date). MACs holding a live stream are skipped. 0 pauses the scheduler.",
   mac_health_multi_only: "When true, single-MAC portals are left alone (they are cheap to Test by hand). When false, every enabled portal is swept.",
 };

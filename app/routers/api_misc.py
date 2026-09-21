@@ -11,7 +11,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 
-from ..config import FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL, TMDB_API_KEY
+from ..config import (
+    FALLBACK_STRATEGY, FETCH_PAGE_BUDGET, OUTPUT_BASE_URL, PREFER_FREE_MAC, TMDB_API_KEY,
+)
 from ..database import get_db
 from ..models import (
     Area, AreaItemTemplate, EpgSource, Enigma2Profile, FFmpegTemplate, LiveGenre,
@@ -111,6 +113,7 @@ DEFAULT_SETTINGS = {
     "playlist_url_format": "{base}/play/{type}/{id}.ts?u={u}&p={p}",
     # Seed from env so a first boot honours docker-compose; later GUI edits win.
     "fallback_strategy": FALLBACK_STRATEGY,     # macs_first | portal_first
+    "prefer_free_mac": "true" if PREFER_FREE_MAC else "false",
     "epg_refresh_hours": 24,
     "epg_portal_enabled": True,
     "logo_country": "netherlands",

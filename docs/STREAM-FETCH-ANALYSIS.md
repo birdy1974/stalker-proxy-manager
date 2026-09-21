@@ -185,9 +185,19 @@ Ordered by how often it will be the cause:
    whole chain again → 502. Measured: redirect zap into a held slot =
    `502` after **2.51 s**; the proxy path = 0 bytes, `fail_note='2 attempt(s)
    without data'`.
-3. **No MAC to fall back to.** `_pick_macs` filters banned/expired MACs; with
-   `macs_first` and one MAC there is no alternative; with several, each
-   candidate costs another handshake/get_profile/create_link.
+3. **No MAC to fall back to — or the wrong one tried first.** `_pick_macs`
+   filters banned/expired MACs; with `macs_first` and one MAC there is no
+   alternative, and with several the chain used to be walked in affinity order,
+   so the MAC the player just left (whose panel slot is still counted) was tried
+   first while an untouched one sat in the same chain. A portal configured
+   `portal_first` never even sees the other MACs: one per portal per pass.
+   
+   *Measured on the reference proxy's topology (several MACs, 1 stream per MAC):
+   it walks the MAC list and plays the first `isMacFree()` one, so a zap lands on
+   the MAC whose slot is actually free. SPM now does the same — see the P0 items
+   below, all implemented: a zap to another channel starts on the free MAC (200
+   in 556 ms on a two-MAC portal while another user held the first), and with
+   nothing free the answer is 503 + `Retry-After` after one chain-wide wait.*
 
 ### 4.3 "Switching back sometimes plays the first channel"
 
@@ -256,7 +266,11 @@ that duplication.
 
 1. ~~**Wait for a busy MAC instead of 404-ing (proxy path).**~~ **DONE** —
    `BUSY_WAIT_S` (3 s, 250 ms polls) in both places, and the final answer is
-   503 + `Retry-After: 2`, not 404.
+   503 + `Retry-After: 2`, not 404. **Refined for multi-MAC portals:** the walk
+   takes the first MAC *nothing* holds (`prefer_free_mac`, default on) and waits
+   once for the whole chain instead of once per busy MAC — waiting per MAC turned
+   a two-MAC portal's zap into seconds of nothing while a free MAC sat in the
+   same chain.
 2. ~~**Preempt the *same user's own* pipe.**~~ **DONE** — `preempt_own()`,
    same "same user only" rule as the lease, same log sentence
    (*"taking over the ffmpeg pipe on this MAC … (the channel this zap left)"*).

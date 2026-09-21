@@ -115,6 +115,16 @@ FETCH_PAGE_BUDGET = int(os.environ.get("SPM_FETCH_PAGE_BUDGET", "30"))
 FETCH_PAGE_CONCURRENCY = max(1, int(os.environ.get("SPM_FETCH_PAGE_CONCURRENCY", "4")))
 # Global fallback strategy (spec): try all MACs of a portal first, or hop portals directly.
 FALLBACK_STRATEGY = os.environ.get("SPM_FALLBACK_STRATEGY", "macs_first")  # or portal_first
+# A zap (or any start) prefers a MAC nothing holds yet over one this user just
+# used. On a portal with several MACs the second one usually has a free slot at
+# the panel *now*, while the one that just played is still counted there for a
+# few seconds - so taking the free one is what makes zapping instant (it is also
+# what the reference STB-Proxy does: walk the MAC list, take the first free one).
+# Set to 0 for the older rule, "take back the MAC this box just left": better
+# when the other MACs of the portal are the unreliable ones (the reported case
+# where the fallback MAC produced no data). GUI setting overrides this.
+PREFER_FREE_MAC = os.environ.get("SPM_PREFER_FREE_MAC", "1").strip().lower() not in (
+    "0", "off", "no", "false")
 
 # ---------------------------------------------------------------------------
 # Optional metadata enrichment

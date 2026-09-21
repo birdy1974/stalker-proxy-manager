@@ -149,6 +149,91 @@ async def test_a_different_user_never_gets_the_pipe_taken_away(monkeypatch):
     assert handle.dead and handle.busy
 
 
+async def test_a_zap_takes_the_free_mac_instead_of_waiting(monkeypatch):
+    """A multi-MAC portal: the first MAC is somebody else's, the second is free.
+
+    This is the topology the reference proxy is normally run in (`streams per
+    mac` = 1, several MACs): its `/play` loop walks the MAC list, asks
+    `isMacFree()` per MAC and plays the first free one - which is why a zap lands
+    there without any locking trickery. SPM has to do the same, or a two-MAC
+    portal spends BUSY_WAIT_S (and a refused create_link) on a MAC it cannot
+    have while a working one sits in the same chain.
+    """
+    monkeypatch.setattr(stream_manager, "BUSY_WAIT_S", 5.0)     # must NOT be spent
+    pl, (mac1, mac2) = await _route(macs=2)
+    held = _fake_stream("other", mac1, "other-user")
+
+    client = _BusyThenOkClient(refusals=0)
+    monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
+
+    async def fake_open(command, url, *, title="", pace=False):
+        return _Proc(), b"\x47" * 188 * 4, None
+
+    monkeypatch.setattr(MANAGER, "_open_with_identity", fake_open)
+
+    started = time.monotonic()
+    handle, gen = await MANAGER.open("live", pl, "box")
+    first = await gen.__anext__()
+    elapsed = time.monotonic() - started
+
+    assert first, "the stream started"
+    assert elapsed < 0.5, f"no waiting while a MAC is free (took {elapsed:.2f}s)"
+    assert handle.mac == "00:1A:79:00:00:02", "the free MAC is the one used"
+    assert client.calls == 1, "one create_link, on the free MAC"
+    assert not held.dead, "another viewer's stream was not touched"
+    assert handle.busy is False
+    await gen.aclose()
+
+
+async def test_both_macs_busy_waits_once_for_the_chain(monkeypatch):
+    """Nothing free: wait BUSY_WAIT_S once for the chain, not per MAC."""
+    monkeypatch.setattr(stream_manager, "BUSY_WAIT_S", 0.4)
+    monkeypatch.setattr(stream_manager, "BUSY_POLL_S", 0.05)
+    pl, (mac1, mac2) = await _route(macs=2)
+    _fake_stream("a", mac1, "other-user")
+    _fake_stream("b", mac2, "other-user")
+
+    started = time.monotonic()
+    handle, _gen = await MANAGER.open("live", pl, "box")
+    elapsed = time.monotonic() - started
+
+    assert handle.dead and handle.busy
+    assert 0.35 <= elapsed < 0.9, (
+        f"one chain-wide wait, not BUSY_WAIT_S per MAC (took {elapsed:.2f}s)")
+
+
+async def test_a_redirect_zap_prefers_the_untouched_mac(monkeypatch):
+    """Our own 302 lease says "that MAC was streaming a moment ago".
+
+    For the *next* channel the untouched MAC is the better candidate: the panel
+    still counts the leased one (so create_link answers `limit` until its table
+    clears), while the other one has a slot free right now. The lease is still
+    taken back when it is the only option - see
+    `test_another_users_pipe_is_waited_for_then_answered_as_busy` and the
+    single-MAC tests above.
+    """
+    pl, (mac1, mac2) = await _route(macs=2)
+    MANAGER.lease_mac(mac1, holder="box", item="Ch1", kind="live", ref=pl)
+    client = _BusyThenOkClient(refusals=0)
+    monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
+    monkeypatch.setattr(stream_manager, "link_is_alive", _always_alive())
+
+    url, _name = await MANAGER.resolve("live", pl, requester="box")
+
+    assert url == client.url
+    assert MANAGER.lease_holder(mac2) == "box", "the new lease is on the fresh MAC"
+    assert (MANAGER.lease_meta.get(mac2) or {}).get("item") == "Ch"
+
+
+async def test_a_free_mac_outranks_the_one_that_worked_last():
+    """Affinity says "this MAC played last"; free says "this one can play now"."""
+    pl, (mac1, mac2) = await _route(macs=2)
+    _fake_stream("last-time", mac1, "box")          # busy: the zap's own channel
+    order = MANAGER.order_by_free(("live", pl), _Src(1), [_Mac(mac1), _Mac(mac2)],
+                                  "box")
+    assert [m.id for m in order] == [mac2, mac1]
+
+
 async def test_a_second_stream_is_allowed_when_the_portal_says_so():
     """Portal.streams_per_mac - the knob STB-Proxy calls "streams per mac"."""
     async with SessionLocal() as s:
@@ -242,6 +327,30 @@ class _Pool:
 
     async def get(self, session):
         return self._client
+
+
+class _Proc:
+    """Enough of an ffmpeg process for the pump: one chunk, then EOF."""
+
+    def __init__(self):
+        self.returncode = None
+        self.pid = 4242
+        self.stdout = self
+        self.stderr = self
+        self._sent = False
+
+    async def read(self, n):
+        if self._sent:
+            return b""
+        self._sent = True
+        return b"\x47" * 188 * 4
+
+    async def wait(self):
+        self.returncode = 0
+        return 0
+
+    def kill(self):
+        self.returncode = -9
 
 
 async def test_the_output_guard_turns_busy_into_503(monkeypatch):
@@ -349,12 +458,15 @@ def test_the_link_cache_expires(monkeypatch):
     assert cached_link("live", 7, 3) is None
 
 
-def test_a_cached_link_is_per_item_and_mac():
-    note_link("live", 1, 1, "http://cdn/one.ts")
-    assert cached_link("live", 2, 1) is None
-    assert cached_link("live", 1, 2) is None
-    drop_link("live", 1, 1)
-    assert cached_link("live", 1, 1) is None
+def test_a_cached_link_is_per_item_mac_and_user():
+    note_link("live", 1, 1, "http://cdn/one.ts", "box")
+    assert cached_link("live", 1, 1, user_name="box")[0] == "http://cdn/one.ts"
+    assert cached_link("live", 2, 1, user_name="box") is None, "another item"
+    assert cached_link("live", 1, 2, user_name="box") is None, "another MAC"
+    assert cached_link("live", 1, 1, user_name="anna") is None, \
+        "a link resolved for one user is not handed to another"
+    drop_link("live", 1, 1, "box")
+    assert cached_link("live", 1, 1, user_name="box") is None
 
 
 async def test_a_zap_back_replays_the_link_without_asking_the_panel(monkeypatch):
@@ -378,7 +490,7 @@ async def test_a_dead_cached_link_is_dropped_and_replaced(monkeypatch):
     client = _BusyThenOkClient(refusals=0)
     monkeypatch.setattr(stream_manager, "POOL", _Pool(client))
 
-    note_link("live", pl, MANAGER.mac_locks and 0 or 1, "http://cdn/stale.ts")
+    note_link("live", pl, await _only_mac_id(), "http://cdn/stale.ts", "box")
     alive = {"calls": 0}
 
     async def probe(url, **kw):
@@ -387,10 +499,18 @@ async def test_a_dead_cached_link_is_dropped_and_replaced(monkeypatch):
         return ProbeResult("/stale" not in url, "fake")
 
     monkeypatch.setattr(stream_manager, "link_is_alive", probe)
-    url, _name = await MANAGER.resolve("live", pl)
+    url, _name = await MANAGER.resolve("live", pl, requester="box")
 
     assert url == client.url, "the stale link was not handed out"
     assert alive["calls"] >= 2, "the cached link was probed before being trusted"
+
+
+async def _only_mac_id() -> int:
+    from sqlalchemy import select as sa_select
+
+    from app.models import MacAddress
+    async with SessionLocal() as s:
+        return (await s.execute(sa_select(MacAddress.id).order_by(MacAddress.id))).scalars().first()
 
 
 def _always_alive():
