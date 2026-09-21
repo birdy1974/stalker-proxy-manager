@@ -17,6 +17,7 @@ from ..models import LivePlaylist, LivePlaylistSource, LiveSource, MacAddress, P
 from ..portal.epg import parse_short_epg
 from ..portal.pool import POOL, PortalSession
 from .item_info import choose_mac
+from .portal_pace import pace_for_playback
 from .stream_manager import MANAGER
 
 MAX_SHORT_CHANNELS = 100
@@ -72,14 +73,15 @@ async def portal_xml(portal_id: int, namespace: str) -> tuple[bytes, str]:
     holder = "epg:" + uuid.uuid4().hex
     MANAGER.lease_mac(mac.id, holder=holder, seconds=100, item="Portal EPG check")
     try:
-        return await asyncio.wait_for(_read(profile, namespace, sources), timeout=90)
+        return await asyncio.wait_for(_read(profile, namespace, sources,
+                                           portal_id=portal_id), timeout=90)
     finally:
         if MANAGER.lease_holder(mac.id) == holder:
             MANAGER.redirect_leases.pop(mac.id, None)
             MANAGER.lease_meta.pop(mac.id, None)
 
 
-async def _read(profile, namespace, sources):
+async def _read(profile, namespace, sources, portal_id: int | None = None):
     client = await POOL.get(profile)
     deadline = time.monotonic() + 85
     try:
@@ -104,6 +106,9 @@ async def _read(profile, namespace, sources):
                 if remaining <= 0:
                     break
                 short_calls += 1
+                # The per-channel fallback is the EPG path that can walk a whole
+                # playlist; while somebody watches this portal, it slows down.
+                await pace_for_playback(portal_id)
                 try:
                     programmes = await asyncio.wait_for(
                         client.short_epg(src.portal_channel_id, size=24, tz=tz),

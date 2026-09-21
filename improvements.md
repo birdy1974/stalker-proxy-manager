@@ -21,6 +21,12 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (a play outranks the background jobs)
+- Everything SPM does with a panel shares one budget: the account's connection slots and whatever rate limiter the panel runs. A catalogue sync walking thousands of pages, a MAC health sweep, an EPG refresh that falls back to a short-EPG call per channel - all of it keeps asking while somebody is watching, and the panel answers the *play* with `limit` or a 429. The job retries; the user sees an error.
+  -> one small gate (`app/services/portal_pace.py`), deliberately not a scheduler or a queue: between background requests, `await pace_for_playback(portal_id)` sleeps `SPM_PLAYBACK_PACE_S` (0.4 s) *while a stream is live on that portal*. Wired into the catalogue sync (per page batch), the MAC health sweep (per row) and the EPG per-channel fallback. Nothing is cancelled or starved; the sync finishes a few seconds later and the play gets the panel to itself.
+  -> the gate reads the live registry instead of keeping its own state, so a *parked* pipe does not hold a portal back: nobody is watching it, and the point of parking is a cheap zap back, not a stopped sync. `StreamHandle.portal_id` exists for exactly this question.
+  -> tests/test_playback_priority.py pins it: a live stream paces, a parked or dead one does not, another portal is unaffected, the kill switch works, and the sync consults the gate once per page batch (the fakes in the pagination tests had to learn `portal_id`, which is the real Job's shape).
+
 2026-09-21 (zap polish: the probe, the busy wait, the stall window)
 Three numbers on the critical path, all taken from measurements rather than taste:
 

@@ -39,6 +39,7 @@ from ..portal.client import (RATE_LIMITED_CODE, PortalError,
                              status_for_error)
 from ..portal.pool import POOL, PortalSession
 from ..portal.resolver import resolve_portal
+from .portal_pace import pace_for_playback
 from .db_logging import db_log
 from .runtime_settings import get_setting
 from .stream_manager import MANAGER
@@ -199,6 +200,10 @@ async def refresh_portal_macs(portal_id: int, *, skip_busy: bool = True) -> dict
         results = []
         skipped = 0
         for m in macs:
+            # A health sweep is cheap per MAC and there may be many: while a
+            # play is running on this portal, the sweep takes its time instead
+            # of competing for the panel's connection budget.
+            await pace_for_playback(portal_id)
             if m.id in busy:
                 skipped += 1
                 results.append({"mac": m.mac, "status": m.status, "online": m.online,

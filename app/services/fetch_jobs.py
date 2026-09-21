@@ -36,6 +36,7 @@ from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, StalkerClient, truthy
 from ..portal.resolver import resolve_portal
 from .db_logging import db_log
+from .portal_pace import pace_for_playback
 from .titles import portal_item_title
 
 
@@ -406,6 +407,10 @@ async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
         for start in range(0, len(remaining), FETCH_PAGE_CONCURRENCY):
             if job._cancel.is_set():
                 break
+            # A sync walking thousands of pages is the single biggest consumer of
+            # a panel's rate budget. It can take a few seconds longer; the play
+            # starting next to it cannot take a refusal.
+            await pace_for_playback(job.portal_id)
             batch = remaining[start:start + FETCH_PAGE_CONCURRENCY]
             job.detail = f"{genre_name}: pages {batch[0]}-{batch[-1]}"
             got = await asyncio.gather(*(fetch_page(pg) for pg in batch),
@@ -427,6 +432,7 @@ async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
         for page in range(2, budget + 1):
             if job._cancel.is_set():
                 break
+            await pace_for_playback(job.portal_id)
             job.detail = f"{genre_name}: page {page}"
             try:
                 data = await fetch_page(page)

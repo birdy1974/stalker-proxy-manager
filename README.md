@@ -67,6 +67,8 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 | `SPM_LINK_CACHE_S` | `90` | seconds a resolved live link may be replayed for the next 302 (zap-back costs no `create_link`). `0` disables; `SPM_LINK_CACHE_KINDS` picks the kinds (default `live`) |
 | `SPM_FFMPEG_USE_STORED_LINK` | `1` | `0` restores "the ffmpeg path always asks for a link", even for a channel whose flags say its link is permanent |
 | `SPM_STREAMS_PER_MAC` | `1` | default concurrent streams per MAC for portals whose row says nothing (the GUI setting is per portal) |
+| `SPM_PLAYBACK_PACE` | `1` | while a stream is live on a portal, background jobs (catalogue sync, MAC health sweep, the per-channel EPG fallback) slow down instead of competing for the same panel budget. `0` disables |
+| `SPM_PLAYBACK_PACE_S` | `0.4` | how long each background request waits while a play is running on that portal. Nothing is cancelled or starved - the job finishes a little later, the play gets the panel |
 | `SPM_LINK_PROBE_TTL` | `20` | how long a link-liveness verdict is trusted (0 disables). The probe is a TLS + RTT to the **media host** on the path the player waits for; a zap back replays the same URL, so without this even the cheapest zap paid it again. Dead verdicts expire much sooner (`SPM_LINK_PROBE_DEAD_TTL`, 3 s) because a link can be re-minted |
 | `SPM_BUSY_WAIT_S` | `7.0` | how long a start waits for a MAC that our own bookkeeping (or the panel's) says is busy. A real panel kept its slot counted for ~6.5 s after the previous connection died, so a 3 s wait was spent *and* the user still got a channel error |
 | `SPM_STREAM_STALL_TIMEOUT` | `25` | seconds without a byte before a pipe counts as finished |

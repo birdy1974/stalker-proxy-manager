@@ -293,6 +293,9 @@ class StreamHandle:
     command: str                   # rendered ffmpeg command with url placeholder
     started: float = field(default_factory=time.time)
     portal_name: str = ""
+    #: Which portal row this stream is playing from. The dashboard does not need
+    #: it (the name is readable); the playback gate does - see portal_pace.py.
+    portal_id: int | None = None
     mac: str = ""
     url: str = ""
     bytes_sent: int = 0
@@ -3283,6 +3286,7 @@ class StreamManager:
                           h.portal_name, h.mac, h.url, h.proc = (
                               f"{portal.name} (xtream)" if adopted else portal.name,
                               "" if adopted else mac_row.mac, url, proc)
+                          h.portal_id = getattr(portal, "id", None)
                           if not registered:
                               await self._register(h)
                               registered = True
