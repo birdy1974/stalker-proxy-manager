@@ -161,6 +161,27 @@ def demote_recently_handed(route, chain: list) -> list:
     return out
 
 
+def prune() -> int:
+    """Drop expired handoffs and stale probe verdicts (see services/janitor.py).
+
+    Both are pruned lazily on access too, but a route nobody asks for again
+    keeps its entry forever that way - and a big playlist produces plenty of
+    routes.
+    """
+    now = time.monotonic()
+    gone = 0
+    for key, (_source, _mac, at) in list(_handed.items()):
+        if not DEMOTE_ENABLED or now - at > DEMOTE_WINDOW:
+            _handed.pop(key, None)
+            gone += 1
+    for url, (at, verdict) in list(_probe_cache.items()):
+        ttl = PROBE_TTL_S if verdict.alive else PROBE_DEAD_TTL_S
+        if ttl <= 0 or now - at > ttl:
+            _probe_cache.pop(url, None)
+            gone += 1
+    return gone
+
+
 def reset() -> None:
     """Tests only."""
     _handed.clear()

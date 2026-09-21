@@ -252,6 +252,26 @@ class _RouteHealth:
         mac_id = preferred[2]
         return sorted(macs, key=lambda mac: getattr(mac, "id", None) != mac_id)
 
+    def prune(self) -> int:
+        """Forget what has expired: stale route affinity and cooled-down breakers.
+
+        Both tables are keyed by (route, source) pairs that history keeps
+        producing; nothing else ever removes an entry whose key is never asked
+        for again (an item deleted from the playlist, a source removed, a
+        one-off route). See services/janitor.py.
+        """
+        now = time.monotonic()
+        gone = 0
+        for route, entry in list(self.success.items()):
+            if now - entry[0] > ROUTE_AFFINITY_TTL:
+                self.success.pop(route, None)
+                gone += 1
+        for key, state in list(self.failures.items()):
+            if now - state[1] > SOURCE_BREAKER_COOLDOWN:
+                self.failures.pop(key, None)
+                gone += 1
+        return gone
+
     def failed(self, source) -> None:
         from .playlist_health import record_playback
         key = self.source_key(source)

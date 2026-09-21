@@ -77,6 +77,22 @@ def get_job(job_id: str) -> Job | None:
     return JOBS.get(job_id)
 
 
+def prune_jobs(keep: int = 100) -> int:
+    """Drop finished jobs beyond the newest `keep` (running ones are never touched).
+
+    One entry per sync/press accumulates for as long as the process lives; the
+    GUI only ever shows the latest few. See services/janitor.py.
+    """
+    finished = sorted(
+        (j for j in JOBS.values() if j.status in ("done", "error", "cancelled")),
+        key=lambda j: j.ended or j.started or 0.0, reverse=True)
+    dropped = 0
+    for job in finished[max(0, keep):]:
+        if JOBS.pop(job.id, None) is not None:
+            dropped += 1
+    return dropped
+
+
 def list_jobs() -> list[dict]:
     return [j.public() for j in sorted(JOBS.values(), key=lambda j: j.started, reverse=True)[:50]]
 

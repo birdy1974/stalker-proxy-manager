@@ -21,6 +21,11 @@ Leave the gc.collect() line in pool_errors alone — that's the suite-flake fix,
 
 ---= DONE =---
 
+2026-09-21 (a janitor, because SPM is meant to run for months)
+- Most of SPM's state is bounded by *configuration* - the pool by the portal/MAC rows, the UA ladder by 512 origins, the link cache by 256 entries, parked pipes by `LINGER_S`, probe verdicts by `SPM_LINK_PROBE_CACHE_MAX`. Three structures are bounded by *history* instead, and history is unbounded: the finished job registry (one entry per sync, forever, each holding its detail strings), the route-affinity/source-breaker tables (one entry per (route, source) pair ever played or failed - and a deleted playlist item never asks again), and the log table (trimmed at boot, never again while the process stays up).
+  -> `app/services/janitor.py`, one pass an hour (`SPM_JANITOR_MINUTES`, 0 disables, cancelled at shutdown with the other schedulers): `prune_jobs()` keeps the newest `SPM_JOB_HISTORY` finished jobs and never touches running ones, `route_health.prune()` drops affinity older than `ROUTE_AFFINITY_TTL` and breakers that have cooled down, `redirect_guard.prune()` drops expired handoffs and probe verdicts, and `cleanup_logs()` trims the log table. Each step is wrapped: a janitor that can break the app is worse than the leak.
+  -> tests/test_janitor.py pins the three prunes and that a sweep reports what it dropped (`janitor.stats()` feeds the diagnostics view).
+
 2026-09-21 (a play outranks the background jobs)
 - Everything SPM does with a panel shares one budget: the account's connection slots and whatever rate limiter the panel runs. A catalogue sync walking thousands of pages, a MAC health sweep, an EPG refresh that falls back to a short-EPG call per channel - all of it keeps asking while somebody is watching, and the panel answers the *play* with `limit` or a 429. The job retries; the user sees an error.
   -> one small gate (`app/services/portal_pace.py`), deliberately not a scheduler or a queue: between background requests, `await pace_for_playback(portal_id)` sleeps `SPM_PLAYBACK_PACE_S` (0.4 s) *while a stream is live on that portal*. Wired into the catalogue sync (per page batch), the MAC health sweep (per row) and the EPG per-channel fallback. Nothing is cancelled or starved; the sync finishes a few seconds later and the play gets the panel to itself.

@@ -67,6 +67,8 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 | `SPM_LINK_CACHE_S` | `90` | seconds a resolved live link may be replayed for the next 302 (zap-back costs no `create_link`). `0` disables; `SPM_LINK_CACHE_KINDS` picks the kinds (default `live`) |
 | `SPM_FFMPEG_USE_STORED_LINK` | `1` | `0` restores "the ffmpeg path always asks for a link", even for a channel whose flags say its link is permanent |
 | `SPM_STREAMS_PER_MAC` | `1` | default concurrent streams per MAC for portals whose row says nothing (the GUI setting is per portal) |
+| `SPM_JANITOR_MINUTES` | `60` | how often the janitor drops expired in-memory state (route affinity/breaker tables, redirect handoffs, probe verdicts) and trims the log table. `0` disables. Everything else in SPM is bounded by configuration; these three grow with history |
+| `SPM_JOB_HISTORY` | `100` | finished fetch jobs kept visible in the GUI |
 | `SPM_PLAYBACK_PACE` | `1` | while a stream is live on a portal, background jobs (catalogue sync, MAC health sweep, the per-channel EPG fallback) slow down instead of competing for the same panel budget. `0` disables |
 | `SPM_PLAYBACK_PACE_S` | `0.4` | how long each background request waits while a play is running on that portal. Nothing is cancelled or starved - the job finishes a little later, the play gets the panel |
 | `SPM_LINK_PROBE_TTL` | `20` | how long a link-liveness verdict is trusted (0 disables). The probe is a TLS + RTT to the **media host** on the path the player waits for; a zap back replays the same URL, so without this even the cheapest zap paid it again. Dead verdicts expire much sooner (`SPM_LINK_PROBE_DEAD_TTL`, 3 s) because a link can be re-minted |

@@ -206,6 +206,12 @@ async def startup() -> None:
     # first link; periodic refresh also keeps healthy sessions ahead of expiry.
     from .services.portal_warmup import portal_warmup_scheduler
     _bg.add(asyncio.create_task(portal_warmup_scheduler(), name="spm-portal-warmup"))
+    # Long-run hygiene: the job registry, the route-affinity/breaker tables and
+    # the log table are bounded by *history*, not by configuration. One pass an
+    # hour (SPM_JANITOR_MINUTES=0 disables). Everything else in SPM bounds
+    # itself - see services/janitor.py.
+    from .services.janitor import janitor_scheduler
+    _bg.add(asyncio.create_task(janitor_scheduler(), name="spm-janitor"))
 
 
 async def _reap_sessions(interval: float = 300.0) -> None:
