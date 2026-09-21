@@ -145,7 +145,16 @@ async def _run_until_disconnect(app, *, chunks: int) -> int:
 
 # ----------------------------------------------------------------------- tests
 async def test_stream_teardown_is_clean_after_client_disconnect(pool_errors, monkeypatch):
-    """The production scenario, end to end through the real pump."""
+    """The production scenario, end to end through the real pump.
+
+    Parking is switched off here on purpose: this test is about the teardown
+    path (nothing leaks when a client vanishes), while *holding* a live pipe for
+    a possible zap back is a deliberate exception to it - see
+    tests/test_sticky_streams.py, which pins that contract (row gone, MAC held,
+    pipe alive, attach instead of a restart).
+    """
+    from app.services import stream_manager as _sm
+    monkeypatch.setattr(_sm, "LINGER_S", 0)
     # Construction now happens inside the shared pool, so the fake has to be
     # installed there - patching sm.StalkerClient no longer intercepts anything.
     from app.portal import pool as _pool

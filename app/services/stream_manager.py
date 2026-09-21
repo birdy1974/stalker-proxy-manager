@@ -310,6 +310,18 @@ class StreamHandle:
     #: "come back in a second" and the one players retry (STB-Proxy answers 503
     #: for the same case; a 404 tells the player the channel does not exist).
     busy: bool = False
+    #: Set while the pipe is being HELD after its client left (see LINGER_S):
+    #: the process keeps running, its MAC stays locked (the panel still counts
+    #: the connection), and the bytes keep being drained into `ring` so a zap
+    #: back can attach to a live stream instead of starting a new one.
+    parked: bool = False
+    #: Bytes of the parked stream, oldest dropped (LINGER_BUFFER_KB). Dropped on
+    #: attach, handed to the returning client first so it sees no gap.
+    ring: bytearray = field(default_factory=bytearray)
+    #: The task draining the parked pipe - cancelled when a client attaches.
+    parker: asyncio.Task | None = None
+    #: How often this pipe was re-used by a returning client (park/attach wins).
+    reattaches: int = 0
 
     def public(self) -> dict:
         return {"id": self.id, "kind": self.kind, "item_name": self.item_name,
@@ -516,6 +528,23 @@ MIDSTREAM_RESTART_DELAY = float(os.environ.get("SPM_MIDSTREAM_RESTART_DELAY", "1
 MIDSTREAM_RESTART_KINDS = {k.strip() for k in
                            os.environ.get("SPM_MIDSTREAM_RESTART_KINDS", "live").split(",")
                            if k.strip()}
+
+#: How long a live pipe is kept alive after its client disappeared, so a zap
+#: away-and-back attaches to the stream that is still running instead of asking
+#: the panel for a new link and starting ffmpeg again (measured: ~560 ms cold on
+#: this instance, vs ~20-50 ms to attach). This is what makes channel flipping
+#: feel instant in the reference proxy - the difference being that STB-Proxy
+#: keeps nothing at all and pays the cold start every time.
+#:
+#: The parked pipe keeps its MAC lock (the panel is still sending us that
+#: stream), it is NOT counted against the user's connection limit, and it is
+#: preemptible: the moment anybody actually wants that MAC (the same user
+#: zapping to another channel, or another user with nothing else free) it is
+#: killed immediately. 0 disables parking entirely.
+LINGER_S = float(os.environ.get("SPM_LINGER_S", "8"))
+LINGER_BUFFER_KB = int(os.environ.get("SPM_LINGER_BUFFER_KB", "2048"))
+LINGER_KINDS = {k.strip() for k in os.environ.get("SPM_LINGER_KINDS", "live").split(",")
+                if k.strip()}
 
 #: portal ids already told about `portal_first` (once per process, not per play)
 _PORTAL_FIRST_NOTED: set[int] = set()
@@ -766,6 +795,149 @@ class StreamManager:
             killed = True
         return killed
 
+    # ------------------------------------------------- parking (see LINGER_S)
+    def _lock_of(self, h: StreamHandle) -> int | None:
+        """The MAC this handle holds, if any."""
+        for mac_id, sids in self.mac_locks.items():
+            if h.id in self._lock_set(mac_id):
+                return mac_id
+        return None
+
+    def _can_park(self, h: StreamHandle) -> bool:
+        """May this pipe be held open for a client that just left?
+
+        Only a live stream that actually played (bytes flowed - parking a pipe
+        that never started would hold a panel slot for nothing), still running,
+        and not deliberately killed (a zap takeover, the dashboard, the
+        reaper all set `dead`).
+        """
+        return (LINGER_S > 0 and not h.parked and not h.dead
+                and h.kind in LINGER_KINDS and h.bytes_sent > 0
+                and h.proc is not None and h.proc.returncode is None)
+
+    async def client_left(self, h: StreamHandle) -> None:
+        """The player's socket is gone - hold the pipe briefly, or kill it.
+
+        Both the disconnect watchdog and the pump's own teardown reach this for
+        the same disconnect; whichever arrives second must not undo the
+        decision - a parked pipe is never killed here.
+        """
+        if h.parked:
+            return
+        if self._can_park(h):
+            await self._park(h)
+            return
+        await self.kill(h.id)
+
+    async def _park(self, h: StreamHandle) -> None:
+        """Keep the pipe alive (and draining) for LINGER_S."""
+        if h.parked or not self._can_park(h):
+            return
+        h.parked = True
+        h.parker = asyncio.get_running_loop().create_task(
+            self._park_proc(h, h.proc), name=f"park-{h.id[:8]}")
+        self._watchers.add(h.parker)
+        h.parker.add_done_callback(self._watchers.discard)
+        # The dashboard shows what somebody is watching, and nobody is: drop the
+        # runtime row while the pipe is only being held (`_adopt` puts it back).
+        try:
+            await run_uncancelled(self._delete_row(h.id), what="parked row delete")
+        except Exception:  # noqa: BLE001
+            log.exception("active_streams delete (park) failed")
+        await db_log("INFO", "stream",
+                     f"[{h.item_name}] client left -> holding the pipe for "
+                     f"{LINGER_S:.0f}s so a zap back is instant "
+                     f"({h.bytes_sent / 1e6:.1f} MB so far)")
+
+    async def _park_proc(self, h: StreamHandle, proc) -> None:
+        """Drain a parked pipe into `ring` until it is wanted, dies, or expires.
+
+        Draining matters: ffmpeg blocks on a full stdout pipe, and a blocked
+        ffmpeg would stall the panel's stream - the parked pipe has to keep
+        consuming for the attach to be worth anything.
+        """
+        deadline = time.monotonic() + LINGER_S
+        cap = max(1, LINGER_BUFFER_KB) * 1024
+        try:
+            while h.parked and not h.dead and time.monotonic() < deadline:
+                left = max(0.05, min(1.0, deadline - time.monotonic()))
+                try:
+                    chunk = await asyncio.wait_for(proc.stdout.read(CHUNK), left)
+                except asyncio.TimeoutError:
+                    continue
+                if not chunk:
+                    break
+                ring = h.ring
+                ring += chunk
+                if len(ring) > cap:
+                    del ring[:len(ring) - cap]
+        except asyncio.CancelledError:
+            # A returning client took the pipe over (see `_adopt`): the
+            # response generator owns the process from here on.
+            raise
+        except Exception:  # noqa: BLE001 - never let the parker die silently
+            log.exception("parked stream %s failed", h.id)
+        if not h.parked:
+            return                       # attached while we were reading
+        h.parked = False
+        h.parker = None
+        gone = proc.returncode is not None
+        await self._kill_quiet(proc)
+        await self._deregister(h)
+        await db_log("INFO", "stream",
+                     f"[{h.item_name}] parked stream expired after {LINGER_S:.0f}s"
+                     + (" (the source had ended)" if gone else "")
+                     + " -> releasing the MAC")
+
+    def _find_parked(self, kind: str, ref_id: int,
+                     user_name: str | None) -> StreamHandle | None:
+        """A still-running pipe of this user + item (the zap-back case)."""
+        if LINGER_S <= 0 or kind not in LINGER_KINDS:
+            return None
+        key = (kind, ref_id)
+        who = user_name or "-"
+        for h in self.streams.values():
+            if (h.parked and h.route_key == key and (h.user_name or "-") == who
+                    and h.proc is not None and h.proc.returncode is None):
+                return h
+        return None
+
+    async def _adopt(self, h: StreamHandle) -> None:
+        """Stop parking so the caller's generator can read the pipe itself."""
+        h.parked = False
+        parker, h.parker = h.parker, None
+        if parker is not None and parker is not asyncio.current_task():
+            parker.cancel()
+            try:
+                await parker
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+        h.reattaches += 1
+        try:
+            await run_uncancelled(self._insert_row(h), what="parked row re-insert")
+        except Exception:  # noqa: BLE001 - the stream works; only the row is late
+            log.exception("active_streams re-insert (attach) failed")
+
+    async def _drop_parked(self, chain: list) -> bool:
+        """Kill parked pipes that stand in the way of somebody who wants to play.
+
+        Parking is a courtesy, never a reservation: the pipe was held for a
+        client that might come back, and it must never make another request wait
+        (or answer 503) while it idles.
+        """
+        mac_ids = {m.id for (_s, _p, macs) in chain for m in (macs or ())}
+        dropped = False
+        for mac_id in mac_ids:
+            for sid in list(self._lock_set(mac_id)):
+                h = self.streams.get(sid)
+                if h is not None and h.parked:
+                    await db_log("INFO", "stream",
+                                 f"[{h.item_name}] giving up the parked pipe on "
+                                 f"{h.mac or mac_id} - somebody wants to play")
+                    await self.kill(sid)
+                    dropped = True
+        return dropped
+
     async def wait_for_mac(self, mac_row, requester: str | None,
                            budget: float | None = None) -> bool:
         """Wait until a MAC can be used, preempting our own stream if needed.
@@ -906,7 +1078,12 @@ class StreamManager:
         container was restarted. A derived count cannot drift.
         """
         key = username or "-"
-        return sum(1 for h in self.streams.values() if (h.user_name or "-") == key)
+        # A parked pipe does not count: it exists only so this same user can
+        # come back to it, and their next request either attaches to it or makes
+        # it give way (see LINGER_S). Counting it would answer "max connections
+        # reached" to the very request the parking exists for.
+        return sum(1 for h in self.streams.values()
+                   if (h.user_name or "-") == key and not h.parked)
 
     def can_open_for(self, username: str | None, max_conn: int | None) -> bool:
         if max_conn is None or max_conn <= 0:
@@ -965,6 +1142,13 @@ class StreamManager:
         if h.dead:
             return True
         h.dead = True
+        if h.parker is not None and not h.parker.done():
+            # A parked pipe is drained by its own task; killing the process is
+            # enough for it to end, but cancelling it now frees the buffer and
+            # the watcher slot deterministically.
+            h.parker.cancel()
+            h.parker = None
+            h.parked = False          # it is not being held any more, it is gone
         if h.proc and h.proc.returncode is None:
             try:
                 h.proc.kill()
@@ -1083,9 +1267,10 @@ class StreamManager:
                 elif registered:                               # deregistered -> normal end
                     return
                 if registered and await request.is_disconnected():
-                    await db_log("INFO", "stream",
-                                 f"client left '{handle.item_name}' -> killing stream")
-                    await self.kill(handle.id)
+                    # `client_left`, not `kill`: a live pipe that played is held
+                    # for LINGER_S first so a zap back attaches to it (see
+                    # LINGER_S). Everything else is killed as before.
+                    await self.client_left(handle)
                     return
                 await asyncio.sleep(interval)
         except Exception:  # noqa: BLE001 - watchdog must never crash the app
@@ -2614,6 +2799,20 @@ class StreamManager:
         # shorter than the chain it guards turns "walking the fallbacks" into a
         # 502 while the engine is still working.
         handle.start_budget = self.start_budget(chain, kind=kind)
+        # A zap back inside LINGER_S: this user's previous pipe for this very
+        # item may still be running, holding its MAC. Attaching to it skips the
+        # create_link, the process start and the panel's slot accounting - the
+        # bytes are already flowing. Deliberately before every "is the MAC free"
+        # check: the MAC is not free, it is OURS.
+        parked = self._find_parked(kind, ref_id, user_name)
+        if parked is not None and kind != "local":
+            # The mechanical attach happens in the pump (it owns the reader);
+            # here it is only announced.
+            await db_log("INFO", "stream",
+                         f"[{parked.item_name}] zap back within {LINGER_S:.0f}s -> "
+                         f"attaching to the pipe that is still running "
+                         f"(no create_link, no ffmpeg start)")
+            return parked, self._pump(parked, chain, kind, adopt=True)
         # Pre-check: empty chain or EVERY mac currently occupied -> fail fast
         # with 404 instead of hanging a client with a 200 + empty body.
         if kind == "local":
@@ -2633,6 +2832,12 @@ class StreamManager:
             # as "no source" (404), because the source is fine.
             free = any(not self.is_mac_busy(m.id, requester=user_name)
                        for (_s, _p, macs) in chain for m in macs)
+            if chain and not free:
+                # Courtesy, not reservation: a pipe we parked for its own client
+                # cannot make this one wait (or answer 503) while it idles.
+                if await self._drop_parked(chain):
+                    free = any(not self.is_mac_busy(m.id, requester=user_name)
+                               for (_s, _p, macs) in chain for m in macs)
             if chain and not free:
                 got = await self._first_free_mac(chain, user_name)
                 free = got is not None
@@ -2659,9 +2864,35 @@ class StreamManager:
         gen = self._pump(handle, chain, kind)
         return handle, gen
 
-    async def _pump(self, h: StreamHandle, chain: list, kind: str):
+    async def _pump(self, h: StreamHandle, chain: list, kind: str,
+                    adopt: bool = False):
         registered = False
         try:
+            if adopt and h.proc is not None and h.proc.returncode is None:
+                # Attach: the pipe is still running (see LINGER_S). Buffered
+                # bytes first, so the player sees no gap, then live bytes. On
+                # EOF the normal machinery below takes over - the chain is
+                # re-walked and the stream restarts in this same response.
+                proc = h.proc
+                await self._adopt(h)
+                await db_log("INFO", "stream",
+                             f"[{h.item_name}] attached to the running pipe "
+                             f"({h.bytes_sent / 1e6:.1f} MB streamed so far)")
+                buffered = bytes(h.ring)
+                h.ring.clear()
+                if buffered:
+                    h.bytes_sent += len(buffered)
+                    yield buffered
+                async for chunk in self._read_proc(h, proc):
+                    yield chunk
+                locked = self._lock_of(h)
+                if locked is not None:
+                    self.unlock_mac(locked, h.id)
+                await self._kill_quiet(proc)
+                if not h.dead:
+                    await db_log("WARNING", "stream",
+                                 f"[{h.item_name}] attached stream ended"
+                                 f" -> re-resolving")
             if kind == "local":
                 if not chain:
                     return
@@ -3097,6 +3328,17 @@ class StreamManager:
 
     async def _finish(self, h: StreamHandle) -> None:
         """Complete stream teardown, run outside the dying request's scope."""
+        if h.parked:
+            # The parker owns the process now (a client may attach to it); the
+            # watchdog already saw the disconnect, and the parker reaps it.
+            return
+        if self._can_park(h):
+            # The client left mid-stream: hold the pipe instead of killing it,
+            # so the same player's zap back costs no create_link and no ffmpeg
+            # start (LINGER_S). `client_left` is the same decision, reached
+            # without a watchdog.
+            await run_uncancelled(self._park(h), what="stream parking")
+            return
         await self._kill_quiet(h.proc)
         await self._deregister(h)
         await db_log("INFO", "stream",
