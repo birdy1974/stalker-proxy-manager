@@ -98,6 +98,8 @@ async def _schema_and_flush():
 
     await flush_logs()
     clear_m3u_cache()                  # the schema reset zeros ids; cached M3Us must die
+    from app.routers.api_portals import clear_pending_genre_items
+    clear_pending_genre_items()
     # The zap memory (resolved links, recently failed candidates) is keyed on
     # (kind, item id, MAC id) and, like the M3U cache, would otherwise survive
     # the id reset: the *next* test's item 1 would "already have a link" on the
@@ -133,6 +135,7 @@ async def _schema_and_flush():
     yield
     await flush_logs()
     clear_m3u_cache()
+    clear_pending_genre_items()
 
 
 @pytest.fixture

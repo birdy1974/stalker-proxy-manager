@@ -15,7 +15,7 @@ from httpx import ASGITransport
 
 from app.database import SessionLocal
 from app.main import app
-from app.models import (LiveGenre, LiveSource, Portal, SerieGenre, SerieSource,
+from app.models import (LiveGenre, LiveSource, MacAddress, Portal, SerieGenre, SerieSource,
                         VodGenre, VodSource)
 
 BASE = "http://test"
@@ -141,3 +141,249 @@ async def test_the_popups_switch_and_the_pane_switch_share_one_toggle_endpoint()
         assert r.json()["count"] == 1
         d = (await c.get(f"/api/portals/{p1}/genres")).json()
         assert {g["name"]: g["enabled"] for g in d["live"]}["News"] is True
+
+
+async def test_disabled_genre_fetches_channels_first_without_storing_until_enabled(monkeypatch):
+    """When a genre is disabled and its channels are not yet fetched:
+    1. Clicking the genre name fetches the channels from the portal first.
+    2. Channels are NOT stored in the database while the genre is disabled.
+    3. Only store the channels in the database if the genre gets enabled.
+    """
+    from sqlalchemy import func, select
+    from tests.mockclient import GOOD, PORTAL, Wired
+
+    Wired(monkeypatch)
+
+    async with SessionLocal() as s:
+        p = Portal(name="mockportal", base_url="http://test/mock/c/", resolved_url=PORTAL, enabled=True)
+        s.add(p)
+        await s.flush()
+        s.add(MacAddress(portal_id=p.id, mac=GOOD, order=0, status="online", online=True))
+        # Genre is disabled and channels not fetched yet
+        news = LiveGenre(portal_id=p.id, genre_portal_id="1", name="News",
+                         enabled=False, channels_fetched=False)
+        s.add(news)
+        await s.commit()
+        pid, gid = p.id, news.id
+
+    # Verify initial database state: 0 channels stored for this portal/genre
+    async with SessionLocal() as s:
+        cnt = (await s.execute(
+            select(func.count()).select_from(LiveSource).where(
+                LiveSource.portal_id == pid, LiveSource.live_genre_id == gid)
+        )).scalar()
+        assert cnt == 0
+        g = await s.get(LiveGenre, gid)
+        assert g.enabled is False
+        assert g.channels_fetched is False
+
+    async with _client() as c:
+        # Step 1: User clicks on the genre name -> GET /items?genre_id=...
+        r = await c.get(f"/api/portals/{pid}/items",
+                        params={"kind": "live", "genre_id": gid})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["total"] == 4
+        assert len(d["items"]) == 4
+        names = {i["name"] for i in d["items"]}
+        assert names == {"NPO 1", "NPO 2", "RTL Nieuws", "BBC News"}
+        first = next(i for i in d["items"] if i["name"] == "NPO 1")
+        assert first["channel_id"] == "1001"
+        assert first["number"] == "1"
+
+        # Step 2: Channels were fetched first, BUT NOT stored in the database!
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(LiveSource).where(
+                    LiveSource.portal_id == pid, LiveSource.live_genre_id == gid)
+            )).scalar()
+            assert cnt == 0, "channels must NOT be stored in DB while genre is disabled"
+            g = await s.get(LiveGenre, gid)
+            assert g.channels_fetched is False, "channels_fetched must stay False while disabled"
+            assert g.enabled is False
+
+        # Step 3: Filtering q also works from the preview cache without storing to DB
+        r_q = await c.get(f"/api/portals/{pid}/items",
+                          params={"kind": "live", "genre_id": gid, "q": "npo"})
+        assert r_q.status_code == 200
+        d_q = r_q.json()
+        assert d_q["total"] == 2
+        assert {i["name"] for i in d_q["items"]} == {"NPO 1", "NPO 2"}
+
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(LiveSource).where(
+                    LiveSource.portal_id == pid, LiveSource.live_genre_id == gid)
+            )).scalar()
+            assert cnt == 0, "filter operations must still not persist to DB"
+
+        # Step 4: User enables the genre -> POST /genres/toggle with enabled=True
+        r_tog = await c.post(f"/api/portals/{pid}/genres/toggle",
+                             json={"kind": "live", "ids": [gid], "enabled": True})
+        assert r_tog.status_code == 200 and r_tog.json() == {"ok": True, "count": 1}
+
+        # Step 5: Now the channels MUST be stored in the database!
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(LiveSource).where(
+                    LiveSource.portal_id == pid, LiveSource.live_genre_id == gid)
+            )).scalar()
+            assert cnt == 4, "channels must now be stored in the database"
+            g = await s.get(LiveGenre, gid)
+            assert g.enabled is True
+            assert g.channels_fetched is True
+            assert g.item_count == 4
+
+        # Step 6: Subsequent calls to /items read from the database
+        r_stored = await c.get(f"/api/portals/{pid}/items",
+                               params={"kind": "live", "genre_id": gid})
+        assert r_stored.status_code == 200
+        d_stored = r_stored.json()
+        assert d_stored["total"] == 4
+        assert {i["name"] for i in d_stored["items"]} == {"NPO 1", "NPO 2", "RTL Nieuws", "BBC News"}
+
+
+async def test_disabled_genre_channels_never_stored_if_closed_without_enabling(monkeypatch):
+    """If the user opens the genre popup, channels are fetched for preview,
+    but user never enables the genre, nothing is ever written to the database."""
+    from sqlalchemy import func, select
+    from tests.mockclient import GOOD, PORTAL, Wired
+
+    Wired(monkeypatch)
+
+    async with SessionLocal() as s:
+        p = Portal(name="mockportal2", base_url="http://test/mock/c/", resolved_url=PORTAL, enabled=True)
+        s.add(p)
+        await s.flush()
+        s.add(MacAddress(portal_id=p.id, mac=GOOD, order=0, status="online", online=True))
+        sport = LiveGenre(portal_id=p.id, genre_portal_id="2", name="Sport",
+                          enabled=False, channels_fetched=False)
+        s.add(sport)
+        await s.commit()
+        pid, gid = p.id, sport.id
+
+    async with _client() as c:
+        r = await c.get(f"/api/portals/{pid}/items",
+                        params={"kind": "live", "genre_id": gid})
+        assert r.status_code == 200
+        assert r.json()["total"] == 4
+
+        # User closes the popup (no toggle)
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(LiveSource).where(
+                    LiveSource.portal_id == pid, LiveSource.live_genre_id == gid)
+            )).scalar()
+            assert cnt == 0
+            g = await s.get(LiveGenre, gid)
+            assert g.channels_fetched is False
+            assert g.enabled is False
+
+
+async def test_disabled_vod_genre_fetches_first_without_storing_until_enabled(monkeypatch):
+    """VOD genre preview: items fetched on demand, not stored until enabled."""
+    from sqlalchemy import func, select
+    from tests.mockclient import GOOD, PORTAL, Wired
+
+    Wired(monkeypatch)
+
+    async with SessionLocal() as s:
+        p = Portal(name="mockportal_vod", base_url="http://test/mock/c/", resolved_url=PORTAL, enabled=True)
+        s.add(p)
+        await s.flush()
+        s.add(MacAddress(portal_id=p.id, mac=GOOD, order=0, status="online", online=True))
+        action = VodGenre(portal_id=p.id, genre_portal_id="11", name="Action",
+                          enabled=False, items_fetched=False)
+        s.add(action)
+        await s.commit()
+        pid, gid = p.id, action.id
+
+    async with _client() as c:
+        r = await c.get(f"/api/portals/{pid}/items",
+                        params={"kind": "vod", "genre_id": gid})
+        assert r.status_code == 200
+        d = r.json()
+        assert d["total"] > 0
+        assert len(d["items"]) > 0
+
+        # NOT stored in DB while disabled
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(VodSource).where(
+                    VodSource.portal_id == pid, VodSource.vod_genre_id == gid)
+            )).scalar()
+            assert cnt == 0
+            g = await s.get(VodGenre, gid)
+            assert g.items_fetched is False
+
+        # Enable genre
+        r_tog = await c.post(f"/api/portals/{pid}/genres/toggle",
+                             json={"kind": "vod", "ids": [gid], "enabled": True})
+        assert r_tog.status_code == 200
+
+        # Now stored in DB
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(VodSource).where(
+                    VodSource.portal_id == pid, VodSource.vod_genre_id == gid)
+            )).scalar()
+            assert cnt > 0
+            g = await s.get(VodGenre, gid)
+            assert g.enabled is True
+            assert g.items_fetched is True
+
+
+async def test_disabled_series_genre_fetches_first_without_storing_until_enabled(monkeypatch):
+    """Series genre preview: items fetched on demand, not stored until enabled."""
+    from sqlalchemy import func, select
+    from tests.mockclient import GOOD, PORTAL, Wired
+
+    Wired(monkeypatch)
+
+    async with SessionLocal() as s:
+        p = Portal(name="mockportal_ser", base_url="http://test/mock/c/", resolved_url=PORTAL, enabled=True)
+        s.add(p)
+        await s.flush()
+        s.add(MacAddress(portal_id=p.id, mac=GOOD, order=0, status="online", online=True))
+        drama = SerieGenre(portal_id=p.id, genre_portal_id="22", name="Drama",
+                           enabled=False, items_fetched=False)
+        s.add(drama)
+        await s.commit()
+        pid, gid = p.id, drama.id
+
+    async with _client() as c:
+        r = await c.get(f"/api/portals/{pid}/items",
+                        params={"kind": "series", "genre_id": gid})
+        assert r.status_code == 200
+        d = r.json()
+        assert d["total"] > 0
+        assert len(d["items"]) > 0
+
+        # NOT stored in DB while disabled
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(SerieSource).where(
+                    SerieSource.portal_id == pid, SerieSource.serie_genre_id == gid)
+            )).scalar()
+            assert cnt == 0
+            g = await s.get(SerieGenre, gid)
+            assert g.items_fetched is False
+
+        # Enable genre
+        r_tog = await c.post(f"/api/portals/{pid}/genres/toggle",
+                             json={"kind": "series", "ids": [gid], "enabled": True})
+        assert r_tog.status_code == 200
+
+        # Now stored in DB
+        async with SessionLocal() as s:
+            cnt = (await s.execute(
+                select(func.count()).select_from(SerieSource).where(
+                    SerieSource.portal_id == pid, SerieSource.serie_genre_id == gid)
+            )).scalar()
+            assert cnt > 0
+            g = await s.get(SerieGenre, gid)
+            assert g.enabled is True
+            assert g.items_fetched is True
+
+
+
