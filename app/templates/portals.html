@@ -310,7 +310,7 @@ async function editPortal(id) {
           <button class="btn btn-sm btn-outline-primary" id="p-fetch-btn" ${id ? "" : "disabled"}><i class="bi bi-cloud-download"></i> Fetch genres</button>
         </div>
       </div>
-      <div class="small text-muted mt-2" data-help="Fetching genres and channels" data-help-for="p-fetch-btn">Two API calls: <b>Fetch genres</b> loads the genre lists → enable/disable the genres you want per tab → <b>Save</b> fetches the channels of the enabled genres (live, VOD, series).</div>
+      <div class="small text-muted mt-2" data-help="Fetching genres and channels" data-help-for="p-fetch-btn">Two API calls: <b>Fetch genres</b> loads the genre lists → enable/disable the genres you want per tab (click a genre's <u>name</u> to see its channels) → <b>Save</b> fetches the channels of the enabled genres (live, VOD, series).</div>
     </div>
     <ul class="nav nav-tabs nav-subtabs mt-3 mb-2">
       <li class="nav-item"><a class="nav-link active" data-tab="live">1 · Live</a></li>
@@ -536,14 +536,26 @@ async function loadGenres(pid, kind) {
   const host = $(`#genre-list-${kind}`);
   if (!host) return;
   const rows = d[kind] || [];
-  /* one switch per genre, applied immediately (no bulk selection/apply) */
+  /* one switch per genre, applied immediately (no bulk selection/apply).
+     The NAME is a real <button>: clicking it opens this genre's channels in
+     a second popup. stopPropagation + preventDefault keep the surrounding
+     <label> from also flipping the switch — enable/disable stays on the
+     switch itself (and works exactly as before). */
   host.innerHTML = rows.length ? rows.map(g => `
     <label class="d-flex align-items-center gap-2 small mb-1" data-name="${esc(g.name.toLowerCase())}">
       <span class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox"
         value="${g.id}" ${g.enabled ? "checked" : ""}></span>
-      <span class="flex-grow-1 genre-item-name">${esc(g.name)}</span>
+      <button type="button" class="genre-item-name flex-grow-1 text-start"
+        data-gid="${g.id}" title="Show the ${kind === "live" ? "channels" : "items"} in this genre">${esc(g.name)}</button>
       <span class="text-muted">${g.item_count ?? "?"} items ${g.fetched ? "· fetched" : ""}</span>
     </label>`).join("") : '<div class="text-muted small p-1 genre-empty">No genres fetched yet.</div>';
+  $$(".genre-item-name", host).forEach(btn => btn.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const gid = +btn.dataset.gid;
+    const cb = $(`input[value="${gid}"]`, host);
+    openGenreChannels(pid, kind, gid, btn.textContent, !!(cb && cb.checked));
+  }));
   $$(`input[type=checkbox]`, host).forEach(cb => cb.addEventListener("change", async () => {
     await api(`/api/portals/${pid}/genres/toggle`, { method: "POST",
       body: { kind, ids: [+cb.value], enabled: cb.checked } });
@@ -553,6 +565,79 @@ async function loadGenres(pid, kind) {
      typed query stays in effect across re-renders (tab switch, refetch) */
   filterGenrePane(host.closest("[data-pane]"));
   host.dataset.loaded = "1";
+}
+
+/* Second popup, opened by clicking a genre's NAME in the Edit/Add portal
+   popup: every channel (live) or item (vod/series) already fetched into this
+   genre, plus the genre's OWN enable switch. That switch posts the SAME
+   genres/toggle endpoint the pane's switches use and mirrors its state onto
+   the pane's checkbox — so enable/disable works from either window and the
+   two never disagree. Server-side view: GET /{pid}/items?genre_id=… */
+async function openGenreChannels(pid, kind, gid, name, enabled) {
+  if (!pid) return;
+  const noun = kind === "live" ? "channels" : "items";
+  const body = el("div");
+  const footer = el("div");
+  const m = openModal({
+    title: `${kind === "live" ? "Channels" : "Items"}: ${name}`,
+    body, footer, size: "lg", closeButton: true,
+  });
+  footer.append(mBtn("Close", "btn-outline-secondary", () => m.close()));
+  let q = "", page = 1, total = 0, pages = 1, rows = [], genreOn = !!enabled;
+  const load = async () => {
+    const d = await api(`/api/portals/${pid}/items?kind=${kind}&genre_id=${gid}` +
+                        `&q=${encodeURIComponent(q)}&page=${page}&per_page=100`);
+    total = d.total | 0;
+    pages = Math.max(1, Math.ceil(total / (d.per_page || 100)));
+    if (page > pages) { page = pages; return load(); }
+    rows = d.items || [];
+    render();
+  };
+  const render = () => {
+    body.innerHTML = `
+      <div class="d-flex gap-3 align-items-center mb-2 flex-wrap">
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="gch-enabled" ${genreOn ? "checked" : ""}>
+          <label class="form-check-label small" for="gch-enabled">genre enabled</label>
+        </div>
+        <span class="small text-muted">${total} ${noun} fetched</span>
+        <input class="form-control form-control-sm ms-auto" style="max-width:230px" id="gch-q"
+               placeholder="filter ${noun}…" value="${esc(q)}">
+      </div>
+      <div class="border rounded" style="max-height:55vh; overflow:auto">
+        <table class="table table-sm table-hover align-middle mb-0">
+          <thead class="sticky-top bg-body"><tr>
+            <th style="width:56px">#</th><th>${kind === "live" ? "Channel" : "Title"}</th>
+            <th style="width:110px">Portal id</th></tr></thead>
+          <tbody>${rows.length ? rows.map(r => `
+            <tr><td class="mono small text-muted">${esc(r.number ?? "—")}</td>
+              <td>${esc(r.name)}</td>
+              <td class="mono small">${esc(r.channel_id ?? "")}</td></tr>`).join("")
+            : `<tr><td colspan="3" class="text-muted">No ${noun} fetched yet — enable the genre and press Save.</td></tr>`}
+          </tbody>
+        </table>
+      </div>
+      <div class="d-flex gap-2 align-items-center mt-2">
+        <button class="btn btn-xs btn-outline-secondary" id="gch-prev" ${page <= 1 ? "disabled" : ""}>‹ Prev</button>
+        <span class="small text-muted" id="gch-page">page ${page} / ${pages} · ${total} total</span>
+        <button class="btn btn-xs btn-outline-secondary" id="gch-next" ${page >= pages ? "disabled" : ""}>Next ›</button>
+      </div>`;
+    $("#gch-enabled", body).onchange = async (e) => {
+      const on = e.target.checked;
+      try {
+        await api(`/api/portals/${pid}/genres/toggle`, { method: "POST",
+          body: { kind, ids: [gid], enabled: on } });
+        genreOn = on;
+        toast(`genre ${on ? "enabled" : "disabled"} — use Fetch to (un)load its items`, "ok");
+        const paneSw = $(`#genre-list-${kind} input[value="${gid}"]`);
+        if (paneSw) paneSw.checked = on;   // the Edit popup's switch stays in step
+      } catch (err) { e.target.checked = !on; }  // api() already toasted
+    };
+    $("#gch-q", body).onchange = (e) => { q = e.target.value.trim(); page = 1; load(); };
+    $("#gch-prev", body).onclick = () => { if (page > 1) { page--; load(); } };
+    $("#gch-next", body).onclick = () => { if (page < pages) { page++; load(); } };
+  };
+  await load();
 }
 
 /* true when at least one genre in any of the three panes is enabled; loads
@@ -673,7 +758,10 @@ $("#btn-mac-health").addEventListener("click", async () => {
 
 /* Multi-MAC genre comparison: choose accounts first, then inspect a
    searchable genre × MAC matrix. Exact portal genre IDs are the identity;
-   similarly named categories are deliberately not merged behind the user's back. */
+   similarly named categories are deliberately not merged behind the user's back.
+   The picker also carries the channel-id second phase (option B): live is
+   always requested, VOD/series are opt-in checkboxes. The backend only runs
+   that phase when the genre diff found ≥2 distinct packages. */
 window.compareGenres = async (pid) => {
   const portal = table.items.find(x => x.id === pid);
   const macs = portal?.macs || [];
@@ -692,25 +780,47 @@ window.compareGenres = async (pid) => {
         <span class="mono">${esc(m.mac)}</span>${statusBadge(m)}
         <span class="small ms-auto">${m.last_checked ? "checked " + esc(fmtTime(m.last_checked, { seconds: false })) : "not checked"}</span>
       </label>`;
-    }).join("")}</div>`;
+    }).join("")}</div>
+    <div class="border rounded p-2 mt-2 small">
+      <div class="fw-semibold mb-1">If packages differ, also compare channel ids (enabled genres)</div>
+      <div class="text-muted mb-1">Same channel name with a different id on another MAC breaks a shared primary/fallback chain — that is what this scan flags. Nothing extra is fetched when the packages turn out identical.</div>
+      <div class="form-check">
+        <input class="form-check-input" type="checkbox" checked disabled id="cmp-k-live">
+        <label class="form-check-label" for="cmp-k-live">Live <span class="text-muted">(1 request per MAC)</span></label>
+      </div>
+      <div class="form-check">
+        <input class="form-check-input cmp-k-opt" type="checkbox" value="vod" id="cmp-k-vod">
+        <label class="form-check-label" for="cmp-k-vod">VOD <span class="text-muted">(pages every enabled VOD genre)</span></label>
+      </div>
+      <div class="form-check">
+        <input class="form-check-input cmp-k-opt" type="checkbox" value="series" id="cmp-k-series">
+        <label class="form-check-label" for="cmp-k-series">Series <span class="text-muted">(pages every enabled series genre)</span></label>
+      </div>
+    </div>`;
   const footer = el("div", {class:"d-flex gap-2"});
   const choose = openModal({title:`Compare packages: ${esc(portal?.name || "")}`, body, footer, size:"lg"});
   const boxes = () => $$(".cmp-mac", body);
+  const kindBoxes = () => $$(".cmp-k-opt", body);
+  const channelKinds = () => ["live", ...kindBoxes().filter(x => x.checked).map(x => x.value)];
   const update = () => {
     const n = boxes().filter(x => x.checked).length;
-    $("#cmp-est", body).textContent = `${n} MACs · up to ${n * 3} genre requests`;
+    const extra = channelKinds().map(k => k.toUpperCase()).join("+");
+    $("#cmp-est", body).textContent =
+      `${n} MACs · up to ${n * 3} genre requests · ids: ${extra} if packages differ`;
     $("#cmp-go", footer).disabled = n < 2;
   };
   $("#cmp-all", body).onclick = () => { boxes().filter(x=>!x.disabled).forEach(x=>x.checked=true); update(); };
   $("#cmp-none", body).onclick = () => { boxes().forEach(x=>x.checked=false); update(); };
   boxes().forEach(x => x.onchange = update);
+  kindBoxes().forEach(x => x.onchange = update);
   footer.append(mBtn("Cancel", "btn-outline-secondary", choose.close));
   const go = mBtn("Fetch & compare", "btn-accent", async () => {
     const ids = boxes().filter(x=>x.checked).map(x=>+x.value);
     if (ids.length < 2) return;
     go.disabled = true; go.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Comparing…';
     try {
-      const d = await api(`/api/portals/${pid}/compare-genres`, {method:"POST", body:{mac_ids:ids}});
+      const d = await api(`/api/portals/${pid}/compare-genres`,
+                          {method:"POST", body:{mac_ids:ids, channel_kinds:channelKinds()}});
       const stored = await api(`/api/portals/${pid}/genres`);
       choose.close();
       table.reload(); // expose the newly persisted per-MAC counts in the portal list
@@ -733,7 +843,7 @@ function showGenreMatrix(pid, d, stored) {
       storedMaps[kind].set(`name:${String(g.name).trim().toLowerCase().replace(/\s+/g," ")}`, g);
     }
   }
-  const state = {kind:"summary", mode:"diff", q:"", mac:"", pkg:"", selected:new Set()};
+  const state = {kind:"summary", mode:"diff", q:"", mac:"", pkg:"", ck:"live", cq:"", cmode:"differ", selected:new Set()};
   const union = kind => {
     const rows = new Map();
     for (const r of good) for (const g of (r[kind] || []))
@@ -743,20 +853,104 @@ function showGenreMatrix(pid, d, stored) {
   const present = (r, kind, key) => new Set((r[kind] || []).map(g=>g.key)).has(key);
   const kindError = (r, kind) => !r.ok || !!r[`${kind}_error`];
 
+  const chData = d.channel_ids || null;
+  const chAvail = k => !!(chData && chData.kinds && chData.kinds[k]);
+  const chDiffers = k => chAvail(k) && (chData.kinds[k].counts?.differ || 0) > 0;
+  const chAnyDiffers = () => (chData?.requested || []).some(chDiffers);
+
   const render = () => {
-    const tabs = ["summary","live","vod","series"].map(k =>
-      `<button class="btn btn-sm ${state.kind===k?'btn-accent':'btn-outline-secondary'} cmp-tab" data-kind="${k}">${k[0].toUpperCase()+k.slice(1)}</button>`).join("");
+    const tabKeys = ["summary","live","vod","series",
+                     ...(chData && Object.keys(chData.kinds || {}).length ? ["channel"] : [])];
+    const tabLabel = k => k === "channel" ? "Channel IDs" : k[0].toUpperCase()+k.slice(1);
+    const tabs = tabKeys.map(k =>
+      `<button class="btn btn-sm ${state.kind===k?'btn-accent':'btn-outline-secondary'} cmp-tab${k==='channel'&&chAnyDiffers()?' text-danger':''}" data-kind="${k}">${tabLabel(k)}${k==='channel'&&chAnyDiffers()?' ⚠':''}</button>`).join("");
     let content = "";
+    // re-read every render: save/clear mutate chData.translations in place
+    const savedN = chData?.translations?.count || 0;
     if (state.kind === "summary") {
       const cards = (d.packages || []).map(p => `<div class="col-md-6"><div class="border rounded p-2 h-100">
         <div class="d-flex"><b>${esc(p.name)}</b><span class="badge text-bg-light ms-auto">${p.macs.length} MAC${p.macs.length===1?'':'s'}</span></div>
         <div class="small mono my-1">${p.macs.map(esc).join('<br>')}</div>
         <div class="small text-muted">Live ${p.counts.live} · VOD ${p.counts.vod} · Series ${p.counts.series}</div>
       </div></div>`).join("");
+      const chBadge = chData ? (
+        chAnyDiffers()
+          ? `<div class="alert alert-danger py-2 small mb-2"><b>⚠ Channel ids differ across packages.</b>
+               The same channel name resolves to different ids on different MACs — do NOT chain those MACs as primary/fallback of one custom channel.
+               ${savedN ? `${savedN} id translation${savedN === 1 ? "" : "s"} saved for this portal — playback asks each MAC with its own id.` : `Save per-MAC id translations in the Channel IDs tab so every MAC stays usable as fallback.`}
+               <button class="btn btn-xs btn-outline-danger ms-2" id="sum-ch-open">Open Channel IDs</button></div>`
+          : Object.keys(chData.kinds || {}).length
+            ? `<div class="alert alert-success py-2 small mb-2">Channel ids of enabled genres match across the compared MACs.
+                 <button class="btn btn-xs btn-outline-secondary ms-2" id="sum-ch-open">Details</button></div>`
+            : `<div class="small text-muted mb-2">Channel ids: ${esc(chData.message || "not compared")}</div>`
+      ) : "";
       content = `<div class="alert ${d.identical?'alert-success':'alert-warning'} py-2 small">${esc(d.message || "")}
         <div class="text-muted">${d.compared} MACs · ${d.packages?.length || 0} distinct package signature(s) · ${esc(fmtTime(d.fetched_at))}</div></div>
+        ${chBadge}
         <div class="row g-2">${cards}</div>
         ${(d.skipped||[]).length ? `<div class="small text-muted mt-2">Skipped: ${(d.skipped||[]).map(x=>esc(x.mac)).join(', ')}</div>`:''}`;
+    } else if (state.kind === "channel") {
+      const kindsHere = (chData?.requested || []).filter(chAvail);
+      if (!kindsHere.length) {
+        content = `<div class="text-muted">${esc(chData?.message || "Channel ids were not compared.")}</div>`;
+      } else {
+        if (!kindsHere.includes(state.ck)) state.ck = kindsHere[0];
+        const blk = chData.kinds[state.ck];
+        const macs = blk.macs || [];
+        const counts = blk.counts || {};
+        const failed = blk.failed || {};
+        let rows = (blk.rows || []).filter(r => {
+          if (state.cq && !r.name.toLowerCase().includes(state.cq)) return false;
+          if (state.cmode === "all") return true;
+          return r.status === state.cmode;   // diff (default) | missing
+        });
+        const kindBtns = kindsHere.map(k =>
+          `<button class="btn btn-xs ${state.ck===k?'btn-accent':'btn-outline-secondary'} ch-kind" data-k="${k}">${k}${chDiffers(k)?' ⚠':''}</button>`).join("");
+        const noEnabled = !(chData.enabled && chData.enabled[state.ck]);
+        const controls = `<div class="row g-1 mb-2 align-items-center">
+          <div class="col-auto"><div class="btn-group">${kindBtns}</div></div>
+          <div class="col-md-3"><input class="form-control form-control-sm" id="cmp-cq" placeholder="filter channel…" value="${esc(state.cq)}"></div>
+          <div class="col-md-3"><select class="form-select form-select-sm" id="cmp-cmode">
+            ${[["differ","Id conflicts only"],["missing","Missing somewhere"],["all","All flagged"]].map(([v,l])=>`<option value="${v}" ${state.cmode===v?'selected':''}>${l}</option>`).join('')}
+          </select></div>
+          <div class="col-md-3 small text-muted text-end">${counts.differ||0} id-conflict · ${counts.missing||0} missing · ${counts.same||0} identical</div>
+        </div>`;
+        // the translation option: SAVE every id-conflict row of this portal
+        // (N = differ rows in the RAW block — what will actually be posted,
+        // not what the current filter happens to show), CLEAR all of them.
+        const differN = (blk.rows || []).filter(r => r.status === "differ").length;
+        const transBar = (state.ck === "live" && ((counts.differ || 0) > 0 || savedN))
+          ? `<div class="d-flex gap-2 align-items-center flex-wrap mt-1 mb-1" id="ch-trans-bar">
+              ${differN ? `<button class="btn btn-xs btn-accent" id="ch-save-trans">Save ${differN} id translation${differN === 1 ? "" : "s"}</button>` : ""}
+              ${savedN ? `<span class="badge text-bg-success" id="ch-trans-count">${savedN} saved for this portal</span>
+                <button class="btn btn-xs btn-outline-danger ms-auto" id="ch-clear-trans">Clear</button>` : ""}
+            </div>`
+          : "";
+        if (noEnabled) {
+          content = controls + transBar + `<div class="text-muted small">No enabled ${state.ck} genres — enable some in the portal editor first.</div>`;
+        } else {
+            const bodyRows = rows.map(r => {
+            const cells = macs.map(m => {
+              if (r.ids && m in r.ids) {
+                const others = macs.filter(x => x in r.ids && r.ids[x] !== r.ids[m]);
+                const bad = r.status === "differ" && others.length;
+                return `<td class="mono small ${bad?'text-danger fw-bold':''}" title="${esc((r.cmds||{})[m]||'')}">${esc(r.ids[m])}</td>`;
+              }
+              return `<td class="text-center text-muted" title="${(failed[m] && esc(failed[m])) || 'not on this MAC'}">—</td>`;
+            }).join("");
+            const badge = r.status === "differ"
+              ? '<span class="badge text-bg-danger">id differs</span>'
+              : '<span class="badge text-bg-warning text-dark">missing</span>';
+            return `<tr><td>${esc(r.name)}</td>${cells}<td>${badge}</td></tr>`;
+          }).join("");
+          content = controls + transBar + `${Object.keys(failed).length ? `<div class="small text-warning mb-1">Could not list on: ${Object.keys(failed).map(esc).join(', ')}</div>` : ''}
+            <div class="table-responsive" style="max-height:55vh"><table class="table table-sm table-hover align-middle mb-0 cmp-matrix">
+            <thead class="sticky-top bg-body"><tr><th style="min-width:220px">Channel</th>
+            ${macs.map(m=>`<th class="text-center mono small" title="${esc(m)}">…${esc(m.slice(-5))}</th>`).join('')}
+            <th>Status</th></tr></thead><tbody>${bodyRows || '<tr><td colspan="99" class="text-muted">No channels match these filters.</td></tr>'}</tbody></table></div>
+            ${blk.truncated ? '<div class="small text-muted mt-1">Row list truncated — counts above are exact.</div>' : ''}`;
+        }
+      }
     } else {
       const kind = state.kind, allRows = union(kind), macs = results;
       const packageRow = (d.packages || []).find(p=>String(p.id)===state.pkg);
@@ -802,7 +996,45 @@ function showGenreMatrix(pid, d, stored) {
     }
     body.innerHTML = `<div class="btn-group mb-3">${tabs}</div>${content}`;
     $$(".cmp-tab",body).forEach(x=>x.onclick=()=>{state.kind=x.dataset.kind;state.selected.clear();render();});
-    if (state.kind === "summary") return;
+    if (state.kind === "summary") {
+      const open = $("#sum-ch-open", body);
+      if (open) open.onclick = () => { state.kind = "channel"; render(); };
+      return;
+    }
+    if (state.kind === "channel") {
+      $$(".ch-kind", body).forEach(x => x.onclick = () => { state.ck = x.dataset.k; render(); });
+      const cq = $("#cmp-cq", body);
+      if (cq) cq.onchange = e => { state.cq = e.target.value.toLowerCase(); render(); };
+      const cm = $("#cmp-cmode", body);
+      if (cm) cm.onchange = e => { state.cmode = e.target.value; render(); };
+      // the option: post every id-conflict row of the RAW live block (filters
+      // only change what is displayed, never what is saved)
+      const saveTrans = $("#ch-save-trans", body);
+      if (saveTrans) saveTrans.onclick = async () => {
+        const diffRows = (chData?.kinds?.live?.rows || []).filter(r => r.status === "differ");
+        if (!diffRows.length) return;
+        try {
+          const r = await api(`/api/portals/${pid}/channel-id-translations`,
+                              {method: "POST", body: {kind: "live", rows: diffRows}});
+          chData.translations = {count: r.count};
+          const skips = Object.values(r.skipped || {}).reduce((a, b) => a + (b || 0), 0);
+          toast(`saved ${r.saved} id translation${r.saved === 1 ? "" : "s"}` +
+                (r.unchanged ? `, ${r.unchanged} already matched` : "") +
+                (skips ? `, ${skips} skipped` : ""), "ok");
+        } catch (e) { /* api() already toasted the failure */ }
+        render();
+      };
+      const clearTrans = $("#ch-clear-trans", body);
+      if (clearTrans) clearTrans.onclick = async () => {
+        try {
+          const r = await api(`/api/portals/${pid}/channel-id-translations`, {method: "DELETE"});
+          chData.translations = {count: 0};
+          toast(`${r.cleared} id translation${r.cleared === 1 ? "" : "s"} cleared`, "ok");
+        } catch (e) { /* api() already toasted the failure */ }
+        render();
+      };
+      return;
+    }
     $("#cmp-q",body).onchange = e => { state.q=e.target.value.toLowerCase(); render(); };
     $("#cmp-mode",body).onchange=e=>{state.mode=e.target.value;render();};
     $("#cmp-mac",body).onchange=e=>{state.mac=e.target.value;render();};

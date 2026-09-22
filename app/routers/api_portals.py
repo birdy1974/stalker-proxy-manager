@@ -26,7 +26,7 @@ from ..portal.capabilities import (dumps_modules, loads_modules, supports,
 from ..portal.identity import IDENTITY_MODES
 from ..portal.resolver import resolve_portal
 from ..security import require_admin
-from ..services import xtream_bridge
+from ..services import channel_translations, xtream_bridge
 from ..services.db_logging import db_log
 from ..services.fetch_jobs import cancel as cancel_job, list_jobs, submit
 from ..services.stream_manager import MANAGER
@@ -700,17 +700,62 @@ async def compare_portal_genres(pid: int, payload: dict | None = None):
     brand-new genres land disabled). Offline/expired/banned MACs are listed
     under `skipped` and not asked. Use this when a secondary MAC might be a
     different package (shared-login resellers often do that).
+
+    `channel_kinds` (list of live/vod/series, default ["live"]) also compares
+    the channel **ids** of the portal's enabled genres across those MACs —
+    but only when the genre phase finds ≥2 distinct packages, because same
+    name + different id is exactly what breaks a shared primary/fallback
+    chain. Response key: `channel_ids`. Pass `channel_kinds: []` for the
+    legacy genre-only compare.
     """
     from ..services import mac_health
     body = payload or {}
     raw_ids = body.get("mac_ids") or []
     if not isinstance(raw_ids, list):
         raise HTTPException(400, "mac_ids must be a list")
-    out = await mac_health.compare_genres(pid, raw_ids)
+    raw_kinds = body.get("channel_kinds", ["live"])
+    if not isinstance(raw_kinds, list) or not all(isinstance(k, str) for k in raw_kinds):
+        raise HTTPException(400, "channel_kinds must be a list of strings")
+    out = await mac_health.compare_genres(pid, raw_ids, channel_kinds=raw_kinds)
     if not out.get("ok") and out.get("error") == "portal not found":
         raise HTTPException(404, "portal not found")
     if not out.get("ok"):
         raise HTTPException(400, out.get("error") or "compare failed")
+    return out
+
+
+@router.post("/{pid}/channel-id-translations")
+async def save_channel_id_translations(pid: int, payload: dict | None = None):
+    """Persist the Compare popup's per-MAC id/cmd rows — the explicit option
+    that keeps every MAC usable as primary/fallback when a channel's id
+    differs across packages.
+
+    Payload: `{kind: "live", rows: [...Channel-IDs compare rows]}`. Only
+    `kind=live` is accepted (vod/series names would collide with live-source
+    ids); validation runs BEFORE the portal 404 so a garbage body is a 400
+    whatever the pid is. Response: `{ok, saved, unchanged, skipped, count}`.
+    """
+    body = payload or {}
+    if body.get("kind") != "live":
+        raise HTTPException(400, "channel-id translations are for kind=live only")
+    rows = body.get("rows")
+    if not isinstance(rows, list):
+        raise HTTPException(400, "rows must be a list")
+    if len(rows) > 5000:
+        raise HTTPException(400, "too many rows (5000 max)")
+    out = await channel_translations.save(pid, rows)
+    if not out.get("ok"):
+        raise HTTPException(404, out.get("error") or "portal not found")
+    return out
+
+
+@router.delete("/{pid}/channel-id-translations")
+async def clear_channel_id_translations(pid: int):
+    """Drop every saved translation of this portal (the tab's Clear button).
+    Response: `{ok, cleared}`."""
+    out = await channel_translations.clear(pid)
+    if not out.get("ok"):
+        raise HTTPException(404, out.get("error") or "portal not found")
     return out
 
 
@@ -780,12 +825,20 @@ async def toggle_genres(pid: int, payload: dict, db=Depends(get_db)):
 # ------------------------------------------------------------------ portal source preview
 @router.get("/{pid}/items")
 async def portal_items(pid: int, kind: str, db=Depends(get_db), q: str = "", page: int = 1,
-                       per_page: int = 25):
-    """Items already stored for one portal (portal popup tabs; NO fetching here)."""
+                       per_page: int = 25, genre_id: int | None = None):
+    """Items already stored for one portal (portal popup tabs; NO fetching here).
+
+    `genre_id` narrows to ONE genre — the popup that opens when a genre NAME
+    is clicked in the Edit/Add portal popup lists that genre's channels.
+    """
     model = {"live": LiveSource, "vod": VodSource, "series": SerieSource}.get(kind)
     if model is None:
         raise HTTPException(400, "kind must be live|vod|series")
     stmt = select(model).where(model.portal_id == pid)
+    genre_col = {"live": "live_genre_id", "vod": "vod_genre_id",
+                 "series": "serie_genre_id"}[kind]
+    if genre_id is not None:
+        stmt = stmt.where(getattr(model, genre_col) == genre_id)
     if q:
         stmt = stmt.where(model.original_name.ilike(f"%{q}%"))       # case-insensitive
     stmt = stmt.order_by(model.original_name)
@@ -794,5 +847,12 @@ async def portal_items(pid: int, kind: str, db=Depends(get_db), q: str = "", pag
     rows = rows[(page - 1) * per_page: page * per_page]
     return {"total": total, "page": page, "per_page": per_page, "items":
             [{"id": r.id, "name": r.original_name, "enabled": r.enabled,
-              "poster": getattr(r, "poster", None) or getattr(r, "logo_original", None)}
+              "poster": getattr(r, "poster", None) or getattr(r, "logo_original", None),
+              # additive: the genre popup's "# / Portal id" columns (live
+              # channels carry number+portal_channel_id; vod/series fall back)
+              "number": (getattr(r, "number", None)
+                         or (str(r.position) if getattr(r, "position", None) is not None
+                             else None)),
+              "channel_id": (getattr(r, "portal_channel_id", None)
+                             or getattr(r, "portal_item_id", None))}
              for r in rows]}

@@ -26,7 +26,7 @@ _RE_STREAM_AUDIO = re.compile(
     r"Stream .*?:\s*Audio:\s*(\w+)[^,]*,\s*(\d+)\s*Hz,\s*([^,]+)(?:.*?(\d+)\s*kb/s)?", re.I)
 _RE_DAR = re.compile(r"DAR\s+([0-9]+:[0-9]+)")
 _RE_STREAM_SUBTITLE = re.compile(
-    r"Stream\s+#\d+:(\d+)(?:\[[^\]]*\])?(?:\([^)]*\))?:\s*Subtitle:\s*([A-Za-z0-9_]+)", re.I)
+    r"Stream\s+#\d+:(\d+)(?:\[[^\]]*\])?(?:\(([^)]*)\))?:\s*Subtitle:\s*([A-Za-z0-9_]+)", re.I)
 _RE_STREAM_AV = re.compile(
     r"Stream\s+#\d+:\d+.*?:\s*(Video|Audio):\s*([A-Za-z0-9_]+)", re.I)
 _RE_INPUT_FORMAT = re.compile(r"Input #0,\s*([^,]+(?:,[^,]+)*?),\s*from", re.I)
@@ -205,7 +205,10 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
                              "rate_hz": int(m.group(2)),
                              "channels": m.group(3).strip(),
                              "kbps": int(m.group(4)) if m.group(4) else None})
-    out["subtitles"] = [{"index": int(m.group(1)), "codec": m.group(2).lower()}
+    # (group 2 is the language tag ffmpeg prints after the stream index —
+    # dut/eng/nl/… — kept because the Matroska nl/en check reads it)
+    out["subtitles"] = [{"index": int(m.group(1)), "codec": m.group(3).lower(),
+                         "lang": (m.group(2) or "").strip().lower() or None}
                         for m in _RE_STREAM_SUBTITLE.finditer(text)]
     if not out["video"] and not out["audio"] and "duration_s" not in out:
         out = {"error": "no stream info parsed — unreachable or unsupported input"}
@@ -226,9 +229,11 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
 # Unlike probe_media (GUI detail popups, generous timeout) this runs in the
 # STREAM START path: a dvb/burn template asks "does this source carry a
 # subtitle track we can keep?" before ffmpeg is spawned, and the answer must
-# come back fast (8 s cap) and cached (10 min). Returns [{'index', 'codec'}]
-# ([] = no subtitle track) or None when the probe itself failed - the caller
-# treats None as "no subtitles" so a slow portal can never wedge a play.
+# come back fast (8 s cap) and cached (10 min). Returns [{'index', 'codec',
+# 'lang'}] ([] = no subtitle track; 'lang' is the ffmpeg tag — dut/eng/nl/… —
+# or None when the source does not tag its tracks) or None when the probe
+# itself failed - the caller treats None as "no subtitles" so a slow portal
+# can never wedge a play.
 # --------------------------------------------------------------------------
 SUBS_PROBE_TIMEOUT = float(os.environ.get("SPM_SUBS_PROBE_TIMEOUT", "8"))
 _SUBS_CACHE: dict[str, tuple[float, list | None]] = {}
@@ -269,7 +274,8 @@ async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
         text = text[:i]
     # The bundled static ffmpeg build can die inside its (flaky) TS demuxer
     # AFTER printing the stream list - parse whatever was printed.
-    subs = [{"index": int(m.group(1)), "codec": m.group(2).lower()}
+    subs = [{"index": int(m.group(1)), "codec": m.group(3).lower(),
+             "lang": (m.group(2) or "").strip().lower() or None}
             for m in _RE_STREAM_SUBTITLE.finditer(text)]
     if not subs and proc.returncode not in (0, None):
         # nothing parsed AND ffmpeg unhappy: report failure, not "no subs",

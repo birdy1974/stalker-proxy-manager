@@ -211,6 +211,142 @@ def test_live_play_of_vod_mkv_template_becomes_mpegts():
 
 
 # --------------------------------------------------------------------------- #
+# the Dutch (nl) / English check for multiple-subtitle VODs
+# --------------------------------------------------------------------------- #
+async def test_probe_captures_subtitle_languages_for_the_nl_en_check(monkeypatch):
+    """The gate's verdict can only be as good as the probe: the (dut)/(eng)
+    tag ffmpeg prints after the stream index must survive the parse — and a
+    track without a tag must come back as lang=None, not crash."""
+    from app.services import probe as probe_svc
+    from app.services.probe import subtitle_streams
+
+    banner = (
+        "Input #0, matroska,webm, from 'movie.mkv':\n"
+        "  Stream #0:2(fre): Subtitle: subrip\n"
+        "  Stream #0:3(dut): Subtitle: subrip (default)\n"
+        "  Stream #0:4(nld): Subtitle: ass\n"
+        "  Stream #0:5[0x810]: Subtitle: dvb_subtitle\n"
+        "Output #0, null, from 'pipe:1':\n"
+    ).encode()
+
+    class _Proc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"", banner)
+
+    async def fake_exec(*args, **kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(probe_svc.asyncio, "create_subprocess_exec", fake_exec)
+    subs = await subtitle_streams("/tmp/lang-probe-movie.mkv", is_url=False)
+    assert subs == [
+        {"index": 2, "codec": "subrip", "lang": "fre"},
+        {"index": 3, "codec": "subrip", "lang": "dut"},
+        {"index": 4, "codec": "ass", "lang": "nld"},
+        {"index": 5, "codec": "dvb_subtitle", "lang": None},
+    ]
+
+
+async def test_mkv_gate_confirms_nl_or_en_when_the_source_tags_them(monkeypatch):
+    """A VOD with multiple tracks: if Dutch or English is among them it IS in
+    the Matroska output (-map 0:s? copies every track) — and the stream log
+    says so, accepting ISO-639-1/2 and BCP47 spellings alike."""
+    cmd = build_command(FFmpegOptions(**VA, resolution="1080p", **MKV))
+    logged = []
+
+    async def fake_log(level, component, message):
+        logged.append((level, message))
+
+    monkeypatch.setattr(sm, "db_log", fake_log)
+    args = await _gate(cmd, "/media/movie.mkv", [
+        {"index": 2, "codec": "subrip", "lang": "fr"},
+        {"index": 3, "codec": "subrip", "lang": "nl-NL"},
+        {"index": 4, "codec": "ass", "lang": "en-GB"},
+    ])
+    assert "0:s?" in _specs(args)              # the check observes, never filters
+    hits = [m for lv, m in logged if "includes Dutch/English" in m]
+    assert hits, f"no inclusion verdict logged: {logged}"
+    assert "nl" in hits[0] and "en" in hits[0]
+    assert all(lv == "INFO" for lv, m in logged if "includes Dutch/English" in m)
+
+
+async def test_mkv_gate_warns_when_neither_nl_nor_en_is_present(monkeypatch):
+    cmd = build_command(FFmpegOptions(**VA, resolution="1080p", **MKV))
+    logged = []
+
+    async def fake_log(level, component, message):
+        logged.append((level, message))
+
+    monkeypatch.setattr(sm, "db_log", fake_log)
+    args = await _gate(cmd, "/media/movie.mkv", [
+        {"index": 2, "codec": "subrip", "lang": "fr"},
+        {"index": 3, "codec": "ass", "lang": "de"},
+        {"index": 4, "codec": "subrip", "lang": "it"},
+    ])
+    assert "0:s?" in _specs(args)              # still copies them all
+    warns = [m for lv, m in logged if lv == "WARNING" and "no Dutch (nl) or English" in m]
+    assert warns, f"missing nl/en WARNING: {logged}"
+    assert "fr" in warns[0] and "de" in warns[0]
+
+
+async def test_mkv_gate_stays_quiet_for_a_single_subtitle_track(monkeypatch):
+    """Scoped to MULTIPLE subtitles: one track means no menu to choose from,
+    so the check does not spam the log for every ordinary play."""
+    cmd = build_command(FFmpegOptions(**VA, resolution="1080p", **MKV))
+    logged = []
+
+    async def fake_log(level, component, message):
+        logged.append((level, message))
+
+    monkeypatch.setattr(sm, "db_log", fake_log)
+    args = await _gate(cmd, "/media/movie.mkv",
+                       [{"index": 2, "codec": "subrip", "lang": "fr"}])
+    assert "0:s?" in _specs(args)
+    assert logged == [], f"single-track play must log no nl/en verdict: {logged}"
+
+
+async def test_mkv_gate_reports_untagged_languages_as_unverifiable(monkeypatch):
+    """Persisted pre-language metadata (or a source that ships its tracks
+    untagged) must not read as a confident 'missing': it says so instead."""
+    cmd = build_command(FFmpegOptions(**VA, resolution="1080p", **MKV))
+    logged = []
+
+    async def fake_log(level, component, message):
+        logged.append((level, message))
+
+    monkeypatch.setattr(sm, "db_log", fake_log)
+    await _gate(cmd, "/media/movie.mkv",
+                [{"index": 2, "codec": "subrip"},        # old shape: no lang key
+                 {"index": 3, "codec": "ass", "lang": None}])
+    infos = [m for lv, m in logged if "untagged" in m and "cannot verify" in m]
+    assert infos, f"missing untagged verdict: {logged}"
+    assert not any("no Dutch (nl)" in m for _lv, m in logged), (
+        "untagged tracks must not be reported as definitively missing nl/en")
+
+
+async def test_mkv_gate_flags_when_all_tracks_were_dropped(monkeypatch):
+    """Teletext-only source: nothing survives into the Matroska, so nl/en is
+    definitively NOT included — the verdict says exactly that (multiple subs,
+    so in scope)."""
+    cmd = build_command(FFmpegOptions(**VA, resolution="1080p", **MKV))
+    logged = []
+
+    async def fake_log(level, component, message):
+        logged.append((level, message))
+
+    monkeypatch.setattr(sm, "db_log", fake_log)
+    args = await _gate(cmd, "/media/movie.mkv", [
+        {"index": 2, "codec": "dvb_teletext", "lang": "nl"},
+        {"index": 3, "codec": "eia_608", "lang": "en"},
+    ])
+    assert "-sn" in args                        # existing drop behaviour intact
+    warns = [m for lv, m in logged
+             if lv == "WARNING" and "no Dutch (nl) or English" in m]
+    assert warns and "dropped" in warns[0], f"missing dropped-verdict: {logged}"
+
+
+# --------------------------------------------------------------------------- #
 # HTTP surface: the .mkv aliases
 # --------------------------------------------------------------------------- #
 async def test_mkv_urls_exist_next_to_the_ts_ones():

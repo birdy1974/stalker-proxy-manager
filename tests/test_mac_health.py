@@ -253,6 +253,229 @@ async def test_compare_genres_single_mac_is_noop():
     assert "fewer than 2" in (out.get("message") or "")
 
 
+# ---------------------------------------------------------------- channel ids
+def test_diff_channel_ids_classifies_differ_and_missing():
+    """Same name + different id is 'differ'; absent on a MAC is 'missing'."""
+    per_mac = [
+        {"mac": "M1", "ok": True, "live": [
+            {"id": "10", "name": "BBC One", "key": "bbc one", "genre": "1", "cmd": "cmd10"},
+            {"id": "11", "name": "CNN", "key": "cnn", "genre": "1", "cmd": "cmd11"},
+            {"id": "12", "name": "OnlyA", "key": "onlya", "genre": "1", "cmd": ""},
+        ]},
+        {"mac": "M2", "ok": True, "live": [
+            {"id": "99", "name": "BBC One", "key": "bbc one", "genre": "1", "cmd": "cmd99"},
+            {"id": "11", "name": "CNN", "key": "cnn", "genre": "1", "cmd": "cmd11"},
+        ]},
+    ]
+    d = svc._diff_channel_ids(per_mac, "live")
+    assert d["counts"] == {"same": 1, "differ": 1, "missing": 1}
+    assert d["identical"] is False
+    by_name = {r["name"]: r for r in d["rows"]}
+    assert by_name["BBC One"]["status"] == "differ"
+    assert by_name["BBC One"]["ids"] == {"M1": "10", "M2": "99"}
+    assert by_name["OnlyA"]["status"] == "missing"
+    assert by_name["OnlyA"]["absent"] == ["M2"]
+    # Actionable id-conflict rows come first.
+    assert d["rows"][0]["status"] == "differ"
+    # CNN matched everywhere → only in counts, not the row list.
+    assert "CNN" not in by_name
+
+
+def test_diff_channel_ids_identical_and_kind_error():
+    same = [
+        {"mac": "M1", "ok": True, "live": [{"id": "1", "name": "A", "key": "a",
+                                            "genre": "1", "cmd": ""}]},
+        {"mac": "M2", "ok": True, "live": [{"id": "1", "name": "A", "key": "a",
+                                            "genre": "1", "cmd": ""}]},
+    ]
+    d = svc._diff_channel_ids(same, "live")
+    assert d["counts"] == {"same": 1, "differ": 0, "missing": 0}
+    assert d["identical"] is True
+    assert d["rows"] == []
+
+    # A MAC whose live listing failed is reported under failed, not as
+    # 'every channel missing on it'.
+    partial = same + [{"mac": "M3", "ok": True, "error": "",
+                       "live_error": "timeout", "live": []}]
+    d2 = svc._diff_channel_ids(partial, "live")
+    assert d2["counts"] == {"same": 1, "differ": 0, "missing": 0}
+    assert d2["failed"] == {"M3": "timeout"}
+    assert d2["macs"] == ["M1", "M2"]
+
+
+def test_resolve_enabled_for_mac_id_then_name():
+    """Packages may renumber genre ids: match id first, then name."""
+    enabled = [("5", "News"), ("9", "Sport")]
+    mac_view = [
+        {"id": "5", "name": "News"},
+        {"id": "77", "name": "Sport"},   # renumbered on this package
+        {"id": "8", "name": "Kids"},     # not enabled
+    ]
+    assert svc._resolve_enabled_for_mac(enabled, mac_view) == ["5", "77"]
+
+    # Genre this MAC cannot see at all → dropped (package difference).
+    assert svc._resolve_enabled_for_mac([("42", "Cinema")], mac_view) == []
+
+
+async def test_compare_genres_channel_ids_runs_when_packages_differ(monkeypatch):
+    pid, mids = await _portal(macs=["00:1A:79:AA:AA:01", "00:1A:79:AA:AA:02"])
+    async with SessionLocal() as s:
+        for mid in mids:
+            m = await s.get(MacAddress, mid)
+            m.status, m.online = "online", True
+        s.add(LiveGenre(portal_id=pid, genre_portal_id="1", name="News", enabled=True))
+        await s.commit()
+
+    async def fake_genres(portal, mac, url):
+        if mac.mac.endswith("01"):
+            live = [{"id": "1", "title": "News"}, {"id": "2", "title": "Sport"}]
+        else:
+            live = [{"id": "1", "title": "News"}, {"id": "3", "title": "Kids"}]
+        return {"mac": mac.mac, "mac_id": mac.id, "ok": True, "error": "",
+                "live": [{"key": svc._genre_key(g), "name": svc._genre_label(g),
+                          "id": str(g.get("id") or "")} for g in live],
+                "vod": [], "series": []}
+
+    channel_calls = []
+
+    async def fake_channels(portal, mac, url, kinds, genre_ids, budget):
+        channel_calls.append((mac.mac, kinds, dict(genre_ids), budget))
+        # Same channel name, different id per package — the hazard case.
+        row = ({"id": "10", "name": "BBC One", "key": "bbc one",
+                "genre": "1", "cmd": "cmdA"} if mac.mac.endswith("01")
+               else {"id": "99", "name": "BBC One", "key": "bbc one",
+                     "genre": "1", "cmd": "cmdB"})
+        return {"mac": mac.mac, "mac_id": mac.id, "ok": True, "error": "",
+                "live": [row], "vod": [], "series": []}
+
+    monkeypatch.setattr(svc, "_genres_for_mac", fake_genres)
+    monkeypatch.setattr(svc, "_channels_for_mac", fake_channels)
+
+    out = await svc.compare_genres(pid, mids, channel_kinds=["live"])
+    assert out["ok"] is True
+    assert out["identical"] is False          # packages differ
+    ch = out["channel_ids"]
+    assert ch["requested"] == ["live"]
+    assert ch["enabled"] == {"live": 1}
+    live_blk = ch["kinds"]["live"]
+    assert live_blk["counts"]["differ"] == 1
+    assert live_blk["rows"][0]["ids"] == {"00:1A:79:AA:AA:01": "10",
+                                          "00:1A:79:AA:AA:02": "99"}
+    assert "different ids" in out["message"]
+    assert len(channel_calls) == 2
+    # Live was requested and the enabled genre resolved per MAC.
+    assert all(kinds == ["live"] for _m, kinds, _g, _b in channel_calls)
+    assert all(gids == {"live": ["1"]} for _m, _k, gids, _b in channel_calls)
+
+
+async def test_compare_genres_channel_ids_skipped_when_identical(monkeypatch):
+    pid, mids = await _portal(macs=["00:1A:79:BB:BB:01", "00:1A:79:BB:BB:02"])
+    async with SessionLocal() as s:
+        for mid in mids:
+            m = await s.get(MacAddress, mid)
+            m.status, m.online = "online", True
+        await s.commit()
+
+    async def fake_genres(portal, mac, url):
+        live = [{"id": "1", "title": "News"}]
+        return {"mac": mac.mac, "mac_id": mac.id, "ok": True, "error": "",
+                "live": [{"key": svc._genre_key(g), "name": svc._genre_label(g),
+                          "id": str(g.get("id") or "")} for g in live],
+                "vod": [], "series": []}
+
+    async def no_channels(*a, **k):  # pragma: no cover - must not run
+        raise AssertionError("_channels_for_mac must not run on identical packages")
+
+    monkeypatch.setattr(svc, "_genres_for_mac", fake_genres)
+    monkeypatch.setattr(svc, "_channels_for_mac", no_channels)
+
+    out = await svc.compare_genres(pid, mids, channel_kinds=["live", "vod"])
+    assert out["ok"] is True
+    assert out["identical"] is True
+    ch = out["channel_ids"]
+    assert ch["kinds"] == {}
+    assert "identical" in ch["message"]
+
+
+async def test_compare_genres_channel_ids_none_when_not_requested(monkeypatch):
+    """channel_kinds=None/[] stays a genre-only compare (legacy callers)."""
+    pid, mids = await _portal(macs=["00:1A:79:CC:CC:01", "00:1A:79:CC:CC:02"])
+    async with SessionLocal() as s:
+        for mid in mids:
+            m = await s.get(MacAddress, mid)
+            m.status, m.online = "online", True
+        await s.commit()
+
+    async def fake_genres(portal, mac, url):
+        live = ([{"id": "1", "title": "News"}] if mac.mac.endswith("01")
+                else [{"id": "3", "title": "Kids"}])
+        return {"mac": mac.mac, "mac_id": mac.id, "ok": True, "error": "",
+                "live": [{"key": svc._genre_key(g), "name": svc._genre_label(g),
+                          "id": str(g.get("id") or "")} for g in live],
+                "vod": [], "series": []}
+
+    async def no_channels(*a, **k):  # pragma: no cover
+        raise AssertionError("_channels_for_mac must not run without channel_kinds")
+
+    monkeypatch.setattr(svc, "_genres_for_mac", fake_genres)
+    monkeypatch.setattr(svc, "_channels_for_mac", no_channels)
+
+    out = await svc.compare_genres(pid, mids)
+    assert out["channel_ids"] is None
+    out2 = await svc.compare_genres(pid, mids, channel_kinds=[])
+    assert out2["channel_ids"] is None
+
+
+async def test_api_compare_genres_passes_channel_kinds(monkeypatch):
+    from httpx import ASGITransport, AsyncClient
+    from app.main import app
+    from app.services import mac_health
+
+    pid, mids = await _portal(macs=["00:1A:79:DD:DD:01", "00:1A:79:DD:DD:02"])
+    async with SessionLocal() as s:
+        for mid in mids:
+            m = await s.get(MacAddress, mid)
+            m.status, m.online = "online", True
+        s.add(LiveGenre(portal_id=pid, genre_portal_id="1", name="News", enabled=True))
+        await s.commit()
+
+    seen_kinds = []
+
+    async def fake_genres(portal, mac, url):
+        live = ([{"id": "1", "title": "News"}, {"id": "2", "title": "Sport"}]
+                if mac.mac.endswith("01")
+                else [{"id": "1", "title": "News"}, {"id": "3", "title": "Kids"}])
+        return {"mac": mac.mac, "mac_id": mac.id, "ok": True, "error": "",
+                "live": [{"key": mac_health._genre_key(g),
+                          "name": mac_health._genre_label(g),
+                          "id": str(g.get("id") or "")} for g in live],
+                "vod": [], "series": []}
+
+    async def fake_channels(portal, mac, url, kinds, genre_ids, budget):
+        seen_kinds.append(list(kinds))
+        return {"mac": mac.mac, "mac_id": mac.id, "ok": True, "error": "",
+                "live": [{"id": "10", "name": "BBC One", "key": "bbc one",
+                          "genre": "1", "cmd": ""}],
+                "vod": [], "series": []}
+
+    monkeypatch.setattr(mac_health, "_genres_for_mac", fake_genres)
+    monkeypatch.setattr(mac_health, "_channels_for_mac", fake_channels)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.post(f"/api/portals/{pid}/compare-genres",
+                         json={"mac_ids": mids, "channel_kinds": ["live"]})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["channel_ids"]["requested"] == ["live"]
+        assert seen_kinds == [["live"], ["live"]]   # one call per compared MAC
+
+        # Bad channel_kinds → 400, genre phase never starts.
+        r2 = await c.post(f"/api/portals/{pid}/compare-genres",
+                          json={"channel_kinds": "live"})
+        assert r2.status_code == 400
+
+
 async def test_removing_mac_clears_runtime_state():
     """PUT /api/portals/{id} dropping a MAC must free locks + pool sessions."""
     from httpx import ASGITransport, AsyncClient

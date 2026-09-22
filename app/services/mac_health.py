@@ -18,15 +18,25 @@ even see the same catalogue?"
      the operator wants to know whether a "secondary" MAC is actually a
      different package (common with shared-login resellers).
 
-The comparison does not fetch source items, but it upserts the discovered genre
-union so the matrix can enable/disable those rows without losing package-only
-categories when the dialog closes.
+  3. **Channel-id comparison** (`compare_genres` second phase, requested via
+     `channel_kinds`) — runs ONLY when the genre phase found ≥2 distinct
+     packages. Asks each compared MAC for the channels of the portal's
+     *enabled* genres and diffs them by normalized name: same channel name
+     with a different `id` on another MAC is the case that breaks
+     primary/fallback chains (one stored cmd, two id spaces). Live uses
+     `get_all_channels` (1 request/MAC where supported); VOD/series page per
+     enabled genre and are opt-in from the GUI.
+
+The genre comparison does not fetch source items, but it upserts the discovered
+genre union so the matrix can enable/disable those rows without losing
+package-only categories when the dialog closes.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 
@@ -41,8 +51,9 @@ from ..portal.pool import POOL, PortalSession
 from ..portal.resolver import resolve_portal
 from .portal_pace import pace_for_playback
 from .db_logging import db_log
-from .runtime_settings import get_setting
+from .runtime_settings import fetch_page_budget, get_setting
 from .stream_manager import MANAGER
+from .channel_translations import count_translations
 
 log = logging.getLogger("spm.mac_health")
 
@@ -52,6 +63,15 @@ DEFAULT_INTERVAL_MIN = 60
 MIN_INTERVAL_MIN = 5
 # Soft per-MAC budget so a slow panel cannot stall the whole sweep forever.
 MAC_TIMEOUT_S = 25.0
+
+# Channel-id second phase (option B): a MAC may have to handshake plus walk
+# get_all_channels and/or every enabled genre's pages — 25 s is a genre sweep.
+CHANNEL_MAC_TIMEOUT_S = float(os.environ.get("SPM_COMPARE_CHANNEL_TIMEOUT", "120"))
+# Rows per kind returned to the GUI. Counts are always exact; only the row
+# LIST is capped (diff rows are kept first — they are the actionable signal).
+CHANNEL_ROW_CAP = int(os.environ.get("SPM_COMPARE_CHANNEL_ROWS", "2000"))
+# Content kinds the channel-id scan understands.
+CHANNEL_KINDS = ("live", "vod", "series")
 
 
 def _norm_genre_name(name: str | None) -> str:
@@ -322,6 +342,230 @@ async def _genres_for_mac(portal: Portal, mac: MacAddress, url: str) -> dict:
     return out
 
 
+async def _enabled_genre_ids(portal_id: int) -> dict[str, list[tuple[str, str]]]:
+    """{kind: [(genre_portal_id, name), …]} for genres the operator enabled.
+
+    The channel-id scan only covers enabled genres: those are the rows that
+    feed LiveSource and thus the chains a mismatched id can break.
+    """
+    out: dict[str, list[tuple[str, str]]] = {"live": [], "vod": [], "series": []}
+    async with SessionLocal() as s:
+        for kind, model in (("live", LiveGenre), ("vod", VodGenre), ("series", SerieGenre)):
+            rows = (await s.execute(select(model).where(
+                model.portal_id == portal_id, model.enabled.is_(True))
+                .order_by(model.genre_portal_id))).scalars().all()
+            out[kind] = [(r.genre_portal_id, r.name) for r in rows]
+    return out
+
+
+def _norm_channel_name(name: str | None) -> str:
+    """Channel identity across MACs: casefolded, whitespace-collapsed name."""
+    return " ".join((name or "").casefold().split())
+
+
+def _resolve_enabled_for_mac(enabled: list[tuple[str, str]],
+                             mac_genres: list[dict]) -> list[str]:
+    """Map the portal's enabled genres onto ONE MAC's view of the genre list.
+
+    Packages can renumber genre ids, so matching only on the stored id would
+    fetch the wrong category (or nothing) on the other MAC. Match id first —
+    the common case — then normalized name, and drop genres this MAC cannot
+    see at all (they are a package difference the genre phase already shows).
+    """
+    by_id = {str(g.get("id") or ""): g for g in mac_genres}
+    by_name = {_norm_channel_name(g.get("name")): g for g in mac_genres}
+    out: list[str] = []
+    for gid, gname in enabled:
+        hit = by_id.get(str(gid)) or by_name.get(_norm_channel_name(gname))
+        if hit is not None:
+            mid = str(hit.get("id") or "").strip()
+            if mid and mid not in ("*", "0", "-1") and mid not in out:
+                out.append(mid)
+    return out
+
+
+async def _channels_for_mac(portal: Portal, mac: MacAddress, url: str,
+                            kinds: list[str],
+                            genre_ids: dict[str, list[str]],
+                            budget: int) -> dict:
+    """Fetch channel rows of the *enabled* genres through one MAC. Never raises.
+
+    live  → get_all_channels when the panel supports it (split by tv_genre_id
+            etc. locally), else paged get_ordered_list per enabled genre.
+    vod/series → paged get_ordered_list per enabled genre, capped at `budget`
+            pages like a normal fetch (SPM_FETCH_PAGE_BUDGET).
+    Returns {mac, mac_id, ok, error, live: [rows], …, <kind>_error}.
+    """
+    out: dict = {"mac": mac.mac, "mac_id": mac.id, "ok": False, "error": ""}
+    for kind in CHANNEL_KINDS:
+        out[kind] = []
+    client = await POOL.get(PortalSession.from_rows(portal, mac, portal_url=url))
+    try:
+        async with asyncio.timeout(CHANNEL_MAC_TIMEOUT_S):
+            await client.ensure_auth()
+
+            async def fetch_pages(fetch_page, gid: str, kind: str) -> None:
+                """Page one genre up to `budget`; rows land in out[kind]."""
+                page = 1
+                while page <= budget:
+                    if page > 1:
+                        # A deep VOD scan must not starve a play that starts
+                        # mid-compare — same rule as the content fetch.
+                        await pace_for_playback(portal.id)
+                    data = await fetch_page(gid, page)
+                    for item in data.items or []:
+                        _channel_row(out, kind, item, gid)
+                    if len(data.items or []) < 14:   # short page = end (see fetch_jobs)
+                        return
+                    page += 1
+
+            if "live" in kinds and genre_ids.get("live"):
+                live_ids = set(genre_ids["live"])
+                try:
+                    complete = await client.all_channels()
+                except Exception:  # noqa: BLE001 - panel without get_all_channels
+                    complete = []
+                if complete:
+                    for item in complete:
+                        gid = _live_genre_id(item)
+                        if gid in live_ids:
+                            _channel_row(out, "live", item, gid)
+                else:
+                    for gid in genre_ids["live"]:
+                        await fetch_pages(client.live_channels, gid, "live")
+
+            for kind in ("vod", "series"):
+                if kind not in kinds or not genre_ids.get(kind):
+                    continue
+                try:
+                    fetch_page = client.vod_list if kind == "vod" else client.series_list
+                    for gid in genre_ids[kind]:
+                        await fetch_pages(fetch_page, gid, kind)
+                except PortalError as exc:
+                    out[f"{kind}_error"] = exc.detail()
+                except TimeoutError:
+                    out[f"{kind}_error"] = f"no answer within {CHANNEL_MAC_TIMEOUT_S:.0f}s"
+                except Exception as exc:  # noqa: BLE001
+                    out[f"{kind}_error"] = f"{type(exc).__name__}: {exc}"
+            out["ok"] = True
+    except PortalError as exc:
+        out["error"] = exc.detail()
+    except TimeoutError:
+        out["error"] = f"no answer within {CHANNEL_MAC_TIMEOUT_S:.0f}s"
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        try:
+            await client.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _live_genre_id(item: dict) -> str:
+    """Portal genre id of a live row — same field sniffing as fetch_jobs."""
+    for key in ("tv_genre_id", "genre_id", "genre", "tv_genre"):
+        val = item.get(key)
+        if val not in (None, ""):
+            return str(val)
+    return ""
+
+
+def _channel_row(out: dict, kind: str, item: dict, gid: str) -> None:
+    """Normalize one portal channel/item row into a diffable row."""
+    from .titles import portal_item_title
+
+    cid = str(item.get("id") or "").strip()
+    if not cid or cid in ("*", "0", "-1"):
+        return
+    if kind == "live":
+        name = str(item.get("name") or "").strip() or "?"
+    else:
+        # vod_list/series_list already split movies vs series (client.py).
+        name = portal_item_title(item, limit=300)
+    out[kind].append({
+        "id": cid,
+        "name": name,
+        "key": _norm_channel_name(name),
+        "genre": gid,
+        "cmd": str(item.get("cmd") or "")[:400],
+    })
+
+
+def _diff_channel_ids(per_mac: list[dict], kind: str) -> dict:
+    """Compare one kind's channel rows across MACs by normalized name.
+
+    Classification per name key:
+      * ``same``    — every MAC that returned the kind has it, one id
+      * ``differ``  — same name, ≥2 distinct ids  ← breaks fallback chains
+      * ``missing`` — present on ≥1 MAC, absent on another
+    Only ``differ``/``missing`` rows are returned (counts are exact; the row
+    list is capped with diff rows kept first).
+    """
+    ok_macs = [b for b in per_mac
+               if b.get("ok") and not b.get(f"{kind}_error")
+               and not b.get("no_genres")
+               and (b.get(kind) is not None)]
+    # name key -> {mac: row}
+    table: dict[str, dict[str, dict]] = {}
+    labels: dict[str, str] = {}
+    for block in ok_macs:
+        for row in block.get(kind) or []:
+            key = row.get("key") or _norm_channel_name(row.get("name"))
+            if not key:
+                continue
+            table.setdefault(key, {})[block["mac"]] = row
+            labels.setdefault(key, row.get("name") or key)
+
+    mac_list = [b["mac"] for b in ok_macs]
+    counts = {"same": 0, "differ": 0, "missing": 0}
+    rows: list[dict] = []
+    for key, by_mac in table.items():
+        ids = {r["id"] for r in by_mac.values()}
+        absent = [m for m in mac_list if m not in by_mac]
+        if len(ids) > 1:
+            status = "differ"
+        elif absent:
+            status = "missing"
+        else:
+            status = "same"
+        counts[status] += 1
+        if status == "same":
+            continue
+        rows.append({
+            "name": labels[key],
+            "key": key,
+            "status": status,
+            "ids": {m: r["id"] for m, r in by_mac.items()},
+            "cmds": {m: r["cmd"] for m, r in by_mac.items() if r.get("cmd")},
+            "genres": {m: r["genre"] for m, r in by_mac.items()},
+            "absent": absent,
+        })
+    # Actionable signal first, then stable name order; cap the list only.
+    rows.sort(key=lambda r: (0 if r["status"] == "differ" else 1, r["name"].casefold()))
+    truncated = len(rows) > CHANNEL_ROW_CAP
+    if truncated:
+        rows = rows[:CHANNEL_ROW_CAP]
+    failed: dict[str, str] = {}
+    for b in per_mac:
+        if b in ok_macs:
+            continue
+        if b.get("no_genres"):
+            failed[b["mac"]] = "none of the enabled genres are in this MAC's package"
+        elif b.get(f"{kind}_error") or b.get("error"):
+            failed[b["mac"]] = b.get(f"{kind}_error") or b.get("error")
+    return {
+        "kind": kind,
+        "macs": mac_list,
+        "counts": counts,
+        "rows": rows,
+        "total": sum(counts.values()),
+        "truncated": truncated,
+        "failed": failed,
+        "identical": counts["differ"] == 0 and counts["missing"] == 0,
+    }
+
+
 def _diff_kind(per_mac: list[dict], kind: str) -> dict:
     """Build common / only-on-MAC sets for one content kind."""
     sets: dict[str, set[str]] = {}
@@ -419,7 +663,8 @@ async def _persist_genres_from_compare(portal_id: int, per_mac: list[dict]) -> d
     return stored
 
 
-async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> dict:
+async def compare_genres(portal_id: int, mac_ids: list[int] | None = None,
+                         channel_kinds: list[str] | None = None) -> dict:
     """
     Ask selected (or, for legacy callers, every) online MAC for genre lists.
 
@@ -429,6 +674,13 @@ async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> di
     Every genre any compared MAC returned is **upserted** into the portal's
     live/vod/series genre tables (enabled flags preserved). That way a
     secondary package's categories are not lost the moment the modal closes.
+
+    `channel_kinds` (subset of live/vod/series) additionally runs the
+    channel-id second phase, but ONLY when the genre phase found ≥2 distinct
+    packages: same channel name with a different id across MACs is what breaks
+    a shared primary/fallback chain, and on identical packages there is nothing
+    to warn about. None/empty = genre-only compare (legacy callers). The phase
+    covers the portal's *enabled* genres only.
     """
     async with SessionLocal() as s:
         p = await s.get(Portal, portal_id)
@@ -445,7 +697,8 @@ async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> di
                 "compared": 0, "skipped": len(macs),
                 "identical": True, "message": "portal has fewer than 2 MACs — nothing to compare",
                 "live": {"identical": True}, "vod": {"identical": True},
-                "series": {"identical": True}, "stored": {"live": 0, "vod": 0, "series": 0}}
+                "series": {"identical": True}, "channel_ids": None,
+                "stored": {"live": 0, "vod": 0, "series": 0}}
 
     url = await _portal_url(p, macs[0])
     if not url:
@@ -524,6 +777,69 @@ async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> di
         "ok": all(b.get("ok") for b in blocks),
     } for index, blocks in enumerate(signatures.values())]
 
+    # ---- channel-id second phase (option B) ------------------------------
+    # Only when packages actually differ AND the caller asked for it. The GUI
+    # always requests at least live; None/empty means genre-only (legacy).
+    # Every failure is recorded per kind — a refused get_all_channels must not
+    # lose the genre report already in hand.
+    kinds = [k for k in dict.fromkeys(channel_kinds or []) if k in CHANNEL_KINDS]
+    channel_ids = None
+    ok_packages = [p for p in packages if p.get("ok")]
+    if kinds and len(ok_packages) > 1:
+        enabled = await _enabled_genre_ids(portal_id)
+        if any(enabled.get(k) for k in kinds):
+            budget = await fetch_page_budget()
+            # Phase-1 genre lists, keyed by MAC: packages may renumber genre
+            # ids, so each MAC gets the enabled set resolved against ITS list.
+            genres_by_mac = {b["mac"]: b for b in per_mac if b.get("ok")}
+
+            async def fetch_channels_one(mac):
+                view = genres_by_mac.get(mac.mac) or {}
+                gids = {k: _resolve_enabled_for_mac(
+                    enabled.get(k) or [], view.get(k) or []) for k in kinds}
+                if not any(gids.values()):
+                    return {"mac": mac.mac, "mac_id": mac.id, "ok": True,
+                            "error": "", "no_genres": True,
+                            **{k: [] for k in CHANNEL_KINDS}}
+                async with gate:
+                    return await _channels_for_mac(p, mac, url, kinds, gids, budget)
+            ch_per_mac = list(await asyncio.gather(
+                *(fetch_channels_one(m) for m in usable)))
+            channel_ids = {
+                "requested": kinds,
+                "enabled": {k: len(enabled.get(k) or []) for k in kinds},
+                "kinds": {k: _diff_channel_ids(ch_per_mac, k)
+                          for k in kinds},
+                "results": ch_per_mac,
+            }
+            bits = []
+            for k in kinds:
+                d = channel_ids["kinds"][k]
+                if d["counts"]["differ"]:
+                    bits.append(f"{k}: {d['counts']['differ']} channel(s) with different ids")
+                if d["counts"]["missing"]:
+                    bits.append(f"{k}: {d['counts']['missing']} channel(s) missing somewhere")
+                if d["failed"]:
+                    bits.append(f"{k}: {len(d['failed'])} MAC(s) could not be listed")
+            if bits:
+                msg_tail = "; ".join(bits)
+                channel_ids["message"] = msg_tail
+                await db_log("WARNING", "portal",
+                             f"[{name}] channel-id compare: {msg_tail}")
+        else:
+            channel_ids = {"requested": kinds, "kinds": {}, "results": [],
+                           "enabled": {k: 0 for k in kinds},
+                           "message": "no enabled genres — enable genres first"}
+    elif kinds:
+        # Not enough distinct successful packages to diff against: either the
+        # packages are genuinely identical, or MACs failed to answer.
+        same = len(packages) == 1 and packages[0].get("ok")
+        channel_ids = {"requested": kinds, "kinds": {}, "results": [],
+                       "enabled": {},
+                       "message": ("packages are identical — channel ids not compared"
+                                   if same else
+                                   "fewer than two usable packages — channel ids not compared")}
+
     if identical and not failed:
         msg = f"all {len(per_mac)} online MAC(s) see the same genres"
     elif identical and failed:
@@ -538,15 +854,23 @@ async def compare_genres(portal_id: int, mac_ids: list[int] | None = None) -> di
     if any(stored.values()):
         msg += (f" · stored {stored['live']} live / {stored['vod']} vod / "
                 f"{stored['series']} series genre(s)")
+    if channel_ids and channel_ids.get("message"):
+        msg += f" · {channel_ids['message']}"
 
     await db_log("INFO" if identical else "WARNING", "portal",
                  f"[{name}] genre compare: {msg}")
+    # Seed the tab's "N saved for this portal" badge. The None-guard is the
+    # contract: the legacy channel_kinds=[] answer must stay None (and the
+    # offline / message-dict paths still get their count).
+    if channel_ids is not None:
+        channel_ids["translations"] = {"count": await count_translations(portal_id)}
     return {
         "ok": True, "portal_id": portal_id, "name": name,
         "compared": len(per_mac), "skipped": skipped,
         "identical": identical and not failed, "message": msg,
         "macs": mac_summary, "results": per_mac, "packages": packages,
         "live": live, "vod": vod, "series": series,
+        "channel_ids": channel_ids,
         "stored": stored, "mac_counts_stored": counts_stored,
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
