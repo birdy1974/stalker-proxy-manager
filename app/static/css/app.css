@@ -128,7 +128,17 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* the name is a <button> that opens the genre's channels popup: reset the
+     UA's button chrome so the row looks exactly as it did as a plain span */
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
 }
+.genre-cols .genre-item-name:hover { text-decoration: underline; }
 .genre-cols .genre-empty { grid-column: 1 / -1; }
 
 /* Explanatory help is opt-in: operational status/errors are never hidden. */

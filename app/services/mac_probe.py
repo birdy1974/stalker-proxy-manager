@@ -47,6 +47,7 @@ from ..portal.links import plan_for
 from ..portal.pool import POOL, PortalSession
 from ..portal.resolver import resolve_portal
 from . import stream_identity
+from .channel_translations import attach_overrides
 from .db_logging import db_log
 from .stream_manager import MANAGER
 
@@ -213,6 +214,11 @@ async def probe_mac(portal_id: int, mac_id: int, *, ref_id: int | None = None,
             if p and not p.resolved_url:
                 p.resolved_url, p.resolved_path = res.portal_url, res.path
                 await s.commit()
+
+    # A saved per-MAC translation (if any) must ride along: this MAC numbers
+    # the channel differently, and asking with the fetch MAC's cmd would
+    # measure the wrong account. `row` may be detached — own session inside.
+    await attach_overrides([(row, portal, [mac])])
 
     # Always ask (ffmpeg=True forces the "ask the panel" policy): a stored link
     # would be handed to nobody and the refusal code IS the answer we came for.

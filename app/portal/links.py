@@ -314,15 +314,28 @@ def plan_for(src, mac_row, *, ffmpeg: bool = False,
              allow_direct: bool = True) -> LinkPlan:
     """The single place that reads a source row and a MAC row for a stream open."""
     stored = str(getattr(src, "cmd", "") or "")
+    # Per-MAC translation (channel_id_translations, saved from the Compare
+    # popup): when THIS mac has one, its cmd is the only one in the right id
+    # space. The stored cmd belongs to another mac - offering it as alt_cmd
+    # would turn a clean refusal into a WRONG-channel retry - and the chain's
+    # next candidate carries its own cmd, so fail over instead. Absent /
+    # whitespace-only overrides fall through; mac_row may be None (getattr).
+    overrides = getattr(src, "mac_cmd_overrides", None) or {}
+    mac_cmd = (overrides.get(getattr(mac_row, "id", None)) or "").strip()
     # S-B: a panel that once needed the `/media/file_<id>` form told us so, and
     # the answer was stored on the row. Ask with that FIRST - re-asking with the
     # catalogue form would pay for a refusal and a movie resolution on every
     # single play - and keep the catalogue cmd as the fallback, because the
     # learned form can go stale (a re-ingested movie gets a new file id) and the
-    # panel's own listing is still the truth.
+    # panel's own listing is still the truth. (LiveSource has no media_cmd, so
+    # learned is always "" there — this branch is the vod/series legacy path.)
     learned = str(getattr(src, "media_cmd", "") or "").strip()
-    cmd = learned or stored
-    alt_cmd = stored if (learned and learned != stored) else None
+    if mac_cmd:
+        cmd = mac_cmd
+        alt_cmd = None
+    else:
+        cmd = learned or stored
+        alt_cmd = stored if (learned and learned != stored) else None
     item_id = str(getattr(src, "portal_item_id", "") or "").strip() or None
     url = extract_url(cmd)
     link_flags = getattr(src, "link_flags", None)

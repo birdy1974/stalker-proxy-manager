@@ -48,6 +48,7 @@ from ..portal.pool import POOL, PortalSession
 from ..portal.client import SLOT_BUSY_CODES, PortalError, is_hls
 from ..portal.links import plan_adopted, plan_for
 from . import stream_identity
+from .channel_translations import attach_overrides
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
                                HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
@@ -187,6 +188,10 @@ _TS_NATIVE_SUB_CODECS = {"dvb_subtitle"}
 # abort the muxer, so the gate maps around them.
 _MKV_UNSUPPORTED_SUB_CODECS = {"dvb_teletext", "eia_608", "eia_708", "cea_608",
                                "arib_caption", "hdmv_text_subtitle"}
+# Subtitle language tags that count as "Dutch or English" for the Matroska
+# output check (ISO-639-1 + ISO-639-2/B + the spellings ffmpeg may print;
+# the region part of BCP47 like en-GB / nl-NL is split off before comparing).
+MKV_PREF_SUB_LANGS = frozenset({"nl", "nld", "dut", "dutch", "en", "eng", "english"})
 # Audio codecs MPEG-TS can carry as a bare copy (and Enigma2 can decode).
 # Anything else in a copy remux (Vorbis/FLAC/PCM/ALAC/Opus - common in MKV)
 # aborts ffmpeg at output init with zero bytes, so the remux gate re-encodes
@@ -1611,6 +1616,49 @@ class StreamManager:
                     args[-1:-1] = ["-metadata", f"title={safe}"]
         return args
 
+    @staticmethod
+    def _pref_lang_hit(raw) -> str | None:
+        """The normalized tag when `raw` is Dutch or English, else None.
+
+        'en-GB' / 'nl_NL' lose their region first, so a Matroska muxed with
+        BCP47 tags answers exactly like one tagged 'eng' / 'dut'."""
+        norm = (str(raw or "")).strip().lower().split("-")[0].split("_")[0]
+        return norm if norm in MKV_PREF_SUB_LANGS else None
+
+    async def _mkv_lang_verdict(self, total: int, kept: list[dict], tag: str) -> None:
+        """For a VOD with MULTIPLE subtitle tracks, record whether Dutch (nl)
+        or English is among what the Matroska output actually carries.
+
+        `-map 0:s?` copies whatever the source has, so "nl/en is in the
+        output" is exactly "nl/en is tagged on one of the KEPT tracks" (the
+        codec gate may have routed some tracks out). Scoped to total > 1 as
+        asked: with a single track there is no menu to choose from. Probe
+        failures never reach here — the caller returns on None/[] first.
+        """
+        if total <= 1:
+            return
+        langs = [(s.get("lang") or "").strip().lower() for s in kept]
+        unknown = sum(1 for l in langs if not l)
+        known = sorted({l for l in langs if l})
+        hits = sorted({h for l in known if (h := self._pref_lang_hit(l))})
+        if hits:
+            await db_log("INFO", "stream", tag +
+                         f"Matroska output includes Dutch/English subtitle(s) "
+                         f"({', '.join(hits)} of {total} track(s))")
+        elif not kept:
+            await db_log("WARNING", "stream", tag +
+                         f"all {total} subtitle track(s) dropped — no Dutch (nl) "
+                         f"or English subtitle in the Matroska output")
+        elif known:
+            tail = f", {unknown} untagged" if unknown else ""
+            await db_log("WARNING", "stream", tag +
+                         f"no Dutch (nl) or English subtitle in the Matroska "
+                         f"output ({', '.join(known)}{tail} of {total} track(s))")
+        else:
+            await db_log("INFO", "stream", tag +
+                         f"{total} subtitle track(s) copied to Matroska, "
+                         f"language(s) untagged — cannot verify nl/en")
+
     async def _subs_gate(self, args: list[str], url: str, pace: bool,
                          name: str = "") -> list[str]:
         """
@@ -1649,6 +1697,8 @@ class StreamManager:
                 return args
             bad = [s["codec"] for s in subs if s["codec"] in _MKV_UNSUPPORTED_SUB_CODECS]
             if not bad:
+                # every track lands in the output — answer the nl/en question
+                await self._mkv_lang_verdict(len(subs), subs, tag)
                 return args
             idxs = [n for n, s in enumerate(subs)
                     if s["codec"] not in _MKV_UNSUPPORTED_SUB_CODECS][:16]
@@ -1656,10 +1706,12 @@ class StreamManager:
                 await db_log("INFO", "stream", tag +
                              "no Matroska-compatible subtitle track ("
                              + ", ".join(bad) + ") -> subtitles dropped")
+                await self._mkv_lang_verdict(len(subs), [], tag)
                 return StreamManager._ensure_sn(StreamManager._strip_subs(args))
             await db_log("INFO", "stream", tag +
                          "subtitles copied to Matroska, skipping "
                          + ", ".join(bad))
+            await self._mkv_lang_verdict(len(subs), [subs[n] for n in idxs], tag)
             return StreamManager._remap_subs(args, idxs, "copy")
 
         # ---- dvb / copy: keep BITMAP subtitles as a track in the output TS --
@@ -2206,6 +2258,10 @@ class StreamManager:
                 if not picked:
                     continue
                 chain.append((src, portal, picked))
+            # Per-MAC id translations: every chain MAC asks with ITS own cmd.
+            # Inside the open session on purpose — chain rows detach when it
+            # closes, and the plain attribute survives that.
+            await attach_overrides(chain, session=s)
             return chain, item.custom_name, item
 
     async def _vod_chain(self, playlist_id: int):
@@ -2310,6 +2366,10 @@ class StreamManager:
                          item_name=name or getattr(src, "original_name", None)
                          or getattr(src, "name", "preview"),
                          user_name="admin", template_name=tpl_name, command=command)
+        # RAW src, not the _WithTemplate probe (that wrapper is template
+        # lookup only): translations ride on the row plan_for will read.
+        # Vod/Serie sources make this a no-op (isinstance guard inside).
+        await attach_overrides([(src, portal, macs)])
         gen = self._pump(h, [(src, portal, macs)], "live" if kind == "live" else "vod")
         return h, gen
 

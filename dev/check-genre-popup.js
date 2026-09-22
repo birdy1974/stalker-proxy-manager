@@ -10,7 +10,11 @@ the stubbed API, and assert the multi-column band wiring:
   4. app.css defines the band: grid, column flow, 15 rows/column, fixed
      column width, overflow-x auto + overflow-y hidden;
   5. the live filter still works on the multi-column list (hides non-matches,
-     updates the N/total counter).
+     updates the N/total counter);
+  6. clicking a genre's NAME opens the channels popup (lists the genre's
+     items, does NOT flip the pane switch) and its own switch posts
+     genres/toggle, mirrors onto the pane switch — while the pane's switch
+     keeps posting that same endpoint on its own.
 
 Usage: node check-genre-popup.js <rendered-portals.html> <app.js> <app.css>
 Exit:  0 all assertions hold, 1 otherwise.
@@ -70,8 +74,23 @@ function stubResponse(data, status = 200) {
   return { status, ok: status < 400, statusText: 'OK',
            json: async () => data, text: async () => JSON.stringify(data) };
 }
-function stubFetch(path) {
+const CALLS = [];
+function stubFetch(path, opts = {}) {
   if (typeof path !== 'string') path = String(path);
+  const method = (opts && opts.method) || 'GET';
+  /* the channels popup's endpoints live UNDER the /genres prefix, so these
+     two matches must run before the generic branches below */
+  if (path.includes('/genres/toggle')) {
+    CALLS.push({ path, method, body: (opts && opts.body) || null });
+    return stubResponse({ ok: true, count: 1 });
+  }
+  if (path.includes('/items?'))
+    return stubResponse({ total: 3, page: 1, per_page: 100,
+                          items: [
+                            { id: 11, name: 'News 1', enabled: true, number: '1', channel_id: '101', poster: null },
+                            { id: 12, name: 'News 2', enabled: true, number: '2', channel_id: '102', poster: null },
+                            { id: 13, name: 'News 3', enabled: false, number: '3', channel_id: '103', poster: null },
+                          ] });
   if (path.startsWith('/api/portals/1/genres'))
     return stubResponse({ live: LIVE, vod: [], series: [] });
   if (path.startsWith('/api/portals'))
@@ -106,7 +125,7 @@ const dom = new JSDOM(injected, {
   virtualConsole: vc,
   beforeParse(window) {
     window.bootstrap = { Modal: class { constructor() {} show() {} hide() {} } };
-    window.fetch = (path) => Promise.resolve(stubFetch(path));
+    window.fetch = (path, opts) => Promise.resolve(stubFetch(path, opts));
   },
 });
 const { window } = dom;
@@ -157,6 +176,60 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     }
   }
 
+  /* ---- 6. genre name → channels popup + mirrored genre switch ---------- */
+  const firstRow = document.querySelector('#genre-list-live label[data-name]');
+  if (!firstRow) fail('no genre row to click in the live pane');
+  else {
+    const gid = LIVE[0].id;
+    const paneSw = firstRow.querySelector('input[type=checkbox]');
+    const wasChecked = paneSw ? !!paneSw.checked : false;
+    const nameBtn = firstRow.querySelector('.genre-item-name');
+    if (!nameBtn) fail('genre row lost its clickable .genre-item-name control');
+    else {
+      nameBtn.click();
+      await sleep(80);
+      const gch = document.querySelector('#gch-enabled');
+      const pop = gch && gch.closest('.modal');
+      if (!pop) fail('clicking the genre name did not open the channels popup');
+      else {
+        if (paneSw && paneSw.checked !== wasChecked)
+          fail('clicking the name must NOT flip the pane switch');
+        const names = [...pop.querySelectorAll('tbody tr')]
+          .map(tr => tr.cells[1] && tr.cells[1].textContent.trim());
+        if (names.length !== 3 || !names.includes('News 1'))
+          fail(`popup should list the genre's 3 channels, got: ${JSON.stringify(names)}`);
+        if (!/3 channels fetched/.test(pop.textContent))
+          fail('popup should show "3 channels fetched"');
+        /* the popup's OWN switch posts the SAME genres/toggle endpoint … */
+        const want = !wasChecked;
+        gch.checked = want;
+        gch.dispatchEvent(new window.Event('change', { bubbles: true }));
+        await sleep(80);
+        const tog = CALLS.find(c => c.path.includes('/genres/toggle'));
+        if (!tog) fail('popup switch did not POST genres/toggle');
+        else {
+          let b = null;
+          try { b = typeof tog.body === 'string' ? JSON.parse(tog.body) : tog.body; } catch {}
+          if (!b || b.kind !== 'live' || !Array.isArray(b.ids) || b.ids[0] !== gid
+              || b.enabled !== want)
+            fail(`toggle body should be {kind:"live", ids:[${gid}], enabled:${want}}, got ${tog.body}`);
+        }
+        /* …and mirrors itself onto the Edit popup's switch */
+        if (paneSw && paneSw.checked !== want)
+          fail('popup toggle must mirror onto the pane switch');
+      }
+    }
+    /* the pane switch still works on its own (and posts the same endpoint) */
+    if (paneSw) {
+      const before = CALLS.filter(c => c.path.includes('/genres/toggle')).length;
+      paneSw.checked = !paneSw.checked;
+      paneSw.dispatchEvent(new window.Event('change', { bubbles: true }));
+      await sleep(80);
+      const after = CALLS.filter(c => c.path.includes('/genres/toggle')).length;
+      if (after <= before) fail('the pane switch no longer posts genres/toggle');
+    }
+  }
+
   const fatal = pageErrors.filter((e) => !/Could not load|css|script/i.test(e));
   if (fatal.length) fail('page errors: ' + fatal.slice(0, 3).join(' | '));
 
@@ -165,6 +238,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     problems.forEach((p) => console.error('  - ' + p));
     process.exit(1);
   }
-  console.log('check-genre-popup: OK — popup opens, 48 genres render in the genre-cols band, filter works');
+  console.log('check-genre-popup: OK — popup opens, 48 genres render in the genre-cols band, filter works, name opens the channels popup, both switches toggle');
   process.exit(0);
 })();

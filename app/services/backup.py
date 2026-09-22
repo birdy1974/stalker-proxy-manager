@@ -39,6 +39,7 @@ IDENTITIES = {
     "live_playlist": ("custom_name",), "vod_playlist": ("custom_name",),
     "serie_playlist": ("custom_name",), "local_playlist": ("local_file_id",),
     "live_playlist_sources": ("live_playlist_id", "live_source_id"),
+    "channel_id_translations": ("live_source_id", "mac_id"),
     "vod_playlist_sources": ("vod_playlist_id", "vod_source_id"),
     "serie_playlist_sources": ("serie_playlist_id", "serie_source_id"),
     "serie_playlist_seasons": ("serie_playlist_id", "serie_season_id"),

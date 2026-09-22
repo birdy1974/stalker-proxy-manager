@@ -432,6 +432,34 @@ class LivePlaylistSource(Base):
     live_source: Mapped[LiveSource] = relationship()
 
 
+class ChannelIdTranslation(Base):
+    """What ONE specific MAC calls a live channel of this portal.
+
+    A portal that renumbers per MAC gives the same channel a different
+    `portal_channel_id` - and therefore a different create_link `cmd` - on
+    another account of the same portal, so a shared primary/fallback chain
+    stored one MAC's cmd and the other MAC got nothing_to_play (or the wrong
+    channel). Rows here are the operator's explicit fix, saved from the
+    Compare popup's Channel IDs tab (one row per source x MAC whose view
+    differs from the stored row; the fetch MAC needs none - its view IS the
+    stored cmd). Playback attaches them to the chain as
+    `src.mac_cmd_overrides` and `links.plan_for` asks with the playing MAC's
+    own cmd. Both FKs CASCADE: portal/MAC deletion wipes the table with its
+    source of truth, never leaving translations for channels that are gone.
+    """
+
+    __tablename__ = "channel_id_translations"
+    __table_args__ = (UniqueConstraint("live_source_id", "mac_id", name="uq_channel_id_translation"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    live_source_id: Mapped[int] = mapped_column(ForeignKey("live_sources.id", ondelete="CASCADE"), index=True)
+    mac_id: Mapped[int] = mapped_column(ForeignKey("mac_addresses.id", ondelete="CASCADE"), index=True)
+    #: the id THIS MAC's package uses for the channel (compare row's `ids[mac]`)
+    portal_channel_id: Mapped[str] = mapped_column(String(60))
+    #: the cmd create_link must be asked with on THIS MAC (compare row's `cmds[mac]`)
+    cmd: Mapped[str] = mapped_column(Text)
+
+
 class VodPlaylist(Base):
     __tablename__ = "vod_playlist"
 
