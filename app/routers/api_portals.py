@@ -6,6 +6,7 @@ start, genre enable toggles, per-portal source listings and the delete flow
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import delete, or_, select
 
+from ..config import FETCH_PAGE_BUDGET
 from ..database import get_db
 from ..models import (
     LiveGenre, LivePlaylistSource, LiveSource, MacAddress, Portal, SerieGenre,
@@ -20,7 +22,7 @@ from ..models import (
 )
 from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, status_for_error
-from ..portal.account import mac_status
+from ..portal.account import mac_is_usable, mac_status
 from ..portal.capabilities import (dumps_modules, loads_modules, supports,
                                    version_js_url)
 from ..portal.identity import IDENTITY_MODES
@@ -28,8 +30,14 @@ from ..portal.resolver import resolve_portal
 from ..security import require_admin
 from ..services import channel_translations, xtream_bridge
 from ..services.db_logging import db_log
-from ..services.fetch_jobs import cancel as cancel_job, list_jobs, submit
+from ..services.fetch_jobs import (
+    _bulk_upsert, _live_fields, _live_genre_of, _serie_fields, _vod_fields,
+    cancel as cancel_job, list_jobs, submit,
+)
 from ..services.stream_manager import MANAGER
+from ..services.titles import portal_item_title
+
+log = logging.getLogger("spm.portals")
 
 router = APIRouter(prefix="/api/portals", tags=["portals"], dependencies=[Depends(require_admin)])
 
@@ -809,15 +817,193 @@ async def genres(pid: int, db=Depends(get_db)):
     return out
 
 
+# Pending fetched genre channels (not yet stored in database because genre is disabled)
+# Key: (portal_id, kind, genre_id) -> list of raw item dicts
+_PENDING_GENRE_ITEMS: dict[tuple[int, str, int], list[dict]] = {}
+
+
+def clear_pending_genre_items() -> None:
+    _PENDING_GENRE_ITEMS.clear()
+
+
+async def _fetch_genre_items_for_preview(
+    db, portal_id: int, kind: str, genre_row
+) -> list[dict]:
+    portal = await db.get(Portal, portal_id)
+    if not portal or not portal.base_url:
+        return []
+
+    macs = (await db.execute(
+        select(MacAddress).where(MacAddress.portal_id == portal_id)
+        .order_by(MacAddress.order)
+    )).scalars().all()
+    if not macs:
+        return []
+
+    mac = next((m for m in macs if mac_is_usable(getattr(m, "status", None))), macs[0])
+
+    resolved = portal.resolved_url
+    if not resolved:
+        try:
+            res = await resolve_portal(portal.base_url, mac=mac.mac, proxy=portal.proxy_url,
+                                       tls_insecure=portal.tls_insecure)
+            if res.ok and res.portal_url:
+                portal.resolved_url = res.portal_url
+                portal.resolved_path = res.path
+                await db.commit()
+                resolved = res.portal_url
+        except Exception as exc:
+            log.warning("Portal resolve failed during preview: %s", exc)
+    if not resolved:
+        return []
+
+    try:
+        session = PortalSession.from_rows(portal, mac, portal_url=resolved)
+        client = await POOL.get(session)
+        await client.ensure_auth()
+    except Exception as exc:
+        log.warning("Could not connect to portal %s (%s): %s", portal_id, mac.mac, exc)
+        return []
+
+    items: list[dict] = []
+    seen_ids: set[str] = set()
+
+    def _add_item(it: dict) -> None:
+        cid = str(it.get("id") or "").strip()
+        if cid and cid not in ("*", "0", "-1") and cid not in seen_ids:
+            seen_ids.add(cid)
+            items.append(it)
+
+    gid = getattr(genre_row, "genre_portal_id", "")
+    try:
+        if kind == "live":
+            # Try live_channels first (type=itv&action=get_ordered_list&genre=...)
+            first = await client.live_channels(gid, 1)
+            if first and first.items:
+                for it in first.items:
+                    _add_item(it)
+                total = first.total
+                if total and len(first.items) >= 14:
+                    last_page = min(FETCH_PAGE_BUDGET, -(-total // 14))
+                    for p in range(2, last_page + 1):
+                        res = await client.live_channels(gid, p)
+                        if not res or not res.items:
+                            break
+                        for it in res.items:
+                            _add_item(it)
+                        if len(res.items) < 14:
+                            break
+
+            # If no items found, try all_channels() and filter by genre
+            if not items:
+                try:
+                    complete = await client.all_channels()
+                    if complete:
+                        target = str(gid or "").strip()
+                        for it in complete:
+                            if _live_genre_of(it) == target:
+                                _add_item(it)
+                except Exception:
+                    pass
+
+        elif kind == "vod":
+            cid = gid or None
+            first = await client.vod_list(cid, 1)
+            if first and first.items:
+                for it in first.items:
+                    _add_item(it)
+                total = first.total
+                if total and len(first.items) >= 14:
+                    last_page = min(FETCH_PAGE_BUDGET, -(-total // 14))
+                    for p in range(2, last_page + 1):
+                        res = await client.vod_list(cid, p)
+                        if not res or not res.items:
+                            break
+                        for it in res.items:
+                            _add_item(it)
+                        if len(res.items) < 14:
+                            break
+
+        elif kind == "series":
+            cid = gid or None
+            first = await client.series_list(cid, 1)
+            if first and first.items:
+                for it in first.items:
+                    _add_item(it)
+                total = first.total
+                if total and len(first.items) >= 14:
+                    last_page = min(FETCH_PAGE_BUDGET, -(-total // 14))
+                    for p in range(2, last_page + 1):
+                        res = await client.series_list(cid, p)
+                        if not res or not res.items:
+                            break
+                        for it in res.items:
+                            _add_item(it)
+                        if len(res.items) < 14:
+                            break
+    except Exception as exc:
+        log.warning("Preview fetch failed for portal %s kind %s genre %s: %s",
+                    portal_id, kind, gid, exc)
+
+    return items
+
+
+async def _store_pending_genre_items(
+    db, portal_id: int, kind: str, genre_row, items: list[dict]
+) -> int:
+    if not items:
+        return 0
+    key_col = {"live": LiveSource.portal_channel_id,
+               "vod": VodSource.portal_item_id,
+               "series": SerieSource.portal_item_id}[kind]
+    source_model = {"live": LiveSource, "vod": VodSource, "series": SerieSource}[kind]
+
+    if kind == "live":
+        count = await _bulk_upsert(
+            db, source_model, portal_id, key_col, items,
+            lambda i: str(i.get("id", "") or ""),
+            lambda row, item: _live_fields(row, item, genre_row.id)
+        )
+        genre_row.channels_fetched = True
+        genre_row.item_count = len(items)
+        return count
+    elif kind == "vod":
+        count = await _bulk_upsert(
+            db, source_model, portal_id, key_col, items,
+            lambda i: str(i.get("id", "") or ""),
+            lambda row, item: _vod_fields(row, item, genre_row.id)
+        )
+        genre_row.items_fetched = True
+        genre_row.item_count = len(items)
+        return count
+    elif kind == "series":
+        count = await _bulk_upsert(
+            db, source_model, portal_id, key_col, items,
+            lambda i: str(i.get("id", "") or ""),
+            lambda row, item: _serie_fields(row, item, genre_row.id)
+        )
+        genre_row.items_fetched = True
+        genre_row.item_count = len(items)
+        return count
+    return 0
+
+
 @router.post("/{pid}/genres/toggle")
 async def toggle_genres(pid: int, payload: dict, db=Depends(get_db)):
     """payload: {kind: live|vod|series, ids: [...], enabled: true|false}"""
-    model = {"live": LiveGenre, "vod": VodGenre, "series": SerieGenre}[payload["kind"]]
+    kind = payload["kind"]
+    model = {"live": LiveGenre, "vod": VodGenre, "series": SerieGenre}[kind]
     ids = payload.get("ids", [])
+    enabled = bool(payload.get("enabled"))
     rows = (await db.execute(select(model).where(model.portal_id == pid,
                                                  model.id.in_(ids)))).scalars().all()
     for r in rows:
-        r.enabled = bool(payload.get("enabled"))
+        r.enabled = enabled
+        if enabled:
+            # Only store the channels if the genre gets enabled
+            pending = _PENDING_GENRE_ITEMS.pop((pid, kind, r.id), None)
+            if pending:
+                await _store_pending_genre_items(db, pid, kind, r, pending)
     await db.commit()
     return {"ok": True, "count": len(rows)}
 
@@ -830,15 +1016,84 @@ async def portal_items(pid: int, kind: str, db=Depends(get_db), q: str = "", pag
 
     `genre_id` narrows to ONE genre — the popup that opens when a genre NAME
     is clicked in the Edit/Add portal popup lists that genre's channels.
+    If the genre's channels are not yet fetched (e.g. because the genre is disabled),
+    they are fetched from the portal first for preview without being stored in the database.
+    They will only be stored in the database if the genre gets enabled.
     """
     model = {"live": LiveSource, "vod": VodSource, "series": SerieSource}.get(kind)
     if model is None:
         raise HTTPException(400, "kind must be live|vod|series")
-    stmt = select(model).where(model.portal_id == pid)
     genre_col = {"live": "live_genre_id", "vod": "vod_genre_id",
                  "series": "serie_genre_id"}[kind]
+    genre_model = {"live": LiveGenre, "vod": VodGenre, "series": SerieGenre}[kind]
+
     if genre_id is not None:
-        stmt = stmt.where(getattr(model, genre_col) == genre_id)
+        genre_row = await db.get(genre_model, genre_id)
+        if genre_row is None or genre_row.portal_id != pid:
+            return {"total": 0, "page": page, "per_page": per_page, "items": []}
+
+        # Check if database already has sources for this genre
+        db_sources = (await db.execute(
+            select(model).where(model.portal_id == pid, getattr(model, genre_col) == genre_id)
+        )).scalars().all()
+
+        if db_sources:
+            rows = list(db_sources)
+            if q:
+                rows = [r for r in rows if q.lower() in (r.original_name or "").lower()]
+            rows.sort(key=lambda r: (r.original_name or "").lower())
+            total = len(rows)
+            rows = rows[(page - 1) * per_page: page * per_page]
+            return {"total": total, "page": page, "per_page": per_page, "items":
+                    [{"id": r.id, "name": r.original_name, "enabled": r.enabled,
+                      "poster": getattr(r, "poster", None) or getattr(r, "logo_original", None),
+                      "number": (getattr(r, "number", None)
+                                 or (str(r.position) if getattr(r, "position", None) is not None
+                                     else None)),
+                      "channel_id": (getattr(r, "portal_channel_id", None)
+                                     or getattr(r, "portal_item_id", None))}
+                     for r in rows]}
+
+        # Not yet stored in database (e.g. because genre is disabled).
+        # Fetch the channel list first, but do not store it in the database as the genre is still disabled.
+        cache_key = (pid, kind, genre_id)
+        if cache_key in _PENDING_GENRE_ITEMS:
+            raw_items = _PENDING_GENRE_ITEMS[cache_key]
+        else:
+            raw_items = await _fetch_genre_items_for_preview(db, pid, kind, genre_row)
+            if not genre_row.enabled:
+                # Do not store in database as genre is still disabled
+                _PENDING_GENRE_ITEMS[cache_key] = raw_items
+            else:
+                # Genre is already enabled: store immediately
+                await _store_pending_genre_items(db, pid, kind, genre_row, raw_items)
+                await db.commit()
+
+        # Format items for preview
+        formatted = []
+        for item in raw_items:
+            cid = str(item.get("id") or "").strip()
+            if not cid or cid in ("*", "0", "-1"):
+                continue
+            name = (item.get("name") or "?").strip() if kind == "live" else portal_item_title(item, limit=400)
+            poster = item.get("logo") or item.get("screenshot_uri") or None
+            number = str(item.get("number", "") or "") or None if kind == "live" else None
+            formatted.append({
+                "id": cid,
+                "name": name,
+                "enabled": False,
+                "poster": poster,
+                "number": number,
+                "channel_id": cid,
+            })
+        if q:
+            formatted = [r for r in formatted if q.lower() in (r["name"] or "").lower()]
+        formatted.sort(key=lambda r: (r["name"] or "").lower())
+        total = len(formatted)
+        rows = formatted[(page - 1) * per_page: page * per_page]
+        return {"total": total, "page": page, "per_page": per_page, "items": rows}
+
+    stmt = select(model).where(model.portal_id == pid)
     if q:
         stmt = stmt.where(model.original_name.ilike(f"%{q}%"))       # case-insensitive
     stmt = stmt.order_by(model.original_name)

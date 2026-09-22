@@ -584,6 +584,7 @@ async function openGenreChannels(pid, kind, gid, name, enabled) {
   });
   footer.append(mBtn("Close", "btn-outline-secondary", () => m.close()));
   let q = "", page = 1, total = 0, pages = 1, rows = [], genreOn = !!enabled;
+  body.innerHTML = `<div class="p-3 text-center text-muted small"><span class="spinner-border spinner-border-sm me-2"></span>Loading ${noun}…</div>`;
   const load = async () => {
     const d = await api(`/api/portals/${pid}/items?kind=${kind}&genre_id=${gid}` +
                         `&q=${encodeURIComponent(q)}&page=${page}&per_page=100`);
@@ -631,6 +632,11 @@ async function openGenreChannels(pid, kind, gid, name, enabled) {
         toast(`genre ${on ? "enabled" : "disabled"} — use Fetch to (un)load its items`, "ok");
         const paneSw = $(`#genre-list-${kind} input[value="${gid}"]`);
         if (paneSw) paneSw.checked = on;   // the Edit popup's switch stays in step
+        const paneRow = paneSw?.closest("label");
+        const paneCount = paneRow?.querySelector(".text-muted");
+        if (paneCount && on && total) {
+          paneCount.textContent = `${total} items · fetched`;
+        }
       } catch (err) { e.target.checked = !on; }  // api() already toasted
     };
     $("#gch-q", body).onchange = (e) => { q = e.target.value.trim(); page = 1; load(); };
