@@ -562,8 +562,8 @@ def _orphan_ffmpeg_pids(root: str = "/proc") -> list[int]:
 #: costs nothing real and caps the walk at a fraction of the old worst case.
 STREAM_START_TIMEOUT_REST = float(os.environ.get("SPM_STREAM_START_TIMEOUT_REST", "5"))
 
-#: When a chain has at least this many candidates that are free to play, a silent
-#: candidate is given only `SPM_HEDGE_AFTER_S` (2 s) before the walk moves on.
+#: When the chain has enough free candidates, a silent one is given only
+#: `SPM_HEDGE_AFTER_S` (2 s) before the walk moves on.
 #:
 #: The measured reality is that a candidate which is going to answer does so in
 #: well under a second (a live start on the demo instance: ~550 ms end to end,
@@ -572,15 +572,36 @@ STREAM_START_TIMEOUT_REST = float(os.environ.get("SPM_STREAM_START_TIMEOUT_REST"
 #: full window, so a two-MAC chain could sit black for up to 24 s before the
 #: player saw anything - the single most-visible symptom the stability work is
 #: about. With an alternative in the chain there is no reason to pay that: the
-#: fence is only lowered while another MAC is actually free, so a single-MAC
-#: portal (nothing to fall back to) keeps the patient windows.
+#: fence is only lowered while candidates are actually free to play, so a walk
+#: with nothing free keeps the patient windows.
+#:
+#: That fence used one blanket rule for every kind of item, and the VOD logs
+#: made the hole in it obvious: `create_link` answers 200 in ~80 ms for every
+#: MAC, so all 4 stay "free" for a whole VOD walk, every candidate gets hedge-cut
+#: to 2 s, and a movie that needs longer than 2 s to open (a slow storage the
+#: panel picked, a cold CDN edge; live was measured at ~550 ms but VOD can need
+#: several seconds) was declared dead before its first byte - six 2 s windows,
+#: zero bytes, 502. The fence must skip at least the first candidate (the one
+#: the engine believes in - by *this* play's order, not by the playlist's),
+#: and `SPM_HEDGE_KINDS` excludes VOD/episode/local so a start that is genuinely
+#: slow is waited for. Higher thresholds stay available for live zapping, where
+#: the 550 ms measurement came from.
 #:
 #: 0 disables it. Deliberately *not* a parallel race: two simultaneous
 #: create_links would hold two panel slots for one zap, and on the panels this
 #: was measured against a second slot is exactly what answers `limit`.
 HEDGE_AFTER_S = float(os.environ.get("SPM_HEDGE_AFTER_S", "2.0"))
-#: How many free candidates must exist before the fence is lowered.
-HEDGE_MIN_CANDIDATES = max(2, int(os.environ.get("SPM_HEDGE_MIN_CANDIDATES", "2")))
+#: Hedge fence: never before the 2nd candidate (the first one is the engine's
+#: best guess and gets a patient window), and never for sorts of items whose
+#: first byte is measured in seconds, not milliseconds (VOD/episode/local).
+#: `0` (the new default) expects the whole chain to be free; thresholds higher
+#: than 1 still ask for that many free candidates. The common false positive
+#: is a slow VOD or slow storage, so users are expected to lower a tuned value
+#: *back to 0* rather than raise it, which is what a field tuned for live only
+#: leaves behind.
+HEDGE_MIN_CANDIDATES = max(0, int(os.environ.get("SPM_HEDGE_MIN_CANDIDATES", "0")))
+HEDGE_KINDS = {k.strip() for k in os.environ.get("SPM_HEDGE_KINDS", "live").split(",")
+               if k.strip()}
 
 #: A live stream that dies mid-play is restarted inside the SAME client response.
 #: The usual cause is not a dead channel but a dead *link*: panels invalidate the
@@ -2665,13 +2686,22 @@ class StreamManager:
                 "portals": portals, "recent": rows[-12:]}
 
     def _free_candidates(self, chain: list, requester: str | None) -> int:
-        """How many MACs in this chain could be played right now (see HEDGE_AFTER_S)."""
-        free = 0
-        for _src, _portal, macs in chain or ():
-            for mac in macs or ():
-                if not self.is_mac_busy(getattr(mac, "id", None), requester=requester):
-                    free += 1
-        return free
+        """How many MACs in this chain could be played right now (see HEDGE_AFTER_S).
+
+        A MAC counts once, even when several steps of the chain carry it: the
+        fence's threshold is "this many *different* slots are free", and a
+        decision walked twice must not look like two free candidates. An
+        adopted Xtream step owns no MAC and never counts - see `_macs_for`.
+        """
+        free: set[int] = set()
+        for _src, portal, macs in chain or ():
+            for mac in self._macs_for(portal, _src, macs) or ():
+                mid = getattr(mac, "id", None)
+                if mid is None:
+                    continue
+                if not self.is_mac_busy(mid, requester=requester):
+                    free.add(mid)
+        return len(free)
 
     def _occupied_note(self, mac_row) -> str:
         """One MAC's occupancy as a phrase for a log line ('' when free)."""
@@ -3276,8 +3306,10 @@ class StreamManager:
                           # window. See HEDGE_AFTER_S.
                           window = (STREAM_START_TIMEOUT if first_candidate
                                     else STREAM_START_TIMEOUT_REST)
-                          if HEDGE_AFTER_S > 0 and self._free_candidates(chain, h.user_name) \
-                                  >= HEDGE_MIN_CANDIDATES:
+                          if (HEDGE_AFTER_S > 0 and h.kind in HEDGE_KINDS
+                                  and not first_candidate
+                                  and self._free_candidates(chain, h.user_name)
+                                  >= HEDGE_MIN_CANDIDATES):
                               window = min(window, HEDGE_AFTER_S)
                           # Decided before the portal is touched, for the same reason the
                           # redirect path decides first: for a source the user adopted onto

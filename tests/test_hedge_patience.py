@@ -9,11 +9,18 @@ two-MAC chain that sat on the full 12 s window per MAC kept the screen black for
 up to 24 s before the player saw anything - the symptom this whole stability pass
 is about (`SPM_HEDGE_AFTER_S`).
 
-The rule has two halves, and both are pinned here: the fence drops *only* while
-another MAC is genuinely free (a single-MAC portal has nothing to fall back to
-and keeps the patient windows), and the dropped window is what the log and the
-502 name - a report that says "silent 12s" when we waited 2 s is a lie that costs
-somebody an afternoon.
+The rule's halves are pinned here:
+
+* the fence drops *only* while another MAC is genuinely free (nothing free to
+  fall back to means patience is the only thing that helps, so the patient
+  windows stay), and *only* after the first candidate has had its full window -
+  the first candidate is the source the engine believes in, and hedge-cutting it
+  to 2 s is what made a slow VOD start fail with six 2 s windows and zero bytes;
+* the dropped window is what the log and the 502 name - a report that says
+  "silent 12s" when we waited 2 s is a lie that costs somebody an afternoon;
+* the fence is a *live* tool (zap speed) - VOD/episode/local first bytes are
+  measured in seconds, not milliseconds, so the fence stays down for them
+  (see tests/test_vod_hedge_patience.py for the reported regression).
 
 A parallel race over two candidates was considered and rejected: it holds two
 panel slots for one zap, and on the panels this was measured against a second
@@ -66,21 +73,24 @@ def _clean():
 
 async def test_a_silent_candidate_is_dropped_early_when_a_mac_is_free(monkeypatch):
     pl, _macs = await _live_route()
-    _wire(monkeypatch, window=5.0, hedge=0.15)
+    _wire(monkeypatch, window=5.0, hedge=0.15, min_candidates=1)
     started = time.monotonic()
     handle, gen = await MANAGER.open("live", pl, "bert")
     chunks = [c async for c in gen]
     took = time.monotonic() - started
     assert chunks == []
-    assert took < 1.0, f"two silent candidates took {took:.2f}s despite a free MAC"
+    assert took < 5.5, f"two silent candidates took {took:.2f}s despite a free MAC"
     assert handle.attempts, handle.trace
-    assert all("silent 0.15s" in a for a in handle.attempts), handle.attempts
+    # the FIRST candidate is never fence-cut (it is the one the engine trusts);
+    # every candidate after it is
+    assert "silent 5s" in handle.attempts[0], handle.attempts
+    assert all("silent 0.15s" in a for a in handle.attempts[1:]), handle.attempts
 
 
 async def test_a_single_free_mac_keeps_the_patient_window(monkeypatch):
     """Nothing to fall back to: patience is the only thing that can help."""
     pl, macs = await _live_route()
-    _wire(monkeypatch, window=0.5, hedge=0.05)
+    _wire(monkeypatch, window=0.5, hedge=0.05, min_candidates=2)
     other = StreamHandle(id="other", kind="live", item_name="Other",
                          user_name="anna", template_name="t", command="ffmpeg")
     MANAGER.streams[other.id] = other
@@ -104,3 +114,21 @@ async def test_hedging_can_be_switched_off(monkeypatch):
     took = time.monotonic() - started
     assert took >= 0.35, f"hedging was off but the window was cut ({took:.2f}s)"
     assert all("silent 0.4s" in a for a in handle.attempts), handle.attempts
+
+
+async def test_the_first_candidate_is_never_fence_cut(monkeypatch):
+    """The engine trusts its first candidate: hedge applies from the second on.
+
+    Cutting the FIRST candidate to 2 s was half of the reported VOD regression:
+    the movie the engine most believed in was given 2 s to open, so every other
+    candidate never got a real turn either. The first window stays patient even
+    with plenty of free MACs around.
+    """
+    pl, _macs = await _live_route()
+    _wire(monkeypatch, window=2.0, hedge=0.05, min_candidates=1)
+    started = time.monotonic()
+    handle, gen = await MANAGER.open("live", pl, "bert")
+    assert [c async for c in gen] == []
+    took = time.monotonic() - started
+    assert 2.0 <= took < 3.0, f"first candidate got {took:.2f}s, not its full window"
+    assert "silent 2s" in handle.attempts[0], handle.attempts
