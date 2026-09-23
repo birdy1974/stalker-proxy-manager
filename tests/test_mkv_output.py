@@ -35,7 +35,7 @@ def _specs(args):
 async def _gate(cmd, url, subs, pace=True):
     args = StreamManager._ffmpeg_argv(cmd, url, pace=pace)
 
-    async def fake_probe(target, *, is_url):
+    async def fake_probe(target, *, is_url, cached_only=False):
         return subs
 
     orig = sm.subtitle_streams
