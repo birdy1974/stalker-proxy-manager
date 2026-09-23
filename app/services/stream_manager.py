@@ -1662,11 +1662,15 @@ class StreamManager:
     async def _subs_gate(self, args: list[str], url: str, pace: bool,
                          name: str = "") -> list[str]:
         """
-        Per-source reality check for the dvb subtitle intent.
+        Per-source reality check for DVB and Matroska subtitle intents.
 
-        The template says what it WANTS; whether the source can deliver it is
-        a property of the file/link being played. The gate probes the source
-        once (8 s cap, 10 min cache keyed without the per-play token) and
+        Matroska network inputs use cached metadata only: a preflight must
+        not spend the portal's playback token. Local Matroska files can be
+        probed, and unknown metadata leaves the optional copy maps intact.
+
+        For DVB, the template says what it WANTS; whether the source can
+        deliver it is a property of the file/link being played. The gate
+        probes once (8 s cap, 10 min cache without the per-play token) and
         degrades to the safe default - no subtitle track in the pipe - instead
         of letting ffmpeg abort before its first output byte. Live inputs
         (pace=False) are trusted instead of probed: zapping must stay instant,
@@ -1692,8 +1696,16 @@ class StreamManager:
         if StreamManager._outputs_matroska(args):
             if not pace:                   # live: trusted, no probe (zap speed)
                 return args
-            subs = await subtitle_streams(url, is_url=is_net)
-            if not subs:                   # None (probe failed) or [] (no subs)
+            # Do not open a portal's playback URL twice. Even a short probe
+            # can spend a one-use token or leave the provider's only stream
+            # slot occupied when the real player opens it. Language reporting
+            # must never require an extra connection before the first byte.
+            # Cached codec information still lets us avoid unsupported tracks;
+            # without it, preserve the optional copy-all mapping (as we do on
+            # probe failure). Local files can safely be probed as before.
+            subs = (await subtitle_streams(url, is_url=True, cached_only=True)
+                    if is_net else await subtitle_streams(url, is_url=False))
+            if not subs:                   # unknown metadata or no subtitles
                 return args
             bad = [s["codec"] for s in subs if s["codec"] in _MKV_UNSUPPORTED_SUB_CODECS]
             if not bad:

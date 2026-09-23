@@ -622,7 +622,8 @@ ffmpeg … -i <url> -map 0:v:0 -map 0:a:0? -map 0:s? -dn
 
 * `-live 1` is what a pipe needs: the Matroska muxer must not try to seek back and patch cues/duration at the end (it cannot, on a pipe).
 * The same mode works **with** hardware transcoding: `-c:v h264_vaapi … -c:s copy` re-encodes the video on the GPU (4K/HEVC → H.264 1080p for a box that cannot decode it) while the subtitle tracks ride along untouched. That is the *Enigma2 VOD - VAAPI 1080p* preset.
-* At spawn time the gate probes the source only to route **around** the handful of codecs Matroska cannot hold (teletext, EIA-608/708); everything else is kept, and a source with no subtitles at all costs nothing (`-map 0:s?` is optional).
+* For **local files**, the startup gate probes the source to route **around** codecs Matroska cannot hold (teletext, EIA-608/708). For **portal/network MKV playback**, it uses only fresh cached subtitle metadata: it never opens the playback URL for a separate subtitle probe. Opening a tokenized URL twice can consume a single-use token or interfere with the provider's connection limit before playback starts. Without cached metadata the optional copy-all mapping is left unchanged; unsupported subtitle codecs cannot be filtered in that case. MPEG-TS subtitle probing is unchanged.
+* The Dutch/English check added in `c3f3ce2` is **diagnostic, not selection**: when metadata is available for multiple tracks, it reports whether Dutch or English is among the kept tracks. It does not filter other languages, force a default track, or change the video/audio codecs, container or Enigma2 player. Without metadata, language availability is unknown, not a playback failure. Select the desired track in the receiver's subtitle menu.
 
 Play those items through the **`.mkv` URL aliases**, which exist next to the `.ts` ones for every kind:
 

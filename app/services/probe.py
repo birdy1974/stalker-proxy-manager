@@ -240,7 +240,15 @@ _SUBS_CACHE: dict[str, tuple[float, list | None]] = {}
 _SUBS_CACHE_TTL = 600.0
 
 
-async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
+async def subtitle_streams(target: str, *, is_url: bool,
+                           cached_only: bool = False) -> list[dict] | None:
+    """Return subtitle metadata, optionally without opening the source.
+
+    MKV portal startup uses cached_only: a separate probe could consume the
+    play token or occupy the provider's connection slot before playback opens
+    it. None in that mode means unknown, NOT that the source has no subtitles.
+    Local files and the MPEG-TS codec gate still probe on a cache miss.
+    """
     # The cache key drops the query string: portal links carry a fresh
     # play_token per play, but the FILE (and its subtitle tracks) behind the
     # same path never changes - so a second play of the same movie skips the
@@ -250,6 +258,8 @@ async def subtitle_streams(target: str, *, is_url: bool) -> list[dict] | None:
     hit = _SUBS_CACHE.get(key)
     if hit and time.time() - hit[0] < _SUBS_CACHE_TTL:
         return hit[1]
+    if cached_only:
+        return None
     # Learned player identity for network URLs (the first-ever probe uses
     # the faithful MAG player UA); local files don't announce anything.
     _ua = stream_identity.learned(target) if is_url else None
