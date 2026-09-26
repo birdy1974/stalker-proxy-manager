@@ -37,6 +37,7 @@ from sqlalchemy import delete, select, update
 
 from ..config import FFMPEG_BIN, STREAM_START_TIMEOUT
 from ..database import SessionLocal, run_uncancelled
+import httpx
 from ..models import (
     ActiveStream, FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource,
     LocalFile, LocalPlaylist, LocalSource, MacAddress, Portal, SerieEpisode, SeriePlaylist,
@@ -51,7 +52,8 @@ from . import stream_identity
 from .channel_translations import attach_overrides
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
-                               HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
+                               HLS_PROTOCOL_WHITELIST, PASSTHROUGH_COMMAND,
+                               PASSTHROUGH_PRESET_NAME, REDIRECT_COMMAND,
                                URL_PLACEHOLDER, argv_validation_errors,
                                mpegts_copy_command, serves_original_file)
 from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
@@ -171,6 +173,72 @@ STREAM_STALL_TIMEOUT = float(os.environ.get("SPM_STREAM_STALL_TIMEOUT", "25.0"))
 STREAM_STALL_TIMEOUT_LIVE = float(os.environ.get(
     "SPM_STREAM_STALL_TIMEOUT_LIVE", "10.0"))
 CHUNK = 64 * 1024
+
+
+class PassthroughStream:
+    """Process-like interface for an asynchronous pass-through HTTP stream (Option E).
+
+    Acts as a drop-in replacement for `asyncio.subprocess.Process` in `StreamManager`,
+    providing `.stdout.read(n)`, `.returncode`, `.kill()`, and `.wait()`.
+    Zero FFmpeg subprocesses, zero transcoding, minimal CPU.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, response: httpx.Response):
+        self._client = client
+        self._response = response
+        self._aiter = response.aiter_bytes(chunk_size=CHUNK)
+        self.returncode: int | None = None
+        self.pid: int | None = None
+        self.spm_stderr_tail: list[bytes] = []
+        self.spm_stderr_task: asyncio.Task | None = None
+        self._closed = False
+        self.stdout = self._Stdout(self)
+
+    class _Stdout:
+        def __init__(self, parent: PassthroughStream):
+            self._parent = parent
+
+        async def read(self, n: int = -1) -> bytes:
+            if self._parent.returncode is not None:
+                return b""
+            try:
+                chunk = await anext(self._parent._aiter)
+                return chunk
+            except StopAsyncIteration:
+                self._parent.returncode = 0
+                return b""
+            except asyncio.CancelledError:
+                self._parent.returncode = -9
+                raise
+            except Exception:
+                self._parent.returncode = 1
+                return b""
+
+    def kill(self) -> None:
+        self.returncode = -9
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._close())
+        except RuntimeError:
+            pass
+
+    async def wait(self) -> int:
+        await self._close()
+        return self.returncode if self.returncode is not None else 0
+
+    async def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._response.aclose()
+        except Exception:
+            pass
+        try:
+            await self._client.aclose()
+        except Exception:
+            pass
+
 # input options that only exist for network protocols (stripped for file://)
 _NETONLY_OPTS = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout|user_agent|headers|http_proxy"
@@ -212,6 +280,8 @@ _TS_VIDEO_BSF = {"h264": "h264_mp4toannexb", "hevc": "hevc_mp4toannexb",
 # VOD on top of a slow portal, a hard disk that has to spin up). Two seconds
 # is plenty for normal A/V skew and keeps stream start responsive.
 MAX_INTERLEAVE_DELTA_US = os.environ.get("SPM_MAX_INTERLEAVE_DELTA_US", "2000000")
+FAST_ANALYZE_DURATION = os.environ.get("SPM_FAST_ANALYZE_DURATION", "1000000")
+FAST_PROBE_SIZE = os.environ.get("SPM_FAST_PROBE_SIZE", "1000000")
 ROUTE_AFFINITY_TTL = float(os.environ.get("SPM_ROUTE_AFFINITY_TTL", "1800"))
 SOURCE_BREAKER_FAILURES = max(1, int(os.environ.get("SPM_SOURCE_BREAKER_FAILURES", "2")))
 SOURCE_BREAKER_COOLDOWN = float(os.environ.get("SPM_SOURCE_BREAKER_COOLDOWN", "45"))
@@ -1585,7 +1655,7 @@ class StreamManager:
         else gets the plain "no subtitles" net (which also strips a legacy
         subtitles= burn filter from the -vf value).
         """
-        if (cmd_template or "").strip() == REDIRECT_COMMAND:
+        if (cmd_template or "").strip() in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
             return None
         is_net = url.lower().startswith(_NET_SCHEMES)
         insert = url if is_net else shlex.quote(url)
@@ -1613,15 +1683,18 @@ class StreamManager:
                 pass
         args = StreamManager._ensure_annexb(args)
         args = StreamManager._ensure_interleave_flush(args)
+        args = StreamManager._ensure_flush_packets(args)
         # Live Matroska is audio-only on Enigma2 (no cues on a pipe). A VOD
         # MKV template assigned to a live channel is rewritten to MPEG-TS.
         if not pace and is_net:
             # `pace=False` is normally live, but callers also use the pure
             # argv renderer for local-file diagnostics. Only a network/live
             # input should have its Matroska pipe rewritten for Enigma2.
+            args = StreamManager._ensure_fast_probe(args)
             args = StreamManager._matroska_to_mpegts_for_live(args)
             args = StreamManager._ensure_annexb(args)
             args = StreamManager._ensure_interleave_flush(args)
+            args = StreamManager._ensure_flush_packets(args)
         # Inject metadata title before the output format specifier so players
         # display the correct stream name instead of source stream metadata.
         # One argv element (create_subprocess_exec); a title with spaces or
@@ -1993,6 +2066,34 @@ class StreamManager:
         return out
 
     @staticmethod
+    def _ensure_fast_probe(args: list[str]) -> list[str]:
+        """Bound demux analysis on live network streams so FFmpeg doesn't
+        wait up to 5 seconds for its default 5MB/5s probe analysis window."""
+        if not args or "-analyzeduration" in args or "-probesize" in args:
+            return args
+        try:
+            i_idx = args.index("-i")
+        except ValueError:
+            return args
+        out = list(args)
+        out[i_idx:i_idx] = ["-analyzeduration", FAST_ANALYZE_DURATION,
+                            "-probesize", FAST_PROBE_SIZE]
+        return out
+
+    @staticmethod
+    def _ensure_flush_packets(args: list[str]) -> list[str]:
+        """Ensure streaming output pipes flush packets immediately instead
+        of holding them in user-space buffers."""
+        if not args or "-flush_packets" in args:
+            return args
+        fmt, f_idx = StreamManager._output_format(args)
+        if fmt not in ("mpegts", "matroska", "mkv") or f_idx is None:
+            return args
+        out = list(args)
+        out[f_idx:f_idx] = ["-flush_packets", "1"]
+        return out
+
+    @staticmethod
     def _copy_flags(args: list[str]) -> tuple[bool, bool]:
         """(video copied, audio copied) for the output section. `-c copy`
         covers both; `-an` means there is no audio to fix at all."""
@@ -2038,6 +2139,91 @@ class StreamManager:
         out[at:at] = ins
         return out
 
+    @staticmethod
+    def _referer_of(url: str) -> str:
+        """Origin-root referer for network requests."""
+        scheme, _, rest = str(url).partition("://")
+        return f"{scheme}://{rest.split('/', 1)[0]}/"
+
+    async def _open_passthrough(
+        self, url: str, *, title: str,
+        first_byte_timeout: float | None = None,
+    ) -> tuple[PassthroughStream | None, bytes, dict | None]:
+        """Open a raw asynchronous pass-through HTTP stream directly to the target URL,
+        bypassing FFmpeg completely (Option E)."""
+        is_net = url.lower().startswith(_NET_SCHEMES)
+        if not is_net:
+            await db_log("ERROR", "stream",
+                         f"[{title}] pass-through proxy requires a network URL: {url}")
+            return None, b"", {"rc": 1, "tail": [b"not a network url"], "stalled": False}
+
+        timeout_s = first_byte_timeout or STREAM_START_TIMEOUT
+        choices = stream_identity.ladder(url)
+        last: dict | None = None
+        for rung, ua in enumerate(choices):
+            t0 = time.monotonic()
+            headers = {
+                "User-Agent": ua or stream_identity.STB_UA,
+                "Referer": StreamManager._referer_of(url),
+                "Accept": "*/*",
+                "Connection": "keep-alive",
+            }
+            timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=None)
+            client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False)
+            try:
+                req = client.build_request("GET", url, headers=headers)
+                resp = await client.send(req, stream=True)
+            except Exception as exc:
+                await client.aclose()
+                last = {"rc": 1, "tail": [f"ConnectError: {exc}".encode()], "stalled": False}
+                if rung + 1 < len(choices):
+                    continue
+                return None, b"", last
+
+            elapsed = time.monotonic() - t0
+            if resp.status_code >= 400:
+                code = resp.status_code
+                tail = [f"HTTP {code}".encode()]
+                await resp.aclose()
+                await client.aclose()
+                last = {"rc": code, "tail": tail, "stalled": False}
+                if code in stream_identity.UA_POLICY_4XX and rung + 1 < len(choices):
+                    nxt = choices[rung + 1]
+                    next_label = ("portal browser"
+                                  if nxt == stream_identity.STB_UA else "media player")
+                    await db_log(
+                        "INFO", "stream",
+                        f"[{title}] origin answered HTTP {code} to passthrough request - "
+                        f"retrying once with the {next_label} user-agent")
+                    continue
+                return None, b"", last
+
+            # Status 2xx: connection established, fetch first chunk
+            stream = PassthroughStream(client, resp)
+            try:
+                first = await asyncio.wait_for(stream.stdout.read(CHUNK), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                await stream._close()
+                last = {"rc": None, "tail": [b"timeout waiting for first bytes"], "stalled": True}
+                return None, b"", last
+            except Exception as exc:
+                await stream._close()
+                last = {"rc": 1, "tail": [f"read error: {exc}".encode()], "stalled": False}
+                return None, b"", last
+
+            if not first:
+                await stream._close()
+                last = {"rc": 0, "tail": [b"EOF before first bytes"], "stalled": False}
+                if rung + 1 < len(choices):
+                    continue
+                return None, b"", last
+
+            if ua:
+                stream_identity.remember(url, ua)
+            return stream, first, None
+
+        return None, b"", last
+
     async def _open_with_identity(self, command: str, url: str, *,
                                   title: str, pace: bool,
                                   first_byte_timeout: float | None = None
@@ -2058,6 +2244,9 @@ class StreamManager:
         the next play costs one spawn again. A silent stall/timeout is NOT an
         identity answer and never spends the browser-UA retry.
         """
+        if (command or "").strip() == PASSTHROUGH_COMMAND:
+            return await self._open_passthrough(
+                url, title=title, first_byte_timeout=first_byte_timeout)
         template_owns = "-user_agent" in (command or "")
         is_net = url.lower().startswith(_NET_SCHEMES)
         # Local files have no media endpoint to negotiate identity with: one
@@ -2125,9 +2314,9 @@ class StreamManager:
 
     async def _spawn(self, cmd_template: str, url: str, title: str | None = None,
                      pace: bool = False, user_agent: str | None = None) -> asyncio.subprocess.Process | None:
-        if (cmd_template or "").strip() == REDIRECT_COMMAND:
+        if (cmd_template or "").strip() in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
             await db_log("ERROR", "stream",
-                         "cannot spawn the redirect template as ffmpeg "
+                         f"cannot spawn the {(cmd_template or '').strip()} template as ffmpeg "
                          "(local files must be served directly)")
             return None
         if "<out_dir>" in (cmd_template or ""):
@@ -2738,7 +2927,8 @@ class StreamManager:
         return macs
 
     @staticmethod
-    def _plan(src, mac_row, portal, *, ffmpeg: bool = False):
+    def _plan(src, mac_row, portal, *, ffmpeg: bool = False,
+              allow_direct: bool | None = None):
         """(ask or play as stored) for one (source, MAC), decided the same way by
         every path. See app/portal/links.py for the rules and their reasons.
 
@@ -2750,8 +2940,9 @@ class StreamManager:
             adopted = str(getattr(src, "xtream_url", "") or "")
             if adopted:
                 return plan_adopted(adopted, src=src, mac_row=mac_row)
-        return plan_for(src, mac_row, ffmpeg=ffmpeg,
-                        allow_direct=bool(getattr(portal, "direct_links", True)))
+        portal_direct = bool(getattr(portal, "direct_links", True))
+        allow = portal_direct and (allow_direct if allow_direct is not None else True)
+        return plan_for(src, mac_row, ffmpeg=ffmpeg, allow_direct=allow)
 
     async def _create_link_with_backoff(self, client, plan, link_kind: str,
                                         item_name: str, mac_row):
@@ -2826,6 +3017,8 @@ class StreamManager:
         from .runtime_settings import prefer_free_mac
         prefer_free = await prefer_free_mac()
         every_candidate_busy = True
+        failed_sources: set[tuple] = set()
+        direct_failed: set[tuple] = set()
         attempts = 2 if (ZAP_RETRY and chain) else 1
         for pass_no in range(attempts):
             if pass_no == 1:
@@ -2843,6 +3036,7 @@ class StreamManager:
                 if prefer_free:
                     candidates = self.order_by_free(route_key, _src, candidates, requester)
                 for mac_row in candidates:
+                    cand_key = (getattr(_src, "id", None), getattr(mac_row, "id", None))
                     # ffmpeg lock OR a recent redirect lease — both mean "leave this
                     # MAC alone". Redirects never enter mac_locks (we no longer hold
                     # the socket after the 302), so the lease is the only signal.
@@ -2891,7 +3085,8 @@ class StreamManager:
                     # player one redirect and us *nothing* - no handshake reuse, no
                     # token, no create_link. The old shape paid for all of that and
                     # then threw the answer away in favour of the stored URL anyway.
-                    plan = self._plan(_src, mac_row, portal)
+                    allow_direct = (cand_key not in direct_failed)
+                    plan = self._plan(_src, mac_row, portal, allow_direct=allow_direct)
                     if plan.policy.direct:
                         await db_log("INFO", "stream",
                                      f"[{item_name}] playing the stored link via "
@@ -2905,6 +3100,7 @@ class StreamManager:
                                          f"[{item_name}] redirect: stored link dead "
                                          f"({portal.name}; {_probe.detail}) -> next candidate")
                             note_candidate_failure(route_key, _src, mac_row)
+                            direct_failed.add(cand_key)
                             every_candidate_busy = False
                             continue
                         note_handed_out(route_key, _src, mac_row)
@@ -2949,9 +3145,17 @@ class StreamManager:
                         if exc.code in SLOT_BUSY_CODES:
                             continue          # busy stays "busy" for the 503
                         every_candidate_busy = False
+                        if exc.code not in SLOT_BUSY_CODES:
+                            if hasattr(client, "invalidate"):
+                                client.invalidate()
+                            if hasattr(POOL, "drop") and mac_row is not None:
+                                await POOL.drop(PortalSession.from_rows(portal, mac_row))
                         if exc.mac_suspect:
                             continue
-                        self.route_health.failed(_src)
+                        src_key = self.route_health.source_key(_src)
+                        if src_key not in failed_sources:
+                            failed_sources.add(src_key)
+                            self.route_health.failed(_src)
                         break
                     except Exception as exc:  # noqa: BLE001
                         await db_log("WARNING", "stream",
@@ -2959,10 +3163,14 @@ class StreamManager:
                                      f"{type(exc).__name__}: {exc} -> next")
                         note_candidate_failure(route_key, _src, mac_row)
                         every_candidate_busy = False
-                        # Transport errors are source failures too. Keep trying
-                        # other MACs/sources for this request, but make subsequent
-                        # starts skip a source that just timed out.
-                        self.route_health.failed(_src)
+                        if hasattr(client, "invalidate"):
+                            client.invalidate()
+                        if hasattr(POOL, "drop") and mac_row is not None:
+                            await POOL.drop(PortalSession.from_rows(portal, mac_row))
+                        src_key = self.route_health.source_key(_src)
+                        if src_key not in failed_sources:
+                            failed_sources.add(src_key)
+                            self.route_health.failed(_src)
                         continue
                     finally:
                         await client.close()
@@ -2975,6 +3183,13 @@ class StreamManager:
                                          f"({portal.name}/{mac_row.mac}; {_probe.detail}) "
                                          f"-> next candidate")
                             note_candidate_failure(route_key, _src, mac_row)
+                            drop_link(kind, ref_id, getattr(mac_row, "id", None), requester)
+                            if mac_row is not None:
+                                sess = PortalSession.from_rows(portal, mac_row)
+                                if hasattr(client, "invalidate"):
+                                    client.invalidate()
+                                if hasattr(POOL, "drop"):
+                                    await POOL.drop(sess)
                             every_candidate_busy = False
                             continue
                         note_handed_out(route_key, _src, mac_row)
@@ -3052,7 +3267,7 @@ class StreamManager:
         # template is the redirect marker, which is not an ffmpeg command: when
         # we reach the pipe (Enigma2 asked for `.ts`, not the original MP4)
         # remux to MPEG-TS with Annex-B instead of dying in _spawn.
-        if kind == "local" and (command or "").strip() == REDIRECT_COMMAND:
+        if kind == "local" and (command or "").strip() in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
             tpl_name = "(local mpegts remux)"
             command = mpegts_copy_command()
         handle = StreamHandle(id=uuid.uuid4().hex, kind=kind, item_name=item_name,
@@ -3253,6 +3468,8 @@ class StreamManager:
                              + " -> giving the player an answer instead of a hang")
 
             tried_any = False
+            failed_sources: set[tuple] = set()
+            direct_failed: set[tuple] = set()
             while True:
               for pass_no in range(attempts):
                   if pass_no == 1:
@@ -3316,7 +3533,10 @@ class StreamManager:
                           # the panel's Xtream side (R7) there is no MAC to spend and no
                           # session to open, and reaching for a client "just in case"
                           # would put the portal back in the loop we removed.
-                          plan = self._plan(src, mac_row, portal, ffmpeg=True)
+                          cand_key = (getattr(src, "id", None), getattr(mac_row, "id", None))
+                          allow_direct = (cand_key not in direct_failed)
+                          plan = self._plan(src, mac_row, portal, ffmpeg=True,
+                                            allow_direct=allow_direct)
                           adopted = plan.adopted
                           # `requester=h.user_name`: this user's own post-302 lease is
                           # the channel the box just zapped away from, not another
@@ -3350,6 +3570,7 @@ class StreamManager:
                                           else f"portal '{portal.name}' mac {mac_row.mac}"))
                           url = None
                           repair = None      # set only when the panel answered
+                          client = None
                           if adopted:
                               url = plan.direct_url
                           elif plan.policy.direct:
@@ -3409,15 +3630,27 @@ class StreamManager:
                                                f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
                                                f"{exc.detail()}"
                                                f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
+                                  if exc.code not in SLOT_BUSY_CODES:
+                                      if client is not None and hasattr(client, "invalidate"):
+                                          client.invalidate()
+                                      if hasattr(POOL, "drop") and mac_row is not None:
+                                          await POOL.drop(PortalSession.from_rows(portal, mac_row))
                                   if exc.mac_suspect:
                                       continue
-                                  self.route_health.failed(src)
+                                  src_key = self.route_health.source_key(src)
+                                  if src_key not in failed_sources:
+                                      failed_sources.add(src_key)
+                                      self.route_health.failed(src)
                                   break  # source-specific failure: another MAC cannot repair it
                               except Exception as exc:  # noqa: BLE001
                                   h.note_attempt(f"{portal.name}/{mac_row.mac}: "
                                                  f"{type(exc).__name__}")
                                   note_candidate_failure(h.route_key, src, mac_row)
                                   other_failures += 1
+                                  if client is not None and hasattr(client, "invalidate"):
+                                      client.invalidate()
+                                  if hasattr(POOL, "drop") and mac_row is not None:
+                                      await POOL.drop(PortalSession.from_rows(portal, mac_row))
                                   await db_log("WARNING", "stream",
                                                f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
                                                f"unexpected {type(exc).__name__}: {exc} -> next")
@@ -3522,7 +3755,23 @@ class StreamManager:
                                                    f"data ({who}) -> fallback{words}")
                               if locked is not None:
                                   self.unlock_mac(locked, h.id)
-                              self.route_health.failed(src)
+                              src_key = self.route_health.source_key(src)
+                              if src_key not in failed_sources:
+                                  failed_sources.add(src_key)
+                                  self.route_health.failed(src)
+                              if plan.policy.direct:
+                                  direct_failed.add(cand_key)
+                                  await db_log("INFO", "stream",
+                                               f"[{h.item_name}] stored direct link produced no data "
+                                               f"({portal.name}/{mac_row.mac if mac_row is not None else 'xtream'}) "
+                                               f"-> falling back to portal create_link on retry")
+                              drop_link(kind, ref_id, getattr(mac_row, "id", None), h.user_name)
+                              if not adopted and mac_row is not None:
+                                  sess = PortalSession.from_rows(portal, mac_row)
+                                  if client is not None and hasattr(client, "invalidate"):
+                                      client.invalidate()
+                                  if hasattr(POOL, "drop"):
+                                      await POOL.drop(sess)
                               if adopted:
                                   break
                               continue
@@ -3572,6 +3821,12 @@ class StreamManager:
                   # (STB-Proxy moves the MAC when a stream dies): the panel may
                   # still count the old one's connection for a few seconds.
                   note_candidate_failure(h.route_key, last_used[0], last_used[1])
+                  _lsrc, _lmac = last_used
+                  if hasattr(POOL, "drop") and _lmac is not None:
+                      for _s, _p, _macs in chain:
+                          if getattr(_s, "id", None) == getattr(_lsrc, "id", None):
+                              await POOL.drop(PortalSession.from_rows(_p, _lmac))
+                              break
               await db_log("INFO", "stream",
                            f"[{h.item_name}] live stream ended after "
                            f"{h.bytes_sent / 1e6:.1f} MB -> re-resolving "

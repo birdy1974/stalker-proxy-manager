@@ -265,6 +265,13 @@ GET    /enigma2/{token}/install.sh           installer/cron one-liner for the bo
 8. **Duo2 is MIPS/1080p:** the transcode template should be H.264 **High@4.0,
    1080p max, 8-bit, AC3 2.0/5.1** — the existing "Dreambox DM800se" preset is far
    too conservative (576p/MP2) for this box; a new "Vu+ Duo2" preset is warranted.
+9. **Zap Latency & Preroll Buffer Tuning:** In *Menu → Setup → System → ServiceApp*,
+   configure `exteplayer3` with a small live buffer (e.g. `256 KB` or `512 KB` instead
+   of the 2048 KB default). Combined with SPM's immediate HTTP 200 chunked output,
+   bounded demux analysis (`-analyzeduration 1000000 -probesize 1000000`), and
+   immediate output packet flushing (`-flush_packets 1`), this allows live channels to
+   lock on and display video in under a second instead of waiting for large multi-megabyte
+   buffers to fill.
 
 ---
 

@@ -161,6 +161,15 @@ FIRST_CHUNK_TIMEOUT = float(os.environ.get("SPM_FIRST_CHUNK_TIMEOUT", "25"))
 # the browser aborts the fetch long before the first frame.
 STREAM_HEADERS = {"Cache-Control": "no-store", "X-Accel-Buffering": "no",
                   "Connection": "keep-alive"}
+# Enigma2 / STB playback optimization (Recommendation 1):
+# Send `HTTP/1.1 200 OK` with chunked transfer immediately upon opening the
+# stream pipeline, rather than withholding the HTTP status headers while
+# waiting for the first media chunk. Delaying the 200 response causes Enigma2's
+# DVB demuxer and connection watchdogs (which time out in 3-5 seconds) to abort
+# and show a black screen, even though FFmpeg starts producing data shortly
+# afterwards. Can be controlled globally via SPM_STREAM_IMMEDIATE_START or
+# per-request with ?immediate=1 / ?guarded=1.
+STREAM_IMMEDIATE_START = os.environ.get("SPM_STREAM_IMMEDIATE_START", "1").lower() in ("1", "true", "yes")
 # One retry for zap overlap: Enigma2 opens the new channel while our
 # disconnect watchdog (<=0.5s) is still tearing down the old pipe, so a
 # user at max_connections would otherwise 429 on every fast zap. Honest
@@ -361,20 +370,80 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
     # disappears (then it kills the stream; see watch_disconnect). watch() keeps
     # a strong reference, so the task cannot be garbage-collected mid-flight.
     MANAGER.watch(request, handle)
-    first_started = time.perf_counter()
-    body = await _guarded(gen, label, handle.item_name, handle=handle)
-    first_ms = (time.perf_counter() - first_started) * 1000
-    total_ms = (time.perf_counter() - started) * 1000
-    MANAGER.note_timing(kind=kind, mode="local" if kind == "local" else "proxy",
-                        item=handle.item_name, portal=handle.portal_name,
-                        mac=handle.mac, total_ms=total_ms, prepare_ms=open_ms,
-                        first_ms=first_ms)
-    await db_log("INFO", "output",
-                 f"[{handle.item_name}] startup timing: prepare={open_ms:.0f}ms "
-                 f"source+ffmpeg+first-byte={first_ms:.0f}ms total={total_ms:.0f}ms")
-    timing = (f"prepare;dur={open_ms:.1f}, first-byte;dur={first_ms:.1f}, "
-              f"total;dur={total_ms:.1f}")
-    return StreamingResponse(body, media_type=media_type,
+
+    immediate_param = request.query_params.get("immediate", "").lower()
+    guarded_param = request.query_params.get("guarded", "").lower()
+    if immediate_param in ("0", "false", "no") or guarded_param in ("1", "true", "yes") or mode == "guarded":
+        use_immediate = False
+    elif immediate_param in ("1", "true", "yes") or mode == "immediate":
+        use_immediate = True
+    else:
+        use_immediate = STREAM_IMMEDIATE_START
+
+    if not use_immediate:
+        first_started = time.perf_counter()
+        body = await _guarded(gen, label, handle.item_name, handle=handle)
+        first_ms = (time.perf_counter() - first_started) * 1000
+        total_ms = (time.perf_counter() - started) * 1000
+        MANAGER.note_timing(kind=kind, mode="local" if kind == "local" else "proxy",
+                            item=handle.item_name, portal=handle.portal_name,
+                            mac=handle.mac, total_ms=total_ms, prepare_ms=open_ms,
+                            first_ms=first_ms)
+        await db_log("INFO", "output",
+                     f"[{handle.item_name}] startup timing: prepare={open_ms:.0f}ms "
+                     f"source+ffmpeg+first-byte={first_ms:.0f}ms total={total_ms:.0f}ms")
+        timing = (f"prepare;dur={open_ms:.1f}, first-byte;dur={first_ms:.1f}, "
+                  f"total;dur={total_ms:.1f}")
+        return StreamingResponse(body, media_type=media_type,
+                                 headers=STREAM_HEADERS | {"X-SPM-Stream": handle.id,
+                                                           "Server-Timing": timing})
+
+    # Immediate HTTP 200 with Chunked Transfer:
+    # Send HTTP 200 OK + headers right away so Enigma2/STB players don't hit
+    # an HTTP connection / PAT timeout while waiting for FFmpeg and upstream.
+    async def stream_chunks():
+        first_started = time.perf_counter()
+        first_chunk = True
+        try:
+            async for chunk in gen:
+                if not chunk:
+                    continue
+                if first_chunk:
+                    first_chunk = False
+                    first_ms = (time.perf_counter() - first_started) * 1000
+                    total_ms = (time.perf_counter() - started) * 1000
+                    MANAGER.note_timing(kind=kind, mode="local" if kind == "local" else "proxy",
+                                        item=handle.item_name, portal=handle.portal_name,
+                                        mac=handle.mac, total_ms=total_ms, prepare_ms=open_ms,
+                                        first_ms=first_ms)
+                    await db_log("INFO", "output",
+                                 f"[{handle.item_name}] startup timing: prepare={open_ms:.0f}ms "
+                                 f"source+ffmpeg+first-byte={first_ms:.0f}ms total={total_ms:.0f}ms")
+                yield chunk
+        except Exception as exc:  # noqa: BLE001
+            await db_log("ERROR", "output",
+                         f"[{handle.item_name}] stream pipe error: {type(exc).__name__}: {exc}")
+        finally:
+            if first_chunk:
+                detail = ""
+                if handle is not None:
+                    note = getattr(handle, "fail_note", "") or ""
+                    trace = getattr(handle, "trace", "") or ""
+                    detail = " | ".join(part for part in (note, trace) if part)
+                is_busy = bool(handle is not None and getattr(handle, "busy", False))
+                total_ms = (time.perf_counter() - started) * 1000
+                MANAGER.note_timing(kind=kind, mode="local" if kind == "local" else "proxy",
+                                    item=handle.item_name, portal=handle.portal_name,
+                                    mac=handle.mac, total_ms=total_ms, prepare_ms=open_ms,
+                                    fail="busy" if is_busy else "no-source")
+                level = "ERROR" if not is_busy else "WARNING"
+                reason = "every candidate busy" if is_busy else "source produced no data"
+                await db_log(level, "output",
+                             f"[{handle.item_name}] stream ended without producing data ({reason})"
+                             + (f" - {detail}" if detail else ""))
+
+    timing = f"prepare;dur={open_ms:.1f}"
+    return StreamingResponse(stream_chunks(), media_type=media_type,
                              headers=STREAM_HEADERS | {"X-SPM-Stream": handle.id,
                                                        "Server-Timing": timing})
 

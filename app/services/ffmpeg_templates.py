@@ -287,6 +287,8 @@ REFERENCE_PRESET_NAME = "VAAPI 720p ~1M (DS918+ reference)"
 # redirected instead of being proxied through ffmpeg.
 REDIRECT_PRESET_NAME = "Redirect (bypass ffmpeg)"
 REDIRECT_COMMAND = "@redirect"
+PASSTHROUGH_PRESET_NAME = "Pass-through proxy (bypass ffmpeg)"
+PASSTHROUGH_COMMAND = "@passthrough"
 COPY_PRESET_NAME = "Copy / passthrough (no transcode)"
 # Enigma2 (Vu+ / OpenPLi) presets. Keep the historical names: the seeder
 # matches built-ins by name and rewriting them would orphan templates already
@@ -541,7 +543,7 @@ def argv_validation_errors(args: list[str]) -> list[str]:
 def template_command_errors(command: str, *, require_placeholder: bool = True) -> list[str]:
     """Validate a stored template's token shape without running FFmpeg."""
     cmd = (command or "").strip()
-    if cmd == REDIRECT_COMMAND:
+    if cmd in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
         return []
     if not cmd:
         return ["empty command"]
@@ -565,7 +567,7 @@ def serves_original_file(command: str | None) -> bool:
     ffmpeg.
     """
     cmd = (command or "").strip()
-    if not cmd or cmd == REDIRECT_COMMAND:
+    if not cmd or cmd in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
         return True
     try:
         toks = shlex.split(cmd)
@@ -1281,6 +1283,18 @@ def default_presets() -> list[dict]:
                                resolution="source", hw_accel="none")),
         "name": REDIRECT_PRESET_NAME,
         "command": REDIRECT_COMMAND,
+        "command_source": "fields",
+        "enabled": True,
+    })
+    # The pass-through proxy preset (Option E) is an async byte proxy, not an ffmpeg
+    # command. It streams raw bytes through SPM without spawning FFmpeg, holding
+    # the client socket for active user playback detection, duration, bandwidth
+    # telemetry, and outside playback support without 302 IP-locking issues.
+    presets.append({
+        **asdict(FFmpegOptions(video_codec="copy", audio_codec="copy",
+                               resolution="source", hw_accel="none", subs="keep")),
+        "name": PASSTHROUGH_PRESET_NAME,
+        "command": PASSTHROUGH_COMMAND,
         "command_source": "fields",
         "enabled": True,
     })

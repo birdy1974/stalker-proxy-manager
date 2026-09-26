@@ -26,7 +26,7 @@
       </div>
       <div class="card-body">
         <div class="alert alert-info py-2 small d-none" id="redirect-note">
-          <i class="bi bi-arrow-right-circle me-1"></i><b id="redirect-help-label">Bypass ffmpeg.</b><span data-help="Redirect mode" data-help-for="redirect-help-label">
+          <i class="bi bi-arrow-right-circle me-1"></i><b id="redirect-help-label">Bypass ffmpeg.</b> <span id="redirect-help-text" data-help="Bypass mode" data-help-for="redirect-help-label">
           Channels assigned this template are 302-redirected straight to the portal's CDN:
           instant start and no CPU, but no transcode and no mid-stream fallback.
           The command text is a marker and cannot be edited here.</span>
@@ -191,6 +191,8 @@ const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","v
   "audio_rate","output_format","subs","vf_preset","extra_input","extra_output"];
 let current = null, templates = [], draftCommandSource = "fields", editorRevision = 0;
 const isRedirectTpl = (t) => (t && (t.command || "").trim() === "@redirect");
+const isPassthroughTpl = (t) => (t && (t.command || "").trim() === "@passthrough");
+const isSentinelTpl = (t) => (isRedirectTpl(t) || isPassthroughTpl(t));
 const sourceOf = () => current?.command_source || draftCommandSource || "fields";
 
 function setDraftSource(source) {
@@ -198,15 +200,16 @@ function setDraftSource(source) {
 }
 
 function applyEditorMode() {
+  const sentinel = isSentinelTpl(current);
   const redir = isRedirectTpl(current);
-  const manual = !redir && sourceOf() === "manual";
+  const manual = !sentinel && sourceOf() === "manual";
   const fieldsButton = $("#btn-fields-mode");
-  fieldsButton.classList.toggle("d-none", !(redir || manual));
-  fieldsButton.textContent = redir ? "Switch to FFmpeg fields" : "Switch to fields mode";
-  fieldsButton.title = redir
-    ? "Leave Redirect mode, clear its raw extras and render a fresh FFmpeg command"
+  fieldsButton.classList.toggle("d-none", !(sentinel || manual));
+  fieldsButton.textContent = sentinel ? "Switch to FFmpeg fields" : "Switch to fields mode";
+  fieldsButton.title = sentinel
+    ? "Leave bypass mode, clear its raw extras and render a fresh FFmpeg command"
     : "Allow the structured fields to replace the manual command";
-  FFmpegEditor.mode(manual, redir);
+  FFmpegEditor.mode(manual, sentinel);
   $("#tpl-delete").disabled = !current || current.is_default;
   $("#tpl-delete").title = current?.is_default ? "Choose another default before deleting this template" : "";
   if (current?.is_default) {
@@ -215,10 +218,10 @@ function applyEditorMode() {
     note.textContent = "The default must stay enabled. Choose another default first.";
     note.hidden = false;
   }
-  $("#f-command").disabled = redir;
-  $("#btn-test-syntax").disabled = redir;
-  $("#btn-test-playlist").disabled = redir;
-  $("#btn-test-url").disabled = redir;
+  $("#f-command").disabled = sentinel;
+  $("#btn-test-syntax").disabled = sentinel;
+  $("#btn-test-playlist").disabled = sentinel;
+  $("#btn-test-url").disabled = sentinel;
 }
 
 function readFields() {
@@ -238,7 +241,7 @@ async function fieldsToCommand() {
   clearTimeout(syncTimer);
   const revision = ++editorRevision;
   applyEditorMode(); // recompute dependencies before validation, not after the API response
-  if (isRedirectTpl(current) || sourceOf() === "manual") return;
+  if (isSentinelTpl(current) || sourceOf() === "manual") return;
   if (!FFmpegEditor.valid()) {
     $("#sync-state").textContent = "Fix the highlighted value before building or saving.";
     return;
@@ -282,9 +285,9 @@ $("#f-command").addEventListener("input", () => {
   }, 350);
 });
 $("#btn-fields-mode").addEventListener("click", () => {
-  if (isRedirectTpl(current)) {
-    // @redirect is a sentinel, not a partially-rendered FFmpeg command. Do not
-    // let its old raw extras leak into the first real command after conversion.
+  if (isSentinelTpl(current)) {
+    // Sentinels (@redirect, @passthrough) are markers, not partially-rendered FFmpeg commands.
+    // Do not let their old raw extras leak into the first real command after conversion.
     if (current) {
       current.command = "";
       current.command_source = "fields";
@@ -342,6 +345,8 @@ async function loadList() {
     const b = el("button", { "data-template-id":t.id, class: "btn btn-sm w-100 text-start mb-1 " + (current?.id === t.id ? "btn-accent" : "btn-light") });
     const sub = isRedirectTpl(t)
       ? "302 redirect to panel CDN · bypasses ffmpeg"
+      : isPassthroughTpl(t)
+      ? "Pass-through proxy · bypasses ffmpeg"
       : `${esc(t.hw_accel)} · ${esc(t.video_codec)} · ${esc(t.resolution)} · ${esc(t.audio_codec)}`;
     b.innerHTML = `<div class="d-flex justify-content-between"><span>${esc(t.name)} ${t.is_default ? '<span class="badge text-bg-dark">default</span>' : ""}</span>
       <span class="badge ${t.enabled ? "st-online" : "st-unknown"}">${t.enabled ? "on" : "off"}</span></div>
@@ -359,7 +364,16 @@ async function selectTemplate(id) {
   writeFields(current);
   $("#f-command").value = current.command || "";
   $("#sync-state").textContent = "";
-  $("#redirect-note").classList.toggle("d-none", !isRedirectTpl(current));
+  const isRedir = isRedirectTpl(current);
+  const isPass = isPassthroughTpl(current);
+  $("#redirect-note").classList.toggle("d-none", !(isRedir || isPass));
+  if (isPass) {
+    $("#redirect-help-label").textContent = "Pass-through proxy (bypass ffmpeg).";
+    $("#redirect-help-text").textContent = "Channels assigned this template stream raw bytes through SPM without running FFmpeg: minimal CPU, maintains connection socket for instant user activity detection, bandwidth stats, and external playback support.";
+  } else if (isRedir) {
+    $("#redirect-help-label").textContent = "Redirect (bypass ffmpeg).";
+    $("#redirect-help-text").textContent = "Channels assigned this template are 302-redirected straight to the portal's CDN: instant start and no CPU, but no transcode and no mid-stream fallback. The command text is a marker and cannot be edited here.";
+  }
   applyEditorMode();
 }
 $("#tpl-new").addEventListener("click", () => {

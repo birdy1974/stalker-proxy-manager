@@ -17,7 +17,7 @@ import asyncio
 
 from app.services import stream_manager as sm
 from app.services.ffmpeg_templates import (
-    COPY_PRESET_NAME, FFmpegOptions, REDIRECT_PRESET_NAME, URL_PLACEHOLDER,
+    COPY_PRESET_NAME, FFmpegOptions, PASSTHROUGH_PRESET_NAME, REDIRECT_PRESET_NAME, URL_PLACEHOLDER,
     build_command, coerce_options, default_presets, parse_command,
 )
 from app.services.stream_manager import StreamManager
@@ -121,6 +121,9 @@ def test_every_builtin_preset_keeps_subtitles():
     for p in default_presets():
         if p["name"] == REDIRECT_PRESET_NAME:
             assert p["command"] == "@redirect"
+            continue
+        if p["name"] == PASSTHROUGH_PRESET_NAME:
+            assert p["command"] == "@passthrough"
             continue
         cmd = p["command"]
         assert p["subs"] in ("dvb", "keep"), p["name"]
