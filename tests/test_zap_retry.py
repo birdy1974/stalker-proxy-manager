@@ -206,3 +206,130 @@ async def test_max_connections_waits_out_zap_overlap(monkeypatch):
         assert exc.value.status_code == 429
     finally:
         await MANAGER._deregister(stuck)
+
+
+async def test_proxy_drops_session_and_reauthenticates_on_failure(monkeypatch):
+    """When a candidate fails to produce data on pass 0, the pooled session is
+    invalidated and dropped, forcing pass 1 to re-handshake and rebuild the connection."""
+    pid = await _live_route()
+
+    class _TrackedClient:
+        def __init__(self, script):
+            self._script = list(script)
+            self.calls = 0
+            self.handshakes = 0
+            self.invalidated = 0
+            self.portal_url = "http://127.0.0.1:1/c/"
+
+        async def ensure_auth(self):
+            self.handshakes += 1
+
+        def invalidate(self):
+            self.invalidated += 1
+
+        async def close(self):
+            return None
+
+        async def create_link(self, cmd, kind="live", **kw):
+            self.calls += 1
+            return self._script[min(self.calls - 1, len(self._script) - 1)]
+
+    client = _TrackedClient(["http://cdn/dead.ts", "http://cdn/fresh.ts"])
+    dropped_sessions = []
+
+    class _TrackedPool:
+        def __init__(self, cl):
+            self._cl = cl
+
+        async def get(self, session):
+            return self._cl
+
+        async def drop(self, session):
+            dropped_sessions.append(session)
+
+    monkeypatch.setattr("app.services.stream_manager.POOL", _TrackedPool(client))
+    monkeypatch.setattr("app.services.stream_manager.ZAP_RETRY_DELAY", 0.01)
+
+    spawns = []
+
+    async def fake_spawn(self, cmd_template, url, title=None, pace=False, user_agent=None):
+        spawns.append(url)
+        if len(spawns) == 1:
+            return _FakeProc([], rc=1)
+        return _FakeProc([b"x" * 188])
+
+    monkeypatch.setattr(type(MANAGER), "_spawn", fake_spawn)
+    _handle, gen = await MANAGER.open("live", pid, "zapbox")
+    try:
+        first = await gen.__anext__()
+    finally:
+        await gen.aclose()
+    assert first == b"x" * 188
+    assert client.invalidated >= 1
+    assert len(dropped_sessions) >= 1
+    assert client.handshakes >= 2
+
+
+async def test_proxy_stored_link_failure_falls_back_to_create_link(monkeypatch):
+    """A channel configured with a permanent direct link that fails on pass 0
+    must not retry the same dead direct URL on pass 1; it must fall back to
+    asking the portal via create_link."""
+    pid = await _live_route(link_flags="")
+    portal_link = "http://cdn/portal_resolved.ts?play_token=fresh"
+    client = _FakeClient([portal_link])
+
+    class _PoolWithDrop:
+        def __init__(self, cl):
+            self._cl = cl
+
+        async def get(self, session):
+            return self._cl
+
+        async def drop(self, session):
+            pass
+
+    monkeypatch.setattr("app.services.stream_manager.POOL", _PoolWithDrop(client))
+    monkeypatch.setattr("app.services.stream_manager.ZAP_RETRY_DELAY", 0.01)
+
+    spawns = []
+
+    async def fake_spawn(self, cmd_template, url, title=None, pace=False, user_agent=None):
+        spawns.append(url)
+        if len(spawns) == 1:
+            return _FakeProc([], rc=1)
+        return _FakeProc([b"x" * 188])
+
+    monkeypatch.setattr(type(MANAGER), "_spawn", fake_spawn)
+    _handle, gen = await MANAGER.open("live", pid, "zapbox")
+    try:
+        first = await gen.__anext__()
+    finally:
+        await gen.aclose()
+    assert first == b"x" * 188
+    assert spawns[0] == "http://cdn/x.ts"
+    assert spawns[1] == portal_link
+    assert client.calls == 1
+
+
+async def test_circuit_breaker_counts_once_per_request(monkeypatch):
+    """Two internal passes failing in a single open request should only increment
+    the failure counter once, not twice, so that a 2-failure circuit breaker
+    does not prematurely lock out the source before the player's external retry."""
+    monkeypatch.setattr("app.services.stream_manager.SOURCE_BREAKER_FAILURES", 2)
+    pid = await _live_route()
+    client = _FakeClient([PortalError("HTTP 502", code="http_502")])
+    monkeypatch.setattr("app.services.stream_manager.POOL", _FakePool(client))
+    monkeypatch.setattr("app.services.stream_manager.ZAP_RETRY_DELAY", 0.01)
+
+    _handle, gen = await MANAGER.open("live", pid, "zapbox")
+    try:
+        await gen.__anext__()
+    except (StopAsyncIteration, Exception):
+        pass
+    finally:
+        await gen.aclose()
+
+    failures = list(MANAGER.route_health.failures.values())
+    assert len(failures) == 1
+    count, _time = failures[0]
+    assert count == 1, "only counted once per open request"

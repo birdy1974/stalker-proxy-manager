@@ -592,7 +592,7 @@ class StalkerClient:
 
     async def _aclose(self) -> None:
         """Really close, shared or not - used by the pool and at shutdown."""
-        self._token, self._token_at = None, 0.0
+        self.invalidate()
         if self._client is not None:
             await self._client.aclose()
             self._client = None

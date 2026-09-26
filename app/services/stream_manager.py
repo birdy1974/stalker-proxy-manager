@@ -2738,7 +2738,8 @@ class StreamManager:
         return macs
 
     @staticmethod
-    def _plan(src, mac_row, portal, *, ffmpeg: bool = False):
+    def _plan(src, mac_row, portal, *, ffmpeg: bool = False,
+              allow_direct: bool | None = None):
         """(ask or play as stored) for one (source, MAC), decided the same way by
         every path. See app/portal/links.py for the rules and their reasons.
 
@@ -2750,8 +2751,9 @@ class StreamManager:
             adopted = str(getattr(src, "xtream_url", "") or "")
             if adopted:
                 return plan_adopted(adopted, src=src, mac_row=mac_row)
-        return plan_for(src, mac_row, ffmpeg=ffmpeg,
-                        allow_direct=bool(getattr(portal, "direct_links", True)))
+        portal_direct = bool(getattr(portal, "direct_links", True))
+        allow = portal_direct and (allow_direct if allow_direct is not None else True)
+        return plan_for(src, mac_row, ffmpeg=ffmpeg, allow_direct=allow)
 
     async def _create_link_with_backoff(self, client, plan, link_kind: str,
                                         item_name: str, mac_row):
@@ -2826,6 +2828,8 @@ class StreamManager:
         from .runtime_settings import prefer_free_mac
         prefer_free = await prefer_free_mac()
         every_candidate_busy = True
+        failed_sources: set[tuple] = set()
+        direct_failed: set[tuple] = set()
         attempts = 2 if (ZAP_RETRY and chain) else 1
         for pass_no in range(attempts):
             if pass_no == 1:
@@ -2843,6 +2847,7 @@ class StreamManager:
                 if prefer_free:
                     candidates = self.order_by_free(route_key, _src, candidates, requester)
                 for mac_row in candidates:
+                    cand_key = (getattr(_src, "id", None), getattr(mac_row, "id", None))
                     # ffmpeg lock OR a recent redirect lease — both mean "leave this
                     # MAC alone". Redirects never enter mac_locks (we no longer hold
                     # the socket after the 302), so the lease is the only signal.
@@ -2891,7 +2896,8 @@ class StreamManager:
                     # player one redirect and us *nothing* - no handshake reuse, no
                     # token, no create_link. The old shape paid for all of that and
                     # then threw the answer away in favour of the stored URL anyway.
-                    plan = self._plan(_src, mac_row, portal)
+                    allow_direct = (cand_key not in direct_failed)
+                    plan = self._plan(_src, mac_row, portal, allow_direct=allow_direct)
                     if plan.policy.direct:
                         await db_log("INFO", "stream",
                                      f"[{item_name}] playing the stored link via "
@@ -2905,6 +2911,7 @@ class StreamManager:
                                          f"[{item_name}] redirect: stored link dead "
                                          f"({portal.name}; {_probe.detail}) -> next candidate")
                             note_candidate_failure(route_key, _src, mac_row)
+                            direct_failed.add(cand_key)
                             every_candidate_busy = False
                             continue
                         note_handed_out(route_key, _src, mac_row)
@@ -2949,9 +2956,17 @@ class StreamManager:
                         if exc.code in SLOT_BUSY_CODES:
                             continue          # busy stays "busy" for the 503
                         every_candidate_busy = False
+                        if exc.code not in SLOT_BUSY_CODES:
+                            if hasattr(client, "invalidate"):
+                                client.invalidate()
+                            if hasattr(POOL, "drop") and mac_row is not None:
+                                await POOL.drop(PortalSession.from_rows(portal, mac_row))
                         if exc.mac_suspect:
                             continue
-                        self.route_health.failed(_src)
+                        src_key = self.route_health.source_key(_src)
+                        if src_key not in failed_sources:
+                            failed_sources.add(src_key)
+                            self.route_health.failed(_src)
                         break
                     except Exception as exc:  # noqa: BLE001
                         await db_log("WARNING", "stream",
@@ -2959,10 +2974,14 @@ class StreamManager:
                                      f"{type(exc).__name__}: {exc} -> next")
                         note_candidate_failure(route_key, _src, mac_row)
                         every_candidate_busy = False
-                        # Transport errors are source failures too. Keep trying
-                        # other MACs/sources for this request, but make subsequent
-                        # starts skip a source that just timed out.
-                        self.route_health.failed(_src)
+                        if hasattr(client, "invalidate"):
+                            client.invalidate()
+                        if hasattr(POOL, "drop") and mac_row is not None:
+                            await POOL.drop(PortalSession.from_rows(portal, mac_row))
+                        src_key = self.route_health.source_key(_src)
+                        if src_key not in failed_sources:
+                            failed_sources.add(src_key)
+                            self.route_health.failed(_src)
                         continue
                     finally:
                         await client.close()
@@ -2975,6 +2994,13 @@ class StreamManager:
                                          f"({portal.name}/{mac_row.mac}; {_probe.detail}) "
                                          f"-> next candidate")
                             note_candidate_failure(route_key, _src, mac_row)
+                            drop_link(kind, ref_id, getattr(mac_row, "id", None), requester)
+                            if mac_row is not None:
+                                sess = PortalSession.from_rows(portal, mac_row)
+                                if hasattr(client, "invalidate"):
+                                    client.invalidate()
+                                if hasattr(POOL, "drop"):
+                                    await POOL.drop(sess)
                             every_candidate_busy = False
                             continue
                         note_handed_out(route_key, _src, mac_row)
@@ -3253,6 +3279,8 @@ class StreamManager:
                              + " -> giving the player an answer instead of a hang")
 
             tried_any = False
+            failed_sources: set[tuple] = set()
+            direct_failed: set[tuple] = set()
             while True:
               for pass_no in range(attempts):
                   if pass_no == 1:
@@ -3316,7 +3344,10 @@ class StreamManager:
                           # the panel's Xtream side (R7) there is no MAC to spend and no
                           # session to open, and reaching for a client "just in case"
                           # would put the portal back in the loop we removed.
-                          plan = self._plan(src, mac_row, portal, ffmpeg=True)
+                          cand_key = (getattr(src, "id", None), getattr(mac_row, "id", None))
+                          allow_direct = (cand_key not in direct_failed)
+                          plan = self._plan(src, mac_row, portal, ffmpeg=True,
+                                            allow_direct=allow_direct)
                           adopted = plan.adopted
                           # `requester=h.user_name`: this user's own post-302 lease is
                           # the channel the box just zapped away from, not another
@@ -3350,6 +3381,7 @@ class StreamManager:
                                           else f"portal '{portal.name}' mac {mac_row.mac}"))
                           url = None
                           repair = None      # set only when the panel answered
+                          client = None
                           if adopted:
                               url = plan.direct_url
                           elif plan.policy.direct:
@@ -3409,15 +3441,27 @@ class StreamManager:
                                                f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
                                                f"{exc.detail()}"
                                                f"{' -> next mac' if exc.mac_suspect else ' -> next'}")
+                                  if exc.code not in SLOT_BUSY_CODES:
+                                      if client is not None and hasattr(client, "invalidate"):
+                                          client.invalidate()
+                                      if hasattr(POOL, "drop") and mac_row is not None:
+                                          await POOL.drop(PortalSession.from_rows(portal, mac_row))
                                   if exc.mac_suspect:
                                       continue
-                                  self.route_health.failed(src)
+                                  src_key = self.route_health.source_key(src)
+                                  if src_key not in failed_sources:
+                                      failed_sources.add(src_key)
+                                      self.route_health.failed(src)
                                   break  # source-specific failure: another MAC cannot repair it
                               except Exception as exc:  # noqa: BLE001
                                   h.note_attempt(f"{portal.name}/{mac_row.mac}: "
                                                  f"{type(exc).__name__}")
                                   note_candidate_failure(h.route_key, src, mac_row)
                                   other_failures += 1
+                                  if client is not None and hasattr(client, "invalidate"):
+                                      client.invalidate()
+                                  if hasattr(POOL, "drop") and mac_row is not None:
+                                      await POOL.drop(PortalSession.from_rows(portal, mac_row))
                                   await db_log("WARNING", "stream",
                                                f"[{h.item_name}] {portal.name}/{mac_row.mac}: "
                                                f"unexpected {type(exc).__name__}: {exc} -> next")
@@ -3522,7 +3566,23 @@ class StreamManager:
                                                    f"data ({who}) -> fallback{words}")
                               if locked is not None:
                                   self.unlock_mac(locked, h.id)
-                              self.route_health.failed(src)
+                              src_key = self.route_health.source_key(src)
+                              if src_key not in failed_sources:
+                                  failed_sources.add(src_key)
+                                  self.route_health.failed(src)
+                              if plan.policy.direct:
+                                  direct_failed.add(cand_key)
+                                  await db_log("INFO", "stream",
+                                               f"[{h.item_name}] stored direct link produced no data "
+                                               f"({portal.name}/{mac_row.mac if mac_row is not None else 'xtream'}) "
+                                               f"-> falling back to portal create_link on retry")
+                              drop_link(kind, ref_id, getattr(mac_row, "id", None), h.user_name)
+                              if not adopted and mac_row is not None:
+                                  sess = PortalSession.from_rows(portal, mac_row)
+                                  if client is not None and hasattr(client, "invalidate"):
+                                      client.invalidate()
+                                  if hasattr(POOL, "drop"):
+                                      await POOL.drop(sess)
                               if adopted:
                                   break
                               continue
@@ -3572,6 +3632,12 @@ class StreamManager:
                   # (STB-Proxy moves the MAC when a stream dies): the panel may
                   # still count the old one's connection for a few seconds.
                   note_candidate_failure(h.route_key, last_used[0], last_used[1])
+                  _lsrc, _lmac = last_used
+                  if hasattr(POOL, "drop") and _lmac is not None:
+                      for _s, _p, _macs in chain:
+                          if getattr(_s, "id", None) == getattr(_lsrc, "id", None):
+                              await POOL.drop(PortalSession.from_rows(_p, _lmac))
+                              break
               await db_log("INFO", "stream",
                            f"[{h.item_name}] live stream ended after "
                            f"{h.bytes_sent / 1e6:.1f} MB -> re-resolving "
