@@ -206,7 +206,7 @@ and, when the ids do not match:
 2. **Fetch Sources** – background job pulls genres → channels/movies/series → seasons/episodes with progress logging. Enable/disable **per genre** what enters the catalog; series enablement is per season. In the **Edit portal** popup this is a two-step flow: *Fetch genres* loads the live/VOD/series genre lists (all disabled by default — including the synthetic *(All VOD)* / *(All series)* a portal without categories gets), you tick the genres you want (the filter box narrows the list as you type), and **Save** then fetches the items of exactly those enabled genres.
 3. **Playlist Builder** – three tabs (Live, VOD, Series, Local). Every output item keeps its own **ordered fallback chain** (source × portal × MAC as needed), an optional **ffmpeg template**, group, epg id and logo. Drag & drop reorders channels. The **channel number** of a live channel *is* its position in the final playlist, kept in sync both ways: saving a new "Channel number (opt)" in the Edit-channel popup moves the channel to that position (the others push down), and reordering, deleting or toggling channels re-derives every number from its position — so `tvg-chno` and the row order can never disagree. A live channel's number can also be **locked** (the lock toggle in the Live table's *Number* column, or *lock number* in the Edit-channel popup, which makes the number field read-only): a locked channel keeps that number through reordering, deletes, adds and toggles — the other channels renumber around it and skip the locked number — and its row is no longer draggable (the grip becomes a lock icon, other rows still drag past it). Clicking a **VOD** or **Series** row (or its ⓘ button) opens the same detail popup as Input Sources — stored portal metadata, a lazy **stream probe** (codec/resolution/bitrate) and **TMDB** enrichment. The ▶ *test stream* buttons (here and in Input Sources) open the preview player, which closes via its header **×** or the **Stop & Close** button.
 4. **Users** – each user gets `username/password` and can receive **M3U** and/or **Xtream** URLs (copy-buttons in the GUI). Per-user active-connection caps enforced.
-5. **Dashboard** – counters, active streams with kill buttons, quick actions (fetch, retry-busy), messages pane.
+5. **Dashboard** – counters, active streams with kill buttons, quick actions (fetch, retry-busy), messages pane. The right column leads with **Zapping & panel answers** (the panel's side of a play), followed by **API status** (our own side), and below both spans **Portal traffic — requests & answers**: every request this process sent to a panel, with the time it was sent, the round trip, the panel's status/refusal code and a summary of its answer.
 
 ### Web preview and technical stream information
 
@@ -1101,6 +1101,28 @@ connection cannot be trusted and is discarded - that is correct, and it is
 logged as a single INFO line, not a traceback.
 
 **Single-stream rule (do not break it):** *every* record - ours and uvicorn's - is written to **stdout** (`app/config.py` sets the root handler, `app/main.py` re-attaches uvicorn's handlers). The Docker logging driver keeps a container's stdout and stderr apart and `docker logs` re-emits them on *its own* two streams, so anything logged on stderr is invisible to `docker logs <c> | grep …` - which is precisely how the CI smoke test managed to fail six runs in a row while the app was healthy. `dev/smoke.sh` therefore asserts that the boot marker is present **on stdout**; keep that check honest by fixing the logging instead of muting uvicorn's output.
+
+### Portal traffic: what we asked the panel, and what it answered
+
+**Dashboard → Portal traffic** (`GET /api/portal-traffic`) lists one row per portal
+request this process made, newest first: the time it was sent (with milliseconds),
+the round trip, portal host, MAC, the request line (`type=…&action=…&cmd=…`), the
+HTTP status, the panel's refusal code plus what that code means, and a bounded
+summary of the answer (`data: 40 item(s)`, `cmd=http://…/1.ts`, `token issued …`).
+Click a row for the full exchange, including the UTC timestamp that matches the
+container log. Filter by portal, by outcome (**Problems only** shows refusals,
+no-answer and held-back requests) or by any text; the table refreshes every 5 s
+and can be paused.
+
+The rows come from a bounded in-memory ring (`app/services/portal_traffic.py`,
+`SPM_PORTAL_TRAFFIC`, default 400, `0` turns it off) - no database write per
+panel call, and a restart starts empty while the container log keeps the same
+events under `[spm.portal]`. A request we deliberately did *not* send is a row
+too (`outcome=skipped`, status 0): after a 429 pauses a portal host, every later
+attempt says "not sent - portal host paused for Ns" instead of leaving a gap that
+reads as "we never tried". Bearers, `prehash` and `play_token`s are masked before
+anything is stored.
+
 
 ---
 

@@ -26,7 +26,7 @@ from ..services.branding import DEFAULT_ID as DEFAULT_FAVICON, refresh as refres
 from ..services.playback import KIND_DEFAULT_COL
 from ..security import require_admin
 from ..services.db_logging import db_log
-from ..services import api_stats
+from ..services import api_stats, portal_traffic
 from ..services.fetch_jobs import list_jobs
 from ..services.stream_manager import MANAGER
 
@@ -51,6 +51,9 @@ def _diagnostics() -> dict:
             "pace": portal_pace.stats(),
             "janitor": janitor.stats(),
             "parked": sum(1 for h in MANAGER.streams.values() if h.parked),
+            # the exchange log behind "refusals the panel sent" - the card shows
+            # the counts, the Portal traffic table shows every single one
+            "traffic": portal_traffic.stats(),
             # filled in by the endpoint below, which has the DB session
             "paused": []}
     return diag
@@ -115,6 +118,32 @@ async def kill_stream(sid: str):
 @router.post("/streams/kill-all")
 async def kill_all_streams():
     return {"killed": await MANAGER.kill_all()}
+
+
+# ------------------------------------------------------------- portal traffic
+@router.get("/portal-traffic")
+async def portal_traffic_log(page: int = 1, per_page: int = 25, host: str = "",
+                             outcome: str = "", q: str = ""):
+    """Every panel request this process made, with what came back and when.
+
+    Newest first, from the in-memory ring (see services/portal_traffic.py) - no
+    database, so a 10 000-row catalogue walk is as cheap to look at as one play.
+    `outcome=errors` is the filter that matters when something is broken; `q`
+    searches host, MAC, action, params, refusal code and answer alike.
+    """
+    from ..portal.client import PORTAL_ERROR_HINTS
+    data = portal_traffic.query(page=page, per_page=per_page, host=host,
+                                outcome=outcome, q=q)
+    # What a refusal code means in plain words, so the table can explain a
+    # `limit` without the operator having to read the source.
+    data["hints"] = PORTAL_ERROR_HINTS
+    return data
+
+
+@router.post("/portal-traffic/clear")
+async def portal_traffic_clear():
+    portal_traffic.clear()
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ logs

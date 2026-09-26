@@ -31,6 +31,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import httpx
 
 from ..config import PORTAL_HTTP_TIMEOUT, PORTAL_KEEPALIVE_S, PORTAL_MAX_CONNECTIONS
+from ..services import portal_traffic as traffic
 from ..services.http_client import outbound_client
 from .account import AccountVerdict, account_verdict
 from .capabilities import (FEATURE_MODULES, PortalVersion, enabled_modules,
@@ -425,6 +426,21 @@ def refusal_code(response) -> str:
     return normalize_error(js.get("error")) or normalize_error(js.get("msg"))
 
 
+def body_snippet(response, limit: int = 160) -> str:
+    """The first bytes of an answer that was not usable JSON.
+
+    An HTTP 503 from the WAF in front of a panel and a 503 from the panel are
+    different problems, and the only thing that tells them apart is the body -
+    which is exactly what the traffic log shows for a non-200 or an unparsable
+    reply. Bounded, and never decoded with a strict codec: a half-sent page
+    must not turn a diagnosis into an exception.
+    """
+    try:
+        return str(response.text or "")[:limit].strip()
+    except Exception:  # noqa: BLE001 - an undecodable body is still a body
+        return ""
+
+
 def status_for_error(exc: PortalError) -> str:
     """Map a failure onto the MacAddress.status vocabulary."""
     code = (exc.code or "").lower()
@@ -619,6 +635,11 @@ class StalkerClient:
         left = rate_limit_left(self.portal_url)
         if left > 0:
             # No socket is opened: the whole point is to not touch the panel.
+            # The traffic log still gets the row - "we held back, and when" is
+            # the answer to "why did nothing happen at 12:04".
+            traffic.exchange(self.portal_url, self.mac, params, retried=retried).done(
+                code=RATE_LIMITED_CODE, skipped=True,
+                error=f"not sent - portal host paused for {left:.0f}s")
             raise PortalError(
                 f"portal is rate limiting us ({left:.0f}s of cooldown left)",
                 code=RATE_LIMITED_CODE)
@@ -627,74 +648,113 @@ class StalkerClient:
             async with self._lock:
                 if self._token is None or self._token_stale():
                     await self.handshake()
+        # One row per attempt, opened before the request goes out and closed at
+        # the exit that decided the outcome - see app/services/portal_traffic.py.
+        ex = traffic.exchange(self.portal_url, self.mac, params, retried=retried)
         log.debug("GET %s params=%s", self.portal_url, {k: v for k, v in params.items() if k != "JsHttpRequest"})
         try:
-            r = await http.get(self.portal_url, params=params)
-        except httpx.TimeoutException as exc:
-            raise PortalError(f"request failed: timeout after {self.timeout:.0f}s",
-                              code="timeout") from exc
-        except Exception as exc:  # noqa: BLE001 - any transport error means "unreachable"
-            raise PortalError(f"request failed: {type(exc).__name__}: {exc}",
-                              code="transport") from exc
-        if r.status_code == 429:
-            note_refusal(self.portal_url, "http_429")
-            wait = note_rate_limit(self.portal_url, retry_after=retry_after_seconds(r),
-                                   reason="HTTP 429")
-            log.warning("portal %s answered 429 -> pausing this portal for %.0fs "
-                        "(every MAC on it, not just this one)",
-                        portal_host(self.portal_url), wait)
-            raise PortalError(
-                f"portal rate limited us (HTTP 429, pausing {wait:.0f}s)",
-                code=RATE_LIMITED_CODE)
-        if r.status_code in (401, 403) and self._may_reauth(retry_on_auth, retried):
-            # Read the refusal before reacting to the status code. A 403 whose
-            # body says "the MAC is already streaming" is not an auth failure:
-            # re-handshaking cannot help, changes the session under a box that
-            # is still playing, and throws away the one thing that *would* fix
-            # it - a short wait and the same MAC (see SLOT_BUSY_CODES).
-            busy = refusal_code(r)
-            if busy in SLOT_BUSY_CODES:
-                note_refusal(self.portal_url, busy)
-                log.info("portal answered %s with %s -> busy slot, not re-handshaking",
-                         r.status_code, busy)
-                raise PortalError(f"portal said {busy} (HTTP {r.status_code})", code=busy)
-            log.info("portal answered %s -> re-handshaking once", r.status_code)
-            async with self._lock:
-                self._token = None
-                await self.handshake()
-            return await self._get(params, retried=True, retry_on_auth=retry_on_auth)
-        if r.status_code != 200:
-            note_refusal(self.portal_url, f"http_{r.status_code}")
-            raise PortalError(f"HTTP {r.status_code}", code=f"http_{r.status_code}")
-        if not r.content:
-            raise PortalError("empty reply (portal dropped connection or IP is blocked)",
-                              code="empty_reply")
-        try:
-            data = r.json()
-        except Exception as exc:  # noqa: BLE001
-            raise PortalError(f"invalid JSON payload ({len(r.content)} bytes)",
-                              code="bad_json") from exc
-        code = js_error(data)
-        if code:
-            note_refusal(self.portal_url, code)
-            if js_has_payload(data):
-                log.debug("portal reported %r alongside a usable payload - ignoring it", code)
-            elif code in TOKEN_ERROR_CODES and self._may_reauth(retry_on_auth, retried):
-                log.info("portal refused the bearer on HTTP 200 (%s) -> re-handshaking once", code)
+            try:
+                r = await http.get(self.portal_url, params=params)
+            except httpx.TimeoutException as exc:
+                ex.done(code="timeout", error=f"timeout after {self.timeout:.0f}s")
+                raise PortalError(f"request failed: timeout after {self.timeout:.0f}s",
+                                  code="timeout") from exc
+            except Exception as exc:  # noqa: BLE001 - any transport error means "unreachable"
+                ex.done(code="transport", error=f"{type(exc).__name__}: {exc}")
+                raise PortalError(f"request failed: {type(exc).__name__}: {exc}",
+                                  code="transport") from exc
+            size = len(r.content or b"")
+            if r.status_code == 429:
+                note_refusal(self.portal_url, "http_429")
+                wait = note_rate_limit(self.portal_url, retry_after=retry_after_seconds(r),
+                                       reason="HTTP 429")
+                log.warning("portal %s answered 429 -> pausing this portal for %.0fs "
+                            "(every MAC on it, not just this one)",
+                            portal_host(self.portal_url), wait)
+                ex.done(status=429, code=RATE_LIMITED_CODE, size=size,
+                        error=f"pausing every MAC on this portal for {wait:.0f}s",
+                        answer=body_snippet(r))
+                raise PortalError(
+                    f"portal rate limited us (HTTP 429, pausing {wait:.0f}s)",
+                    code=RATE_LIMITED_CODE)
+            if r.status_code in (401, 403) and self._may_reauth(retry_on_auth, retried):
+                # Read the refusal before reacting to the status code. A 403 whose
+                # body says "the MAC is already streaming" is not an auth failure:
+                # re-handshaking cannot help, changes the session under a box that
+                # is still playing, and throws away the one thing that *would* fix
+                # it - a short wait and the same MAC (see SLOT_BUSY_CODES).
+                busy = refusal_code(r)
+                if busy in SLOT_BUSY_CODES:
+                    note_refusal(self.portal_url, busy)
+                    log.info("portal answered %s with %s -> busy slot, not re-handshaking",
+                             r.status_code, busy)
+                    ex.done(status=r.status_code, code=busy, size=size,
+                            error="busy slot, not re-handshaking",
+                            answer=body_snippet(r))
+                    raise PortalError(f"portal said {busy} (HTTP {r.status_code})", code=busy)
+                log.info("portal answered %s -> re-handshaking once", r.status_code)
+                # Recorded BEFORE the re-handshake, so the log reads in the order
+                # the panel saw it: refusal, handshake, retry.
+                ex.done(status=r.status_code, code=f"http_{r.status_code}", size=size,
+                        error="re-handshaking once, then retrying",
+                        answer=body_snippet(r))
                 async with self._lock:
                     self._token = None
                     await self.handshake()
                 return await self._get(params, retried=True, retry_on_auth=retry_on_auth)
-            else:
-                # The portal told us WHY. Keep its code, and its text when the
-                # code is not self-explanatory, so the log is actionable.
-                msg = ""
-                js = data.get("js") if isinstance(data, dict) else None
-                if isinstance(js, dict):
-                    msg = normalize_error(js.get("msg"))
-                raise PortalError(f"portal said {code}"
-                                  + (f" ({msg})" if msg and msg != code else ""), code=code)
-        return data
+            if r.status_code != 200:
+                note_refusal(self.portal_url, f"http_{r.status_code}")
+                ex.done(status=r.status_code, code=f"http_{r.status_code}", size=size,
+                        error=f"HTTP {r.status_code}", answer=body_snippet(r))
+                raise PortalError(f"HTTP {r.status_code}", code=f"http_{r.status_code}")
+            if not r.content:
+                ex.done(status=r.status_code, code="empty_reply",
+                        error="no body - portal dropped the connection or our IP is blocked")
+                raise PortalError("empty reply (portal dropped connection or IP is blocked)",
+                                  code="empty_reply")
+            try:
+                data = r.json()
+            except Exception as exc:  # noqa: BLE001
+                ex.done(status=r.status_code, code="bad_json", size=size,
+                        error=f"not JSON ({size} bytes)", answer=body_snippet(r))
+                raise PortalError(f"invalid JSON payload ({len(r.content)} bytes)",
+                                  code="bad_json") from exc
+            code = js_error(data)
+            if code:
+                note_refusal(self.portal_url, code)
+                if js_has_payload(data):
+                    log.debug("portal reported %r alongside a usable payload - ignoring it", code)
+                    ex.done(status=r.status_code, size=size,
+                            answer=f"panel reported {code} next to a usable payload - "
+                                   f"{traffic.summarize_answer(data)}")
+                elif code in TOKEN_ERROR_CODES and self._may_reauth(retry_on_auth, retried):
+                    log.info("portal refused the bearer on HTTP 200 (%s) -> re-handshaking once", code)
+                    ex.done(status=r.status_code, code=code, size=size,
+                            error="bearer refused on HTTP 200 - re-handshaking once, "
+                                  "then retrying")
+                    async with self._lock:
+                        self._token = None
+                        await self.handshake()
+                    return await self._get(params, retried=True, retry_on_auth=retry_on_auth)
+                else:
+                    # The portal told us WHY. Keep its code, and its text when the
+                    # code is not self-explanatory, so the log is actionable.
+                    msg = ""
+                    js = data.get("js") if isinstance(data, dict) else None
+                    if isinstance(js, dict):
+                        msg = normalize_error(js.get("msg"))
+                    ex.done(status=r.status_code, code=code, size=size,
+                            error=msg or code, answer=traffic.summarize_answer(data))
+                    raise PortalError(f"portal said {code}"
+                                      + (f" ({msg})" if msg and msg != code else ""), code=code)
+            ex.done(status=r.status_code, size=size, data=data)
+            return data
+        finally:
+            # The net, for an exit nobody described (a bug, a cancellation): a
+            # row that says "we asked and do not know how it ended" beats a
+            # silent gap in the middle of the log. Idempotent - every exit above
+            # has already closed its own row.
+            ex.done(code="unknown", error="request ended without a recorded outcome")
 
     async def ensure_auth(self) -> None:
         """
@@ -723,41 +783,63 @@ class StalkerClient:
 
     # ------------------------------------------------------------- handshake
     async def _handshake_stage(self, http: httpx.AsyncClient, params: dict,
-                               *, bearer: str | None = None) -> tuple[dict, str, str]:
+                               *, bearer: str | None = None,
+                               stage: int = 0) -> tuple[dict, str, str]:
         """One handshake GET -> `(js, token, error_code)`.
 
         It does not raise for a refusal: a handshake *sequence* has to keep
         trying shapes, and the reason for the last failure is reported once at the
         end. Transport/timeout codes are kept distinct because "portal is down"
         must never be written to the log as "MAC not enrolled".
+
+        Every shape lands in the traffic log as its own row: which of the three
+        handshake shapes a panel needed is exactly the kind of thing you cannot
+        see from the aggregate refusal counts.
         """
         headers = {"Authorization": f"Bearer {bearer}"} if bearer else None
+        ex = traffic.exchange(self.portal_url, self.mac, params, stage=stage)
         try:
             r = await http.get(self.portal_url, params=params, headers=headers)
         except httpx.TimeoutException:
+            ex.done(code="timeout", error=f"timeout after {self.timeout:.0f}s")
             return {}, "", "timeout"
         except Exception as exc:  # noqa: BLE001 - unreachable is a verdict, not a bug
             log.debug("handshake transport error: %s", exc)
+            ex.done(code="transport", error=f"{type(exc).__name__}: {exc}")
             return {}, "", "transport"
+        size = len(r.content or b"")
         if r.status_code == 429:
             note_refusal(self.portal_url, "http_429")
             note_rate_limit(self.portal_url, retry_after=retry_after_seconds(r),
                             reason="HTTP 429 (handshake)")
+            ex.done(status=429, code=RATE_LIMITED_CODE, size=size,
+                    error="pausing every MAC on this portal", answer=body_snippet(r))
             return {}, "", RATE_LIMITED_CODE
         if r.status_code != 200:
-            return {}, "", ("unauthorized" if r.status_code in (401, 403)
-                            else f"http_{r.status_code}")
+            code = ("unauthorized" if r.status_code in (401, 403)
+                    else f"http_{r.status_code}")
+            ex.done(status=r.status_code, code=code, size=size,
+                    error=f"HTTP {r.status_code}", answer=body_snippet(r))
+            return {}, "", code
         try:
             data = r.json()
         except Exception:  # noqa: BLE001 - an unparsable answer is a refusal
             log.debug("handshake reply was not JSON (%d bytes)", len(r.content or b""))
+            ex.done(status=200, code="bad_json", size=size,
+                    error=f"not JSON ({size} bytes)", answer=body_snippet(r))
             return {}, "", "bad_json"
         js = data.get("js") if isinstance(data, dict) else None
         js = js if isinstance(js, dict) else {}
         token = str(js.get("token") or "")
         if token:
+            ex.done(status=200, size=size,
+                    answer=f"token issued (random={bool(js.get('random'))}, "
+                           f"not_valid={js.get('not_valid') or '-'})")
             return js, token, ""
-        return js, "", (js_error(data) or "no_token")
+        code = js_error(data) or "no_token"
+        ex.done(status=200, code=code, size=size, error="no token in this reply",
+                answer=traffic.summarize_answer(data))
+        return js, "", code
 
     async def handshake(self) -> str:
         """
@@ -777,6 +859,13 @@ class StalkerClient:
         """
         left = rate_limit_left(self.portal_url)
         if left > 0:
+            # Same rule as `_get`: a request we deliberately did not send is
+            # still a row, because "nothing happened at 13:40" is otherwise
+            # indistinguishable from "we never tried".
+            traffic.exchange(self.portal_url, self.mac,
+                             {"type": "stb", "action": "handshake"}).done(
+                code=RATE_LIMITED_CODE, skipped=True,
+                error=f"not sent - portal host paused for {left:.0f}s")
             raise PortalError(
                 f"portal is rate limiting us ({left:.0f}s of cooldown left)",
                 code=RATE_LIMITED_CODE)
@@ -799,13 +888,15 @@ class StalkerClient:
             (1, {**base, "prehash": "0"}, None),
             (2, {**base, "prehash": "0", "token": "", "mac": self.mac}, None),
         ):
-            js, token, code = await self._handshake_stage(http, params, bearer=bearer)
+            js, token, code = await self._handshake_stage(http, params, bearer=bearer,
+                                                          stage=stage)
             if token:
                 break
             if stage == 2 and missing_token(js):
                 fake, prehash = make_fake_bearer()
                 js, token, code = await self._handshake_stage(
-                    http, {**base, "mac": self.mac, "prehash": prehash}, bearer=fake)
+                    http, {**base, "mac": self.mac, "prehash": prehash}, bearer=fake,
+                    stage=3)
                 if token:
                     log.info("portal required the second-step (prehash) handshake -> satisfied")
                 break
