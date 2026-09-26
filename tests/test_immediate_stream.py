@@ -21,7 +21,7 @@ from app.database import SessionLocal
 from app.main import app
 from app.models import LivePlaylist, User
 from app.routers.output import _stream_response
-from app.services.stream_manager import MANAGER, StreamHandle
+from app.services.stream_manager import MANAGER, StreamHandle, StreamManager
 
 
 @pytest.fixture
@@ -194,3 +194,41 @@ async def test_immediate_stream_empty_generator_terminates_gracefully(seeded_liv
     # Verify diagnostic log was emitted
     assert any("stream ended without producing data" in msg for _, _, msg in logs)
     assert any("upstream timed out" in msg for _, _, msg in logs)
+
+
+def test_argv_ensures_fast_probe_and_flush_packets_for_live_network_streams():
+    """Live network streams must bound probe analysis and flush output packets immediately."""
+    cmd = "ffmpeg -i <url> -c copy -f mpegts pipe:1"
+    url = "http://cdn.example.com/stream.ts"
+    args = StreamManager._ffmpeg_argv(cmd, url, pace=False)
+    assert args is not None
+    # Bounded probe before -i
+    assert "-analyzeduration" in args
+    assert "-probesize" in args
+    assert args.index("-analyzeduration") < args.index("-i")
+    assert args.index("-probesize") < args.index("-i")
+    # Immediate packet flushing on output
+    assert "-flush_packets" in args
+    assert args[args.index("-flush_packets") + 1] == "1"
+
+
+def test_argv_preserves_explicit_probe_options():
+    """Explicitly specified probe options in the template must not be overridden."""
+    cmd = "ffmpeg -analyzeduration 500000 -probesize 250000 -i <url> -c copy -f mpegts pipe:1"
+    url = "http://cdn.example.com/stream.ts"
+    args = StreamManager._ffmpeg_argv(cmd, url, pace=False)
+    assert args is not None
+    assert args.count("-analyzeduration") == 1
+    assert args[args.index("-analyzeduration") + 1] == "500000"
+    assert args.count("-probesize") == 1
+    assert args[args.index("-probesize") + 1] == "250000"
+
+
+def test_argv_local_files_do_not_inject_fast_probe():
+    """Local files have their own probe logic and must not have live network probe flags injected."""
+    cmd = "ffmpeg -i <url> -c copy -f mpegts pipe:1"
+    args = StreamManager._ffmpeg_argv(cmd, "/media/movie.mp4", pace=True)
+    assert args is not None
+    assert "-analyzeduration" not in args
+    assert "-probesize" not in args
+

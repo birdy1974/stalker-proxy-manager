@@ -212,6 +212,8 @@ _TS_VIDEO_BSF = {"h264": "h264_mp4toannexb", "hevc": "hevc_mp4toannexb",
 # VOD on top of a slow portal, a hard disk that has to spin up). Two seconds
 # is plenty for normal A/V skew and keeps stream start responsive.
 MAX_INTERLEAVE_DELTA_US = os.environ.get("SPM_MAX_INTERLEAVE_DELTA_US", "2000000")
+FAST_ANALYZE_DURATION = os.environ.get("SPM_FAST_ANALYZE_DURATION", "1000000")
+FAST_PROBE_SIZE = os.environ.get("SPM_FAST_PROBE_SIZE", "1000000")
 ROUTE_AFFINITY_TTL = float(os.environ.get("SPM_ROUTE_AFFINITY_TTL", "1800"))
 SOURCE_BREAKER_FAILURES = max(1, int(os.environ.get("SPM_SOURCE_BREAKER_FAILURES", "2")))
 SOURCE_BREAKER_COOLDOWN = float(os.environ.get("SPM_SOURCE_BREAKER_COOLDOWN", "45"))
@@ -1613,15 +1615,18 @@ class StreamManager:
                 pass
         args = StreamManager._ensure_annexb(args)
         args = StreamManager._ensure_interleave_flush(args)
+        args = StreamManager._ensure_flush_packets(args)
         # Live Matroska is audio-only on Enigma2 (no cues on a pipe). A VOD
         # MKV template assigned to a live channel is rewritten to MPEG-TS.
         if not pace and is_net:
             # `pace=False` is normally live, but callers also use the pure
             # argv renderer for local-file diagnostics. Only a network/live
             # input should have its Matroska pipe rewritten for Enigma2.
+            args = StreamManager._ensure_fast_probe(args)
             args = StreamManager._matroska_to_mpegts_for_live(args)
             args = StreamManager._ensure_annexb(args)
             args = StreamManager._ensure_interleave_flush(args)
+            args = StreamManager._ensure_flush_packets(args)
         # Inject metadata title before the output format specifier so players
         # display the correct stream name instead of source stream metadata.
         # One argv element (create_subprocess_exec); a title with spaces or
@@ -1990,6 +1995,34 @@ class StreamManager:
             return args
         out = list(args)
         out[f_idx:f_idx] = ["-max_interleave_delta", MAX_INTERLEAVE_DELTA_US]
+        return out
+
+    @staticmethod
+    def _ensure_fast_probe(args: list[str]) -> list[str]:
+        """Bound demux analysis on live network streams so FFmpeg doesn't
+        wait up to 5 seconds for its default 5MB/5s probe analysis window."""
+        if not args or "-analyzeduration" in args or "-probesize" in args:
+            return args
+        try:
+            i_idx = args.index("-i")
+        except ValueError:
+            return args
+        out = list(args)
+        out[i_idx:i_idx] = ["-analyzeduration", FAST_ANALYZE_DURATION,
+                            "-probesize", FAST_PROBE_SIZE]
+        return out
+
+    @staticmethod
+    def _ensure_flush_packets(args: list[str]) -> list[str]:
+        """Ensure streaming output pipes flush packets immediately instead
+        of holding them in user-space buffers."""
+        if not args or "-flush_packets" in args:
+            return args
+        fmt, f_idx = StreamManager._output_format(args)
+        if fmt not in ("mpegts", "matroska", "mkv") or f_idx is None:
+            return args
+        out = list(args)
+        out[f_idx:f_idx] = ["-flush_packets", "1"]
         return out
 
     @staticmethod
