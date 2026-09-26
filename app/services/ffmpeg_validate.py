@@ -12,8 +12,8 @@ import time
 
 from ..config import FFMPEG_BIN
 from . import stream_identity
-from .ffmpeg_templates import (REDIRECT_COMMAND, URL_PLACEHOLDER,
-                                template_command_errors)
+from .ffmpeg_templates import (PASSTHROUGH_COMMAND, REDIRECT_COMMAND,
+                                URL_PLACEHOLDER, template_command_errors)
 
 # 10-second H.264 360p clip (CC-BY Big Buck Bunny) — small enough to probe
 # a real HTTP input without downloading a movie.
@@ -51,8 +51,10 @@ DEMO_RECONNECT_DELAY_MAX = 2          # cap the backoff (template often says 5)
 
 def syntax_check(command: str) -> dict:
     cmd = (command or "").strip()
-    if cmd == REDIRECT_COMMAND:
-        return {"ok": True, "mode": "syntax", "detail": "redirect template (no ffmpeg)"}
+    if cmd in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
+        detail = ("redirect template (no ffmpeg)" if cmd == REDIRECT_COMMAND
+                  else "pass-through proxy template (no ffmpeg)")
+        return {"ok": True, "mode": "syntax", "detail": detail}
     if not cmd:
         return {"ok": False, "mode": "syntax", "detail": "empty command"}
     if not cmd.startswith("ffmpeg"):
@@ -241,7 +243,7 @@ async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
     syn = syntax_check(command)
     if mode == "syntax" or not syn["ok"]:
         return syn
-    if (command or "").strip() == REDIRECT_COMMAND:
+    if (command or "").strip() in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
         return syn
 
     lavfi = mode == "lavfi"

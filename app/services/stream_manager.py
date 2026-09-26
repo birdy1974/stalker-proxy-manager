@@ -37,6 +37,7 @@ from sqlalchemy import delete, select, update
 
 from ..config import FFMPEG_BIN, STREAM_START_TIMEOUT
 from ..database import SessionLocal, run_uncancelled
+import httpx
 from ..models import (
     ActiveStream, FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource,
     LocalFile, LocalPlaylist, LocalSource, MacAddress, Portal, SerieEpisode, SeriePlaylist,
@@ -51,7 +52,8 @@ from . import stream_identity
 from .channel_translations import attach_overrides
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
-                               HLS_PROTOCOL_WHITELIST, REDIRECT_COMMAND,
+                               HLS_PROTOCOL_WHITELIST, PASSTHROUGH_COMMAND,
+                               PASSTHROUGH_PRESET_NAME, REDIRECT_COMMAND,
                                URL_PLACEHOLDER, argv_validation_errors,
                                mpegts_copy_command, serves_original_file)
 from .probe import media_codecs, prime_local_startup_cache, subtitle_streams
@@ -171,6 +173,72 @@ STREAM_STALL_TIMEOUT = float(os.environ.get("SPM_STREAM_STALL_TIMEOUT", "25.0"))
 STREAM_STALL_TIMEOUT_LIVE = float(os.environ.get(
     "SPM_STREAM_STALL_TIMEOUT_LIVE", "10.0"))
 CHUNK = 64 * 1024
+
+
+class PassthroughStream:
+    """Process-like interface for an asynchronous pass-through HTTP stream (Option E).
+
+    Acts as a drop-in replacement for `asyncio.subprocess.Process` in `StreamManager`,
+    providing `.stdout.read(n)`, `.returncode`, `.kill()`, and `.wait()`.
+    Zero FFmpeg subprocesses, zero transcoding, minimal CPU.
+    """
+
+    def __init__(self, client: httpx.AsyncClient, response: httpx.Response):
+        self._client = client
+        self._response = response
+        self._aiter = response.aiter_bytes(chunk_size=CHUNK)
+        self.returncode: int | None = None
+        self.pid: int | None = None
+        self.spm_stderr_tail: list[bytes] = []
+        self.spm_stderr_task: asyncio.Task | None = None
+        self._closed = False
+        self.stdout = self._Stdout(self)
+
+    class _Stdout:
+        def __init__(self, parent: PassthroughStream):
+            self._parent = parent
+
+        async def read(self, n: int = -1) -> bytes:
+            if self._parent.returncode is not None:
+                return b""
+            try:
+                chunk = await anext(self._parent._aiter)
+                return chunk
+            except StopAsyncIteration:
+                self._parent.returncode = 0
+                return b""
+            except asyncio.CancelledError:
+                self._parent.returncode = -9
+                raise
+            except Exception:
+                self._parent.returncode = 1
+                return b""
+
+    def kill(self) -> None:
+        self.returncode = -9
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._close())
+        except RuntimeError:
+            pass
+
+    async def wait(self) -> int:
+        await self._close()
+        return self.returncode if self.returncode is not None else 0
+
+    async def _close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            await self._response.aclose()
+        except Exception:
+            pass
+        try:
+            await self._client.aclose()
+        except Exception:
+            pass
+
 # input options that only exist for network protocols (stripped for file://)
 _NETONLY_OPTS = re.compile(
     r"-(?:reconnect\w*|-?rw_timeout|timeout|user_agent|headers|http_proxy"
@@ -1587,7 +1655,7 @@ class StreamManager:
         else gets the plain "no subtitles" net (which also strips a legacy
         subtitles= burn filter from the -vf value).
         """
-        if (cmd_template or "").strip() == REDIRECT_COMMAND:
+        if (cmd_template or "").strip() in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
             return None
         is_net = url.lower().startswith(_NET_SCHEMES)
         insert = url if is_net else shlex.quote(url)
@@ -2071,6 +2139,91 @@ class StreamManager:
         out[at:at] = ins
         return out
 
+    @staticmethod
+    def _referer_of(url: str) -> str:
+        """Origin-root referer for network requests."""
+        scheme, _, rest = str(url).partition("://")
+        return f"{scheme}://{rest.split('/', 1)[0]}/"
+
+    async def _open_passthrough(
+        self, url: str, *, title: str,
+        first_byte_timeout: float | None = None,
+    ) -> tuple[PassthroughStream | None, bytes, dict | None]:
+        """Open a raw asynchronous pass-through HTTP stream directly to the target URL,
+        bypassing FFmpeg completely (Option E)."""
+        is_net = url.lower().startswith(_NET_SCHEMES)
+        if not is_net:
+            await db_log("ERROR", "stream",
+                         f"[{title}] pass-through proxy requires a network URL: {url}")
+            return None, b"", {"rc": 1, "tail": [b"not a network url"], "stalled": False}
+
+        timeout_s = first_byte_timeout or STREAM_START_TIMEOUT
+        choices = stream_identity.ladder(url)
+        last: dict | None = None
+        for rung, ua in enumerate(choices):
+            t0 = time.monotonic()
+            headers = {
+                "User-Agent": ua or stream_identity.STB_UA,
+                "Referer": StreamManager._referer_of(url),
+                "Accept": "*/*",
+                "Connection": "keep-alive",
+            }
+            timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=None)
+            client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False)
+            try:
+                req = client.build_request("GET", url, headers=headers)
+                resp = await client.send(req, stream=True)
+            except Exception as exc:
+                await client.aclose()
+                last = {"rc": 1, "tail": [f"ConnectError: {exc}".encode()], "stalled": False}
+                if rung + 1 < len(choices):
+                    continue
+                return None, b"", last
+
+            elapsed = time.monotonic() - t0
+            if resp.status_code >= 400:
+                code = resp.status_code
+                tail = [f"HTTP {code}".encode()]
+                await resp.aclose()
+                await client.aclose()
+                last = {"rc": code, "tail": tail, "stalled": False}
+                if code in stream_identity.UA_POLICY_4XX and rung + 1 < len(choices):
+                    nxt = choices[rung + 1]
+                    next_label = ("portal browser"
+                                  if nxt == stream_identity.STB_UA else "media player")
+                    await db_log(
+                        "INFO", "stream",
+                        f"[{title}] origin answered HTTP {code} to passthrough request - "
+                        f"retrying once with the {next_label} user-agent")
+                    continue
+                return None, b"", last
+
+            # Status 2xx: connection established, fetch first chunk
+            stream = PassthroughStream(client, resp)
+            try:
+                first = await asyncio.wait_for(stream.stdout.read(CHUNK), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                await stream._close()
+                last = {"rc": None, "tail": [b"timeout waiting for first bytes"], "stalled": True}
+                return None, b"", last
+            except Exception as exc:
+                await stream._close()
+                last = {"rc": 1, "tail": [f"read error: {exc}".encode()], "stalled": False}
+                return None, b"", last
+
+            if not first:
+                await stream._close()
+                last = {"rc": 0, "tail": [b"EOF before first bytes"], "stalled": False}
+                if rung + 1 < len(choices):
+                    continue
+                return None, b"", last
+
+            if ua:
+                stream_identity.remember(url, ua)
+            return stream, first, None
+
+        return None, b"", last
+
     async def _open_with_identity(self, command: str, url: str, *,
                                   title: str, pace: bool,
                                   first_byte_timeout: float | None = None
@@ -2091,6 +2244,9 @@ class StreamManager:
         the next play costs one spawn again. A silent stall/timeout is NOT an
         identity answer and never spends the browser-UA retry.
         """
+        if (command or "").strip() == PASSTHROUGH_COMMAND:
+            return await self._open_passthrough(
+                url, title=title, first_byte_timeout=first_byte_timeout)
         template_owns = "-user_agent" in (command or "")
         is_net = url.lower().startswith(_NET_SCHEMES)
         # Local files have no media endpoint to negotiate identity with: one
@@ -2158,9 +2314,9 @@ class StreamManager:
 
     async def _spawn(self, cmd_template: str, url: str, title: str | None = None,
                      pace: bool = False, user_agent: str | None = None) -> asyncio.subprocess.Process | None:
-        if (cmd_template or "").strip() == REDIRECT_COMMAND:
+        if (cmd_template or "").strip() in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
             await db_log("ERROR", "stream",
-                         "cannot spawn the redirect template as ffmpeg "
+                         f"cannot spawn the {(cmd_template or '').strip()} template as ffmpeg "
                          "(local files must be served directly)")
             return None
         if "<out_dir>" in (cmd_template or ""):
@@ -3111,7 +3267,7 @@ class StreamManager:
         # template is the redirect marker, which is not an ffmpeg command: when
         # we reach the pipe (Enigma2 asked for `.ts`, not the original MP4)
         # remux to MPEG-TS with Annex-B instead of dying in _spawn.
-        if kind == "local" and (command or "").strip() == REDIRECT_COMMAND:
+        if kind == "local" and (command or "").strip() in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
             tpl_name = "(local mpegts remux)"
             command = mpegts_copy_command()
         handle = StreamHandle(id=uuid.uuid4().hex, kind=kind, item_name=item_name,

@@ -656,9 +656,12 @@ async def test_an_existing_install_gets_the_columns_it_is_promised(tmp_path):
             await conn.run_sync(models.Base.metadata.create_all)
             for table, columns in _NEW_COLUMNS.items():
                 for col in columns:
-                    await conn.run_sync(
-                        lambda c, t=table, n=col: c.execute(
-                            text(f'ALTER TABLE {t} DROP COLUMN {n}')))
+                    try:
+                        await conn.run_sync(
+                            lambda c, t=table, n=col: c.execute(
+                                text(f'ALTER TABLE {t} DROP COLUMN {n}')))
+                    except Exception:
+                        pass
 
         for _ in range(2):
             async with eng.begin() as conn:

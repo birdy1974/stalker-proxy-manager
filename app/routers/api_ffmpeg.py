@@ -16,7 +16,8 @@ from ..models import (
 )
 from ..security import require_admin
 from ..services import item_info
-from ..services.ffmpeg_templates import (FFmpegOptions, REDIRECT_COMMAND,
+from ..services.ffmpeg_templates import (FFmpegOptions, PASSTHROUGH_COMMAND,
+                                     PASSTHROUGH_PRESET_NAME, REDIRECT_COMMAND,
                                      build_command, coerce_options,
                                      extra_option_warnings,
                                      option_warnings, parse_command,
@@ -36,7 +37,7 @@ def _row(t: FFmpegTemplate) -> dict:
 def _template_errors(t: FFmpegTemplate) -> list[str]:
     """Validate the stored command and raw extension fields before persistence."""
     errors = extra_option_warnings(_opts(t))
-    if t.command_source == "fields" and (t.command or "").strip() != REDIRECT_COMMAND:
+    if t.command_source == "fields" and (t.command or "").strip() not in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
         errors.extend(field_errors(_opts(t)))
     errors.extend(template_command_errors(t.command or ""))
     return errors
@@ -71,7 +72,7 @@ def _source_from_payload(t: FFmpegTemplate, payload: dict) -> str:
         return "fields"
     if "command" in payload:
         supplied = str(payload.get("command", "") or "").strip()
-        expected = (REDIRECT_COMMAND if supplied == REDIRECT_COMMAND
+        expected = (supplied if supplied in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND)
                     else build_command(_opts(t))).strip()
         return "manual" if supplied and supplied != expected else "fields"
     return t.command_source if t.command_source in ("fields", "manual") else "fields"
@@ -119,8 +120,9 @@ async def create_template(payload: dict, db=Depends(get_db)):
             setattr(t, f, payload[f])
     t.command_source = _source_from_payload(t, payload)
     if t.command_source == "fields":
-        t.command = ((t.command or "").strip() == REDIRECT_COMMAND
-                     and REDIRECT_COMMAND) or build_command(_opts(t))
+        cmd_str = (t.command or "").strip()
+        t.command = (cmd_str if cmd_str in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND)
+                     else build_command(_opts(t)))
     _reject_template(_template_errors(t))
     db.add(t)
     if make_default:
@@ -138,7 +140,7 @@ async def update_template(tid: int, payload: dict, db=Depends(get_db)):
     if t.is_default and (make_default is False or payload.get("enabled") is False):
         raise HTTPException(409, "Choose another default before disabling or clearing this default")
     old_command = (t.command or "").strip()
-    was_redirect = old_command == REDIRECT_COMMAND
+    was_sentinel = old_command in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND)
     for f in FIELDS:
         if f in payload and f != "is_default":
             setattr(t, f, payload[f])
@@ -155,14 +157,15 @@ async def update_template(tid: int, payload: dict, db=Depends(get_db)):
     # byte-for-byte intact when a script or an older UI sends unrelated field
     # updates without the command text.
     if source == "fields":
-        if (t.command or "").strip() == REDIRECT_COMMAND:
-            t.command = REDIRECT_COMMAND
+        cmd_str = (t.command or "").strip()
+        if cmd_str in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
+            t.command = cmd_str
         elif "command" not in payload or supplied_command != build_command(_opts(t)):
             t.command = build_command(_opts(t))
 
-    # A redirect row carries structured defaults only for seeding/UI shape. It
+    # A sentinel row carries structured defaults only for seeding/UI shape. It
     # must not leak stale raw extras into a newly-created FFmpeg command.
-    if was_redirect and (t.command or "").strip() != REDIRECT_COMMAND:
+    if was_sentinel and (t.command or "").strip() not in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND):
         if "extra_input" not in payload:
             t.extra_input = ""
         if "extra_output" not in payload:

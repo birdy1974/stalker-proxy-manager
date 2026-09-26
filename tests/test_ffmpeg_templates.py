@@ -24,7 +24,8 @@ import shlex
 
 from app.services.ffmpeg_templates import (
     COPY_PRESET_NAME, E2_DUO2_LIVE_PRESET_NAME, E2_VOD_REMUX_PRESET_NAME,
-    E2_VOD_TRANSCODE_PRESET_NAME, FFmpegOptions, REDIRECT_COMMAND,
+    E2_VOD_TRANSCODE_PRESET_NAME, FFmpegOptions, PASSTHROUGH_COMMAND,
+    PASSTHROUGH_PRESET_NAME, REDIRECT_COMMAND,
     REDIRECT_PRESET_NAME, asdict,
     REFERENCE_PRESET_NAME, argv_validation_errors, build_command,
     default_presets, extra_option_warnings, parse_command, serves_original_file,
@@ -186,9 +187,9 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
         else:
             assert "-rc_mode" not in p["command"], name
     # every preset's stored command must match its structured fields (2-way sync);
-    # the redirect preset is exempt: it is a marker, not an ffmpeg command.
+    # the redirect and passthrough presets are exempt: they are markers, not ffmpeg commands.
     for name, p in presets.items():
-        if name == REDIRECT_PRESET_NAME:
+        if name in (REDIRECT_PRESET_NAME, PASSTHROUGH_PRESET_NAME):
             continue
         fields = {k: v for k, v in p.items() if k in FFmpegOptions.__dataclass_fields__}
         assert build_command(FFmpegOptions(**fields)) == p["command"], name
@@ -314,6 +315,7 @@ def test_serves_original_file_covers_redirect_and_copy():
     presets = {p["name"]: p for p in default_presets()}
     assert serves_original_file(presets[COPY_PRESET_NAME]["command"]) is True
     assert serves_original_file(presets[REDIRECT_PRESET_NAME]["command"]) is True
+    assert serves_original_file(presets[PASSTHROUGH_PRESET_NAME]["command"]) is True
 
 
 def test_enigma2_presets_bound_input_analysis_for_fast_start():
@@ -340,6 +342,18 @@ def test_redirect_preset_is_a_sentinel_not_a_command():
     for f in FFmpegOptions.__dataclass_fields__:
         assert f in redirect, f
     assert build_command(FFmpegOptions()) != REDIRECT_COMMAND
+
+
+def test_passthrough_preset_is_a_sentinel_not_a_command():
+    """The pass-through proxy preset (Option E) ships as a sentinel row,
+    not an ffmpeg command."""
+    presets = {p["name"]: p for p in default_presets()}
+    passthrough = presets[PASSTHROUGH_PRESET_NAME]
+    assert passthrough["command"] == PASSTHROUGH_COMMAND
+    assert passthrough["enabled"] is True
+    for f in FFmpegOptions.__dataclass_fields__:
+        assert f in passthrough, f
+    assert build_command(FFmpegOptions()) != PASSTHROUGH_COMMAND
 
 
 def test_dreambox_preset_targets_mpeg2_ts_for_enigma2():
