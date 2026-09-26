@@ -40,6 +40,27 @@
   <div class="col-xl-5">
     <div class="card">
       <div class="card-header d-flex justify-content-between align-items-center">
+        <span><i class="bi bi-stopwatch"></i> Zapping &amp; panel answers</span>
+        <a class="btn btn-sm btn-outline-secondary" href="#portal-traffic"
+           title="Every request we sent to a panel and every answer it gave, with timestamps">
+          <i class="bi bi-arrow-left-right"></i> Requests &amp; answers</a>
+      </div>
+      <div class="card-body py-2">
+        <div class="row small g-1" id="diag-summary"></div>
+        <div class="muted-label mt-2">Refusals the panel sent</div>
+        <div id="diag-refusals" class="small"></div>
+        <div class="muted-label mt-2">Last starts</div>
+        <div id="diag-recent" class="small mono" style="max-height:140px;overflow:auto"></div>
+      </div>
+      <div class="card-footer small text-muted" data-help="Zapping latency">
+        Phase timings of the last starts (this process only). <b>proxy</b> = panel link + ffmpeg + first byte;
+        <b>redirect</b> = panel link + one liveness probe, no ffmpeg. A parked pipe is a live stream whose player
+        left and that is held for a moment so a zap back attaches instead of restarting.
+      </div>
+    </div>
+
+    <div class="card mt-3">
+      <div class="card-header d-flex justify-content-between align-items-center">
         <span><i class="bi bi-broadcast"></i> API status</span>
         <span id="api-dot" class="badge text-bg-secondary">…</span>
       </div>
@@ -53,22 +74,6 @@
       <div class="card-footer small text-muted" data-help="API request logging">
         Every request is also written to stdout as <span class="mono">[spm.api]</span> —
         <span class="mono">docker logs stalker-proxy-manager | grep spm.api</span>
-      </div>
-    </div>
-
-    <div class="card mt-3">
-      <div class="card-header"><i class="bi bi-stopwatch"></i> Zapping & panel answers</div>
-      <div class="card-body py-2">
-        <div class="row small g-1" id="diag-summary"></div>
-        <div class="muted-label mt-2">Refusals the panel sent</div>
-        <div id="diag-refusals" class="small"></div>
-        <div class="muted-label mt-2">Last starts</div>
-        <div id="diag-recent" class="small mono" style="max-height:140px;overflow:auto"></div>
-      </div>
-      <div class="card-footer small text-muted" data-help="Zapping latency">
-        Phase timings of the last starts (this process only). <b>proxy</b> = panel link + ffmpeg + first byte;
-        <b>redirect</b> = panel link + one liveness probe, no ffmpeg. A parked pipe is a live stream whose player
-        left and that is held for a moment so a zap back attaches instead of restarting.
       </div>
     </div>
 
@@ -89,6 +94,43 @@
       </div>
       <div class="card-footer small text-muted" id="mock-hint" data-help="Demo portal"></div>
     </div>
+  </div>
+</div>
+
+<div class="card mt-3" id="portal-traffic">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span><i class="bi bi-arrow-left-right"></i> Portal traffic — requests &amp; answers
+      <span id="traffic-dot" class="badge text-bg-secondary ms-1">…</span>
+    </span>
+    <div class="d-flex flex-wrap gap-1">
+      <select class="form-select form-select-sm" id="traffic-host" style="width:180px"
+              aria-label="Portal"><option value="">All portals</option></select>
+      <select class="form-select form-select-sm" id="traffic-outcome" style="width:170px"
+              aria-label="Outcome">
+        <option value="">All outcomes</option>
+        <option value="errors">Problems only</option>
+        <option value="ok">Accepted answers</option>
+        <option value="refused">Refused by the panel</option>
+        <option value="failed">No answer at all</option>
+        <option value="skipped">Not sent (portal paused)</option>
+      </select>
+      <input class="form-control form-control-sm" id="traffic-q" style="width:170px"
+             placeholder="MAC, action, code…" aria-label="Filter">
+      <button class="btn btn-sm btn-outline-secondary" id="traffic-pause"
+              title="Stop / resume the automatic refresh"><i class="bi bi-pause"></i></button>
+      <button class="btn btn-sm btn-outline-secondary" id="traffic-reload"
+              title="Reload now"><i class="bi bi-arrow-clockwise"></i></button>
+      <button class="btn btn-sm btn-outline-danger" id="traffic-clear"
+              title="Forget the recorded exchanges"><i class="bi bi-trash"></i></button>
+    </div>
+  </div>
+  <div class="card-body p-2"><div id="traffic-table"></div></div>
+  <div class="card-footer small text-muted" data-help="Portal traffic">
+    Every request this process sent to a Stalker panel and what it answered, newest first, with the
+    time it was sent and how long the answer took. Click a row for the full request and answer.
+    Kept in memory for this process only (the last 400 exchanges, <span class="mono">SPM_PORTAL_TRAFFIC</span>
+    to change that) — a restart starts empty, and the same events are in the container log as
+    <span class="mono">[spm.portal]</span>. Bearers and <span class="mono">play_token</span>s are masked.
   </div>
 </div>
 {% endblock %}
@@ -151,6 +193,9 @@ function renderDiag(g) {
   if (paced) html += cell(paced, "background requests yielded to a play");
   if (g.parked) html += cell(g.parked, "parked pipe(s) waiting for a zap back");
   for (const q of g.paused || []) html += cell(`${q.seconds}s`, `paused (rate limited): ${esc(q.name)}`);
+  const tr = g.traffic || {}, tc = tr.counts || {};
+  if (tr.kept) html += cell(`${tc.ok || 0}/${tr.kept}`, "panel answers accepted (see below)");
+  if (tr.last_minute) html += cell(tr.last_minute, "panel requests in the last minute");
   box.innerHTML = html || '<span class="text-muted">no starts recorded yet</span>';
 
   const codes = ((g.refusals || {}).codes || []);
@@ -246,6 +291,137 @@ logsTable = new DataTable($("#logs-table"), {
   ],
   emptyText: "no log messages yet",
 });
+/* ------------------------------------------------------- portal traffic
+ * What we asked each panel and what it answered, one row per attempt.
+ * `t` is epoch seconds straight from the in-memory ring (no database, no
+ * timezone conversion to undo), so the browser renders it in its own zone -
+ * with milliseconds, because "which of these two requests was first" is the
+ * whole reason this table exists. */
+const pad = (n, w = 2) => String(n).padStart(w, "0");
+const clockOf = (t) => { const d = new Date(t * 1000); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}`; };
+const dayOf = (t) => { const d = new Date(t * 1000); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${clockOf(t)}`; };
+function agoOf(t) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  return s < 60 ? `${s}s ago` : s < 3600 ? `${Math.floor(s / 60)}m ago` : `${Math.floor(s / 3600)}h ago`;
+}
+const statusBadge = (r) => r.status
+  ? `<span class="badge text-bg-${r.status >= 500 ? "danger" : r.status >= 400 ? "warning" : "success"}">HTTP ${r.status}</span>`
+  : `<span class="badge text-bg-dark">${r.outcome === "skipped" ? "not sent" : "no answer"}</span>`;
+const codeBadge = (r) => !r.code ? '<span class="text-muted">—</span>'
+  : `<span class="badge text-bg-${r.outcome === "refused" ? "danger" : r.outcome === "skipped" ? "secondary" : "light text-dark border"} mono">${esc(r.code)}</span>`;
+let trafficHints = {};
+
+function showTraffic(row) {
+  const line = (label, html) =>
+    `<tr><th class="small fw-normal text-muted" style="width:150px">${esc(label)}</th><td class="small">${html}</td></tr>`;
+  const notes = [];
+  if (row.retried) notes.push("this was the retry after a re-handshake");
+  if (row.stage) notes.push(`handshake shape ${row.stage} of 3`);
+  if (row.outcome === "skipped") notes.push("never sent - the portal host was paused after a 429");
+  const hint = row.code && trafficHints[row.code]
+    ? `<div class="text-muted">${esc(trafficHints[row.code])}</div>` : "";
+  const body = el("div");
+  body.innerHTML = `<table class="table table-sm mb-0"><tbody>
+    ${line("Sent (local)", `<span class="mono">${dayOf(row.t)}</span> <span class="text-muted">(${agoOf(row.t)})</span>`)}
+    ${line("Sent (UTC)", `<span class="mono">${esc(new Date(row.t * 1000).toISOString())}</span>
+      <span class="text-muted">— matches the container log</span>`)}
+    ${line("Answered after", `<b>${row.ms} ms</b> <span class="text-muted">at
+      <span class="mono">${clockOf(row.t + row.ms / 1000)}</span></span>`)}
+    ${line("Portal", `<span class="mono">${esc(row.host)}</span>`)}
+    ${line("MAC", row.mac ? `<span class="mono">${esc(row.mac)}</span>` : '<span class="text-muted">—</span>')}
+    ${line("Request", `<div><b>GET</b> ${esc(row.type ? `type=${row.type}` : "")}
+      ${esc(row.action ? `action=${row.action}` : "")}</div>
+      <div class="mono mt-1" style="white-space:pre-wrap;word-break:break-all">${esc(row.params || "—")}</div>`)}
+    ${line("Response", `${statusBadge(row)} ${codeBadge(row)}${hint}`)}
+    ${line("Panel said", row.error
+      ? `<b class="log-WARNING">${esc(row.error)}</b>`
+      : `<span class="mono" style="white-space:pre-wrap;word-break:break-all">${esc(row.answer || "—")}</span>`)}
+    ${line("Bytes", row.bytes ? `${row.bytes.toLocaleString()} bytes` : '<span class="text-muted">none</span>')}
+    ${notes.length ? line("Note", notes.map(esc).join(" · ")) : ""}
+  </tbody></table>`;
+  const footer = el("div");
+  const m = openModal({ title: `Portal exchange #${row.id}`, body, footer, size: "lg", closeButton: true });
+  footer.append(mBtn("Close", "btn-outline-secondary", m.close));
+}
+
+function fillTrafficHosts(hosts) {
+  const sel = $("#traffic-host"), key = hosts.map(h => h.host).join("|");
+  if (sel.dataset.loaded === key) return;      // never rebuild under the user's mouse
+  sel.dataset.loaded = key;
+  const cur = sel.value;
+  sel.innerHTML = "";
+  sel.append(el("option", { value: "" }, "All portals"));
+  for (const h of hosts) sel.append(el("option", { value: h.host }, `${h.host} (${h.count})`));
+  sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
+}
+function renderTrafficDot(d) {
+  const c = d.counts || {}, dot = $("#traffic-dot");
+  const trouble = (c.refused || 0) + (c.failed || 0) + (c.skipped || 0);
+  dot.textContent = d.kept ? `${d.kept} kept · ${d.last_minute} in the last minute` : "nothing recorded yet";
+  dot.className = "badge ms-1 text-bg-" + (!d.kept ? "secondary" : trouble ? "warning" : "success");
+}
+
+const trafficTable = new DataTable($("#traffic-table"), {
+  perPageDefault: 25,
+  onRowClick: showTraffic,
+  server: async (q) => {
+    /* `q` carries page/per_page from the table; the header controls are ours. */
+    const p = new URLSearchParams(q);
+    for (const [id, param] of [["#traffic-host", "host"], ["#traffic-outcome", "outcome"]]) {
+      if ($(id).value) p.set(param, $(id).value);
+    }
+    if ($("#traffic-q").value.trim()) p.set("q", $("#traffic-q").value.trim());
+    const d = await api("/api/portal-traffic?" + p.toString());
+    trafficHints = d.hints || {};
+    fillTrafficHosts(d.hosts || []);
+    renderTrafficDot(d);
+    return d;
+  },
+  columns: [
+    { key: "t", label: "Sent", width: "118px",
+      render: r => `<div class="mono">${clockOf(r.t)}</div><div class="small text-muted">${agoOf(r.t)}</div>` },
+    { key: "host", label: "Portal / MAC", width: "190px",
+      render: r => `<div>${esc(r.host)}</div><div class="small mono text-muted">${esc(r.mac)}</div>` },
+    { key: "action", label: "Request",
+      render: r => `<b>${esc(r.action || r.type || "—")}</b>` +
+        `<div class="small mono text-muted" style="white-space:normal">${esc(r.params)}</div>` },
+    { key: "status", label: "HTTP", width: "92px", render: r => statusBadge(r) },
+    { key: "code", label: "Outcome", width: "150px",
+      render: r => codeBadge(r) + (r.code && trafficHints[r.code]
+        ? `<div class="small text-muted" style="white-space:normal">${esc(trafficHints[r.code])}</div>` : "") },
+    { key: "answer", label: "Panel said",
+      render: r => r.error ? `<span class="log-WARNING" style="white-space:normal">${esc(r.error)}</span>`
+                           : `<span class="mono" style="white-space:normal">${esc(r.answer || "—")}</span>` },
+    { key: "ms", label: "Took", width: "86px",
+      render: r => r.outcome === "skipped" ? '<span class="text-muted">not sent</span>' : `${r.ms} ms` },
+  ],
+  emptyText: "No panel requests recorded yet - play a channel or fetch a portal and they appear here.",
+});
+
+let trafficPaused = false, trafficPoll = setInterval(() => trafficTable.reload(), 5000);
+$("#traffic-pause").addEventListener("click", () => {
+  trafficPaused = !trafficPaused;
+  clearInterval(trafficPoll);
+  if (!trafficPaused) trafficPoll = setInterval(() => trafficTable.reload(), 5000);
+  $("#traffic-pause").innerHTML = `<i class="bi bi-${trafficPaused ? "play" : "pause"}"></i>`;
+  $("#traffic-pause").title = trafficPaused ? "Resume the automatic refresh" : "Stop the automatic refresh";
+});
+$("#traffic-reload").addEventListener("click", () => trafficTable.reload());
+for (const id of ["#traffic-host", "#traffic-outcome"])
+  $(id).addEventListener("change", () => { trafficTable.state.page = 1; trafficTable.reload(); });
+$("#traffic-q").addEventListener("input", () => {
+  clearTimeout(window._tt);
+  window._tt = setTimeout(() => { trafficTable.state.page = 1; trafficTable.reload(); }, 400);
+});
+$("#traffic-clear").addEventListener("click", () => confirmDialog({
+  title: "Forget the recorded exchanges",
+  body: "Clear the portal traffic log of this process? The container log keeps its own copy of the same events.",
+  okText: "Clear", okClass: "btn-danger",
+  onOk: async () => { await api("/api/portal-traffic/clear", { method: "POST" });
+                      toast("portal traffic cleared", "warn"); trafficTable.reload(); },
+}));
+window.addEventListener("pagehide", () => clearInterval(trafficPoll), { once: true });
+
 $("#kill-all").addEventListener("click", () => confirmDialog({ title: "Kill all streams", body: "Stop ALL active streams?", okText: "Kill all", okClass: "btn-danger", onOk: async () => { const r = await api("/api/streams/kill-all", { method: "POST" }); toast(`${r.killed} streams killed`, "warn"); refreshStats(); } }));
 $("#reload-streams").addEventListener("click", refreshStats);
 refreshStats();
