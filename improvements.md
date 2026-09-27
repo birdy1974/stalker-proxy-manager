@@ -1,3 +1,12 @@
+2026-09-27
+- in case Channel list from an enabled genre from the source is fetched again: give options how to show which channels are new/changed. consider an automatic schedule to check channels of enabled genres (live, vod, series) and add a button to show differences so user can quickly add new channels, vod, series
+- in settings give option so user can define how long a channel wil be active to support quick zapping back
+- check memory usage, as it looks like the memory gets filled in case there is a connection / stream open for a long time
+- 
+
+
+
+
 Quick check that I give you the exact marker text:
 
 Verified — 4 marked blocks in stream_manager.py, 1 in conftest.py. Paste this in a future session and I'll handle the rest:
