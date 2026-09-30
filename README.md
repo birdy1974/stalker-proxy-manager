@@ -548,9 +548,54 @@ disabling or deleting it.
 Preset suggestions and numeric checks do **not** guarantee encoder/hardware
 compatibility. The GUI warns about common CPU/VAAPI/QSV mismatches. Use **Validate
 syntax** and **Demo** on the actual host to check its FFmpeg build, drivers, codecs,
-container and player combination. No new database columns are required by this editor.
+container and player combination.
 Regression checks: `pytest -n 0 tests/test_ffmpeg_editor.py tests/test_ffmpeg_applicability.py tests/test_ffmpeg_defaults.py`; optional DOM checks:
 `node tests/ffmpeg_editor_gui.cjs` (install `jsdom` as described in the backup section).
+
+### Optimisation advisor (quality vs. speed vs. host load)
+
+Below the field editor, the **Optimisation advice** card reads the template you are editing and lists
+settings that cost more than they give. It is **advisory only**: it never changes a value by itself and
+never blocks saving (a *critical* finding only asks "Save anyway?" — a missing GPU node is a fact, not a verdict).
+It is hidden for Redirect / Pass-through templates (there is no ffmpeg command) and read-only in
+manual-command mode (the command is parsed and judged, but no field is rewritten).
+
+- **Goal per template** (saved in the database with the template): *Balanced*, *Fast start* (zapping),
+  *Best quality*, *Light on the host*, *Internet / low bandwidth*. The goal changes which findings appear
+  and how strict they are (for example a 4 s keyframe gap is fine for *Balanced*, a warning for *Fast start*).
+- **Findings** have a severity (critical / warning / tip), a plain-language *Why*, and usually a concrete fix.
+  **Review changes…** shows the exact field-by-field diff and the resulting command first; nothing is
+  touched until **Apply changes**, and you can still discard the draft. Conflicting fixes are skipped and
+  reported, never merged. **Dismiss** hides one finding for this template (kept under "dismissed", reversible).
+- **Rules** cover keyframe interval, `-async_depth`, probe size, `bufsize`/`maxrate` against the bitrate,
+  the libx264 `-preset` and `-tune zerolatency`, software HEVC, `low_power`, thread count, frame rate,
+  transcoding at the source size, bits-per-pixel (too low / too high for the resolution and goal), CQP without a
+  cap, audio (MP2 surround, 44.1 kHz), the H.264 level against size × fps, and the host checks below.
+- **Host awareness** (`GET /api/ffmpeg/environment`, cached): ffmpeg's `-encoders` / `-hwaccels`, the
+  `/dev/dri/renderD*` nodes and their access, `vainfo` (H.264 / low-power encode), the CPU count **as limited by
+  the container's cgroup quota**, and how many ffmpeg transcodes are running now. A VAAPI preset on a host with no
+  render node therefore shows a *critical* "device missing" finding (with the node that does exist as the fix).
+  Probes that cannot run report "unknown", never "absent".
+- **Trade-off bars** (picture quality / start speed / load on the host) are a rough estimate from the
+  settings, labelled as such. Only the **Demo** and live streams measure anything.
+- **Demo speed**: a transcoding demo now reports ffmpeg's `speed=` as a verdict (synthetic/URL source:
+  under 0.5× critical, under 1.0× warning, under 1.5× "little headroom"; a playlist source can only show
+  whether it keeps up, because a live input cannot run faster than real time).
+- **Live speed warning**: while a *transcoding* stream runs, SPM measures real throughput from ffmpeg's
+  `time=` progress (ffmpeg's own `speed=` is a whole-run average and lags) and, when the encode stays under
+  0.95× for ~30 s after a 15 s warm-up, logs one `WARNING` naming the template and likely cause. The
+  stream dashboard shows the measured speed, and the editor shows the template's last live result as a
+  *critical* finding. A stall on the source (panel reconnect) is not counted.
+- **List badges** show the number of open findings per template; `GET /api/ffmpeg/advice-summary`.
+- The advisor's numbers ("x264 `veryfast` uses roughly 2–3× less CPU at ~10 % more bitrate") are rules of
+  thumb and are labelled as such. The shipped presets give **no advice on a host that matches them**
+  (pinned by `tests/test_ffmpeg_advisor.py`); the Software preset now ships `-preset veryfast`, since an
+  unset x264 preset means `medium`, which is too heavy for a live 720p transcode on a NAS CPU.
+- API: `POST /api/ffmpeg/advice`, `POST /api/ffmpeg/advice/preview`. Two columns are added to
+  `ffmpeg_templates` (`advice_goal`, `advice_ignored`; created automatically on upgrade, included in
+  export/backup).
+
+Tests: `pytest -n 0 tests/test_ffmpeg_advisor.py tests/test_ffmpeg_env.py tests/test_ffmpeg_speed.py tests/test_ffmpeg_advice_api.py`.
 
 Shipped presets (stored as rows in the database and **re-seeded on every boot** — see below):
 

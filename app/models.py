@@ -385,6 +385,9 @@ class FFmpegTemplate(Base):
     extra_output: Mapped[str | None] = mapped_column(Text)                 # raw extra output flags
     command: Mapped[str | None] = mapped_column(Text)                      # rendered/edited full command
     command_source: Mapped[str] = mapped_column(String(8), default="fields")  # fields|manual
+    # ----- optimisation advisor (advice only; never changes the command) -----
+    advice_goal: Mapped[str] = mapped_column(String(12), default="balanced")   # see ffmpeg_advisor.GOALS
+    advice_ignored: Mapped[str] = mapped_column(Text, default="")            # dismissed advice ids, comma separated
 
 
 # ===========================================================================

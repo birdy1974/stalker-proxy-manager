@@ -262,7 +262,8 @@ function makeStreamsTable() {
       { key: "item_name", label: "Item", render: r => `<b>${esc(r.item_name)}</b><div class="small text-muted">${esc(r.kind)}</div>` },
       { key: "user_name", label: "User", render: r => esc(r.user_name || "admin") },
       { key: "portal_name", label: "Portal / MAC", render: r => `<div>${esc(r.portal_name || "-")}</div><div class="small mono text-muted">${esc(r.mac || "")}</div>` },
-      { key: "template_name", label: "Template", render: r => `<span class="small">${esc(r.template_name)}</span>` },
+      { key: "template_name", label: "Template", render: r => `<span class="small">${esc(r.template_name)}</span>` + (r.encode_speed == null ? "" :
+        `<div class="small ${r.encode_speed < 0.95 ? "text-danger fw-semibold" : "text-muted"}" title="Encode speed measured from ffmpeg's progress over the last ~10 s; below 1.00x the stream stutters">${r.encode_speed.toFixed(2)}x real time</div>`) },
       { key: "started", label: "Active since", render: r => { const s = Math.round(Date.now()/1000 - r.started); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")} min`; } },
       { key: "bytes_sent", label: "Data", render: r => (r.bytes_sent/1048576).toFixed(1) + " MB" },
       { key: "id", label: "", render: r => `<button class="btn btn-sm btn-outline-danger" onclick="api('/api/streams/${r.id}/kill',{method:'POST'}).then(()=>{toast('stream killed','warn');refreshStats();})"><i class='bi bi-x-lg'></i></button>` },

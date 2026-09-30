@@ -15,7 +15,10 @@ from ..models import (
     VodPlaylist, VodSource,
 )
 from ..security import require_admin
-from ..services import item_info
+from ..services import ffmpeg_env, ffmpeg_speed, item_info
+from ..services.ffmpeg_advisor import (GOALS, advise, apply_selected, clean_goal,
+                                       clean_ignored, goals_public,
+                                       is_transcode_command)
 from ..services.ffmpeg_templates import (FFmpegOptions, PASSTHROUGH_COMMAND,
                                      PASSTHROUGH_PRESET_NAME, REDIRECT_COMMAND,
                                      build_command, coerce_options,
@@ -78,6 +81,22 @@ def _source_from_payload(t: FFmpegTemplate, payload: dict) -> str:
     return t.command_source if t.command_source in ("fields", "manual") else "fields"
 
 
+def _normalise_advice(t: FFmpegTemplate, payload: dict) -> None:
+    """The advisor's per-template settings: a known goal and a clean id list.
+    Older clients that never send them keep what the row already has."""
+    if "advice_goal" in payload:
+        goal = str(payload.get("advice_goal") or "").strip().lower()
+        if goal not in GOALS:
+            raise HTTPException(422, "advice_goal must be one of: " + ", ".join(GOALS))
+        t.advice_goal = goal
+    elif not t.advice_goal:
+        t.advice_goal = "balanced"
+    if "advice_ignored" in payload:
+        t.advice_ignored = clean_ignored(payload.get("advice_ignored"))
+    elif t.advice_ignored is None:
+        t.advice_ignored = ""
+
+
 def _requested_default(payload):
     value = payload.get("is_default")
     if "is_default" in payload and not isinstance(value, bool):
@@ -118,6 +137,7 @@ async def create_template(payload: dict, db=Depends(get_db)):
     for f in FIELDS:
         if f in payload and f != "is_default":
             setattr(t, f, payload[f])
+    _normalise_advice(t, payload)
     t.command_source = _source_from_payload(t, payload)
     if t.command_source == "fields":
         cmd_str = (t.command or "").strip()
@@ -147,6 +167,7 @@ async def update_template(tid: int, payload: dict, db=Depends(get_db)):
 
     if t.is_default and not t.enabled:
         raise HTTPException(409, "Choose another default before disabling this template")
+    _normalise_advice(t, payload)
     source = _source_from_payload(t, payload)
     supplied_command = str(payload.get("command", "") or "").strip()
     if "command" in payload:
@@ -198,6 +219,82 @@ async def build(payload: dict):
     opts = FFmpegOptions(**coerce_options(payload))
     _reject_template(field_errors(opts))
     return {"command": build_command(opts), "warnings": option_warnings(opts)}
+
+
+def _active_transcodes() -> int:
+    """Running streams whose ffmpeg re-encodes video (parked ones still burn CPU)."""
+    from ..services.stream_manager import MANAGER
+    return sum(1 for h in list(MANAGER.streams.values())
+               if h.proc is not None and not h.dead and is_transcode_command(h.command))
+
+
+async def _environment(devices=()) -> dict:
+    env = await ffmpeg_env.snapshot(extra_devices=list(devices))
+    env["active_transcodes"] = _active_transcodes()
+    return env
+
+
+def _env_public(env: dict, device: str | None = None) -> dict:
+    """What the GUI may show of the host facts (it never needs the raw probes)."""
+    return {
+        "cpus": env.get("cpus"), "load1": env.get("load1"),
+        "active_transcodes": env.get("active_transcodes"),
+        "ffmpeg_found": env.get("ffmpeg_found"),
+        "devices": env.get("devices"),
+        "vaapi": (env.get("vaapi") or {}).get(device) if device else None,
+    }
+
+
+@router.get("/environment")
+async def environment():
+    """Host facts behind the advisor: CPUs, render nodes, encoders, VAAPI caps."""
+    env = await _environment()
+    return {**env, "encoders": env.get("encoders")}
+
+
+@router.post("/advice")
+async def advice(payload: dict):
+    """Optimisation advice for the editor's current fields (advisory only)."""
+    opts = FFmpegOptions(**coerce_options(payload.get("options")))
+    env = await _environment([opts.device])
+    live = ffmpeg_speed.latest(str(payload.get("name") or ""))
+    report = advise(opts, goal=clean_goal(payload.get("goal")), env=env, live=live,
+                    ignored=payload.get("ignored") or "")
+    return {**report, "goals": goals_public(), "live": live,
+            "environment": _env_public(env, opts.device)}
+
+
+@router.post("/advice/preview")
+async def advice_preview(payload: dict):
+    """The exact field changes of the ticked findings - nothing is applied here;
+    the editor writes them into the form only when the operator confirms."""
+    opts = FFmpegOptions(**coerce_options(payload.get("options")))
+    ids = payload.get("ids")
+    if not isinstance(ids, list):
+        raise HTTPException(422, "ids must be a list of advice ids")
+    env = await _environment([opts.device])
+    live = ffmpeg_speed.latest(str(payload.get("name") or ""))
+    res = apply_selected(opts, [str(i) for i in ids], goal=clean_goal(payload.get("goal")),
+                         env=env, live=live)
+    after = FFmpegOptions(**coerce_options(res["options"]))
+    res["command"] = build_command(after)
+    res["errors"] = field_errors(after)
+    return res
+
+
+@router.get("/advice-summary")
+async def advice_summary(db=Depends(get_db)):
+    """Per-template advice counts for the template list badges."""
+    rows = (await db.execute(select(FFmpegTemplate))).scalars().all()
+    usable = [t for t in rows
+              if (t.command or "").strip() not in (REDIRECT_COMMAND, PASSTHROUGH_COMMAND)]
+    env = await _environment(sorted({t.device for t in usable if t.device}))
+    out = {}
+    for t in usable:
+        rep = advise(_opts(t), goal=clean_goal(t.advice_goal), env=env,
+                     live=ffmpeg_speed.latest(t.name), ignored=t.advice_ignored or "")
+        out[str(t.id)] = rep["counts"]
+    return {"items": out}
 
 
 @router.post("/extra-option")

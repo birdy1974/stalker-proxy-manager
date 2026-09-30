@@ -48,7 +48,9 @@ from ..portal.account import mac_is_usable
 from ..portal.pool import POOL, PortalSession
 from ..portal.client import SLOT_BUSY_CODES, PortalError, is_hls
 from ..portal.links import plan_adopted, plan_for
-from . import stream_identity
+from . import ffmpeg_speed, stream_identity
+from .ffmpeg_advisor import hint_for_command, is_transcode_command
+from .ffmpeg_speed import SpeedWatch, looks_like_progress
 from .channel_translations import attach_overrides
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
@@ -89,6 +91,46 @@ _OUTPUT_FAILURE_MARKERS = (
     "error reinitializing filters",
     "error while opening encoder",
 )
+
+
+_STDERR_SEGMENT_END = re.compile(rb"[\r\n]")
+
+
+async def _stderr_segments(stream):
+    """Yield (segment, is_progress) pairs from an ffmpeg stderr pipe.
+
+    Segments end at `\r` or `\n`. `is_progress` marks a `\r`-terminated
+    `frame= .. time= .. speed=` stats line. Reads in chunks, so there is no
+    line-length limit to overrun; a stream object that only has `readline()`
+    (a test stand-in) is read line by line, tolerating an over-long line."""
+    read = getattr(stream, "read", None)
+    if read is None:
+        while True:
+            try:
+                line = await stream.readline()
+            except ValueError:      # asyncio already discarded the over-long line
+                continue
+            if not line:
+                return
+            yield line, looks_like_progress(line)
+    buf = b""
+    while True:
+        chunk = await read(4096)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            m = _STDERR_SEGMENT_END.search(buf)
+            if not m:
+                break
+            seg, buf = buf[:m.end()], buf[m.end():]
+            if seg.strip():
+                yield seg, seg.endswith(b"\r") and looks_like_progress(seg)
+        if len(buf) > 16384:        # a runaway line without any terminator
+            yield buf, False
+            buf = b""
+    if buf.strip():
+        yield buf, False
 
 
 def _is_template_output_failure(fail: dict | None) -> bool:
@@ -446,7 +488,10 @@ class StreamHandle:
                 "user_name": self.user_name, "portal_name": self.portal_name,
                 "mac": self.mac, "template_name": self.template_name,
                 "started": self.started, "bytes_sent": self.bytes_sent,
-                "url": self.url, "pid": self.proc.pid if self.proc else None}
+                "url": self.url, "pid": self.proc.pid if self.proc else None,
+                # latest real-time speed of a transcode (1.0 = keeps up), when known
+                "encode_speed": (round(w.last_speed, 2) if (w := getattr(
+                    self.proc, "spm_speed", None)) and w.last_speed is not None else None)}
 
     def note_attempt(self, text: str) -> None:
         """Remember one candidate outcome (bounded, oldest dropped)."""
@@ -2484,15 +2529,31 @@ class StreamManager:
         deliberately not logged here - it is mostly user kills) then still
         gets to explain itself; the local pump logs that tail after stopping
         the process (see _pump's 'no data' branch).
+
+        ffmpeg separates its progress lines (`frame= .. time= .. speed=`) with
+        a bare `\r`, about twice a second and never a newline. Read line by
+        line they add up to one "line" that outgrows asyncio's 64 KiB limit
+        after ~5 minutes: readline() then raised, this loop ended, nothing
+        drained stderr any more and ffmpeg blocked on a full pipe. So the
+        stream is read in chunks and split on \r and \n; progress lines go to
+        a SpeedWatch (they would otherwise flush the real error lines out of the
+        30-line tail within a minute) and only a sustained speed below real
+        time is reported - see ffmpeg_speed.
         """
         lines: list[bytes] = []
         proc.spm_stderr_tail = lines
+        watch = SpeedWatch()
+        proc.spm_speed = watch
         try:
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    break
-                lines.append(line)
+            async for segment, is_progress in _stderr_segments(proc.stderr):
+                if is_progress:
+                    event = watch.feed(segment.decode(errors="replace"))
+                    if event:
+                        await self._report_slow(proc, event)
+                    elif watch.last_speed is not None:
+                        self._record_speed(proc, watch.last_speed)
+                    continue
+                lines.append(segment)
                 del lines[:-30]
         except Exception:  # noqa: BLE001
             pass
@@ -2501,6 +2562,30 @@ class StreamManager:
             tail = b"".join(lines[-12:]).decode(errors="replace").strip()
             if tail:
                 await db_log("WARNING", "ffmpeg", f"ffmpeg exited rc={rc}: {tail[:900]}")
+
+    def _handle_of(self, proc):
+        return next((h for h in list(self.streams.values()) if h.proc is proc), None)
+
+    def _record_speed(self, proc, speed: float) -> None:
+        """Keep the latest windowed speed per template for the editor's advisor
+        (transcodes only: a remux runs at the source's pace by design)."""
+        h = self._handle_of(proc)
+        if h is not None and h.template_name and is_transcode_command(h.command):
+            ffmpeg_speed.record(h.template_name, speed)
+
+    async def _report_slow(self, proc, event: dict) -> None:
+        """One log line, once per stream, when a transcode stays below real time."""
+        h = self._handle_of(proc)
+        if h is None or not is_transcode_command(h.command):
+            return
+        ffmpeg_speed.record(h.template_name, event["speed"])
+        await db_log(
+            "WARNING", "ffmpeg",
+            f"template '{h.template_name}' encodes at {event['speed']:.2f}x real time "
+            f"(after {event['seconds']} s; it needs >= 1.0x) - the picture will "
+            f"stutter. {hint_for_command(h.command)} It can also mean the source "
+            f"delivers slower than real time. See the template's advice in FFmpeg "
+            f"templates.")
 
     @staticmethod
     def _stderr_tail(proc, max_lines: int = 8, limit: int = 600) -> str:
