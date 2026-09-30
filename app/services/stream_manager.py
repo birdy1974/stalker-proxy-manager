@@ -36,7 +36,7 @@ from datetime import datetime
 from sqlalchemy import delete, select, update
 
 from ..config import FFMPEG_BIN, STREAM_START_TIMEOUT
-from ..database import SessionLocal, run_uncancelled
+from ..database import SessionLocal, run_uncancelled, spawn
 import httpx
 from ..models import (
     ActiveStream, FFmpegTemplate, LivePlaylist, LivePlaylistSource, LiveSource,
@@ -48,7 +48,9 @@ from ..portal.account import mac_is_usable
 from ..portal.pool import POOL, PortalSession
 from ..portal.client import SLOT_BUSY_CODES, PortalError, is_hls
 from ..portal.links import plan_adopted, plan_for
-from . import stream_identity
+from . import ffmpeg_speed, stream_identity
+from .ffmpeg_advisor import hint_for_command, is_transcode_command
+from .ffmpeg_speed import SpeedWatch, looks_like_progress
 from .channel_translations import attach_overrides
 from .db_logging import db_log
 from .ffmpeg_templates import (COPY_PRESET_NAME, HLS_ALLOWED_EXTENSIONS,
@@ -89,6 +91,46 @@ _OUTPUT_FAILURE_MARKERS = (
     "error reinitializing filters",
     "error while opening encoder",
 )
+
+
+_STDERR_SEGMENT_END = re.compile(rb"[\r\n]")
+
+
+async def _stderr_segments(stream):
+    """Yield (segment, is_progress) pairs from an ffmpeg stderr pipe.
+
+    Segments end at `\r` or `\n`. `is_progress` marks a `\r`-terminated
+    `frame= .. time= .. speed=` stats line. Reads in chunks, so there is no
+    line-length limit to overrun; a stream object that only has `readline()`
+    (a test stand-in) is read line by line, tolerating an over-long line."""
+    read = getattr(stream, "read", None)
+    if read is None:
+        while True:
+            try:
+                line = await stream.readline()
+            except ValueError:      # asyncio already discarded the over-long line
+                continue
+            if not line:
+                return
+            yield line, looks_like_progress(line)
+    buf = b""
+    while True:
+        chunk = await read(4096)
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            m = _STDERR_SEGMENT_END.search(buf)
+            if not m:
+                break
+            seg, buf = buf[:m.end()], buf[m.end():]
+            if seg.strip():
+                yield seg, seg.endswith(b"\r") and looks_like_progress(seg)
+        if len(buf) > 16384:        # a runaway line without any terminator
+            yield buf, False
+            buf = b""
+    if buf.strip():
+        yield buf, False
 
 
 def _is_template_output_failure(fail: dict | None) -> bool:
@@ -186,12 +228,20 @@ class PassthroughStream:
     def __init__(self, client: httpx.AsyncClient, response: httpx.Response):
         self._client = client
         self._response = response
-        self._aiter = response.aiter_bytes(chunk_size=CHUNK)
+        # No `chunk_size`: httpx's re-chunker holds data back until a full chunk
+        # has accumulated, which at a live bitrate of 0.5-2 Mbit/s is 0.3-1 s of
+        # added start-up delay (measured). Raw reads hand each piece on as soon
+        # as the socket delivers it - at most 64 KB at a time anyway.
+        self._aiter = response.aiter_bytes()
         self.returncode: int | None = None
         self.pid: int | None = None
         self.spm_stderr_tail: list[bytes] = []
         self.spm_stderr_task: asyncio.Task | None = None
         self._closed = False
+        #: The teardown started by kill(); StreamManager.kill() awaits it so the
+        #: upstream socket (= the panel's connection slot) is really closed
+        #: before the next create_link asks for a new one.
+        self._close_task: asyncio.Task | None = None
         self.stdout = self._Stdout(self)
 
     class _Stdout:
@@ -218,7 +268,7 @@ class PassthroughStream:
         self.returncode = -9
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self._close())
+            self._close_task = loop.create_task(self._close())
         except RuntimeError:
             pass
 
@@ -429,13 +479,19 @@ class StreamHandle:
     parker: asyncio.Task | None = None
     #: How often this pipe was re-used by a returning client (park/attach wins).
     reattaches: int = 0
+    #: The dashboard-row INSERT of `_register`, running beside the stream instead
+    #: of in front of its first byte. Whoever deletes the row waits for it first.
+    row_task: asyncio.Task | None = None
 
     def public(self) -> dict:
         return {"id": self.id, "kind": self.kind, "item_name": self.item_name,
                 "user_name": self.user_name, "portal_name": self.portal_name,
                 "mac": self.mac, "template_name": self.template_name,
                 "started": self.started, "bytes_sent": self.bytes_sent,
-                "url": self.url, "pid": self.proc.pid if self.proc else None}
+                "url": self.url, "pid": self.proc.pid if self.proc else None,
+                # latest real-time speed of a transcode (1.0 = keeps up), when known
+                "encode_speed": (round(w.last_speed, 2) if (w := getattr(
+                    self.proc, "spm_speed", None)) and w.last_speed is not None else None)}
 
     def note_attempt(self, text: str) -> None:
         """Remember one candidate outcome (bounded, oldest dropped)."""
@@ -723,6 +779,10 @@ def reset_zap_state() -> None:
     _LINK_CACHE.clear()
     _CANDIDATE_FAILURES.clear()
     _PORTAL_FIRST_NOTED.clear()
+    # MAC ids repeat across test databases: a cooldown from an earlier test must
+    # not rank a fresh MAC behind another.
+    MANAGER._released.clear()
+    MANAGER.starting.clear()
 
 
 # After a 302 redirect we no longer hold the socket, so we cannot know when the
@@ -786,7 +846,17 @@ ATTEMPT_TRACE = 6
 #: longer than the panel needs is free by comparison: `start_budget` still caps
 #: the whole start, and the wait ends the moment the slot frees.
 BUSY_WAIT_S = float(os.environ.get("SPM_BUSY_WAIT_S", "7.0"))
-BUSY_POLL_S = float(os.environ.get("SPM_BUSY_POLL_S", "0.25"))
+#: How often a start re-checks whether the MAC it waits for has been freed. 100 ms,
+#: not 250: the wait ends the moment the slot frees, and the poll interval is
+#: how late "the moment" is noticed.
+BUSY_POLL_S = float(os.environ.get("SPM_BUSY_POLL_S", "0.1"))
+#: After a pipe on a MAC is released, the *panel* still counts that connection
+#: for a few seconds (~6.5 s measured on a real panel). Locally the MAC looks
+#: free at once, so without this a zap re-picks the MAC it just left and then
+#: waits out the panel's answer. For this long a just-released MAC ranks behind
+#: MACs that were not used - ordering only, never a veto (a single-MAC portal
+#: still uses it). 0 disables.
+SLOT_COOLDOWN_S = float(os.environ.get("SPM_SLOT_COOLDOWN_S", "7.0"))
 #: Retry ladder for a panel that answers "this MAC is already streaming"
 #: (`limit`, `account_is_in_use`, 456). The panel frees the slot seconds after
 #: the previous connection dies, so the same MAC is worth re-asking before
@@ -842,6 +912,12 @@ class StreamManager:
         self._watchers: set[asyncio.Task] = set()           # strong refs, see watch()
         self._proc_gone_since: dict[str, float] = {}        # stream_id -> first seen
         self.route_health = _RouteHealth()
+        #: mac_id -> monotonic time its last pipe was released (see SLOT_COOLDOWN_S)
+        self._released: dict[int, float] = {}
+        #: stream id -> portal id for plays that are still LOOKING for their first
+        #: byte. A starting play is not in `streams` yet, but it is exactly when it
+        #: needs the panel to itself (see portal_pace).
+        self.starting: dict[str, int | None] = {}
         #: The last TIMING_HISTORY starts (and start failures) with their phase
         #: timings - what the diagnostics view answers "why is zapping slow, and
         #: on which portal" with. Bounded on purpose: a ring of 200 tells a panel
@@ -940,8 +1016,30 @@ class StreamManager:
         if not held:
             return
         held.discard(stream_id)
+        self._note_release(mac_id)
         if not held:
             self.mac_locks.pop(mac_id, None)
+
+    def _note_release(self, mac_id: int | None) -> None:
+        """Remember when a pipe let go of a MAC (the panel needs a moment too)."""
+        if mac_id is None or SLOT_COOLDOWN_S <= 0:
+            return
+        now = time.monotonic()
+        self._released[mac_id] = now
+        if len(self._released) > 256:              # bounded: one entry per MAC ever used
+            for k in [k for k, t in self._released.items() if now - t > SLOT_COOLDOWN_S]:
+                self._released.pop(k, None)
+
+    def cooling_down(self, mac_id: int | None) -> bool:
+        """True while the panel probably still counts the pipe that just left."""
+        if mac_id is None or SLOT_COOLDOWN_S <= 0:
+            return False
+        at = self._released.get(mac_id)
+        return at is not None and time.monotonic() - at < SLOT_COOLDOWN_S
+
+    def starting_portal_ids(self) -> set:
+        """Portals a play is currently starting on (first byte not seen yet)."""
+        return {pid for pid in self.starting.values() if pid is not None}
 
     async def preempt_own(self, mac_id: int | None, requester: str | None) -> bool:
         """Kill a pipe of the SAME user on this MAC - a zap, not a conflict.
@@ -1014,7 +1112,7 @@ class StreamManager:
         # The dashboard shows what somebody is watching, and nobody is: drop the
         # runtime row while the pipe is only being held (`_adopt` puts it back).
         try:
-            await run_uncancelled(self._delete_row(h.id), what="parked row delete")
+            await run_uncancelled(self._delete_row_for(h), what="parked row delete")
         except Exception:  # noqa: BLE001
             log.exception("active_streams delete (park) failed")
         await db_log("INFO", "stream",
@@ -1278,12 +1376,28 @@ class StreamManager:
             await s.execute(delete(ActiveStream).where(ActiveStream.id == stream_id))
             await s.commit()
 
-    async def _register(self, h: StreamHandle) -> None:
-        self.streams[h.id] = h
+    async def _insert_row_logged(self, h: StreamHandle) -> None:
         try:
-            await run_uncancelled(self._insert_row(h), what="active_streams insert")
-        except Exception:  # noqa: BLE001
+            await self._insert_row(h)
+        except Exception:  # noqa: BLE001 - the stream works; only its row is missing
             log.exception("active_streams insert failed")
+
+    async def _delete_row_for(self, h: StreamHandle) -> None:
+        """Delete the dashboard row, after its INSERT has landed (never before)."""
+        pending = h.row_task
+        if pending is not None and not pending.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(pending), 5.0)
+            except Exception:  # noqa: BLE001
+                pass
+        await self._delete_row(h.id)
+
+    async def _register(self, h: StreamHandle) -> None:
+        # The in-memory registry is what occupancy and the watchdog read, and it is
+        # set first. The dashboard row is a DB write (5-30 ms) that used to sit
+        # between the first byte and the player; it runs beside the stream now.
+        self.streams[h.id] = h
+        h.row_task = spawn(self._insert_row_logged(h), name=f"row-{h.id[:8]}")
 
     async def _deregister(self, h: StreamHandle) -> None:
         # In-memory state first, DB second: the connection slot and the MAC
@@ -1293,8 +1407,11 @@ class StreamManager:
         h.dead = True
         self.streams.pop(h.id, None)
         self._proc_gone_since.pop(h.id, None)
+        self.starting.pop(h.id, None)
         for mac_id in list(self.mac_locks):
             sids = self._lock_set(mac_id)
+            if h.id in sids:
+                self._note_release(mac_id)
             sids.discard(h.id)
             if not sids:
                 del self.mac_locks[mac_id]
@@ -1304,7 +1421,7 @@ class StreamManager:
         # SQLAlchemy drops the pooled connection, and the row stays behind as a
         # ghost until the next container start.
         try:
-            await run_uncancelled(self._delete_row(h.id), what="active_streams delete")
+            await run_uncancelled(self._delete_row_for(h), what="active_streams delete")
         except Exception:  # noqa: BLE001
             pass
 
@@ -1335,6 +1452,16 @@ class StreamManager:
         # Release BEFORE logging: the log write goes to the database, and a
         # slow database must not delay freeing the user's connection slot.
         await self._deregister(h)
+        # A pass-through pipe closes its upstream socket in a task of its own. The
+        # caller of a takeover goes straight on to create_link, and the panel only
+        # starts counting its slot down once that socket is really closed - so wait
+        # for it (briefly), instead of racing it.
+        closing = getattr(h.proc, "_close_task", None)
+        if isinstance(closing, asyncio.Future):
+            try:
+                await asyncio.wait_for(asyncio.shield(closing), 1.0)
+            except Exception:  # noqa: BLE001 - teardown is best effort
+                pass
         await db_log("WARNING", "stream", f"stream '{h.item_name}' killed (user/disconnect)")
         return True
 
@@ -1421,7 +1548,7 @@ class StreamManager:
                 log.exception("reaper sweep failed")
 
     async def watch_disconnect(self, request, handle: StreamHandle,
-                               interval: float = 0.5) -> None:
+                               interval: float = 0.25) -> None:
         """
         Client-disconnect watchdog. Runs from response-creation time on: the
         stream registers itself inside the pump only once data actually flows,
@@ -2155,27 +2282,41 @@ class StreamManager:
         if not is_net:
             await db_log("ERROR", "stream",
                          f"[{title}] pass-through proxy requires a network URL: {url}")
-            return None, b"", {"rc": 1, "tail": [b"not a network url"], "stalled": False}
+            return None, b"", {"rc": 1, "tail": "not a network url", "stalled": False}
 
         timeout_s = first_byte_timeout or STREAM_START_TIMEOUT
         choices = stream_identity.ladder(url)
         last: dict | None = None
+        # NOTE: "tail" is always a *string* (like the ffmpeg path's stderr tail):
+        # the fallback engine calls .strip() on it, and a list here used to turn
+        # every pass-through failure into "pump crashed" - no MAC/source fallback.
         for rung, ua in enumerate(choices):
             t0 = time.monotonic()
             headers = {
                 "User-Agent": ua or stream_identity.STB_UA,
                 "Referer": StreamManager._referer_of(url),
                 "Accept": "*/*",
+                # A transport stream does not compress; asking for gzip only
+                # invites an origin/CDN to buffer before it sends anything.
+                "Accept-Encoding": "identity",
                 "Connection": "keep-alive",
             }
             timeout = httpx.Timeout(connect=15.0, read=None, write=15.0, pool=None)
             client = httpx.AsyncClient(timeout=timeout, follow_redirects=True, verify=False)
             try:
                 req = client.build_request("GET", url, headers=headers)
-                resp = await client.send(req, stream=True)
+                # The response headers are part of the start window too: an origin
+                # that accepts the connection and then says nothing used to be
+                # waited for until the output guard (start budget + slack) fired.
+                resp = await asyncio.wait_for(client.send(req, stream=True), timeout_s)
+            except asyncio.TimeoutError:
+                await client.aclose()
+                last = {"rc": None, "stalled": True,
+                        "tail": f"no response headers within {timeout_s:g}s"}
+                return None, b"", last
             except Exception as exc:
                 await client.aclose()
-                last = {"rc": 1, "tail": [f"ConnectError: {exc}".encode()], "stalled": False}
+                last = {"rc": 1, "tail": f"ConnectError: {exc}", "stalled": False}
                 if rung + 1 < len(choices):
                     continue
                 return None, b"", last
@@ -2183,11 +2324,24 @@ class StreamManager:
             elapsed = time.monotonic() - t0
             if resp.status_code >= 400:
                 code = resp.status_code
-                tail = [f"HTTP {code}".encode()]
+                tail = f"HTTP {code}"
                 await resp.aclose()
                 await client.aclose()
                 last = {"rc": code, "tail": tail, "stalled": False}
                 if code in stream_identity.UA_POLICY_4XX and rung + 1 < len(choices):
+                    if elapsed > stream_identity.FAST_REFUSAL_S:
+                        # A WAF refuses a client shape in tens of milliseconds. A
+                        # refusal that took seconds is the panel's connection-slot
+                        # check (a slot still held after a zap, ~6.5 s on a real
+                        # panel): the other UA cannot change that and would only
+                        # double the wait. Same rule as the ffmpeg path.
+                        await db_log(
+                            "INFO", "stream",
+                            f"[{title}] origin answered HTTP {code} after {elapsed:.1f}s - "
+                            "too slow for an identity refusal (usually: MAC connection "
+                            "slot still held); moving to the next source/MAC instead of "
+                            "retrying the user-agent")
+                        return None, b"", last
                     nxt = choices[rung + 1]
                     next_label = ("portal browser"
                                   if nxt == stream_identity.STB_UA else "media player")
@@ -2198,22 +2352,24 @@ class StreamManager:
                     continue
                 return None, b"", last
 
-            # Status 2xx: connection established, fetch first chunk
+            # Status 2xx: connection established, fetch first chunk. What is left of
+            # the window after the headers, never less than a second.
             stream = PassthroughStream(client, resp)
+            left = max(1.0, timeout_s - (time.monotonic() - t0))
             try:
-                first = await asyncio.wait_for(stream.stdout.read(CHUNK), timeout=timeout_s)
+                first = await asyncio.wait_for(stream.stdout.read(CHUNK), timeout=left)
             except asyncio.TimeoutError:
                 await stream._close()
-                last = {"rc": None, "tail": [b"timeout waiting for first bytes"], "stalled": True}
+                last = {"rc": None, "tail": "timeout waiting for first bytes", "stalled": True}
                 return None, b"", last
             except Exception as exc:
                 await stream._close()
-                last = {"rc": 1, "tail": [f"read error: {exc}".encode()], "stalled": False}
+                last = {"rc": 1, "tail": f"read error: {exc}", "stalled": False}
                 return None, b"", last
 
             if not first:
                 await stream._close()
-                last = {"rc": 0, "tail": [b"EOF before first bytes"], "stalled": False}
+                last = {"rc": 0, "tail": "EOF before first bytes", "stalled": False}
                 if rung + 1 < len(choices):
                     continue
                 return None, b"", last
@@ -2373,15 +2529,31 @@ class StreamManager:
         deliberately not logged here - it is mostly user kills) then still
         gets to explain itself; the local pump logs that tail after stopping
         the process (see _pump's 'no data' branch).
+
+        ffmpeg separates its progress lines (`frame= .. time= .. speed=`) with
+        a bare `\r`, about twice a second and never a newline. Read line by
+        line they add up to one "line" that outgrows asyncio's 64 KiB limit
+        after ~5 minutes: readline() then raised, this loop ended, nothing
+        drained stderr any more and ffmpeg blocked on a full pipe. So the
+        stream is read in chunks and split on \r and \n; progress lines go to
+        a SpeedWatch (they would otherwise flush the real error lines out of the
+        30-line tail within a minute) and only a sustained speed below real
+        time is reported - see ffmpeg_speed.
         """
         lines: list[bytes] = []
         proc.spm_stderr_tail = lines
+        watch = SpeedWatch()
+        proc.spm_speed = watch
         try:
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    break
-                lines.append(line)
+            async for segment, is_progress in _stderr_segments(proc.stderr):
+                if is_progress:
+                    event = watch.feed(segment.decode(errors="replace"))
+                    if event:
+                        await self._report_slow(proc, event)
+                    elif watch.last_speed is not None:
+                        self._record_speed(proc, watch.last_speed)
+                    continue
+                lines.append(segment)
                 del lines[:-30]
         except Exception:  # noqa: BLE001
             pass
@@ -2390,6 +2562,30 @@ class StreamManager:
             tail = b"".join(lines[-12:]).decode(errors="replace").strip()
             if tail:
                 await db_log("WARNING", "ffmpeg", f"ffmpeg exited rc={rc}: {tail[:900]}")
+
+    def _handle_of(self, proc):
+        return next((h for h in list(self.streams.values()) if h.proc is proc), None)
+
+    def _record_speed(self, proc, speed: float) -> None:
+        """Keep the latest windowed speed per template for the editor's advisor
+        (transcodes only: a remux runs at the source's pace by design)."""
+        h = self._handle_of(proc)
+        if h is not None and h.template_name and is_transcode_command(h.command):
+            ffmpeg_speed.record(h.template_name, speed)
+
+    async def _report_slow(self, proc, event: dict) -> None:
+        """One log line, once per stream, when a transcode stays below real time."""
+        h = self._handle_of(proc)
+        if h is None or not is_transcode_command(h.command):
+            return
+        ffmpeg_speed.record(h.template_name, event["speed"])
+        await db_log(
+            "WARNING", "ffmpeg",
+            f"template '{h.template_name}' encodes at {event['speed']:.2f}x real time "
+            f"(after {event['seconds']} s; it needs >= 1.0x) - the picture will "
+            f"stutter. {hint_for_command(h.command)} It can also mean the source "
+            f"delivers slower than real time. See the template's advice in FFmpeg "
+            f"templates.")
 
     @staticmethod
     def _stderr_tail(proc, max_lines: int = 8, limit: int = 600) -> str:
@@ -2787,7 +2983,9 @@ class StreamManager:
         def rank(m):
             mid = getattr(m, "id", None)
             if not self._lock_set(mid) and self.lease_remaining(mid) <= 0:
-                return 0
+                # Free for us, but a pipe left it moments ago and the panel still
+                # counts that connection: behind the MACs nobody touched.
+                return 1 if self.cooling_down(mid) else 0
             if not self._lock_set(mid) and requester \
                     and self.lease_holder(mid) == requester:
                 return 1
@@ -2944,8 +3142,28 @@ class StreamManager:
         allow = portal_direct and (allow_direct if allow_direct is not None else True)
         return plan_for(src, mac_row, ffmpeg=ffmpeg, allow_direct=allow)
 
+    def _has_alternative(self, chain: list, step: int, candidates: list, mac_row,
+                         requester: str | None) -> bool:
+        """Is there another MAC left to try after `mac_row` in this walk?
+
+        `step` is the 1-based index of the chain step being walked. Only MACs our
+        own bookkeeping does not hold count: a busy one is not an alternative.
+        """
+        rest = []
+        seen = False
+        for m in candidates or ():
+            if seen:
+                rest.append(m)
+            elif m is mac_row:
+                seen = True
+        for _s, _p, macs in chain[step:]:
+            rest.extend(self._macs_for(_p, _s, macs) or ())
+        return any(not self.is_mac_busy(getattr(m, "id", None), requester=requester)
+                   for m in rest)
+
     async def _create_link_with_backoff(self, client, plan, link_kind: str,
-                                        item_name: str, mac_row):
+                                        item_name: str, mac_row, *,
+                                        patient: bool = True):
         """create_link, re-asking the same MAC while the panel says "busy".
 
         A panel refuses a second link on a MAC that is still streaming with
@@ -2957,15 +3175,21 @@ class StreamManager:
         deliberately short (BUSY_BACKOFF): it sits inside the start budget, and
         a MAC that is genuinely in use elsewhere must not cost seconds before
         the walk moves on.
+
+        `patient=False` is for a caller that has another MAC to try: the first
+        "busy" answer is then final for this MAC, because walking on costs one
+        round trip while the ladder costs `sum(BUSY_BACKOFF)` (3.5 s) for a slot
+        the panel frees in ~6.5 s anyway.
         """
-        for idx, wait in enumerate((0.0,) + BUSY_BACKOFF):
+        ladder = BUSY_BACKOFF if patient else ()
+        for idx, wait in enumerate((0.0,) + ladder):
             if wait:
                 await asyncio.sleep(wait)
             try:
                 return await client.create_link(plan.cmd, link_kind,
                                                 **plan.request_kwargs())
             except PortalError as exc:
-                if exc.code not in SLOT_BUSY_CODES or idx >= len(BUSY_BACKOFF):
+                if exc.code not in SLOT_BUSY_CODES or idx >= len(ladder):
                     raise
                 await db_log("INFO", "stream",
                              f"[{item_name}] {getattr(mac_row, 'mac', '?')}: the panel still "
@@ -3029,7 +3253,7 @@ class StreamManager:
             # A (source, MAC) that failed a moment ago goes last (see
             # demote_failed_candidates): affinity must not re-pick it first.
             chain = demote_failed_candidates(route_key, chain)
-            for _src, portal, macs in chain:
+            for _step, (_src, portal, macs) in enumerate(chain, 1):
                 candidates = self._macs_for(portal, _src, macs)
                 candidates = self.route_health.ordered_macs(route_key, _src, candidates)
                 candidates = demote_macs(route_key, _src, candidates)
@@ -3131,8 +3355,10 @@ class StreamManager:
                                 client.portal_url = res.portal_url
                                 client.invalidate()   # token was for the old URL
                         await client.ensure_auth()
-                        url = await self._create_link_with_backoff(client, plan, link_kind,
-                                                                   item_name, mac_row)
+                        url = await self._create_link_with_backoff(
+                            client, plan, link_kind, item_name, mac_row,
+                            patient=not self._has_alternative(
+                                chain, _step, candidates, mac_row, requester))
                         # getattr, not the attribute: a stand-in client (the test
                         # doubles, and anything else that grows into this slot)
                         # owes us a URL, not this hand-off field.
@@ -3516,6 +3742,10 @@ class StreamManager:
                               return
                           first_candidate = not tried_any
                           tried_any = True
+                          # A play that is still looking for its first byte is not in
+                          # `streams`, but it is when it needs the panel to itself:
+                          # background jobs yield to it (portal_pace).
+                          self.starting[h.id] = getattr(portal, "id", None)
                           # Hedge by patience, not by a parallel race: with a free
                           # alternative in the chain, a candidate that has said
                           # nothing after HEDGE_AFTER_S is not "slow", it is
@@ -3613,7 +3843,9 @@ class StreamManager:
                                   # is the zap overlap, and on a single-MAC portal it
                                   # is the only candidate there is.
                                   url = await self._create_link_with_backoff(
-                                      client, plan, link_kind, h.item_name, mac_row)
+                                      client, plan, link_kind, h.item_name, mac_row,
+                                      patient=not self._has_alternative(
+                                          chain, idx, candidates, mac_row, h.user_name))
                                   repair = getattr(client, "last_cmd_repair", None)
                               except PortalError as exc:
                                   # The code decides what this means for the rest of the
@@ -3791,6 +4023,7 @@ class StreamManager:
                                        f"{mac_row.mac if mac_row is not None else 'xtream'} "
                                        f"({'transcode' if ' -c:v copy' not in h.command else 'copy'})")
                           yielded_any = True
+                          self.starting.pop(h.id, None)
                           last_used = (src, mac_row)
                           yield first
                           async for chunk in self._read_proc(h, proc):
@@ -3864,6 +4097,7 @@ class StreamManager:
                          f"[{h.item_name}] pump crashed: {type(exc).__name__}: {exc}\n"
                          f"{''.join(traceback.format_exception(exc))[-1200:]}")
         finally:
+            self.starting.pop(h.id, None)
             if registered or h.proc:
                 # One shielded unit, not three sequential awaits: this runs
                 # while the client's request task is being cancelled, and every

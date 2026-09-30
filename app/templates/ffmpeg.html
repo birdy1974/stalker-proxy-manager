@@ -149,6 +149,27 @@
               </div>
               <div class="col-md-6"><label class="muted-label">Extra input flags</label><textarea rows="2" class="form-control form-control-sm mono ff-field" id="f-extra_input" spellcheck="false"></textarea></div>
               <div class="col-md-6"><label class="muted-label">Extra output flags</label><textarea rows="2" class="form-control form-control-sm mono ff-field" id="f-extra_output" spellcheck="false"></textarea></div>
+          <div class="col-12 mt-3" id="ff-advisor" hidden>
+            <div class="border rounded p-2 ff-adv">
+              <div class="d-flex flex-wrap align-items-center gap-2">
+                <h6 class="mb-0" id="ff-adv-title" data-help="Optimisation advisor" data-help-for="ff-adv-goal"><i class="bi bi-speedometer2"></i> Optimisation advisor</h6>
+                <span id="ff-adv-counts" class="d-flex gap-1 flex-wrap"></span>
+                <div class="ms-auto d-flex align-items-center gap-2">
+                  <label for="ff-adv-goal" class="muted-label mb-0">Optimise for</label>
+                  <select id="ff-adv-goal" class="form-select form-select-sm w-auto"></select>
+                </div>
+              </div>
+              <div class="small text-muted mt-1" id="ff-adv-goal-hint"></div>
+              <div class="row g-2 mt-1" id="ff-adv-scores"></div>
+              <div class="small text-muted mt-2" id="ff-adv-facts"></div>
+              <div id="ff-adv-list" class="mt-2" aria-live="polite"></div>
+              <div id="ff-adv-ignored" class="small mt-1"></div>
+              <div class="d-flex flex-wrap gap-2 mt-2 align-items-center">
+                <button id="ff-adv-review" class="btn btn-sm btn-outline-primary" type="button" disabled>Review changes…</button>
+                <span class="small text-muted" id="ff-adv-note"></span>
+              </div>
+            </div>
+          </div>
           <div class="col-12 mt-2">
             <label class="muted-label">Full ffmpeg command (edit freely — fields update on the fly)</label>
             <textarea class="form-control ff-edit mono" id="f-command" spellcheck="false"></textarea>
@@ -183,6 +204,7 @@
 
 {% block scripts %}
 <script src="/static/js/ffmpeg-editor.js?v={{ static_v.ffmpeg_editor_js }}"></script>
+<script src="/static/js/ffmpeg-advisor.js?v={{ static_v.ffmpeg_advisor_js }}"></script>
 <script>
 FFmpegEditor.setup({{ ffmpeg_editor_schema()|tojson }});
 const FIELD_IDS = ["name","enabled","hw_accel","device","resolution","aspect","video_codec","video_bitrate",
@@ -224,6 +246,14 @@ function applyEditorMode() {
   $("#btn-test-url").disabled = sentinel;
 }
 
+FFmpegAdvisor.init({
+  readFields: () => readFields(),
+  writeFields: (t) => writeFields(t),
+  mode: () => ({ sentinel: isSentinelTpl(current), manual: !isSentinelTpl(current) && sourceOf() === "manual" }),
+  name: () => $("#f-name").value,
+  onApplied: () => fieldsToCommand(),
+});
+
 function readFields() {
   return Object.fromEntries(FIELD_IDS.map(k => [k, FFmpegEditor.value(k)]));
 }
@@ -241,6 +271,7 @@ async function fieldsToCommand() {
   clearTimeout(syncTimer);
   const revision = ++editorRevision;
   applyEditorMode(); // recompute dependencies before validation, not after the API response
+  FFmpegAdvisor.refresh();
   if (isSentinelTpl(current) || sourceOf() === "manual") return;
   if (!FFmpegEditor.valid()) {
     $("#sync-state").textContent = "Fix the highlighted value before building or saving.";
@@ -278,6 +309,7 @@ $("#f-command").addEventListener("input", () => {
       body: { command: $("#f-command").value, base: readFields() } });
     if (revision !== editorRevision) return;
     writeFields(r.options);
+    FFmpegAdvisor.refresh();
     $("#sync-state").innerHTML = '<span class="text-success">command → fields</span>' +
       (r.warnings.length ? ` <span class="text-warning">${esc(r.warnings.join("; "))}</span>` : "");
     setDraftSource("manual");
@@ -354,6 +386,23 @@ async function loadList() {
     b.addEventListener("click", () => { selectTemplate(t.id); $("#ff-editor-card").scrollIntoView({block:"start", behavior:"smooth"}); });
     host.append(b);
   }
+  loadAdviceBadges();
+}
+async function loadAdviceBadges() {
+  try {
+    const r = await api("/api/ffmpeg/advice-summary");
+    for (const [id, c] of Object.entries(r.items || {})) {
+      const n = c.critical + c.warn + c.tip;
+      const sub = $(`#tpl-list [data-template-id="${id}"] .small.text-muted`);
+      if (!n || !sub) continue;
+      const [cls, icon] = c.critical ? ["text-bg-danger", "bi-x-octagon-fill"]
+        : c.warn ? ["text-bg-warning", "bi-exclamation-triangle-fill"] : ["text-bg-info", "bi-lightbulb-fill"];
+      const parts = [[c.critical, "critical"], [c.warn, "warning"], [c.tip, "tip"]]
+        .filter(([k]) => k).map(([k, w]) => `${k} ${w}${k > 1 && w !== "critical" ? "s" : ""}`);
+      sub.insertAdjacentHTML("beforeend",
+        ` <span class="badge ${cls} ms-1" title="Optimisation advice: ${esc(parts.join(", "))}"><i class="bi ${icon}"></i> ${n}</span>`);
+    }
+  } catch { /* badges are a nicety; the list works without them */ }
 }
 async function selectTemplate(id) {
   ++editorRevision; clearTimeout(syncTimer); clearTimeout(parseTimer);
@@ -362,6 +411,7 @@ async function selectTemplate(id) {
   draftCommandSource = current.command_source || "fields";
   $("#ed-title").textContent = "Edit template: " + current.name;
   writeFields(current);
+  FFmpegAdvisor.load(current);
   $("#f-command").value = current.command || "";
   $("#sync-state").textContent = "";
   const isRedir = isRedirectTpl(current);
@@ -395,6 +445,7 @@ $("#tpl-new").addEventListener("click", () => {
                 output_format: "mpegts", subs: "drop", vf_preset: "none",
                 extra_input: "", extra_output: "" });
   $("#f-command").value = "";
+  FFmpegAdvisor.load(null);
   applyEditorMode();
   fieldsToCommand();
   $("#ff-editor-card").scrollIntoView({block:"start", behavior:"smooth"});
@@ -404,7 +455,7 @@ $("#tpl-save-top").addEventListener("click", () => $("#tpl-save").click());
 $("#tpl-save").addEventListener("click", async () => {
   if (sourceOf() === "fields" && !isRedirectTpl(current) && !FFmpegEditor.valid(true)) return;
   ++editorRevision; clearTimeout(syncTimer); clearTimeout(parseTimer);
-  const body = { ...readFields(), command: $("#f-command").value,
+  const body = { ...readFields(), ...FFmpegAdvisor.state(), command: $("#f-command").value,
                  command_source: sourceOf() };
   if (!body.name.trim()) return toast("name required", "warn");
   const buttons = [$("#tpl-save"), $("#tpl-save-top")];
@@ -435,6 +486,11 @@ function showValidate(result, label) {
   }
   if (result.ms != null) {
     lines.push(`bytes=${result.bytes ?? 0}   rc=${result.rc ?? "?"}   ${result.ms} ms`);
+  }
+  if (result.speed_verdict) {
+    const v = result.speed_verdict;
+    const speedMark = { ok: "✔", tip: "ℹ", warn: "⚠", critical: "✘" };
+    lines.push((speedMark[v.level] || "•") + " speed: " + v.text);
   }
   const argv = result.argv_text || (result.argv ? result.argv.join(" ") : "");
   if (argv) lines.push("", "--- ffmpeg command ---", argv);

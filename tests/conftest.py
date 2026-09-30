@@ -223,3 +223,22 @@ async def _reset_playlist_health_evidence():
         health._files_task.cancel()
         await asyncio.gather(health._files_task, return_exceptions=True)
     health._OBSERVATIONS.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_advisor_probes(monkeypatch):
+    """The optimisation advisor probes the host (`ffmpeg -encoders`, `vainfo`)
+    and remembers live encode speeds per template. Tests must neither depend on
+    what is installed on the machine running them nor leak those memories into
+    each other: probes answer "unknown" unless a test installs its own fake."""
+    from app.services import ffmpeg_env, ffmpeg_speed
+
+    async def _no_probe(args, timeout=0):
+        return None
+
+    monkeypatch.setattr(ffmpeg_env, "_run", _no_probe)
+    ffmpeg_env.reset_cache()
+    ffmpeg_speed.reset()
+    yield
+    ffmpeg_env.reset_cache()
+    ffmpeg_speed.reset()

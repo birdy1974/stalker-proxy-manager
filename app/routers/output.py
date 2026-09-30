@@ -290,7 +290,17 @@ async def _ensure_slot(user: User | None) -> None:
     max_conn = user.max_connections if user else None
     if MANAGER.can_open_for(uname, max_conn):
         return
-    await asyncio.sleep(MAXCONN_RETRY_DELAY)
+    # Poll instead of sleeping the whole delay: the old slot is usually released
+    # within a few hundred ms (the disconnect watchdog), and the start should go
+    # ahead the moment it is, not at the end of a fixed 1.2 s.
+    deadline = time.monotonic() + MAXCONN_RETRY_DELAY
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        await asyncio.sleep(min(0.05, left))
+        if MANAGER.can_open_for(uname, max_conn):
+            return
     if MANAGER.can_open_for(uname, max_conn):
         return
     await db_log("WARNING", "output",

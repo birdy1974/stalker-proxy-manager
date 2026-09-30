@@ -1230,8 +1230,11 @@ def default_presets() -> list[dict]:
         # build_command keeps this tuning inside VAAPI_ENCODERS. The field says
         # CQP anyway, so the row, the GUI and every other template agree.
         mk("QSV 720p ~1M", hw_accel="qsv", video_codec="h264_qsv", subs="dvb"),
+        # -preset veryfast: without it libx264 runs "medium", which needs 2-3x
+        # the CPU for a live stream (the optimisation advisor flags exactly that).
         mk("Software 720p ~1.2M (libx264)", hw_accel="none", video_codec="libx264",
-           video_bitrate="1200k", maxrate="1300k", bufsize="2400k", subs="dvb"),
+           video_bitrate="1200k", maxrate="1300k", bufsize="2400k", subs="dvb",
+           extra_output="-preset veryfast"),
         mk(COPY_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source", subs="dvb"),
         # --- Enigma2 / Vu+ Duo2 --------------------------------------------

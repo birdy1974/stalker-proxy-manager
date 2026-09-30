@@ -40,7 +40,7 @@ _asked: dict[Any, int] = {}
 
 
 def playback_portal_ids() -> set:
-    """Portal ids with a stream that somebody is actually watching right now."""
+    """Portal ids with a stream somebody is watching - or a play starting - right now."""
     from .stream_manager import MANAGER           # local: avoid an import cycle
     ids = set()
     for h in MANAGER.streams.values():
@@ -49,6 +49,12 @@ def playback_portal_ids() -> set:
         pid = getattr(h, "portal_id", None)
         if pid is not None:
             ids.add(pid)
+    # A play that is still looking for its first byte is not in `streams` yet, but
+    # that is the moment it needs the panel to itself: create_link, the handshake
+    # and the slot check all share the budget a background request would spend.
+    starting = getattr(MANAGER, "starting_portal_ids", None)
+    if callable(starting):
+        ids |= set(starting())
     return ids
 
 

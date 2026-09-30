@@ -424,6 +424,10 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         # migrations above on databases that predate them.
         "subs": ("VARCHAR(6)", "'drop'"),
         "vf_preset": ("VARCHAR(32)", "'none'"),
+        # optimisation advisor: the goal this template is tuned for and the
+        # advice ids the operator dismissed for it (comma separated)
+        "advice_goal": ("VARCHAR(12)", "'balanced'"),
+        "advice_ignored": ("TEXT", "''"),
     },
     "local_files": {
         "duration_s": ("FLOAT", "NULL"),

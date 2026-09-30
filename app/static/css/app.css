@@ -167,3 +167,10 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 .order-status { min-height: 1.5rem; }
 .table-host.order-saving { cursor: progress; }
 .table-host.order-saving .row-drag { cursor: progress; opacity: .5; }
+
+/* FFmpeg template optimisation advisor */
+.ff-adv-item { border-radius: 2px; transition: background-color .4s; }
+.ff-adv-item:focus { outline: none; }
+.ff-adv-flash { background: rgba(255, 193, 7, .25); }
+.ff-adv summary { cursor: pointer; width: fit-content; }
+.ff-adv code { white-space: normal; word-break: break-word; }

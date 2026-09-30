@@ -35,6 +35,7 @@ def _static_versions() -> dict:
     for key, rel in (("js", "app/static/js/app.js"),
                      ("backup_js", "app/static/js/settings-backup.js"),
                      ("ffmpeg_editor_js", "app/static/js/ffmpeg-editor.js"),
+                     ("ffmpeg_advisor_js", "app/static/js/ffmpeg-advisor.js"),
                      ("help_js", "app/static/js/help-tooltips.js"),
                      ("epg_js", "app/static/js/epg-matching.js"),
                      ("epg_controls_js", "app/static/js/epg-controls.js"),

@@ -11,7 +11,7 @@ import signal
 import time
 
 from ..config import FFMPEG_BIN
-from . import stream_identity
+from . import ffmpeg_speed, stream_identity
 from .ffmpeg_templates import (PASSTHROUGH_COMMAND, REDIRECT_COMMAND,
                                 URL_PLACEHOLDER, template_command_errors)
 
@@ -229,12 +229,22 @@ def _result(*, ok: bool, mode: str, detail: str, args: list[str] | None = None,
             out_n: int = 0, rc=None, err: str = "", ms: int = 0,
             source: str = "") -> dict:
     argv = list(args or [])
-    return {
+    res = {
         "ok": ok, "mode": mode, "detail": detail, "bytes": out_n, "rc": rc,
         "stderr": err, "ms": ms, "source": source,
         "argv": argv,
         "argv_text": " ".join(shlex.quote(a) for a in argv),
     }
+    # Measured encode speed (ffmpeg's own final `speed=` figure) and what it means
+    # for live use; absent when ffmpeg printed none (copy remux, failed run).
+    transcodes = any(a == "-c:v" and i + 1 < len(argv) and argv[i + 1] != "copy"
+                     for i, a in enumerate(argv))
+    if ok and transcodes:
+        prog = ffmpeg_speed.last_progress(err)
+        if prog:
+            res["speed"] = prog["speed"]
+            res["speed_verdict"] = ffmpeg_speed.demo_verdict(prog["speed"], mode)
+    return res
 
 
 async def run_demo(command: str, mode: str = "lavfi", url: str | None = None,
