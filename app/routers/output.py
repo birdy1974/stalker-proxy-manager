@@ -100,19 +100,25 @@ async def get_php(request: Request, username: str = "", password: str = "",
 # ---------------------------------------------------------------- xtream api
 @router.get("/player_api.php")
 async def player_api(request: Request, username: str = "", password: str = "",
-                     action: str = "", vod_id: int = 0, series_id: int = 0):
+                     action: str = "", vod_id: int = 0, series_id: int = 0,
+                     category_id: str = "", stream_id: int = 0, limit: int = 6):
     user = await _authed(username, password, "xtream")
     base = await base_url_of(request)
     if not action:
         return await xtream_base(user, base)
+    # `category_id` is the filter every bulk list takes: clients re-ask one
+    # category at a time when a full list comes back truncated.
     if action == "get_live_categories":
         return await xtream_categories(user, "live")
     if action == "get_live_streams":
-        return await xtream_live(user, base)
+        return await xtream_live(user, base, category_id=category_id)
     if action == "get_vod_categories":
         return await xtream_categories(user, "vod")
     if action == "get_vod_streams":
-        return await xtream_vod(user)
+        return await xtream_vod(user, category_id=category_id)
+    if action == "get_short_epg":
+        from ..services.playlist_gen import xtream_short_epg
+        return await xtream_short_epg(user, stream_id, limit)
     if action == "get_vod_info":
         from ..services.playlist_gen import xtream_vod_info
         info = await xtream_vod_info(user, vod_id)
@@ -120,7 +126,7 @@ async def player_api(request: Request, username: str = "", password: str = "",
             raise HTTPException(404, "vod not found")
         return info
     if action == "get_series":
-        return await xtream_series(user)
+        return await xtream_series(user, category_id=category_id)
     if action == "get_series_categories":
         return await xtream_categories(user, "series")
     if action == "get_series_info":

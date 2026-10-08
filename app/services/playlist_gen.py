@@ -347,6 +347,23 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
 # ---------------------------------------------------------------------------
 # Xtream Codes API data views (player_api.php)
 # ---------------------------------------------------------------------------
+def xtream_account_status(user: User, now: int) -> str:
+    """What `user_info.status` says about the account, in the panel's own words.
+
+    Only an expiry date can make a valid account \"Expired\" here: a disabled or
+    xtream-disabled user never gets as far as this (auth fails first). A missing
+    or unreadable date stays \"Active\", the same as before, so nothing that worked
+    flips to Expired by accident.
+    """
+    if not user.expire_date:
+        return "Active"
+    try:
+        exp = int(datetime.fromisoformat(user.expire_date).timestamp())
+    except (TypeError, ValueError):
+        return "Active"
+    return "Expired" if exp <= now else "Active"
+
+
 async def xtream_base(user: User, base_url: str) -> dict:
     from .stream_manager import MANAGER as _mgr
     now = int(datetime.now(timezone.utc).timestamp())
@@ -359,7 +376,7 @@ async def xtream_base(user: User, base_url: str) -> dict:
     return {
         "user_info": {
             "username": user.name, "password": user.password, "message": "",
-            "auth": 1, "status": "Active",
+            "auth": 1, "status": xtream_account_status(user, now),
             "exp_date": str(int(datetime.fromisoformat(user.expire_date).timestamp()))
             if user.expire_date else None,
             "is_trial": "0",
@@ -411,7 +428,7 @@ async def xtream_categories(user: User, kind: str) -> list[dict]:
     return out
 
 
-async def xtream_live(user: User, base_url: str) -> list[dict]:
+async def xtream_live(user: User, base_url: str, category_id: str = "") -> list[dict]:
     from .epg import channel_epg_id
     groups = _groups(user)
     cats = {c["category_name"]: c["category_id"] for c in await xtream_categories(user, "live")}
@@ -422,17 +439,20 @@ async def xtream_live(user: User, base_url: str) -> list[dict]:
     for it in items:
         if not _allowed(effective_group("live", it.group_name), groups["live"]):
             continue
+        cid = cats.get(effective_group("live", it.group_name), "1")
+        if category_id and cid != category_id:
+            continue
         out.append({
             "num": it.number or it.order, "name": it.custom_name, "stream_type": "live",
             "stream_id": it.id, "stream_icon": it.logo or "", "epg_channel_id": channel_epg_id(it),
-            "added": "0", "category_id": cats.get(effective_group("live", it.group_name), "1"),
+            "added": "0", "category_id": cid,
             "custom_sid": "", "tv_archive": 0, "direct_source": "",
             "tv_archive_duration": 0, "timeshift": "", "is_adult": 0,
         })
     return out
 
 
-async def xtream_vod(user: User) -> list[dict]:
+async def xtream_vod(user: User, category_id: str = "") -> list[dict]:
     groups = _groups(user)
     cats = {c["category_name"]: c["category_id"] for c in await xtream_categories(user, "vod")}
     async with SessionLocal() as s:
@@ -462,12 +482,16 @@ async def xtream_vod(user: User) -> list[dict]:
         "category_id": cats.get(effective_group("vod", it.group_name), "1"),
         "container_extension": tmap.resolve("vod", it).container,
         "custom_sid": "", "direct_source": "",
-    } for it in items if _allowed(effective_group("vod", it.group_name), groups["vod"])]
+    } for it in items if _allowed(effective_group("vod", it.group_name), groups["vod"])
+        and (not category_id or cats.get(effective_group("vod", it.group_name), "1") == category_id)]
     for it in locals_:
         if not _allowed(effective_group("local", it.group_name), groups["local"]):
             continue
         local_file = files.get(it.local_file_id)
         if not local_file:
+            continue
+        local_cid = cats.get(effective_group("local", it.group_name), "1")
+        if category_id and local_cid != category_id:
             continue
         resolved = tmap.resolve("local", it)
         ext = (play_extension(local_file.relative_path or local_file.filename).lstrip(".")
@@ -477,7 +501,7 @@ async def xtream_vod(user: User) -> list[dict]:
             "name": best_title(it.custom_name, local_file.filename),
             "stream_type": "movie", "stream_id": xtream_local_id(it.id),
             "stream_icon": "", "rating": "", "rating_5based": 0, "added": "0",
-            "category_id": cats.get(effective_group("local", it.group_name), "1"),
+            "category_id": local_cid,
             "container_extension": ext, "custom_sid": "", "direct_source": "",
         })
     return out
@@ -550,7 +574,7 @@ async def xtream_vod_info(user: User, vod_id: int) -> dict | None:
                            "container_extension": ext, "custom_sid": "", "direct_source": ""}}
 
 
-async def xtream_series(user: User) -> list[dict]:
+async def xtream_series(user: User, category_id: str = "") -> list[dict]:
     groups = _groups(user)
     cats = {c["category_name"]: c["category_id"] for c in await xtream_categories(user, "series")}
     async with SessionLocal() as s:
@@ -565,7 +589,52 @@ async def xtream_series(user: User) -> list[dict]:
         "category_id": cats.get(effective_group("series", it.group_name), "1"),
         "backdrop_path": [], "youtube_trailer": "", "episode_run_time": "42",
         "last_modified": "0",
-    } for it in items if _allowed(effective_group("series", it.group_name), groups["series"])]
+    } for it in items if _allowed(effective_group("series", it.group_name), groups["series"])
+        and (not category_id or cats.get(effective_group("series", it.group_name), "1") == category_id)]
+
+
+async def xtream_short_epg(user: User, stream_id: int, limit: int = 6) -> dict:
+    """`get_short_epg`: the next few programmes of one live channel.
+
+    Answers from the same guide resolver as /xmltv.php, so the two can never
+    disagree. Titles and descriptions are base64 (the panel convention clients
+    decode); times are unix seconds as strings. An unknown or hidden channel is an
+    empty list, not an error - that is what a panel without a guide answers.
+    """
+    from .epg_policy import load_schedules
+    from .user_groups import group_name
+    import base64
+
+    groups = _groups(user)
+    async with SessionLocal() as s:
+        item = await s.get(LivePlaylist, stream_id)
+        if (item is None or not item.enabled
+                or not _allowed(group_name("live", item.group_name), groups["live"])):
+            return {"epg_listings": []}
+        now = datetime.now(timezone.utc)
+        schedules, _, _, _ = await load_schedules(s, [item], now)
+    from .epg import channel_epg_id
+    cid = channel_epg_id(item)
+
+    def b64(text: str | None) -> str:
+        return base64.b64encode((text or "").encode("utf-8")).decode("ascii")
+
+    listings = []
+    for event in schedules.get(item.id, []):
+        if event.stop <= now:
+            continue
+        p = event.programme
+        listings.append({
+            "id": str(len(listings) + 1), "epg_id": cid, "title": b64(p.title),
+            "lang": "", "start": event.start.strftime("%Y-%m-%d %H:%M:%S"),
+            "end": event.stop.strftime("%Y-%m-%d %H:%M:%S"),
+            "description": b64(p.desc), "channel_id": cid,
+            "start_timestamp": str(int(event.start.timestamp())),
+            "stop_timestamp": str(int(event.stop.timestamp())),
+        })
+        if len(listings) >= max(1, limit):
+            break
+    return {"epg_listings": listings}
 
 
 async def xtream_series_info(user: User, series_id: int) -> dict | None:
