@@ -183,3 +183,34 @@ def pick_now(programmes: list[Programme], *, now: datetime | None = None,
     else:
         out["next"] = None
     return out
+
+
+def _as_int(value) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_archive_day(payload, tz: timezone | None = None) -> tuple[int, int, list[dict]]:
+    """One page of `get_simple_data_table` → (total_items, page_size, rows).
+
+    Each row is `{"id", "start", "stop", "archived"}` with aware datetimes, sorted
+    by start. Rows without an id or a readable start/stop are dropped, never guessed.
+    """
+    data = payload.get("js", payload) if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return 0, 0, []
+    rows: list[dict] = []
+    for row in data.get("data") or []:
+        if not isinstance(row, dict):
+            continue
+        rid = str(row.get("id") or "").strip()
+        start = parse_portal_ts(row.get("start_timestamp"), tz)
+        stop = parse_portal_ts(row.get("stop_timestamp"), tz)
+        if not rid or start is None or stop is None:
+            continue
+        archived = str(row.get("mark_archive") or "0").strip() not in ("", "0")
+        rows.append({"id": rid, "start": start, "stop": stop, "archived": archived})
+    rows.sort(key=lambda r: r["start"])
+    return _as_int(data.get("total_items")), _as_int(data.get("max_page_items")), rows

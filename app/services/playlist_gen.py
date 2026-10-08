@@ -435,6 +435,8 @@ async def xtream_live(user: User, base_url: str, category_id: str = "") -> list[
     async with SessionLocal() as s:
         items = (await s.execute(select(LivePlaylist).where(LivePlaylist.enabled.is_(True))
                                  .order_by(LivePlaylist.order))).scalars().all()
+    from .catchup import ARCHIVE_DAYS, archive_playlist_ids
+    archive = await archive_playlist_ids()
     out = []
     for it in items:
         if not _allowed(effective_group("live", it.group_name), groups["live"]):
@@ -442,12 +444,14 @@ async def xtream_live(user: User, base_url: str, category_id: str = "") -> list[
         cid = cats.get(effective_group("live", it.group_name), "1")
         if category_id and cid != category_id:
             continue
+        has_archive = it.id in archive
         out.append({
             "num": it.number or it.order, "name": it.custom_name, "stream_type": "live",
             "stream_id": it.id, "stream_icon": it.logo or "", "epg_channel_id": channel_epg_id(it),
             "added": "0", "category_id": cid,
-            "custom_sid": "", "tv_archive": 0, "direct_source": "",
-            "tv_archive_duration": 0, "timeshift": "", "is_adult": 0,
+            "custom_sid": "", "tv_archive": 1 if has_archive else 0, "direct_source": "",
+            "tv_archive_duration": ARCHIVE_DAYS if has_archive else 0, "timeshift": "",
+            "is_adult": 0,
         })
     return out
 
