@@ -1265,6 +1265,62 @@ class StreamManager:
         for mid in mac_ids or ():
             self.release_mac(mid)
 
+    def _drop_locks_of(self, stream_id: str) -> None:
+        """Remove one stream id from every MAC lock (no await, no registry)."""
+        for mac_id in list(self.mac_locks):
+            sids = self._lock_set(mac_id)
+            if stream_id in sids:
+                self._note_release(mac_id)
+                sids.discard(stream_id)
+            if not sids:
+                self.mac_locks.pop(mac_id, None)
+
+    async def release_mac_occupancy(self, mac_id: int | None) -> dict:
+        """Free one MAC from the operator's side: stop what holds it.
+
+        * every ffmpeg pipe on the MAC is killed (a real, registered stream);
+        * a lock whose stream is no longer registered is dropped (the ghost
+          a cancelled start used to leave behind);
+        * a redirect lease is forgotten. The player on the panel's CDN cannot
+          be stopped from here, so only our claim on the MAC goes away.
+
+        Returns what was done, so the GUI can say so.
+        """
+        out = {"mac_id": mac_id, "streams_killed": 0, "ghost_locks": 0,
+               "lease_released": False}
+        if mac_id is None:
+            return out
+        for sid in sorted(self._lock_set(mac_id)):
+            if sid in self.streams:
+                if await self.kill(sid):
+                    out["streams_killed"] += 1
+            else:
+                out["ghost_locks"] += 1
+        self.mac_locks.pop(mac_id, None)
+        self._expire_lease(mac_id)
+        if mac_id in self.redirect_leases:
+            out["lease_released"] = True
+        self.redirect_leases.pop(mac_id, None)
+        self.lease_meta.pop(mac_id, None)
+        if out["streams_killed"] or out["ghost_locks"] or out["lease_released"]:
+            await db_log("WARNING", "stream",
+                         f"MAC #{mac_id} released by the operator: "
+                         f"{out['streams_killed']} stream(s) stopped, "
+                         f"{out['ghost_locks']} stale lock(s) cleared, "
+                         f"lease {'released' if out['lease_released'] else 'none'}")
+        return out
+
+    async def release_all_occupancy(self) -> dict:
+        """`release_mac_occupancy` for every MAC that the portal tab shows busy."""
+        per_mac = []
+        for mid in sorted(self.busy_mac_ids(), key=lambda m: int(m)):
+            per_mac.append(await self.release_mac_occupancy(mid))
+        return {"macs": len(per_mac),
+                "streams_killed": sum(m["streams_killed"] for m in per_mac),
+                "ghost_locks": sum(m["ghost_locks"] for m in per_mac),
+                "leases_released": sum(1 for m in per_mac if m["lease_released"]),
+                "per_mac": per_mac}
+
     def busy_mac_ids(self) -> set[int]:
         """mac_ids with an ffmpeg pipe or a live redirect lease (any count).
 
@@ -4104,6 +4160,14 @@ class StreamManager:
                 # step (proc.wait, the active_streams DELETE, the log write)
                 # awaits something a cancellation would abort halfway.
                 await run_uncancelled(self._finish(h), what="stream teardown")
+            if not registered:
+                # The MAC lock is taken BEFORE the stream is registered. A client
+                # that leaves while ffmpeg is still waiting for its first byte
+                # ends the generator here with no process and no registry entry,
+                # so `_finish` never runs - and the lock would stay forever, with
+                # the portal showing the MAC as "streaming" and the dashboard
+                # empty. Nothing else can hold this stream id, so drop it.
+                self._drop_locks_of(h.id)
 
     async def _finish(self, h: StreamHandle) -> None:
         """Complete stream teardown, run outside the dying request's scope."""

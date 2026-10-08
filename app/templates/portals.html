@@ -7,6 +7,7 @@
       <button class="btn btn-sm btn-accent" id="btn-add"><i class="bi bi-plus-circle"></i> Add portal</button>
       <button class="btn btn-sm btn-outline-secondary" id="btn-test-sel"><i class="bi bi-plug"></i> Test selected</button>
       <button class="btn btn-sm btn-outline-secondary" id="btn-test-all"><i class="bi bi-plug-fill"></i> Test all</button>
+      <button class="btn btn-sm btn-outline-warning" id="btn-release-macs" title="Free every MAC this proxy holds: stop its ffmpeg pipes and clear stale locks and redirect leases. Use when the table shows MACs as streaming/leased but the dashboard has no active streams."><i class="bi bi-eject"></i> Release all MACs</button>
       <button class="btn btn-sm btn-outline-secondary" id="btn-mac-health" title="Refresh status + expire date of every MAC on multi-MAC portals (same work the background scheduler does)"><i class="bi bi-heart-pulse"></i> Refresh MAC health</button>
       <button class="btn btn-sm btn-outline-danger" id="btn-del-sel"><i class="bi bi-trash"></i> Delete selected</button>
       <span class="vr mx-1"></span>
@@ -198,6 +199,8 @@ function makeTable() {
                 onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
               <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="Test this MAC against the panel: is it available, or is somebody else already streaming on it? (costs one portal request and a few seconds of a connection slot)"
                 onclick="probeMac(${r.id}, ${m.id}, '${m.mac}')"><i class="bi bi-broadcast-pin"></i></button>
+              ${m.runtime && m.runtime.busy ? `<button class="btn btn-xs btn-outline-warning py-0 px-1" title="Release this MAC: stop its ffmpeg pipe and clear stale locks/leases so the proxy stops treating it as busy"
+                onclick="releaseMac(${r.id}, ${m.id}, '${m.mac}')"><i class="bi bi-eject"></i> release</button>` : ""}
               <button class="btn btn-xs btn-outline-danger py-0 px-1" title="delete mac"
                 onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
             </div>`;
@@ -754,6 +757,36 @@ $("#btn-test-sel").addEventListener("click", async () => {
 });
 $("#btn-test-all").addEventListener("click", async () => {
   toast("testing all portals…"); await api("/api/portals/test-batch", { method: "POST", body: { ids: [] } }); table.reload();
+});
+/* Release MAC occupancy: the portal tab's "streaming" / "leased" badges are this
+   proxy's own bookkeeping (ffmpeg pipe locks and post-302 redirect leases). A lock
+   whose stream is gone is a ghost; a live pipe is stopped. The panel's own slot
+   cannot be seen from here - use the Test button for that. */
+function describeRelease(r) {
+  const parts = [];
+  if (r.streams_killed) parts.push(`${r.streams_killed} stream(s) stopped`);
+  if (r.ghost_locks) parts.push(`${r.ghost_locks} stale lock(s) cleared`);
+  if (r.lease_released) parts.push("redirect lease released");
+  return parts.length ? parts.join(" · ") : "nothing was holding it";
+}
+window.releaseMac = (pid, mid, mac) => {
+  confirmDialog({ title: "Release MAC", okText: "Release", okClass: "btn-warning",
+    body: `Release <span class="mono">${esc(mac)}</span>? Any ffmpeg stream playing on it is stopped, and the proxy stops counting it as busy. A player still on the panel's CDN is not stopped from here.`,
+    onOk: async () => {
+      const r = await api(`/api/portals/${pid}/macs/${mid}/release`, { method: "POST", body: {} });
+      toast(`${mac}: ${describeRelease(r)}`, "ok");
+      table.reload();
+    } });
+};
+$("#btn-release-macs").addEventListener("click", () => {
+  confirmDialog({ title: "Release all MACs", okText: "Release all", okClass: "btn-warning",
+    body: "Stop every ffmpeg stream this proxy runs on any MAC, and clear every stale lock and redirect lease. Players currently on a panel CDN link are not stopped from here.",
+    onOk: async () => {
+      const r = await api("/api/portals/macs/release-all", { method: "POST", body: {} });
+      toast(r.macs ? `released ${r.macs} MAC(s): ${describeRelease({ streams_killed: r.streams_killed, ghost_locks: r.ghost_locks, lease_released: r.leases_released > 0 })}`
+                   : "no MAC was busy", r.macs ? "ok" : "info");
+      table.reload();
+    } });
 });
 $("#btn-mac-health").addEventListener("click", async () => {
   toast("refreshing MAC status + expiry on multi-MAC portals…");

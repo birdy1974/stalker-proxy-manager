@@ -691,6 +691,28 @@ async def probe_portal_mac(pid: int, mid: int, payload: dict | None = None):
         force=bool(body.get("force")))
 
 
+@router.post("/{pid}/macs/{mid}/release")
+async def release_portal_mac(pid: int, mid: int, db=Depends(get_db)):
+    """Free one MAC of this portal: stop its ffmpeg pipes, clear stale locks/leases.
+
+    The portal tab shows a MAC as busy from our own bookkeeping; this is the
+    operator's way to make that bookkeeping match reality.
+    """
+    row = (await db.execute(select(MacAddress).where(
+        MacAddress.id == mid, MacAddress.portal_id == pid))).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, "MAC not found on this portal")
+    out = await MANAGER.release_mac_occupancy(row.id)
+    out["mac"] = row.mac
+    return {"ok": True, **out}
+
+
+@router.post("/macs/release-all")
+async def release_all_portal_macs():
+    """Free every busy MAC (all portals): kill their pipes, clear stale locks/leases."""
+    return {"ok": True, **(await MANAGER.release_all_occupancy())}
+
+
 @router.post("/{pid}/macs/probe")
 async def probe_all_portal_macs(pid: int, payload: dict | None = None):
     """Probe every MAC of one portal (sequential; see probe_portal_mac)."""

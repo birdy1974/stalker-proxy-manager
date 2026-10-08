@@ -23,10 +23,10 @@ import os
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse, Response, StreamingResponse
 from starlette.background import BackgroundTask
 
-from ..database import get_db
+from ..database import SessionLocal, get_db
 from ..models import (
     LivePlaylist, LiveSource, LocalPlaylist, LocalFile, SerieEpisode,
     SeriePlaylist, User, VodPlaylist, VodSource,
@@ -100,19 +100,25 @@ async def get_php(request: Request, username: str = "", password: str = "",
 # ---------------------------------------------------------------- xtream api
 @router.get("/player_api.php")
 async def player_api(request: Request, username: str = "", password: str = "",
-                     action: str = "", vod_id: int = 0, series_id: int = 0):
+                     action: str = "", vod_id: int = 0, series_id: int = 0,
+                     category_id: str = "", stream_id: int = 0, limit: int = 6):
     user = await _authed(username, password, "xtream")
     base = await base_url_of(request)
     if not action:
         return await xtream_base(user, base)
+    # `category_id` is the filter every bulk list takes: clients re-ask one
+    # category at a time when a full list comes back truncated.
     if action == "get_live_categories":
         return await xtream_categories(user, "live")
     if action == "get_live_streams":
-        return await xtream_live(user, base)
+        return await xtream_live(user, base, category_id=category_id)
     if action == "get_vod_categories":
         return await xtream_categories(user, "vod")
     if action == "get_vod_streams":
-        return await xtream_vod(user)
+        return await xtream_vod(user, category_id=category_id)
+    if action == "get_short_epg":
+        from ..services.playlist_gen import xtream_short_epg
+        return await xtream_short_epg(user, stream_id, limit)
     if action == "get_vod_info":
         from ..services.playlist_gen import xtream_vod_info
         info = await xtream_vod_info(user, vod_id)
@@ -120,7 +126,7 @@ async def player_api(request: Request, username: str = "", password: str = "",
             raise HTTPException(404, "vod not found")
         return info
     if action == "get_series":
-        return await xtream_series(user)
+        return await xtream_series(user, category_id=category_id)
     if action == "get_series_categories":
         return await xtream_categories(user, "series")
     if action == "get_series_info":
@@ -600,6 +606,32 @@ async def _xtream_stream(request: Request, kind: str, sid: int, u: str, p: str,
 @router.api_route("/live/{u}/{p}/{sid}.ts", methods=["GET", "HEAD"])
 async def xlive(request: Request, sid: int, u: str, p: str, mode: str = ""):
     return await _xtream_stream(request, "live", sid, u, p, mode)
+
+
+@router.api_route("/timeshift/{u}/{p}/{dur}/{start}/{sid}.ts", methods=["GET", "HEAD"])
+async def xtimeshift(request: Request, dur: int, start: str, sid: int, u: str, p: str):
+    """Catch-up: a 302 to the real source (never relayed or stored here).
+
+    `dur` is minutes, `start` is `yyyy-MM-dd:HH-mm` in UTC, `sid` is the live channel id.
+    See app/services/catchup.py for how the source is chosen.
+    """
+    from ..services.catchup import ARCHIVE_DAYS, CatchupUnavailable, parse_start, resolve
+    from ..services.playlist_gen import _allowed, _groups, effective_group
+    from ..models import LivePlaylist
+    user = await _authed(u, p, "xtream")
+    try:
+        when = parse_start(start)
+        if not 0 < dur <= ARCHIVE_DAYS * 24 * 60:
+            raise CatchupUnavailable(400, "duration out of range")
+        async with SessionLocal() as s:
+            item = await s.get(LivePlaylist, sid)
+        if not item or not item.enabled or not _allowed(
+                effective_group("live", item.group_name), _groups(user)["live"]):
+            raise CatchupUnavailable(404, "unknown channel")
+        target = await resolve(sid, when, dur, user.name)
+    except CatchupUnavailable as exc:
+        raise HTTPException(exc.status, exc.detail)
+    return RedirectResponse(target, status_code=302)
 
 
 async def _xtream_movie(request: Request, sid: int, u: str, p: str,

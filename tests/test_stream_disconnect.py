@@ -139,7 +139,13 @@ async def _run_until_disconnect(app, *, chunks: int) -> int:
     # named like uvicorn's task so the CancelledError reads like the bug report
     task = asyncio.create_task(app(scope, receive, send),
                                name="RequestResponseCycle.run_asgi()")
-    await asyncio.wait_for(task, 30)
+    # Bounded wait, and NO await on the task after it: when the bug reproduces,
+    # the task is stuck in its own cancelled teardown, and wait_for() would sit
+    # waiting for that cancellation to finish - the whole suite hangs. Let the
+    # caller's assertions decide; the stuck task is cancelled and left behind.
+    done, _ = await asyncio.wait({task}, timeout=10)
+    if not done:
+        task.cancel()
     return sent
 
 

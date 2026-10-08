@@ -1118,6 +1118,16 @@ class StalkerClient:
                                 "JsHttpRequest": "1-xml"})
         return parse_short_epg(data, tz)
 
+    async def archive_day(self, ch_id: str, date: str, page: int = 1) -> dict:
+        """`type=epg&action=get_simple_data_table` for one channel and day (catch-up).
+
+        Returns the raw answer; `epg.parse_archive_day` reads it. `date` is
+        `yyyy-MM-dd` in the portal's timezone. Pages are 1-based.
+        """
+        return await self._get({"type": "epg", "action": "get_simple_data_table",
+                                "ch_id": str(ch_id or ""), "date": date,
+                                "p": str(int(page)), "JsHttpRequest": "1-xml"})
+
     def _may_reauth(self, retry_on_auth: bool = True, retried: bool = False) -> bool:
         """May this failure be answered by a fresh handshake?
 
@@ -1386,7 +1396,8 @@ class StalkerClient:
         call on this client) so the caller can persist what worked.
         """
         self.last_cmd_repair = None
-        type_ = {"live": "itv", "itv": "itv", "vod": "vod", "series": "vod", "episode": "vod"}.get(kind, "itv")
+        type_ = {"live": "itv", "itv": "itv", "vod": "vod", "series": "vod", "episode": "vod",
+                 "archive": "tv_archive"}.get(kind, "itv")
         if series is not None:
             # Classic-Stalker episode: the panel selects the episode server-side
             # by the `series` parameter of a type=vod create_link (the stored cmd
