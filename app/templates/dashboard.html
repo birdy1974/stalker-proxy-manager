@@ -147,6 +147,16 @@ function card(label, value, sub="", href="#") {
     <div class="card-body py-2 px-3"><div class="num">${value}</div><div class="lbl">${label}</div>
     <div class="small text-muted">${sub}</div></div></div></a></div>`;
 }
+function _occupancySub(d, shown) {
+  const occ = (d.api && d.api.mac_occupancy) || {};
+  const busy = occ.busy || 0;
+  if (!busy) return "";
+  if (busy <= shown) return `${busy} MAC(s) busy`;
+  const extra = busy - shown;
+  return occ.ghost
+    ? `${extra} MAC(s) held with no stream → Portals › Release`
+    : `${extra} MAC(s) busy but not streaming → Portals`;
+}
 async function refreshStats() {
   const d = await api("/api/dashboard");
   const s = d.stats;
@@ -160,7 +170,13 @@ async function refreshStats() {
     card("Areas", s.areas ?? 0, "playback overlays", "/areas") +
     card("Users", s.users, "", "/users") +
     card("Enigma2", s.enigma2_profiles, "receivers", "/enigma2") +
-    card("Active streams", d.streams.length);
+    // Two views of "what is running", and they can disagree: a MAC the
+    // Portals tab shows as busy while this card says zero is either a
+    // redirect lease (a player we sent to the panel's CDN and cannot see
+    // any more) or a stale lock from a cancelled start. Naming that here
+    // is what stops it looking like a dashboard that lost a stream.
+    card("Active streams", d.streams.length, _occupancySub(d, d.streams.length),
+         (((d.api && d.api.mac_occupancy) || {}).busy || 0) > d.streams.length ? "/portals" : "#");
   $("#mock-hint").innerHTML = {% if mock_enabled %}`<b>Demo tip:</b> add portal <span class="mono">{{ mock_portal_url }}</span> with MAC <span class="mono">{{ mock_macs }}</span> to try the full flow without a real portal. The Mock Control there simulates offline/busy portals so you can watch fallback work.`{% else %}""{% endif %};
   renderApi(d.api);
   renderDiag(d.diag);

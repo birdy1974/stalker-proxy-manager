@@ -22,6 +22,7 @@ unlogged.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -482,6 +483,12 @@ class StreamHandle:
     #: The dashboard-row INSERT of `_register`, running beside the stream instead
     #: of in front of its first byte. Whoever deletes the row waits for it first.
     row_task: asyncio.Task | None = None
+    #: True once `_register` put this handle in the registry (i.e. it produced
+    #: bytes and became a dashboard row). Only a registered stream gets a
+    #: "stopped after N MB" log line: a start that died before its first byte is
+    #: not a stream anybody watched, and logging it made every cancelled zap
+    #: look like a finished programme in the log pane.
+    registered: bool = False
 
     def public(self) -> dict:
         return {"id": self.id, "kind": self.kind, "item_name": self.item_name,
@@ -1265,6 +1272,107 @@ class StreamManager:
         for mid in mac_ids or ():
             self.release_mac(mid)
 
+    # -------------------------------------------------------- release a MAC
+    async def free_mac(self, mac_id: int | None) -> dict:
+        """Kill everything this proxy holds on one MAC and report what went.
+
+        The operator-facing counterpart to `release_mac` (which only forgets
+        bookkeeping): this one ends the streams first, so a MAC is never left
+        "released" while a viewer's ffmpeg pipe is still running on it - the
+        pipe would keep the panel's connection slot and the operator would be
+        told the MAC is free when it is not.
+
+        Order matters: kill the pipes (their own teardown drops the locks),
+        then drop the redirect lease, then prune ghost locks - so even a MAC
+        stuck from an old cancelled start comes back.
+
+        The report is what the GUI shows and the log stores, so it names what
+        was taken down rather than just counting it.
+        """
+        if mac_id is None:
+            return {"mac_id": None, "killed": [], "starting": 0,
+                    "lease_dropped": False, "ghosts": 0, "was_busy": False}
+        before = self.mac_occupancy(mac_id) or {}
+        killed: list[dict] = []
+        procs = []
+        starting: list[str] = []
+        for sid in sorted(self._lock_set(mac_id)):
+            h = self.streams.get(sid)
+            if h is None and sid in self.starting:
+                # Still opening: it has no pipe to end yet, and its own start
+                # ends within the start budget. Named, not silently skipped.
+                starting.append(sid)
+                continue
+            if h is not None:
+                killed.append({"stream_id": sid, "item": h.item_name,
+                               "user": h.user_name, "kind": h.kind,
+                               "mb": round(h.bytes_sent / 1e6, 1),
+                               "portal": h.portal_name, "mac": h.mac})
+                if h.proc is not None:
+                    procs.append(h.proc)
+                await self.kill(sid)
+        # kill() only sends the signal. The panel's connection slot is held
+        # until the process really exits, so a release reports "done" only
+        # once every pipe it ended has been reaped.
+        for proc in procs:
+            if getattr(proc, "returncode", None) is None:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), 3.0)
+        lease_dropped = bool(self.redirect_leases.pop(mac_id, None))
+        if lease_dropped:
+            self.lease_meta.pop(mac_id, None)
+        ghosts = self.prune_ghost_locks().get(int(mac_id), [])
+        return {"mac_id": int(mac_id), "killed": killed, "starting": len(starting),
+                "lease_dropped": lease_dropped, "ghosts": len(ghosts),
+                "was_busy": bool(before.get("busy")),
+                "was_reason": before.get("reason") or "free"}
+
+    # ------------------------------------------------------------ ghost locks
+    def ghost_lock_ids(self) -> dict[int, list[str]]:
+        """MAC locks whose stream is no longer in the registry - dead bookkeeping.
+
+        A lock is taken *before* ffmpeg is spawned (so a parallel request sees
+        the MAC as taken) and released again by the same code path. Every path
+        that reaches an `await` between the two used to be able to lose the
+        release: a client that hangs up while the engine is still opening the
+        pipe cancels the request task, the `CancelledError` skips the
+        `unlock_mac` calls, and the pump's `finally` did not run at all for a
+        handle that had neither registered nor spawned a process yet.
+
+        What is left behind is the worst possible state to be in, and it is
+        permanent: the Portals tab shows the MAC as **streaming**, the
+        dashboard shows **no active streams** (the handle never reached the
+        registry), the reaper only walks the registry so nothing cleans it up,
+        and the panel keeps refusing that MAC with `limit` /
+        "account is in use" until the container restarts.
+
+        Returned as {mac_id: [stream_id, ...]} so a caller can name what it
+        dropped - the point is that this is never supposed to be non-empty.
+        """
+        out: dict[int, list[str]] = {}
+        for mac_id in list(self.mac_locks):
+            sids = self._lock_set(mac_id)
+            # A stream still looking for its first byte holds its lock on
+            # purpose and is not in `streams` yet - it is `starting`, not a ghost.
+            dead = [sid for sid in sids
+                    if sid not in self.streams and sid not in self.starting]
+            if dead:
+                out[int(mac_id)] = sorted(dead)
+        return out
+
+    def prune_ghost_locks(self) -> dict[int, list[str]]:
+        """Drop locks with no stream behind them. Returns what was dropped."""
+        ghosts = self.ghost_lock_ids()
+        for mac_id, sids in ghosts.items():
+            held = self._lock_set(mac_id)
+            for sid in sids:
+                held.discard(sid)
+                self._note_release(mac_id)
+            if not held:
+                self.mac_locks.pop(mac_id, None)
+                self._note_release(mac_id)
+        return ghosts
+
     def busy_mac_ids(self) -> set[int]:
         """mac_ids with an ffmpeg pipe or a live redirect lease (any count).
 
@@ -1287,6 +1395,9 @@ class StreamManager:
           ``pipe``  an ffmpeg pipe we own (a real stream, right now)
           ``lease`` a post-302 redirect lease: the player is on the panel's CDN,
                      so this is "probably still watching", with N seconds left
+          ``ghost`` a lock whose stream is gone from the registry - dead
+                    bookkeeping, never a real stream. Nothing is playing and
+                    nothing will release it on its own (see ghost_lock_ids).
         """
         if mac_id is None:
             return None
@@ -1294,6 +1405,13 @@ class StreamManager:
         stream_ids = sorted(self._lock_set(mac_id))
         if stream_ids and len(stream_ids) >= self._mac_limit(mac_id):
             h = self.streams.get(stream_ids[0])
+            if h is None and stream_ids[0] not in self.starting:
+                # Occupied by stream ids nobody holds any more. Saying "pipe"
+                # here is what made a stuck MAC look like a real stream on the
+                # Portals tab while the dashboard showed nothing.
+                return {"busy": True, "reason": "ghost", "stream_id": stream_ids[0],
+                        "streams": len(stream_ids), "holder": None, "item": "",
+                        "remaining_s": 0.0}
             return {"busy": True, "reason": "pipe", "stream_id": stream_ids[0],
                     "streams": len(stream_ids),
                     "holder": (h.user_name if h else None),
@@ -1397,6 +1515,7 @@ class StreamManager:
         # set first. The dashboard row is a DB write (5-30 ms) that used to sit
         # between the first byte and the player; it runs beside the stream now.
         self.streams[h.id] = h
+        h.registered = True
         h.row_task = spawn(self._insert_row_logged(h), name=f"row-{h.id[:8]}")
 
     async def _deregister(self, h: StreamHandle) -> None:
@@ -1542,6 +1661,16 @@ class StreamManager:
                                  f"[{h.item_name}] teardown was lost (process gone "
                                  f">{REAP_GRACE:.0f}s) -> freeing slot/MAC")
                     await self._deregister(h)
+                # Second pass, independent of the registry: a lock with no
+                # stream behind it can never be freed by the sweep above (that
+                # one only walks `streams`). Without this, one cancelled start
+                # marks its MAC as streaming forever - see ghost_lock_ids.
+                ghosts = self.prune_ghost_locks()
+                for mac_id, sids in ghosts.items():
+                    await db_log("WARNING", "stream",
+                                 f"MAC #{mac_id} was held by {len(sids)} stream(s) "
+                                 f"that no longer exist -> released (a start was "
+                                 f"cancelled before it produced data)")
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 - the reaper must never die
@@ -2275,9 +2404,16 @@ class StreamManager:
     async def _open_passthrough(
         self, url: str, *, title: str,
         first_byte_timeout: float | None = None,
+        owner: StreamHandle | None = None,
     ) -> tuple[PassthroughStream | None, bytes, dict | None]:
         """Open a raw asynchronous pass-through HTTP stream directly to the target URL,
-        bypassing FFmpeg completely (Option E)."""
+        bypassing FFmpeg completely (Option E).
+
+        ``owner`` is recorded on the moment the upstream connection is opened:
+        the socket *is* the panel's connection slot, so a client that hangs up
+        while we are still waiting for the first byte has to be able to close
+        it from teardown (see `_open_with_identity`).
+        """
         is_net = url.lower().startswith(_NET_SCHEMES)
         if not is_net:
             await db_log("ERROR", "stream",
@@ -2355,6 +2491,10 @@ class StreamManager:
             # Status 2xx: connection established, fetch first chunk. What is left of
             # the window after the headers, never less than a second.
             stream = PassthroughStream(client, resp)
+            if owner is not None:
+                # Teardown can close it from here on: this socket is the panel's
+                # connection slot whether or not it ever sends a byte.
+                owner.proc = stream
             left = max(1.0, timeout_s - (time.monotonic() - t0))
             try:
                 first = await asyncio.wait_for(stream.stdout.read(CHUNK), timeout=left)
@@ -2382,7 +2522,8 @@ class StreamManager:
 
     async def _open_with_identity(self, command: str, url: str, *,
                                   title: str, pace: bool,
-                                  first_byte_timeout: float | None = None
+                                  first_byte_timeout: float | None = None,
+                                  owner: StreamHandle | None = None
                                   ) -> tuple[object | None, bytes, dict | None]:
         """Spawn ffmpeg for a network URL, walking the media-UA ladder.
 
@@ -2391,6 +2532,14 @@ class StreamManager:
         ``{"rc", "tail", "stalled"}`` for the caller's existing warning, or
         None when ffmpeg itself could not be spawned (bad template/binary -
         the caller already logged it).
+
+        ``owner`` is the handle this pipe is being opened for. Passing it
+        records every spawned process on the handle *as it is spawned*, so a
+        cancellation anywhere inside this call (a client that hangs up while we
+        wait for the first byte) can still kill it from the pump's teardown.
+        Without it, an ffmpeg started for a stream that never produced a byte
+        kept running - and kept the panel's connection slot - until the next
+        container restart swept it up.
 
         A template that pins its own ``-user_agent`` opts out of the ladder:
         the operator's explicit choice wins. Otherwise the origin is offered
@@ -2402,7 +2551,8 @@ class StreamManager:
         """
         if (command or "").strip() == PASSTHROUGH_COMMAND:
             return await self._open_passthrough(
-                url, title=title, first_byte_timeout=first_byte_timeout)
+                url, title=title, first_byte_timeout=first_byte_timeout,
+                owner=owner)
         template_owns = "-user_agent" in (command or "")
         is_net = url.lower().startswith(_NET_SCHEMES)
         # Local files have no media endpoint to negotiate identity with: one
@@ -2418,6 +2568,12 @@ class StreamManager:
                                      user_agent=ua)
             if proc is None:
                 return None, b"", None
+            if owner is not None:
+                # On the handle BEFORE we wait for its first byte, so a
+                # cancellation during that wait still reaches teardown
+                # (see StreamManager._finish) instead of leaving the process -
+                # and the panel connection slot it holds - behind.
+                owner.proc = proc
             first = await self._first_bytes(proc, first_byte_timeout)
             if first:
                 if ua:
@@ -3604,6 +3760,10 @@ class StreamManager:
                 _tag, path = chain[0]
                 try:
                     proc = await self._spawn(h.command, path, h.item_name, pace=True)
+                    if proc is not None:
+                        # Visible to teardown before the first-byte wait
+                        # (see _open_with_identity's `owner`).
+                        h.proc = proc
                 except FFmpegTemplateError as exc:
                     h.dead = True
                     h.fail_note = f"invalid FFmpeg template: {exc}"
@@ -3931,7 +4091,8 @@ class StreamManager:
                                   # answers in ~550 ms), and a whole chain of
                                   # 12 s waits is what a player shows as a frozen
                                   # screen. See STREAM_START_TIMEOUT_REST.
-                                  first_byte_timeout=window)
+                                  first_byte_timeout=window,
+                                  owner=h)
                           except FFmpegTemplateError as exc:
                               if locked is not None:
                                   self.unlock_mac(locked, h.id)
@@ -4098,12 +4259,21 @@ class StreamManager:
                          f"{''.join(traceback.format_exception(exc))[-1200:]}")
         finally:
             self.starting.pop(h.id, None)
-            if registered or h.proc:
-                # One shielded unit, not three sequential awaits: this runs
-                # while the client's request task is being cancelled, and every
-                # step (proc.wait, the active_streams DELETE, the log write)
-                # awaits something a cancellation would abort halfway.
-                await run_uncancelled(self._finish(h), what="stream teardown")
+            # Unconditionally, not `if registered or h.proc`: a start can be
+            # cancelled (client hung up, player gave up, shutdown) while the
+            # engine is still inside `_open_with_identity` - ffmpeg running, no
+            # bytes yet, nothing registered. That handle used to fall out of
+            # the pump with its MAC lock still held and its ffmpeg process
+            # still holding the panel's connection slot, and nothing in the app
+            # could ever release either: the registry never saw the handle, so
+            # the reaper could not see it either. The Portals tab showed
+            # "streaming" while the dashboard showed nothing.
+            #
+            # One shielded unit, not three sequential awaits: this runs while
+            # the client's request task is being cancelled, and every step
+            # (proc.wait, the active_streams DELETE, the log write) awaits
+            # something a cancellation would abort halfway.
+            await run_uncancelled(self._finish(h), what="stream teardown")
 
     async def _finish(self, h: StreamHandle) -> None:
         """Complete stream teardown, run outside the dying request's scope."""
@@ -4120,8 +4290,13 @@ class StreamManager:
             return
         await self._kill_quiet(h.proc)
         await self._deregister(h)
-        await db_log("INFO", "stream",
-                     f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
+        if h.registered:
+            # Only a stream that actually played gets a "stopped" line. A start
+            # that died before its first byte is not a programme anybody
+            # watched, and logging it turned every cancelled zap into what
+            # looked like a finished stream in the log pane.
+            await db_log("INFO", "stream",
+                         f"[{h.item_name}] stopped after {h.bytes_sent/1e6:.1f} MB")
 
     def _stall_window(self, h: StreamHandle) -> float:
         """Seconds of silence this stream tolerates before it counts as over.

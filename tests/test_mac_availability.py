@@ -88,7 +88,12 @@ def test_an_anonymous_lease_is_never_taken_over():
 def test_an_ffmpeg_pipe_is_never_taken_over_even_by_its_own_user():
     """A lock is a real concurrent stream, not a guess - the same user opening
     a second channel must still be told to wait."""
-    MANAGER.mac_locks[6] = "stream-a"
+    # A real pipe is a registered handle AND a lock. A bare lock with no handle
+    # is a ghost (see StreamManager.ghost_lock_ids), so this test registers one.
+    MANAGER.streams["stream-a"] = StreamHandle(
+        id="stream-a", kind="live", item_name="NPO 1", user_name="bert",
+        template_name="t", command="ffmpeg {url}")
+    MANAGER.mac_locks[6] = {"stream-a"}
     assert MANAGER.is_mac_busy(6, requester="bert") is True
     info = MANAGER.mac_occupancy(6)
     assert info["reason"] == "pipe" and info["stream_id"] == "stream-a"
@@ -202,7 +207,7 @@ async def _live_route(macs=("00:1A:79:00:00:01", "00:1A:79:00:00:02")):
 
 
 async def _never_data(self, command, url, *, title, pace,
-                      first_byte_timeout=None):
+                      first_byte_timeout=None, owner=None):
     """A spawn that never produces a byte: stalled, with a stderr tail."""
     return None, b"", {"rc": None, "tail": "[vaapi @ 0x1] Failed to initialise",
                        "stalled": True}

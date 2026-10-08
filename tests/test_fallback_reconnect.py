@@ -84,7 +84,8 @@ class _RecordingPool:
         self.events.append(("drop", session.mac))
 
 
-async def _no_data(self, command, url, *, title, pace, first_byte_timeout=None):
+async def _no_data(self, command, url, *, title, pace, first_byte_timeout=None,
+                   owner=None):
     """ffmpeg exits before a single byte: the `open_fail` no-data branch."""
     return None, b"", {"rc": 8, "tail": "http://cdn/x.ts: Server returned 404",
                        "stalled": False}

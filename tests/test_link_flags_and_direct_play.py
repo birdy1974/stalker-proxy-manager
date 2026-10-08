@@ -394,7 +394,8 @@ async def test_the_pipe_plays_a_permanent_stored_link_without_asking(monkeypatch
     mgr = stream_manager.StreamManager()
     mgr.mac_locks.clear()
 
-    async def fake_open_with_identity(command, url, *, title="", pace=False, first_byte_timeout=None):
+    async def fake_open_with_identity(command, url, *, title="", pace=False,
+                                      first_byte_timeout=None, owner=None):
         _fake_open["url"] = url
         return _OneShotProc(), b"\x47" * 188 * 4, None
 

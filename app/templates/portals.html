@@ -10,6 +10,8 @@
       <button class="btn btn-sm btn-outline-secondary" id="btn-mac-health" title="Refresh status + expire date of every MAC on multi-MAC portals (same work the background scheduler does)"><i class="bi bi-heart-pulse"></i> Refresh MAC health</button>
       <button class="btn btn-sm btn-outline-danger" id="btn-del-sel"><i class="bi bi-trash"></i> Delete selected</button>
       <span class="vr mx-1"></span>
+      <button class="btn btn-sm btn-outline-danger" id="btn-release-all" title="Release every MAC of every portal: stop the streams this proxy runs through them, drop their portal sessions and stale locks, and handshake again. Use it when the Portals tab shows MACs as busy while the dashboard lists no active stream."><i class="bi bi-eject-fill"></i> Release streams</button>
+      <span class="vr mx-1"></span>
       <a class="btn btn-sm btn-outline-secondary" href="/api/export?section=portals"><i class="bi bi-download"></i> Export</a>
       <button class="btn btn-sm btn-outline-secondary" id="btn-import"><i class="bi bi-upload"></i> Import</button>
       {% if mock_enabled %}<button class="btn btn-sm btn-outline-warning" id="btn-mock"><i class="bi bi-bug"></i> Mock control</button>{% endif %}
@@ -43,13 +45,126 @@ function runtimeBadge(m) {
   // What THIS proxy is doing with the MAC right now - not what the panel thinks.
   // "free" here still means "we hold nothing": the panel is the authority on its
   // single connection slot, which is what the Test button below asks it.
+  //
+  // `ghost` is the one that used to be reported as `streaming`: a lock left
+  // behind by a start that was cancelled before it produced any data (the
+  // player hung up while ffmpeg was still opening). Nothing is playing and
+  // nothing will ever release it on its own, so it must not look like a
+  // stream somebody is watching - it is stale bookkeeping, and the only cure
+  // is the release button next to it.
   const rt = m.runtime || {};
   if (!rt.busy) return `<span class="badge text-bg-light" title="this proxy holds nothing on this MAC - use the test button to ask the panel">free here</span>`;
+  if (rt.reason === "ghost") {
+    return `<span class="badge text-bg-danger" title="no stream: a lock left by a start that was cancelled before it produced data (the dashboard shows no active stream for it). Press Release to clear it.">stuck${rt.holder ? " · " + esc(rt.holder) : ""}</span>`;
+  }
   if (rt.reason === "pipe") {
     return `<span class="badge text-bg-success" title="this proxy is streaming through this MAC right now (ffmpeg): ${esc(rt.item || "")}">streaming${rt.holder ? " · " + esc(rt.holder) : ""}</span>`;
   }
   const secs = Math.round(rt.remaining_s || 0);
   return `<span class="badge text-bg-warning" title="redirect lease: the player was sent to the panel CDN and we cannot see when it stopped. Used by ${esc(rt.holder || "unknown")} for ${esc(rt.item || "?")}">leased ${secs}s</span>`;
+}
+function releaseOneMac(pid, mid) {
+  // "Release" is the answer to "the portal tab says this MAC is busy but the
+  // dashboard is empty", and to "the panel keeps saying account is in use".
+  // It ends the stream (so it is a confirmation, never automatic), drops the
+  // pooled session and handshakes again, then asks the panel whether the MAC
+  // is free now - the panel's own answer is what the toast reports.
+  //
+  // The MAC and what is on it are looked up here rather than passed through
+  // the onclick attribute: a channel name with an apostrophe in it would
+  // otherwise break out of the quoted string.
+  const portal = table.items.find(x => x.id === pid);
+  const m = (portal && portal.macs || []).find(x => x.id === mid);
+  if (!m) return toast("MAC not found - reload the table", "warn");
+  const mac = m.mac || "?";
+  const rt = m.runtime || {};
+  const what = rt.reason === "ghost" ? "the stale lock left by a cancelled start"
+             : rt.item ? `the stream playing ${rt.item}` : "this MAC";
+  confirmDialog({
+    title: `Release ${esc(mac)}?`,
+    okText: "Release", okClass: "btn-danger",
+    body: `<div class="mb-2">This ends <b>${esc(what)}</b> on <span class="mono">${esc(mac)}</span>:</div>
+      <ul class="small mb-2">
+        <li>stops every stream this proxy is running through this MAC (they disappear from the dashboard)</li>
+        <li>drops the redirect lease and any stale lock left by a cancelled start</li>
+        <li>closes the portal session for this MAC and handshakes again, so the panel retires the old token</li>
+        <li>then asks the panel whether the MAC can stream now</li>
+      </ul>
+      <div class="small text-muted">A viewer watching through this MAC loses the picture. The panel's own connection
+      slot can take a few seconds to free up even after everything here is done.</div>`,
+    onOk: async () => {
+      toast(`releasing ${mac}…`);
+      try {
+        const r = await api(`/api/portals/${pid}/macs/${mid}/release`, { method: "POST", body: { verify: true } });
+        const killed = r.local.killed.length;
+        const v = r.verify || {};
+        const verdict = v.ok === false ? `panel check failed (${esc(v.detail || "?")})`
+                      : v.available ? "panel says: available"
+                      : `panel says: ${esc(v.reason || "not available")}`;
+        toast(`${mac}: ${killed ? killed + " stream(s) stopped" : "nothing of ours was running"} — ${verdict}`,
+              killed || v.available !== false ? "ok" : "warn", 8000);
+      } catch (e) { toast(`${mac}: release failed - ${e.message}`, "error"); }
+      table.reload();
+    }
+  });
+}
+async function releasePortalMacs(pid) {
+  // Per portal: the middle step between "release this MAC" and "release
+  // everything". Same confirmation shape, scoped to one panel.
+  const portal = table.items.find(x => x.id === pid);
+  const busy = ((portal && portal.macs) || []).filter(m => m.runtime && m.runtime.busy);
+  confirmDialog({
+    title: `Release ${esc((portal && portal.name) || "portal")}?`,
+    okText: "Release", okClass: "btn-danger",
+    body: `<div class="mb-2">Release all ${((portal && portal.macs) || []).length} MAC(s) of this portal
+        (${busy.length} busy here right now)?</div>
+      <div class="small text-muted">Stops every stream this proxy runs through them, drops their redirect
+      leases and stale locks, then closes each portal session and handshakes again.</div>`,
+    onOk: async () => {
+      toast("releasing the portal's MACs…");
+      try {
+        const r = await api(`/api/portals/${pid}/release`, { method: "POST", body: {} });
+        toast(`${r.count} MAC(s) released · ${r.released_streams} stream(s) stopped`
+              + (r.stale_locks ? ` · ${r.stale_locks} stale lock(s) cleared` : ""), "warn", 8000);
+      } catch (e) { toast(`release failed - ${e.message}`, "error"); }
+      table.reload();
+    }
+  });
+}
+async function releaseAllMacs() {
+  // The bulk form of the same thing. Asking the panel costs one create_link
+  // per MAC, so it is opt-in here and on by default for a single MAC.
+  const ov = await api("/api/portals/release-overview").catch(() => ({ busy: 0, ghost: 0 }));
+  const body = el("div");
+  body.innerHTML = `<div class="mb-2">Release every MAC of every portal?</div>
+    <div class="small mb-2">Right now: <b>${ov.busy}</b> MAC(s) busy in this proxy${ov.ghost ? `, of which <b>${ov.ghost}</b> stuck with no stream behind them` : ""}.</div>
+    <ul class="small mb-2">
+      <li>stops every stream this proxy is running through any MAC</li>
+      <li>drops redirect leases and stale locks on all MACs</li>
+      <li>closes every pooled portal session and handshakes again</li>
+    </ul>
+    <div class="form-check mb-1">
+      <input class="form-check-input" type="checkbox" id="rel-only-busy">
+      <label class="form-check-label small" for="rel-only-busy">only MACs this proxy has something on (faster; leaves other sessions alone)</label>
+    </div>
+    <div class="form-check">
+      <input class="form-check-input" type="checkbox" id="rel-verify">
+      <label class="form-check-label small" for="rel-verify">ask each panel afterwards whether its MAC is free (one portal request per MAC, and a few seconds of its connection slot)</label>
+    </div>`;
+  confirmDialog({
+    title: "Release all MACs", okText: "Release all", okClass: "btn-danger", body,
+    onOk: async () => {
+      toast("releasing every MAC…");
+      try {
+        const r = await api("/api/portals/release-streams", { method: "POST", body: {
+          only_busy: $("#rel-only-busy", body).checked,
+          verify: $("#rel-verify", body).checked } });
+        toast(`${r.count} MAC(s) released · ${r.released_streams} stream(s) stopped`
+              + (r.stale_locks ? ` · ${r.stale_locks} stale lock(s) cleared` : ""), "warn", 8000);
+      } catch (e) { toast(`release failed - ${e.message}`, "error"); }
+      table.reload();
+    }
+  });
 }
 function probeMac(pid, mid, mac) {
   // The one question local state cannot answer: does the PANEL still have this
@@ -200,6 +315,8 @@ function makeTable() {
                 onclick="probeMac(${r.id}, ${m.id}, '${m.mac}')"><i class="bi bi-broadcast-pin"></i></button>
               <button class="btn btn-xs btn-outline-danger py-0 px-1" title="delete mac"
                 onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
+              ${m.runtime && m.runtime.busy ? `<button class="btn btn-xs btn-outline-danger py-0 px-1" title="release this MAC: stop the stream(s) this proxy runs through it, drop its portal session and handshake again, then ask the panel whether it is free"
+                onclick="releaseOneMac(${r.id}, ${m.id})"><i class="bi bi-eject"></i> release</button>` : ""}
             </div>`;
           }).join("") || '<span class="text-muted small">none</span>';
           const cmp = multi
@@ -213,6 +330,7 @@ function makeTable() {
           <button class="btn btn-outline-secondary" title="Edit / genres / content" onclick="editPortal(${r.id})"><i class="bi bi-pencil"></i></button>
           <button class="btn btn-outline-secondary" title="Resolve URL" onclick="resolvePortal(${r.id})"><i class="bi bi-signpost-split"></i></button>
           <button class="btn btn-outline-secondary" title="Fetch content" onclick="fetchPortal(${r.id})"><i class="bi bi-cloud-download"></i></button>
+          <button class="btn btn-outline-danger" title="Release every MAC of this portal: stop the streams this proxy runs through them, drop their portal sessions and handshake again" onclick="releasePortalMacs(${r.id})"><i class="bi bi-eject"></i></button>
           <button class="btn btn-outline-danger" title="Delete" onclick="deletePortal(${r.id})"><i class="bi bi-trash"></i></button>
         </div>` },
     ],
@@ -1068,6 +1186,7 @@ $("#btn-del-sel").addEventListener("click", async () => {
     onOk: async () => { for (const id of ids) { try { await api(`/api/portals/${id}`, { method: "DELETE" }); } catch (e) {} } table.reload(); } });
 });
 $("#btn-add").addEventListener("click", () => editPortal(null));
+$("#btn-release-all").addEventListener("click", () => releaseAllMacs());
 $("#btn-reload").addEventListener("click", () => table.reload());
 $("#btn-import").addEventListener("click", () => $("#import-file").click());
 $("#import-file").addEventListener("change", async (e) => {

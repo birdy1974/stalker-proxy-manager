@@ -40,7 +40,7 @@ from tests.test_mac_availability import _FakeClient, _FakePool, _live_route
 
 
 async def _silent_for_window(self, command, url, *, title, pace,
-                             first_byte_timeout=None):
+                             first_byte_timeout=None, owner=None):
     """ffmpeg 'lives' for exactly the window it was given, then reports silence."""
     await asyncio.sleep(float(first_byte_timeout or 0.0))
     return None, b"", {"rc": None, "tail": "", "stalled": True}

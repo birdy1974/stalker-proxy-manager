@@ -47,7 +47,7 @@ MAC_ADDRS = ("00:1A:79:00:12:AD", "00:1A:79:01:6D:BF",
 
 
 async def _silent_for_window(self, command, url, *, title, pace,
-                             first_byte_timeout=None):
+                             first_byte_timeout=None, owner=None):
     """ffmpeg 'lives' for exactly the window it was given, then reports silence."""
     await asyncio.sleep(float(first_byte_timeout or 0.0))
     return None, b"", {"rc": None, "tail": "", "stalled": True}
@@ -154,7 +154,7 @@ async def test_a_slow_vod_plays_once_it_produces_a_byte(monkeypatch):
     pl, _macs = await _vod_route()
 
     async def slow_then_data(self, command, url, *, title, pace,
-                             first_byte_timeout=None):
+                             first_byte_timeout=None, owner=None):
         # arrives just before the window would have declared it silent
         await asyncio.sleep(float(first_byte_timeout or 0.0) - 0.05)
         return _Proc(), b"data", None

@@ -369,7 +369,8 @@ async def test_the_starting_marker_is_cleared_when_the_walk_ends(monkeypatch):
     events: list = []
     monkeypatch.setattr(sm, "POOL", _RecordingPool(_RecordingClient(events), events))
 
-    async def no_data(self, command, url, *, title, pace, first_byte_timeout=None):
+    async def no_data(self, command, url, *, title, pace, first_byte_timeout=None,
+                       owner=None):
         assert MANAGER.starting, "the play must be marked as starting while it looks"
         return None, b"", {"rc": 8, "tail": "x", "stalled": False}
     monkeypatch.setattr(sm.StreamManager, "_open_with_identity", no_data)

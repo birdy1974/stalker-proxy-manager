@@ -91,6 +91,12 @@ async def dashboard(db=Depends(get_db)):
     api["streams_active"] = len(streams)
     from ..portal.pool import POOL
     api["portal_sessions"] = POOL.stats()
+    # MAC occupancy belongs on the dashboard as well as on the Portals tab:
+    # the two disagreeing without either of them saying so is exactly how a
+    # stuck MAC went unnoticed - "no active streams" here, "streaming" there.
+    # `ghost` counts MACs held by bookkeeping with no stream behind them.
+    from ..services.mac_release import occupancy_overview
+    api["mac_occupancy"] = occupancy_overview()
     api["streams_per_user"] = [{"user": k, "streams": v}
                                for k, v in sorted(per_user.items(), key=lambda kv: -kv[1])]
     diag = _diagnostics()

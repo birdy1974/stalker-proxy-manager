@@ -699,6 +699,93 @@ async def probe_all_portal_macs(pid: int, payload: dict | None = None):
     return await mac_probe.probe_portal(pid, only_free=bool(body.get("only_free")))
 
 
+# ------------------------------------------------------------------ release
+@router.post("/{pid}/macs/{mid}/release")
+async def release_portal_mac(pid: int, mid: int, payload: dict | None = None,
+                            db=Depends(get_db)):
+    """Let one MAC go: end every stream this proxy holds on it, then ask.
+
+    There is no "close stream" call in the Stalker protocol - the panel counts
+    one connection slot per MAC and only mentions it as a refusal. So this does
+    the two things that can be done, and then *reports* whether they worked:
+
+      * **local** - kill this MAC's ffmpeg pipes (a real stream, the one the
+        dashboard lists), drop its redirect lease (a player we sent to the
+        panel's CDN), and clear stale locks left by a start that was cancelled
+        before it produced data (the "portals tab says streaming, dashboard
+        says nothing" case).
+      * **panel** - drop this MAC's pooled session and handshake again: a
+        panel binds one token per MAC, so the fresh handshake retires the
+        previous session's token.
+
+    Body (all optional):
+      verify  – default true: probe the MAC afterwards and include the panel's
+                own verdict ("available" or why not). Costs one create_link
+                and a few seconds of a connection slot.
+      panel   – default true: do the session-drop + re-handshake step.
+
+    The answer names what was ended (`local.killed`), so the GUI can say
+    "stopped NPO 1 (wouter)" instead of "released".
+    """
+    from ..services import mac_release
+    body = payload or {}
+    portal = await db.get(Portal, pid)
+    mac = await db.get(MacAddress, mid)
+    if not portal or not mac or mac.portal_id != pid:
+        raise HTTPException(404, "portal or MAC not found")
+    return await mac_release.release_one(
+        portal, mac,
+        verify=body.get("verify", True),
+        panel=bool(body.get("panel", True)))
+
+
+@router.post("/{pid}/release")
+async def release_portal_macs(pid: int, payload: dict | None = None, db=Depends(get_db)):
+    """Release every MAC of one portal (see the per-MAC endpoint above).
+
+    Body (all optional): `verify` (default **false** - one create_link per MAC
+    is a lot of panel traffic for a bulk action), `panel` (default true),
+    `only_busy` (default false: touch MACs this proxy has nothing on too, so a
+    stuck panel session is retired as well).
+    """
+    from ..services import mac_release
+    body = payload or {}
+    out = await mac_release.release_portal(
+        pid, verify=bool(body.get("verify")),
+        panel=bool(body.get("panel", True)),
+        only_busy=bool(body.get("only_busy")))
+    if out.get("ok") is False:
+        raise HTTPException(404, out.get("error") or "portal not found")
+    return out
+
+
+@router.post("/release-streams")
+async def release_all_macs(payload: dict | None = None, db=Depends(get_db)):
+    """Release every MAC of every portal (the "release all" button).
+
+    Same body as `/{pid}/release`: `verify` (default false), `panel`
+    (default true), `only_busy` (default false).
+    """
+    from ..services import mac_release
+    body = payload or {}
+    return await mac_release.release_all(
+        verify=bool(body.get("verify")),
+        panel=bool(body.get("panel", True)),
+        only_busy=bool(body.get("only_busy")))
+
+
+@router.get("/release-overview")
+async def release_overview(db=Depends(get_db)):
+    """What the release buttons would touch, without touching anything.
+
+    Lets the confirmation name the damage ("ends 2 streams on 3 MACs"), and
+    tells a stale lock apart from a real stream - the difference between
+    "somebody is watching" and "leftover bookkeeping from a cancelled start".
+    """
+    from ..services import mac_release
+    return mac_release.occupancy_overview()
+
+
 @router.post("/{pid}/compare-genres")
 async def compare_portal_genres(pid: int, payload: dict | None = None):
     """Compare selected `mac_ids` (or every online MAC for legacy callers).
