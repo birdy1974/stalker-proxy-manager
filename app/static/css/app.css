@@ -32,6 +32,14 @@ body { background: var(--spm-bg); }
 /* Name/title columns: let them wrap onto a second line instead of hiding the
    tail of "Some Movie (2026) [1080p] Extended Director's Cut". */
 .table-spm td.col-name { white-space: normal; overflow: visible; text-overflow: clip; max-width: 420px; word-break: break-word; }
+/* Portals → MAC addresses: one MAC per visual row, never wrapped. The cell
+   takes the room its content needs (the generic 460px td cap would fold the
+   row in two); the table host scrolls horizontally on narrow screens. */
+.table-spm td.col-macs { max-width: none; }
+/* ... and the neighbouring portal columns are capped so they cannot steal
+   that room back. The portal URL keeps its full value in a tooltip. */
+.table-spm td.col-portal { max-width: 200px; }
+.table-spm td.col-portal .portal-url { display: block; overflow: hidden; text-overflow: ellipsis; }
 .table-spm tbody tr:hover { background: #f0fdfa; }
 .table-spm .filters input, .table-spm .filters select { font-size: .75rem; padding: .1rem .3rem; height: 26px; }
 
