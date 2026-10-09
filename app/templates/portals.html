@@ -155,17 +155,20 @@ function makeTable() {
       { key: "enabled", label: "On", width: "40px", render: r =>
         `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""}
           onchange="api('/api/portals/${r.id}',{method:'PUT',body:{enabled:this.checked}}).then(()=>toast('portal ${r.enabled ? "disabled" : "enabled"}','ok'))"></div>` },
-      { key: "name", label: "Portal", sort: "name", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono">${esc(r.base_url)}</div>`
+      { key: "name", label: "Portal", sort: "name", class: "col-portal", width: "250px", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono portal-url" title="${esc(r.base_url)}">${esc(r.base_url)}</div>`
           /* visible in the list, not only in the editor: an unverified portal is
              a deliberate exception and should be easy to spot and remove */
-          + (r.tls_insecure ? '<div><span class="badge text-bg-warning" title="certificate verification is OFF for this portal"><i class="bi bi-shield-exclamation"></i> TLS unverified</span></div>' : ""),
+          + (r.tls_insecure ? '<div><span class="badge text-bg-warning" title="certificate verification is OFF for this portal"><i class="bi bi-shield-exclamation"></i> TLS unverified</span></div>' : "")
+          /* multi-MAC portals get the genre comparison here, under the address,
+             so the MAC column holds nothing but one single-line row per MAC */
+          + ((r.macs || []).length >= 2 ? `<div><button class="btn btn-xs btn-outline-secondary mt-1" title="Select MACs and compare their Live, VOD and Series packages" onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button></div>` : ""),
         filter: { type: "text", placeholder: "name…" } },
-      { key: "resolved_path", label: "Resolved path", render: r => r.resolved_url ? `<span class="badge text-bg-light mono">${esc(r.resolved_path || "?")}</span>` : '<span class="text-muted small">not resolved</span>' },
+      { key: "resolved_path", label: "Resolved path", width: "110px", render: r => r.resolved_url ? `<span class="badge text-bg-light mono">${esc(r.resolved_path || "?")}</span>` : '<span class="text-muted small">not resolved</span>' },
       /* what the panel said about itself (version.js + get_modules, read on
          Resolve). In the list and not only in the editor, because it is the first
          line of any "this portal behaves oddly" report - and a VOD catalogue
          that is empty stops being a mystery once the row says `no vclub`. */
-      { key: "portal_version", label: "Panel", render: r => {
+      { key: "portal_version", label: "Panel", width: "140px", render: r => {
           const mods = r.modules || null;
           const off = Object.entries(r.features || {}).filter(([, v]) => v === false).map(([k]) => k);
           const ver = r.portal_version ? `<span class="badge text-bg-info">${esc(r.portal_version)}</span>` : "";
@@ -180,21 +183,23 @@ function makeTable() {
       /* R7 in one badge per row: "offered" means we found an account and have
          changed nothing, which is the whole point of keeping the two steps apart */
       { key: "xtream", label: "Xtream", width: "150px", render: r => xtreamHtml(r, false) },
-      { key: "macs", label: "MAC addresses", render: r => {
-          const multi = (r.macs || []).length >= 2;
+      { key: "macs", label: "MAC addresses", class: "col-macs", render: r => {
           const rows = (r.macs || []).map(m => {
-            const checked = m.last_checked ? ` · checked ${esc(fmtTime(m.last_checked, { seconds: false }))}` : "";
+            /* one MAC per visual row, never wrapped (see td.col-macs): the
+               checked time moves into the MAC tooltip to buy the row ~130px */
+            const checkedTip = m.last_checked
+              ? `last checked ${fmtTime(m.last_checked, { seconds: false })}`
+              : "never checked";
             const gc = m.genre_counts || {};
             const compared = m.genres_compared_at
               ? `Compared ${esc(fmtTime(m.genres_compared_at, { seconds: false }))}` : "Not compared yet";
             const genreCounts = [gc.live, gc.vod, gc.series].some(v => v !== null && v !== undefined)
               ? `<span class="badge text-bg-light" title="${compared}">Genres L ${gc.live ?? '?'} · V ${gc.vod ?? '?'} · S ${gc.series ?? '?'}</span>`
               : `<span class="small text-muted" title="Run Compare genres across MACs">genres not compared</span>`;
-            return `<div class="d-flex flex-wrap align-items-center gap-2 mb-1">
-              <span class="mono small">${esc(m.mac)}</span> ${statusBadge(m)} ${runtimeBadge(m)}
+            return `<div class="d-flex flex-nowrap align-items-center gap-2 mb-1">
+              <span class="mono small" title="${esc(checkedTip)}">${esc(m.mac)}</span> ${statusBadge(m)} ${runtimeBadge(m)}
               <span class="small text-muted" title="expire date from the panel">${esc(m.expire_date || "")}</span>
               ${genreCounts}
-              <span class="small text-muted">${checked}</span>
               <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="STB identity this portal is told (serial, device id) - pin the values your box really sends"
                 onclick="pinIdentity(${r.id}, ${m.id}, '${m.mac}', '${esc(m.sn || "")}', '${esc(m.device_id || "")}')"><i class="bi bi-cpu"></i></button>
               <button class="btn btn-xs btn-outline-secondary py-0 px-1" title="Test this MAC against the panel: is it available, or is somebody else already streaming on it? (costs one portal request and a few seconds of a connection slot)"
@@ -205,13 +210,11 @@ function makeTable() {
                 onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
             </div>`;
           }).join("") || '<span class="text-muted small">none</span>';
-          const cmp = multi
-            ? `<button class="btn btn-xs btn-outline-secondary mt-1" title="Select MACs and compare their Live, VOD and Series packages"
-                 onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button>`
-            : "";
-          return rows + cmp;
+          /* the "Compare genres across MACs" button lives in the Portal column,
+             under the address - this column holds one single-line row per MAC */
+          return rows;
         } },
-      { key: "actions", label: "Actions", render: r => `
+      { key: "actions", label: "Actions", width: "140px", render: r => `
         <div class="btn-group btn-group-sm">
           <button class="btn btn-outline-secondary" title="Edit / genres / content" onclick="editPortal(${r.id})"><i class="bi bi-pencil"></i></button>
           <button class="btn btn-outline-secondary" title="Resolve URL" onclick="resolvePortal(${r.id})"><i class="bi bi-signpost-split"></i></button>

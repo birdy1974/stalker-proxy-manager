@@ -1697,6 +1697,12 @@ class StreamManager:
                 return_when=asyncio.FIRST_COMPLETED)
         except Exception:  # noqa: BLE001 - never let the wait break the pump
             done = set()
+        except BaseException:
+            # Unwinding (the client left mid-start): drop the two waiters - the
+            # process itself is killed one frame up, which completes them anyway.
+            read_t.cancel()
+            exit_t.cancel()
+            raise
         if read_t in done:
             try:
                 data = read_t.result() or b""
@@ -2376,6 +2382,14 @@ class StreamManager:
                 if rung + 1 < len(choices):
                     continue
                 return None, b"", last
+            except BaseException:
+                # Same orphan as the ffmpeg path (see _open_with_identity): a
+                # disconnect while the headers are still on their way must not
+                # leave the client - and the panel connection behind it - open
+                # until garbage collection.
+                await run_uncancelled(client.aclose(),
+                                      what="cancelled passthrough teardown")
+                raise
 
             elapsed = time.monotonic() - t0
             if resp.status_code >= 400:
@@ -2422,6 +2436,12 @@ class StreamManager:
                 await stream._close()
                 last = {"rc": 1, "tail": f"read error: {exc}", "stalled": False}
                 return None, b"", last
+            except BaseException:
+                # Same orphan as above, one stage later: the upstream socket
+                # is the panel's connection slot, so close it deterministically.
+                await run_uncancelled(stream._close(),
+                                      what="cancelled passthrough teardown")
+                raise
 
             if not first:
                 await stream._close()
@@ -2474,7 +2494,19 @@ class StreamManager:
                                      user_agent=ua)
             if proc is None:
                 return None, b"", None
-            first = await self._first_bytes(proc, first_byte_timeout)
+            try:
+                first = await self._first_bytes(proc, first_byte_timeout)
+            except BaseException:
+                # The caller is going away (the player disconnected while this
+                # candidate was still starting, the engine gave up, ...): a
+                # process that stays alive here keeps running with nobody
+                # reading it and keeps holding its panel slot until IT gives
+                # up - the production orphan that logged "rc=8" 18 s after
+                # its request was already dead. Kill it where the unwinding
+                # cannot interrupt the kill, then keep unwinding.
+                await run_uncancelled(self._kill_quiet(proc),
+                                      what="cancelled spawn teardown")
+                raise
             if first:
                 if ua:
                     stream_identity.remember(url, ua)
@@ -4023,7 +4055,20 @@ class StreamManager:
                                   # reason - VAAPI init, a 4xx on the media request, a
                                   # panel slot check - to guesswork.
                                   tail = (open_fail.get("tail") or "").strip()
-                                  words = f" | ffmpeg's last words: {tail[:400]}" if tail else ""
+                                  if tail:
+                                      words = f" | ffmpeg's last words: {tail[:400]}"
+                                  else:
+                                      # No output at all - not even the banner ffmpeg
+                                      # always prints before it opens an input. This
+                                      # process never reached the media request, so the
+                                      # stall is in local startup (process init /
+                                      # -init_hw_device on this box), not a portal or
+                                      # network refusal - say so, or the next such line
+                                      # sends somebody debugging the wrong host.
+                                      words = (" | ffmpeg printed nothing at all before it was "
+                                               "killed - it never reached the media request "
+                                               "(suspect local startup or hardware-device "
+                                               "init, not the portal)")
                                   note_candidate_failure(h.route_key, src, mac_row)
                                   other_failures += 1
                                   if open_fail["stalled"]:
@@ -4160,7 +4205,7 @@ class StreamManager:
                 # step (proc.wait, the active_streams DELETE, the log write)
                 # awaits something a cancellation would abort halfway.
                 await run_uncancelled(self._finish(h), what="stream teardown")
-            if not registered:
+            if not registered and not h.parked:
                 # The MAC lock is taken BEFORE the stream is registered. A client
                 # that leaves while ffmpeg is still waiting for its first byte
                 # ends the generator here with no process and no registry entry,
@@ -4168,6 +4213,15 @@ class StreamManager:
                 # the portal showing the MAC as "streaming" and the dashboard
                 # empty. Nothing else can hold this stream id, so drop it.
                 self._drop_locks_of(h.id)
+                # ... and the handle is finished: without this nobody ever marks
+                # a start that produced no byte, so the disconnect watchdog -
+                # which waits for a registration that will never come - loops
+                # forever (one leaked task per failed start).
+                # `not h.parked` matters: an attached-then-abandoned stream is
+                # unregistered too (its registry entry predates this pump), and
+                # `_finish` just re-parked it - dropping its lock and marking it
+                # dead here would undo the park it just took.
+                h.dead = True
 
     async def _finish(self, h: StreamHandle) -> None:
         """Complete stream teardown, run outside the dying request's scope."""
