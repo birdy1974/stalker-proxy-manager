@@ -37,8 +37,10 @@ body { background: var(--spm-bg); }
    row in two); the table host scrolls horizontally on narrow screens. */
 .table-spm td.col-macs { max-width: none; }
 /* ... and the neighbouring portal columns are capped so they cannot steal
-   that room back. The portal URL keeps its full value in a tooltip. */
-.table-spm td.col-portal { max-width: 200px; }
+   that room back. The portal URL keeps its full value in a tooltip; the
+   Portal cap leaves room for the "Compare genres across MACs" button that
+   lives under the address on multi-MAC portals. */
+.table-spm td.col-portal { max-width: 280px; }
 .table-spm td.col-portal .portal-url { display: block; overflow: hidden; text-overflow: ellipsis; }
 .table-spm tbody tr:hover { background: #f0fdfa; }
 .table-spm .filters input, .table-spm .filters select { font-size: .75rem; padding: .1rem .3rem; height: 26px; }

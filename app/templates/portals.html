@@ -155,10 +155,13 @@ function makeTable() {
       { key: "enabled", label: "On", width: "40px", render: r =>
         `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""}
           onchange="api('/api/portals/${r.id}',{method:'PUT',body:{enabled:this.checked}}).then(()=>toast('portal ${r.enabled ? "disabled" : "enabled"}','ok'))"></div>` },
-      { key: "name", label: "Portal", sort: "name", class: "col-portal", width: "200px", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono portal-url" title="${esc(r.base_url)}">${esc(r.base_url)}</div>`
+      { key: "name", label: "Portal", sort: "name", class: "col-portal", width: "250px", render: r => `<b>${esc(r.name)}</b><div class="small text-muted mono portal-url" title="${esc(r.base_url)}">${esc(r.base_url)}</div>`
           /* visible in the list, not only in the editor: an unverified portal is
              a deliberate exception and should be easy to spot and remove */
-          + (r.tls_insecure ? '<div><span class="badge text-bg-warning" title="certificate verification is OFF for this portal"><i class="bi bi-shield-exclamation"></i> TLS unverified</span></div>' : ""),
+          + (r.tls_insecure ? '<div><span class="badge text-bg-warning" title="certificate verification is OFF for this portal"><i class="bi bi-shield-exclamation"></i> TLS unverified</span></div>' : "")
+          /* multi-MAC portals get the genre comparison here, under the address,
+             so the MAC column holds nothing but one single-line row per MAC */
+          + ((r.macs || []).length >= 2 ? `<div><button class="btn btn-xs btn-outline-secondary mt-1" title="Select MACs and compare their Live, VOD and Series packages" onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button></div>` : ""),
         filter: { type: "text", placeholder: "name…" } },
       { key: "resolved_path", label: "Resolved path", width: "110px", render: r => r.resolved_url ? `<span class="badge text-bg-light mono">${esc(r.resolved_path || "?")}</span>` : '<span class="text-muted small">not resolved</span>' },
       /* what the panel said about itself (version.js + get_modules, read on
@@ -181,7 +184,6 @@ function makeTable() {
          changed nothing, which is the whole point of keeping the two steps apart */
       { key: "xtream", label: "Xtream", width: "150px", render: r => xtreamHtml(r, false) },
       { key: "macs", label: "MAC addresses", class: "col-macs", render: r => {
-          const multi = (r.macs || []).length >= 2;
           const rows = (r.macs || []).map(m => {
             /* one MAC per visual row, never wrapped (see td.col-macs): the
                checked time moves into the MAC tooltip to buy the row ~130px */
@@ -208,11 +210,9 @@ function makeTable() {
                 onclick="delMac(${r.id}, '${m.mac}')"><i class="bi bi-x"></i></button>
             </div>`;
           }).join("") || '<span class="text-muted small">none</span>';
-          const cmp = multi
-            ? `<button class="btn btn-xs btn-outline-secondary mt-1" title="Select MACs and compare their Live, VOD and Series packages"
-                 onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button>`
-            : "";
-          return rows + cmp;
+          /* the "Compare genres across MACs" button lives in the Portal column,
+             under the address - this column holds one single-line row per MAC */
+          return rows;
         } },
       { key: "actions", label: "Actions", width: "140px", render: r => `
         <div class="btn-group btn-group-sm">
