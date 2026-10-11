@@ -738,6 +738,10 @@ HEDGE_KINDS = {k.strip() for k in os.environ.get("SPM_HEDGE_KINDS", "live").spli
 #: while". 0 disables the restarts.
 MIDSTREAM_RESTARTS = int(os.environ.get("SPM_MIDSTREAM_RESTARTS", "3"))
 MIDSTREAM_RESTART_DELAY = float(os.environ.get("SPM_MIDSTREAM_RESTART_DELAY", "1.5"))
+#: Time budget in seconds allowed to resolve and connect fallback candidate(s)
+#: when a stream dies midstream. A fresh budget is granted on failover so long-playing
+#: channels are never aborted due to the initial zap start budget.
+MIDSTREAM_FAILOVER_BUDGET = float(os.environ.get("SPM_MIDSTREAM_FAILOVER_BUDGET", "30.0"))
 #: kinds allowed to restart (a VOD that ended was *finished*, not dropped)
 MIDSTREAM_RESTART_KINDS = {k.strip() for k in
                            os.environ.get("SPM_MIDSTREAM_RESTART_KINDS", "live").split(",")
@@ -4134,6 +4138,12 @@ class StreamManager:
                               self.unlock_mac(locked, h.id)
                           await self._kill_quiet(proc)
                           if not h.dead:
+                              # Midstream failover: grant a fresh failover budget and reset attempt
+                              # tracking so subsequent fallback candidates are not aborted by the
+                              # expired initial tune-in start budget.
+                              if MIDSTREAM_FAILOVER_BUDGET > 0:
+                                  deadline = time.monotonic() + MIDSTREAM_FAILOVER_BUDGET
+                              h.attempts.clear()
                               await db_log("WARNING", "stream",
                                            f"[{h.item_name}] stream ended from {portal.name}/{mac_row.mac}"
                                            f" -> trying next fallback")
@@ -4166,6 +4176,9 @@ class StreamManager:
                            f"{h.bytes_sent / 1e6:.1f} MB -> re-resolving "
                            f"(restart {MIDSTREAM_RESTARTS - restarts}/{MIDSTREAM_RESTARTS})")
               await asyncio.sleep(MIDSTREAM_RESTART_DELAY)
+              if MIDSTREAM_FAILOVER_BUDGET > 0:
+                  deadline = time.monotonic() + MIDSTREAM_FAILOVER_BUDGET
+              h.attempts.clear()
               chain = self.route_health.ordered_chain(h.route_key, chain)
               yielded_any = False
               busy_skips = 0
