@@ -88,6 +88,7 @@ Named volumes are owned by the image user, so no `PUID`/`PGID` is needed here â€
 | `SPM_LINGER_KINDS` | `live` | kinds that may be parked; a VOD that ended is finished, not held |
 | `SPM_MIDSTREAM_RESTARTS` | `3` | how many times a live stream that died mid-play is restarted inside the same client response (fresh `create_link`, MAC rotation); `0` disables. A VOD that finished is never restarted |
 | `SPM_MIDSTREAM_RESTART_DELAY` | `1.5` | seconds between those restarts |
+| `SPM_MIDSTREAM_FAILOVER_BUDGET` | `30.0` | seconds allowed for walking fallback candidates when a stream ends midstream; resets deadline on failover so streams older than the initial zap budget do not abort |
 | `SPM_MIDSTREAM_RESTART_KINDS` | `live` | kinds allowed to restart after a mid-stream end |
 | `SPM_PORTAL_KEEPALIVE_S` | `90` | how long a pooled portal session keeps its HTTP connection while idle. httpx's own default (5 s) meant every `create_link` after a quiet moment paid a fresh TCP+TLS handshake â€” pure zap latency the portal never asked for. `0` = never expire |
 | `SPM_PORTAL_MAX_CONNECTIONS` | `32` | connections per portal session (one session = one portal + MAC), shared by playback and background fetches |
