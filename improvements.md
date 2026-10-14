@@ -3,7 +3,7 @@
 - in settings give option so user can define how long a channel wil be active to support quick zapping back
 - check memory usage, as it looks like the memory gets filled in case there is a connection / stream open for a long time
 - provide web player that also can handle playlist, so user has an url, needs to login, opens the playlist, user can select a channel, user can select ffmpeg template and play the selected channel.
-- if I use the web preview player in the source tab, the channel is streaming really quick (1 second), same for the preview player in the playlist tab. Why does it takes a lot longer from an external connection (outside the SPM url)
+- if I use the web preview player in the source tab, the channel is streaming really quick (1 second), same for the preview player in the playlist tab. Why does it takes a lot longer from an external connection (outside the SPM url) or it does not connect at all
 
 
 
