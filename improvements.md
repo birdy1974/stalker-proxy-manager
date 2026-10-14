@@ -2,7 +2,7 @@
 - in case Channel list from an enabled genre from the source is fetched again: give options how to show which channels are new/changed. consider an automatic schedule to check channels of enabled genres (live, vod, series) and add a button to show differences so user can quickly add new channels, vod, series
 - in settings give option so user can define how long a channel wil be active to support quick zapping back
 - check memory usage, as it looks like the memory gets filled in case there is a connection / stream open for a long time
-- 
+- provide web player that also can handle playlist, so user has an url, needs to login, opens the playlist, user can select a channel, user can select ffmpeg template and play the selected channel.
 
 
 
