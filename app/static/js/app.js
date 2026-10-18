@@ -719,6 +719,11 @@ function playInModal(url, title) {
         "or an MSE error. Retry with a transcode template (H.264 + AAC).");
     }
   }, 1000);
+  // WorkerGlobalScope fetch requires an absolute URL; a bare "/preview/..." path fails there
+  const absoluteUrl = new URL(url, window.location.href).href;
+  const _kindMatch = /\/(live|vod|series|episode|local)\//.exec(url);
+  const _kind = _kindMatch ? _kindMatch[1] : "live";
+  const _isLive = _kind === "live";
   const t0 = performance.now();
 
   try {
@@ -734,9 +739,9 @@ function playInModal(url, title) {
       engine.on(Hls.Events.MANIFEST_PARSED, () => {
         video.play().catch(() => say("Autoplay was blocked — press ▶ on the player.", "alert-secondary"));
       });
-      engine.loadSource(url); engine.attachMedia(video);
+      engine.loadSource(absoluteUrl); engine.attachMedia(video);
     } else {
-      engine = mpegts.createPlayer({ type: "mpegts", isLive: true, url },
+      engine = mpegts.createPlayer({ type: "mpegts", isLive: _isLive, url: absoluteUrl },
                                    { enableStashBuffer: false, stashInitialSize: 384 });
       engine.on(mpegts.Events.ERROR, (type, detail, info) => {
         pushDiag(`mpegts ERROR ${type}/${detail || ""} ${info?.msg || ""}`);
