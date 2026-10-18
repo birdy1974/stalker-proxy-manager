@@ -1236,7 +1236,8 @@ def default_presets() -> list[dict]:
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k", subs="dvb",
            extra_output="-preset veryfast"),
         mk(COPY_PRESET_NAME, hw_accel="none", video_codec="copy",
-           audio_codec="copy", resolution="source", subs="dvb"),
+           audio_codec="copy", resolution="source", extra_input=fast_input,
+           subs="dvb"),
         # --- Enigma2 / Vu+ Duo2 --------------------------------------------
         # VOD + series as Matroska so text subtitles survive on exteplayer3
         # (service 5002). MPEG-TS has no slot for SRT/ASS, and dvbsub on a
