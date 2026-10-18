@@ -58,10 +58,14 @@
 
     <section id="player-panel" hidden>
       <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
-        <div><h1 class="h4 mb-0">Web player</h1><div class="small muted">Signed in as <span id="account-name"></span></div></div>
-        <div class="d-flex gap-2">
-          <button class="btn btn-sm btn-outline-secondary" id="reload-playlist"><i class="bi bi-arrow-repeat me-1"></i>Reload playlist</button>
-          <button class="btn btn-sm btn-outline-secondary" id="logout"><i class="bi bi-box-arrow-right me-1"></i>Log out</button>
+        <div>
+          <h1 class="h4 mb-0">Web player</h1>
+          <div class="small muted">Signed in as <span id="account-name"></span> <button class="btn btn-link btn-sm p-0 ms-1 align-baseline text-decoration-underline muted" id="switch-user-inline" type="button" title="Log out and sign in as different user">Switch user</button></div>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          <button class="btn btn-sm btn-outline-secondary" id="reload-playlist" type="button"><i class="bi bi-arrow-repeat me-1"></i>Reload playlist</button>
+          <button class="btn btn-sm btn-outline-secondary" id="switch-user" type="button" title="Log out and login as different user"><i class="bi bi-person-gear me-1"></i>Switch user</button>
+          <button class="btn btn-sm btn-outline-secondary" id="logout" type="button"><i class="bi bi-box-arrow-right me-1"></i>Log out</button>
         </div>
       </div>
 
@@ -139,7 +143,6 @@
 
     const KIND_LABEL = {live:"Live", vod:"VOD", episode:"Series", local:"Local"};
     const KIND_BADGE_CLASS = {live:"kind-live", vod:"kind-vod", episode:"kind-episode", local:"kind-local"};
-    const KIND_ICON = {live:"bi-broadcast", vod:"bi-film", episode:"bi-collection-play", local:"bi-hdd"};
 
     async function api(path, options = {}) {
       const response = await fetch(path, {
@@ -192,7 +195,6 @@
       if (!filtered.length) {
         channelSelect.add(new Option(channels.length ? "No items match filter" : "No visible playlist items", ""));
       } else {
-        // Group by kind for visual distinction
         const groups = {live:[], vod:[], episode:[], local:[]};
         const other = [];
         filtered.forEach(item => {
@@ -200,7 +202,6 @@
           else other.push(item);
         });
         const order = ["live","vod","episode","local"];
-        let hasAdded = false;
         channelSelect.add(new Option(`Choose a playlist item… (${filtered.length} shown, ${channels.length} total)`, ""));
         order.forEach(kind => {
           const list = groups[kind];
@@ -210,12 +211,10 @@
           list.forEach(item => {
             const label = `${item.group ? item.group + " · " : ""}${item.name || "Unnamed item"}`;
             const opt = new Option(label, `${item.kind}:${item.id}`);
-            // store kind for styling if needed
             opt.dataset.kind = item.kind;
             og.appendChild(opt);
           });
           channelSelect.appendChild(og);
-          hasAdded = true;
         });
         if (other.length) {
           const og = document.createElement("optgroup");
@@ -226,11 +225,9 @@
           });
           channelSelect.appendChild(og);
         }
-        // Try to restore previous selection if still visible
         if (previousValue && [...channelSelect.options].some(o => o.value === previousValue)) {
           channelSelect.value = previousValue;
         } else if (filtered.length) {
-          // select first real item (skip placeholder)
           for (let i=0;i<channelSelect.options.length;i++) if (channelSelect.options[i].value) { channelSelect.selectedIndex = i; break; }
         }
         filterCount.textContent = `${filtered.length} / ${channels.length}`;
@@ -251,7 +248,6 @@
       $("playlist-status").innerHTML = channels.length
         ? `${channels.length} item${channels.length === 1 ? "" : "s"} in your allowed output playlist — ${summary}.`
         : "No enabled playlist items match this account’s group access.";
-      // Update type hint with per-type counts
       typeHint.textContent = parts.length
         ? `Visible: ${summary}. Browser-compatible enabled MPEG-TS templates are listed; playback stays on SPM.`
         : "Only enabled items in your allowed Live, VOD, Series and Local groups are shown.";
@@ -294,10 +290,41 @@
 
     async function showLogin(message = "") {
       stopPlayback();
+      // reset player state so next user doesn't see previous user's data
+      channels = [];
+      templates = [];
+      // keep select placeholders but clear counts
+      try { channelSelect.replaceChildren(new Option("Loading playlist…","")); } catch {}
+      try { templateSelect.replaceChildren(new Option("Loading templates…","")); } catch {}
+      try { $("playlist-status").textContent = ""; } catch {}
+      try { filterCount.textContent = ""; } catch {}
+      try { selectedMeta.innerHTML = ""; } catch {}
+      try { playStatus.textContent = "Choose a playlist item and template, then press Play."; } catch {}
+      currentKindFilter = "all";
+      try { kindFilter.value = "all"; } catch {}
+      document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === "all"));
+      try { searchFilter.value = ""; } catch {}
       playerPanel.hidden = true;
       loginPanel.hidden = false;
       loginStatus.textContent = message;
       loginStatus.className = "small mt-3 " + (message ? "text-warning" : "");
+      // focus username for quick re-login as different user
+      setTimeout(() => { try { $("username").focus(); } catch {} }, 50);
+    }
+
+    async function doLogout({ switchUser = false } = {}) {
+      stopPlayback();
+      try { await api("/player/logout", { method: "POST" }); } catch {}
+      if (switchUser) {
+        // prepare form for a different user
+        $("username").value = "";
+        $("password").value = "";
+        await showLogin("Switched user — enter credentials for different account.");
+      } else {
+        // regular logout keeps username for convenience, clears password
+        $("password").value = "";
+        await showLogin("You have been logged out.");
+      }
     }
 
     $("login-form").addEventListener("submit", async event => {
@@ -311,6 +338,7 @@
         }) });
         $("password").value = "";
         await loadPlayer();
+        playStatus.textContent = "Signed in — choose a playlist item and template, then press Play.";
       } catch (error) {
         loginStatus.textContent = error.message;
         loginStatus.className = "small mt-3 text-warning";
@@ -319,10 +347,9 @@
 
     $("reload-playlist").addEventListener("click", async () => {
       try { await loadPlayer(); playStatus.textContent = "Playlist and templates reloaded."; }
-      catch (error) { if (/session|login|expired|disabled/i.test(error.message)) await showLogin(error.message); else playStatus.textContent = error.message; }
+      catch (error) { if (/session|login|required|expired|disabled/i.test(error.message)) await showLogin(error.message); else playStatus.textContent = error.message; }
     });
 
-    // Kind filter handling
     kindFilter.addEventListener("change", () => {
       currentKindFilter = kindFilter.value;
       document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === currentKindFilter));
@@ -350,7 +377,6 @@
       }
       stopPlayback();
       const template = templates.find(row => String(row.id) === templateId);
-      // Build absolute URL — WorkerGlobalScope fetch cannot parse a bare relative path
       const relativePath = `/player/stream/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.id)}.ts?tpl=${encodeURIComponent(templateId)}`;
       const url = new URL(relativePath, window.location.href).href;
       const isLive = item.kind === "live";
@@ -358,16 +384,13 @@
       const isLocal = item.kind === "local";
       video.muted = true;
       video.controls = true;
-      // Distinguish UI per kind
       const badge = kindBadge(item.kind);
       playStatus.innerHTML = `${badge} Connecting to ${esc(item.name)} <span class="muted">with ${esc(template?.name || "the selected template")}…</span>`;
       try {
-        // mpegts.js config tuned per kind: live keeps stash off + auto-cleanup, VOD/series allow seek, local is VOD-like
         const playerConfig = {
           type: "mpegts",
           isLive: isLive,
           url: url,
-          // For VOD/series, allow seeking; for live, keep low-latency
           hasAudio: true,
           hasVideo: true,
         };
@@ -378,16 +401,13 @@
           autoCleanupSourceBuffer: true,
           autoCleanupMaxBackwardDuration: isLive ? 30 : 120,
           autoCleanupMinBackwardDuration: isLive ? 10 : 30,
-          // Live streams are low-latency; VOD benefits from larger buffer
           lazyLoad: !isLive,
           lazyLoadMaxDuration: isVodLike || isLocal ? 120 : 30,
         };
         engine = mpegts.createPlayer(playerConfig, opts);
         engine.on(mpegts.Events.ERROR, (type, detail, info) => {
-          // If local file is actually an MP4 served directly (not TS), mpegts will error — fallback to native
           const msg = info?.msg ? ` — ${info.msg}` : "";
           playStatus.innerHTML = `${badge} Player error: ${esc(type)}/${esc(detail)}${esc(msg)}`;
-          // For local, offer native fallback hint
           if (isLocal && /codec|format|demux/i.test(type + detail + msg)) {
             playStatus.innerHTML += ` <span class="text-warning">(Local file may need transcoding — try another template)</span>`;
           }
@@ -426,9 +446,13 @@
       playStatus.innerHTML = kindBadge(channels.find(r=>`${r.kind}:${r.id}`===channelSelect.value)?.kind || "live") + " Sound enabled.";
     });
     $("logout").addEventListener("click", async () => {
-      stopPlayback();
-      try { await api("/player/logout", { method: "POST" }); } catch {}
-      await showLogin("You have been logged out.");
+      await doLogout({ switchUser: false });
+    });
+    $("switch-user").addEventListener("click", async () => {
+      await doLogout({ switchUser: true });
+    });
+    $("switch-user-inline").addEventListener("click", async () => {
+      await doLogout({ switchUser: true });
     });
 
     // A valid signed-in session survives page refresh; credentials never need
