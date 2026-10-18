@@ -20,6 +20,15 @@
     .muted { color: #a8b6c1; }
     .accent { background: #287b69; border-color: #287b69; }
     .accent:hover { background: #32917b; border-color: #32917b; }
+    .kind-badge { font-size: 0.70rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; padding: .22em .45em; border-radius: .35rem; }
+    .kind-live { background: #1a5c4a; color: #a8f0d8; border: 1px solid #287b69; }
+    .kind-vod { background: #2a3d6b; color: #a8c4ff; border: 1px solid #3a5a9a; }
+    .kind-episode { background: #5a2d6b; color: #e0b0ff; border: 1px solid #7a4a8a; }
+    .kind-local { background: #6b4a2a; color: #ffd6a8; border: 1px solid #9a6a3a; }
+    .filter-pills { display:flex; flex-wrap:wrap; gap:.4rem; }
+    .filter-pill { font-size:.78rem; padding:.28em .7em; border-radius:999px; border:1px solid #3a4a56; background:#111b23; color:#a8b6c1; cursor:pointer; }
+    .filter-pill.active { background:#287b69; border-color:#287b69; color:#fff; }
+    .filter-pill:hover { border-color:#73c4ad; }
     @media (max-width: 600px) { .video-frame { min-height: 180px; } }
   </style>
 </head>
@@ -49,21 +58,35 @@
 
     <section id="player-panel" hidden>
       <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
-        <div><h1 class="h4 mb-0">Web player</h1><div class="small muted">Signed in as <span id="account-name"></span></div></div>
-        <div class="d-flex gap-2">
-          <button class="btn btn-sm btn-outline-secondary" id="reload-playlist"><i class="bi bi-arrow-repeat me-1"></i>Reload playlist</button>
-          <button class="btn btn-sm btn-outline-secondary" id="logout"><i class="bi bi-box-arrow-right me-1"></i>Log out</button>
+        <div>
+          <h1 class="h4 mb-0">Web player</h1>
+          <div class="small muted">Signed in as <span id="account-name"></span> <button class="btn btn-link btn-sm p-0 ms-1 align-baseline text-decoration-underline muted" id="switch-user-inline" type="button" title="Log out and sign in as different user">Switch user</button></div>
+        </div>
+        <div class="d-flex gap-2 flex-wrap">
+          <button class="btn btn-sm btn-outline-secondary" id="reload-playlist" type="button"><i class="bi bi-arrow-repeat me-1"></i>Reload playlist</button>
+          <button class="btn btn-sm btn-outline-secondary" id="switch-user" type="button" title="Log out and login as different user"><i class="bi bi-person-gear me-1"></i>Switch user</button>
+          <button class="btn btn-sm btn-outline-secondary" id="logout" type="button"><i class="bi bi-box-arrow-right me-1"></i>Log out</button>
         </div>
       </div>
 
       <div class="card mb-3">
         <div class="card-body">
           <div class="row g-3 align-items-end">
-            <div class="col-lg-6">
+            <div class="col-lg-5">
               <label class="form-label small" for="channel">Playlist item</label>
               <select class="form-select" id="channel" aria-label="Playlist item"><option value="">Loading playlist…</option></select>
             </div>
-            <div class="col-lg-4">
+            <div class="col-lg-3">
+              <label class="form-label small" for="kind-filter">Content type</label>
+              <select class="form-select" id="kind-filter" aria-label="Content type filter">
+                <option value="all">All types</option>
+                <option value="live">Live</option>
+                <option value="vod">VOD</option>
+                <option value="episode">Series</option>
+                <option value="local">Local</option>
+              </select>
+            </div>
+            <div class="col-lg-2">
               <label class="form-label small" for="template">FFmpeg template</label>
               <select class="form-select" id="template" aria-label="FFmpeg template"><option value="">Loading templates…</option></select>
             </div>
@@ -71,7 +94,21 @@
               <button class="btn accent" id="play" type="button"><i class="bi bi-play-fill me-1"></i>Play</button>
             </div>
           </div>
-          <div class="small muted mt-2">Only enabled items in your allowed Live, VOD, Series and Local groups are shown. Browser-compatible enabled MPEG-TS templates are listed; playback stays on SPM and uses the normal fallback, connection-limit and stream-cleanup pipeline.</div>
+          <div class="d-flex flex-wrap gap-2 align-items-center mt-3">
+            <span class="small muted">Filter:</span>
+            <div class="filter-pills" id="kind-pills">
+              <button type="button" class="filter-pill active" data-kind="all">All</button>
+              <button type="button" class="filter-pill" data-kind="live"><i class="bi bi-broadcast me-1"></i>Live</button>
+              <button type="button" class="filter-pill" data-kind="vod"><i class="bi bi-film me-1"></i>VOD</button>
+              <button type="button" class="filter-pill" data-kind="episode"><i class="bi bi-collection-play me-1"></i>Series</button>
+              <button type="button" class="filter-pill" data-kind="local"><i class="bi bi-hdd me-1"></i>Local</button>
+            </div>
+            <div class="ms-auto d-flex gap-2 align-items-center">
+              <input class="form-control form-control-sm" id="search-filter" placeholder="Search…" style="max-width:180px">
+              <span class="small muted" id="filter-count"></span>
+            </div>
+          </div>
+          <div class="small muted mt-2"><span id="type-hint">Only enabled items in your allowed Live, VOD, Series and Local groups are shown.</span> Browser-compatible enabled MPEG-TS templates are listed; playback stays on SPM and uses the normal fallback, connection-limit and stream-cleanup pipeline. <span id="selected-meta"></span></div>
         </div>
       </div>
 
@@ -98,7 +135,14 @@
     const loginPanel = $("login-panel"), playerPanel = $("player-panel");
     const loginStatus = $("login-status"), playStatus = $("play-status");
     const video = $("video"), channelSelect = $("channel"), templateSelect = $("template");
+    const kindFilter = $("kind-filter"), searchFilter = $("search-filter"), filterCount = $("filter-count");
+    const selectedMeta = $("selected-meta"), typeHint = $("type-hint");
     let engine = null, channels = [], templates = [], playingHandler = null;
+    let currentKindFilter = "all";
+    let nativeFallback = false;
+
+    const KIND_LABEL = {live:"Live", vod:"VOD", episode:"Series", local:"Local"};
+    const KIND_BADGE_CLASS = {live:"kind-live", vod:"kind-vod", episode:"kind-episode", local:"kind-local"};
 
     async function api(path, options = {}) {
       const response = await fetch(path, {
@@ -120,26 +164,110 @@
       try { engine?.detachMediaElement(); } catch {}
       try { engine?.destroy(); } catch {}
       engine = null;
+      nativeFallback = false;
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+    }
+
+    function kindBadge(kind) {
+      const cls = KIND_BADGE_CLASS[kind] || "kind-live";
+      const label = KIND_LABEL[kind] || kind;
+      return `<span class="kind-badge ${cls}">${label}</span>`;
+    }
+
+    function filteredItems() {
+      let out = channels;
+      if (currentKindFilter !== "all") out = out.filter(i => i.kind === currentKindFilter);
+      const q = (searchFilter.value || "").trim().toLowerCase();
+      if (q) out = out.filter(i => (i.name||"").toLowerCase().includes(q) || (i.group||"").toLowerCase().includes(q) || (KIND_LABEL[i.kind]||i.kind).toLowerCase().includes(q));
+      return out;
     }
 
     function fillChannels(items) {
       channels = items || [];
-      channelSelect.replaceChildren(new Option(channels.length ? "Choose a playlist item…" : "No visible playlist items", ""));
-      channels.forEach(item => {
-        const type = ({live:"Live", vod:"VOD", episode:"Episode", local:"Local"})[item.kind] || item.kind;
-        const label = `${type}${item.group ? " · " + item.group : ""} · ${item.name || "Unnamed item"}`;
-        channelSelect.add(new Option(label, `${item.kind}:${item.id}`));
-      });
-      if (channels.length) channelSelect.selectedIndex = 1;
-      $("playlist-status").textContent = channels.length
-        ? `${channels.length} item${channels.length === 1 ? "" : "s"} in your allowed output playlist.`
-        : "No enabled playlist items match this account’s group access.";
+      renderChannelSelect();
+      updatePlaylistStatus();
     }
+
+    function renderChannelSelect() {
+      const filtered = filteredItems();
+      const previousValue = channelSelect.value;
+      channelSelect.replaceChildren();
+      if (!filtered.length) {
+        channelSelect.add(new Option(channels.length ? "No items match filter" : "No visible playlist items", ""));
+      } else {
+        const groups = {live:[], vod:[], episode:[], local:[]};
+        const other = [];
+        filtered.forEach(item => {
+          if (groups[item.kind]) groups[item.kind].push(item);
+          else other.push(item);
+        });
+        const order = ["live","vod","episode","local"];
+        channelSelect.add(new Option(`Choose a playlist item… (${filtered.length} shown, ${channels.length} total)`, ""));
+        order.forEach(kind => {
+          const list = groups[kind];
+          if (!list.length) return;
+          const og = document.createElement("optgroup");
+          og.label = `${KIND_LABEL[kind] || kind} — ${list.length}`;
+          list.forEach(item => {
+            const label = `${item.group ? item.group + " · " : ""}${item.name || "Unnamed item"}`;
+            const opt = new Option(label, `${item.kind}:${item.id}`);
+            opt.dataset.kind = item.kind;
+            og.appendChild(opt);
+          });
+          channelSelect.appendChild(og);
+        });
+        if (other.length) {
+          const og = document.createElement("optgroup");
+          og.label = `Other — ${other.length}`;
+          other.forEach(item => {
+            const label = `${item.group ? item.group + " · " : ""}${item.name || "Unnamed item"}`;
+            og.appendChild(new Option(label, `${item.kind}:${item.id}`));
+          });
+          channelSelect.appendChild(og);
+        }
+        if (previousValue && [...channelSelect.options].some(o => o.value === previousValue)) {
+          channelSelect.value = previousValue;
+        } else if (filtered.length) {
+          for (let i=0;i<channelSelect.options.length;i++) if (channelSelect.options[i].value) { channelSelect.selectedIndex = i; break; }
+        }
+        filterCount.textContent = `${filtered.length} / ${channels.length}`;
+      }
+      if (!filtered.length) filterCount.textContent = channels.length ? `0 / ${channels.length}` : "";
+      updateSelectedMeta();
+    }
+
+    function updatePlaylistStatus() {
+      const counts = {live:0, vod:0, episode:0, local:0};
+      channels.forEach(i => { if (counts[i.kind] !== undefined) counts[i.kind]++; else counts[i.kind]=1; });
+      const parts = [];
+      if (counts.live) parts.push(`${counts.live} Live`);
+      if (counts.vod) parts.push(`${counts.vod} VOD`);
+      if (counts.episode) parts.push(`${counts.episode} Series`);
+      if (counts.local) parts.push(`${counts.local} Local`);
+      const summary = parts.length ? parts.join(" · ") : "No items";
+      $("playlist-status").innerHTML = channels.length
+        ? `${channels.length} item${channels.length === 1 ? "" : "s"} in your allowed output playlist — ${summary}.`
+        : "No enabled playlist items match this account’s group access.";
+      typeHint.textContent = parts.length
+        ? `Visible: ${summary}. Browser-compatible enabled MPEG-TS templates are listed; playback stays on SPM.`
+        : "Only enabled items in your allowed Live, VOD, Series and Local groups are shown.";
+    }
+
+    function updateSelectedMeta() {
+      const item = channels.find(row => `${row.kind}:${row.id}` === channelSelect.value);
+      if (!item) { selectedMeta.innerHTML = ""; return; }
+      const badge = kindBadge(item.kind);
+      const detail = item.kind === "live" ? "Live stream — low-latency, auto-cleanup enabled."
+        : item.kind === "vod" ? "VOD — seekable, full-duration playback."
+        : item.kind === "episode" ? "Series episode — seekable, grouped by show/season."
+        : "Local file — proxied via SPM, transcoded to MPEG-TS.";
+      selectedMeta.innerHTML = ` Selected: ${badge} ${item.group ? esc(item.group) + " · " : ""}${esc(item.name)} — <span class="muted">${detail}</span>`;
+    }
+    function esc(s){ return String(s??"").replace(/[&<>\"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
 
     function fillTemplates(items) {
       templates = items || [];
-      templateSelect.replaceChildren(new Option(templates.length ? "Choose a template…" : "No browser-compatible templates", ""));
+      templateSelect.replaceChildren(new Option(templates.length ? "Choose a template…": "No browser-compatible templates", ""));
       templates.forEach(item => {
         templateSelect.add(new Option(`${item.name}${item.is_default ? " (default)" : ""}`, String(item.id)));
       });
@@ -162,10 +290,41 @@
 
     async function showLogin(message = "") {
       stopPlayback();
+      // reset player state so next user doesn't see previous user's data
+      channels = [];
+      templates = [];
+      // keep select placeholders but clear counts
+      try { channelSelect.replaceChildren(new Option("Loading playlist…","")); } catch {}
+      try { templateSelect.replaceChildren(new Option("Loading templates…","")); } catch {}
+      try { $("playlist-status").textContent = ""; } catch {}
+      try { filterCount.textContent = ""; } catch {}
+      try { selectedMeta.innerHTML = ""; } catch {}
+      try { playStatus.textContent = "Choose a playlist item and template, then press Play."; } catch {}
+      currentKindFilter = "all";
+      try { kindFilter.value = "all"; } catch {}
+      document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === "all"));
+      try { searchFilter.value = ""; } catch {}
       playerPanel.hidden = true;
       loginPanel.hidden = false;
       loginStatus.textContent = message;
       loginStatus.className = "small mt-3 " + (message ? "text-warning" : "");
+      // focus username for quick re-login as different user
+      setTimeout(() => { try { $("username").focus(); } catch {} }, 50);
+    }
+
+    async function doLogout({ switchUser = false } = {}) {
+      stopPlayback();
+      try { await api("/player/logout", { method: "POST" }); } catch {}
+      if (switchUser) {
+        // prepare form for a different user
+        $("username").value = "";
+        $("password").value = "";
+        await showLogin("Switched user — enter credentials for different account.");
+      } else {
+        // regular logout keeps username for convenience, clears password
+        $("password").value = "";
+        await showLogin("You have been logged out.");
+      }
     }
 
     $("login-form").addEventListener("submit", async event => {
@@ -179,6 +338,7 @@
         }) });
         $("password").value = "";
         await loadPlayer();
+        playStatus.textContent = "Signed in — choose a playlist item and template, then press Play.";
       } catch (error) {
         loginStatus.textContent = error.message;
         loginStatus.className = "small mt-3 text-warning";
@@ -187,13 +347,29 @@
 
     $("reload-playlist").addEventListener("click", async () => {
       try { await loadPlayer(); playStatus.textContent = "Playlist and templates reloaded."; }
-      catch (error) { if (/session|login|expired|disabled/i.test(error.message)) await showLogin(error.message); else playStatus.textContent = error.message; }
+      catch (error) { if (/session|login|required|expired|disabled/i.test(error.message)) await showLogin(error.message); else playStatus.textContent = error.message; }
     });
+
+    kindFilter.addEventListener("change", () => {
+      currentKindFilter = kindFilter.value;
+      document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === currentKindFilter));
+      renderChannelSelect();
+    });
+    document.querySelectorAll("#kind-pills .filter-pill").forEach(btn => {
+      btn.addEventListener("click", () => {
+        currentKindFilter = btn.dataset.kind;
+        kindFilter.value = currentKindFilter;
+        document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === currentKindFilter));
+        renderChannelSelect();
+      });
+    });
+    searchFilter.addEventListener("input", () => renderChannelSelect());
+    channelSelect.addEventListener("change", () => updateSelectedMeta());
 
     $("play").addEventListener("click", async () => {
       const item = channels.find(row => `${row.kind}:${row.id}` === channelSelect.value);
       const templateId = templateSelect.value;
-      if (!item) { playStatus.textContent = "Choose a playlist item first."; return; }
+      if (!item) { playStatus.innerHTML = "Choose a playlist item first."; return; }
       if (!templateId) { playStatus.textContent = "Choose an FFmpeg template first."; return; }
       if (!window.mpegts || !mpegts.isSupported()) {
         playStatus.textContent = "This browser does not support MediaSource MPEG-TS playback. Try a current Chrome, Edge or Firefox.";
@@ -201,38 +377,62 @@
       }
       stopPlayback();
       const template = templates.find(row => String(row.id) === templateId);
-      const url = `/player/stream/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.id)}.ts?tpl=${encodeURIComponent(templateId)}`;
+      const relativePath = `/player/stream/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.id)}.ts?tpl=${encodeURIComponent(templateId)}`;
+      const url = new URL(relativePath, window.location.href).href;
+      const isLive = item.kind === "live";
+      const isVodLike = item.kind === "vod" || item.kind === "episode";
+      const isLocal = item.kind === "local";
       video.muted = true;
-      playStatus.textContent = `Connecting to ${item.name} with ${template?.name || "the selected template"}…`;
+      video.controls = true;
+      const badge = kindBadge(item.kind);
+      playStatus.innerHTML = `${badge} Connecting to ${esc(item.name)} <span class="muted">with ${esc(template?.name || "the selected template")}…</span>`;
       try {
-        engine = mpegts.createPlayer({ type: "mpegts", isLive: item.kind === "live", url }, {
+        const playerConfig = {
+          type: "mpegts",
+          isLive: isLive,
+          url: url,
+          hasAudio: true,
+          hasVideo: true,
+        };
+        const opts = {
           enableWorker: true,
           enableStashBuffer: false,
           stashInitialSize: 384,
-          // Discard old browser-side media data on long-running live playback.
           autoCleanupSourceBuffer: true,
-          autoCleanupMaxBackwardDuration: 30,
-          autoCleanupMinBackwardDuration: 10,
-        });
+          autoCleanupMaxBackwardDuration: isLive ? 30 : 120,
+          autoCleanupMinBackwardDuration: isLive ? 10 : 30,
+          lazyLoad: !isLive,
+          lazyLoadMaxDuration: isVodLike || isLocal ? 120 : 30,
+        };
+        engine = mpegts.createPlayer(playerConfig, opts);
         engine.on(mpegts.Events.ERROR, (type, detail, info) => {
-          playStatus.textContent = `Player error: ${type}/${detail}${info?.msg ? ` — ${info.msg}` : ""}`;
+          const msg = info?.msg ? ` — ${info.msg}` : "";
+          playStatus.innerHTML = `${badge} Player error: ${esc(type)}/${esc(detail)}${esc(msg)}`;
+          if (isLocal && /codec|format|demux/i.test(type + detail + msg)) {
+            playStatus.innerHTML += ` <span class="text-warning">(Local file may need transcoding — try another template)</span>`;
+          }
+        });
+        engine.on(mpegts.Events.MEDIA_INFO, (mi) => {
+          const v = mi.videoCodec ? `video ${mi.videoCodec}` : "";
+          const a = mi.audioCodec ? `audio ${mi.audioCodec}` : "";
+          playStatus.innerHTML = `${badge} Media: ${esc([v,a].filter(Boolean).join(", ") || "detected")} — ${esc(item.name)}`;
         });
         engine.on(mpegts.Events.LOADING_COMPLETE, () => {
-          playStatus.textContent = "Stream ended.";
+          playStatus.innerHTML = `${badge} Stream ended.`;
         });
         playingHandler = () => {
-          playStatus.textContent = `Playing: ${item.name} · ${template?.name || "template"}`;
+          playStatus.innerHTML = `${badge} Playing: ${esc(item.name)} · ${esc(template?.name || "template")} ${isLive ? '<span class="muted">(live)</span>' : isLocal ? '<span class="muted">(local)</span>' : '<span class="muted">(VOD)</span>'}`;
           playingHandler = null;
         };
         video.addEventListener("playing", playingHandler, { once: true });
         engine.attachMediaElement(video);
         engine.load();
         video.play().catch(() => {
-          playStatus.textContent = "Stream is ready. Press Play in the video controls to start.";
+          playStatus.innerHTML = `${badge} Stream is ready. Press Play in the video controls to start.`;
         });
       } catch (error) {
         stopPlayback();
-        playStatus.textContent = `Could not start the player: ${error.message}`;
+        playStatus.innerHTML = `${badge} Could not start the player: ${esc(error.message)}`;
       }
     });
 
@@ -243,12 +443,16 @@
     $("sound").addEventListener("click", () => {
       video.muted = false;
       video.volume = 1;
-      playStatus.textContent = "Sound enabled.";
+      playStatus.innerHTML = kindBadge(channels.find(r=>`${r.kind}:${r.id}`===channelSelect.value)?.kind || "live") + " Sound enabled.";
     });
     $("logout").addEventListener("click", async () => {
-      stopPlayback();
-      try { await api("/player/logout", { method: "POST" }); } catch {}
-      await showLogin("You have been logged out.");
+      await doLogout({ switchUser: false });
+    });
+    $("switch-user").addEventListener("click", async () => {
+      await doLogout({ switchUser: true });
+    });
+    $("switch-user-inline").addEventListener("click", async () => {
+      await doLogout({ switchUser: true });
     });
 
     // A valid signed-in session survives page refresh; credentials never need

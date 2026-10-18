@@ -85,6 +85,9 @@ async def web_player_stream(kind: str, pid: int, request: Request,
                             tpl: int = Query(..., ge=1),
                             db=Depends(get_db)):
     user = await _session_user(request, db)
+    # "series" is an alias for "episode" (playlist uses episode ids for series)
+    if kind == "series":
+        kind = "episode"
     if kind not in ("live", "vod", "episode", "local"):
         raise HTTPException(404, "playlist item not found")
     if not await user_can_play_playlist_item(user, kind, pid):
