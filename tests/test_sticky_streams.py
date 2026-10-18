@@ -273,6 +273,25 @@ async def test_another_user_takes_the_parked_mac_instead_of_waiting(monkeypatch)
     assert h.parked is False
 
 
+async def test_parked_replay_buffer_stays_within_its_configured_cap(monkeypatch):
+    monkeypatch.setattr(stream_manager, "LINGER_S", 10.0)
+    monkeypatch.setattr(stream_manager, "LINGER_BUFFER_KB", 1)
+    pipe = _Pipe()
+    handle = StreamHandle(id="bounded-ring", kind="live", item_name="Ch1",
+                          user_name="box", template_name="t", command="ffmpeg",
+                          proc=pipe)
+    handle.bytes_sent = 1
+    await MANAGER._register(handle)
+    await MANAGER._park(handle)
+    for _ in range(8):
+        pipe.feed(b"x" * (64 * 1024))
+    await asyncio.sleep(0.1)
+
+    assert handle.parked
+    assert 0 < len(handle.ring) <= 1024
+    await MANAGER.kill(handle.id)
+
+
 async def test_the_same_user_zapping_elsewhere_drops_the_parked_pipe(monkeypatch):
     pl, mac_id, pipe, client, h, _first, portal_id = await _park_one(monkeypatch)
     # Same portal, same MAC: this is the "zap to another channel" case.

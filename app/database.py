@@ -364,6 +364,9 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
                     "refresh_hours": ("INTEGER", "NULL"), "stale_hours": ("INTEGER", "NULL"),
                     "last_attempt": ("TIMESTAMP", "NULL"), "last_error": ("VARCHAR(500)", "NULL")},
     "epg_programmes": {"epg_source_id": ("INTEGER", "NULL")},
+    "live_genres": {"catalog_baseline": ("BOOLEAN", "0")},
+    "vod_genres": {"catalog_baseline": ("BOOLEAN", "0")},
+    "serie_genres": {"catalog_baseline": ("BOOLEAN", "0")},
     "portals": {
         "tls_insecure": ("BOOLEAN", "0"),
         "identity_mode": ("VARCHAR(12)", "'minimal'"),
@@ -379,6 +382,9 @@ _NEW_COLUMNS: dict[str, dict[str, tuple[str, str]]] = {
         "xtream": ("TEXT", "NULL"),
         "xtream_at": ("TIMESTAMP", "NULL"),
         "xtream_adopted": ("BOOLEAN", "0"),
+        "catalog_last_attempt": ("TIMESTAMP", "NULL"),
+        "catalog_last_success": ("TIMESTAMP", "NULL"),
+        "catalog_last_error": ("VARCHAR(500)", "NULL"),
     },
     # R2: which of a channel's links the panel has to rebuild. NULL is not "":
     # NULL means the row predates the flags, and a fetch will fill them in.

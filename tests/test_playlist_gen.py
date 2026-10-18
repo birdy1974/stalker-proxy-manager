@@ -276,6 +276,24 @@ async def test_every_entry_has_a_matching_playable_url():
     assert all("u=user1&p=pw" in u for u in urls), "every url must carry the user's credentials"
 
 
+async def test_proxy_delivery_variant_forces_all_streams_through_spm():
+    await _seed(2)
+    async with SessionLocal() as s:
+        user = await s.get(User, 1)
+
+    standard = await build_m3u(BASE, user)
+    proxy = await build_m3u(BASE, user, delivery_mode="proxy")
+    standard_urls = [line for line in standard.splitlines() if line.startswith(BASE + "/play/")]
+    proxy_urls = [line for line in proxy.splitlines() if line.startswith(BASE + "/play/")]
+
+    assert standard_urls and len(proxy_urls) == len(standard_urls)
+    assert all("mode=proxy" not in line for line in standard_urls)
+    assert all("u=user1&p=pw&mode=proxy" in line for line in proxy_urls)
+    assert any("/play/live/" in line for line in proxy_urls)
+    assert any("/play/episode/" in line for line in proxy_urls)
+    assert any("/play/local/" in line for line in proxy_urls)
+
+
 async def test_playlist_endpoint_returns_parseable_m3u_for_vlc():
     """
     Regression: `_playlist_revision` used a genexp of awaits, so every
@@ -308,6 +326,21 @@ async def test_playlist_endpoint_returns_parseable_m3u_for_vlc():
         r2 = await c.get("/get.php?username=user1&password=pw&type=m3u_plus")
         assert r2.status_code == 200, r2.text
         assert r2.text.startswith("#EXTM3U")
+
+        # A separate opt-in export mirrors the preview route's forced proxy.
+        proxy = await c.get("/playlist.m3u?u=user1&p=pw&delivery=proxy")
+        assert proxy.status_code == 200, proxy.text
+        proxy_urls = [ln for ln in proxy.text.splitlines() if ln.startswith(BASE + "/play/")]
+        assert proxy_urls and all("u=user1&p=pw&mode=proxy" in ln for ln in proxy_urls)
+        assert 'filename="playlist_user1_proxy.m3u"' in proxy.headers.get("content-disposition", "")
+
+        proxy_get = await c.get(
+            "/get.php?username=user1&password=pw&type=m3u_plus&delivery=proxy")
+        assert proxy_get.status_code == 200, proxy_get.text
+        assert all("mode=proxy" in ln for ln in proxy_get.text.splitlines()
+                   if ln.startswith(BASE + "/play/"))
+        invalid = await c.get("/playlist.m3u?u=user1&p=pw&delivery=unknown")
+        assert invalid.status_code == 400
 
 
 async def test_newlines_in_titles_do_not_break_m3u_lines():

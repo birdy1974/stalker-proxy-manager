@@ -113,6 +113,39 @@ async def test_short_page_stops_early():
     assert state["calls"] <= 8, f"kept fetching past the end: {state['calls']} calls"
 
 
+async def test_baseline_requires_a_complete_scan(monkeypatch):
+    """A partial first walk must not make the next pass report old rows as NEW."""
+    from app.services import fetch_jobs
+
+    async def no_pacing(_portal_id):
+        return False
+
+    monkeypatch.setattr(fetch_jobs, "pace_for_playback", no_pacing)
+
+    async def complete_page(p):
+        count = 14 if p == 1 else 6
+        return Page(items=[{"id": f"i{p}_{k}"} for k in range(count)], total=20)
+
+    async def upsert(_items):
+        pass
+
+    assert (await _paged_upsert(_Job(), complete_page, upsert, "Action", "test",
+                                budget=10, return_complete=True))[2] is True
+
+    async def truncated_page(_p):
+        return Page(items=[{"id": f"i{k}"} for k in range(14)], total=42)
+
+    assert (await _paged_upsert(_Job(), truncated_page, upsert, "Action", "test",
+                                budget=1, return_complete=True))[2] is False
+
+    async def no_total_short_end(p):
+        count = 14 if p == 1 else 3
+        return Page(items=[{"id": f"i{p}_{k}"} for k in range(count)], total=0)
+
+    assert (await _paged_upsert(_Job(), no_total_short_end, upsert, "Action", "test",
+                                budget=10, return_complete=True))[2] is True
+
+
 async def test_a_failing_page_is_skipped_not_fatal():
     state: dict = {}
     got: list = []
@@ -132,10 +165,12 @@ async def test_a_failing_page_is_skipped_not_fatal():
     cfg.FETCH_PAGE_CONCURRENCY = 4
     try:
         job = _Job()
-        n, _total = await _paged_upsert(job, flaky, upsert, "Action", "test", budget=40)
+        n, _total, scan_complete = await _paged_upsert(
+            job, flaky, upsert, "Action", "test", budget=40, return_complete=True)
     finally:
         cfg.FETCH_PAGE_CONCURRENCY = old
     assert n == 5 * 14, "one bad page must not take the whole genre down"
+    assert not scan_complete, "a failed page cannot establish a baseline"
     assert not any(i.startswith("i3_") for i in got)
 
 

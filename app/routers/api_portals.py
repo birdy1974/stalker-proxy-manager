@@ -6,19 +6,21 @@ start, genre enable toggles, per-portal source listings and the delete flow
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import delete, func, or_, select
 
 from ..config import FETCH_PAGE_BUDGET
 from ..database import get_db
 from ..models import (
-    LiveGenre, LivePlaylistSource, LiveSource, MacAddress, Portal, SerieGenre,
-    SeriePlaylistSource, SerieSource, VodGenre, VodPlaylistSource, VodSource,
+    CatalogChange, LiveGenre, LivePlaylistSource, LiveSource, MacAddress, Portal,
+    SerieGenre, SeriePlaylistSource, SerieSource, VodGenre, VodPlaylistSource,
+    VodSource,
 )
 from ..portal.pool import POOL, PortalSession
 from ..portal.client import PortalError, status_for_error
@@ -30,6 +32,7 @@ from ..portal.resolver import resolve_portal
 from ..security import require_admin
 from ..services import channel_translations, xtream_bridge
 from ..services.db_logging import db_log
+from ..services.playlist_sync import sync_sources
 from ..services.fetch_jobs import (
     _bulk_upsert, _live_fields, _live_genre_of, _serie_fields, _vod_fields,
     cancel as cancel_job, list_jobs, submit,
@@ -101,6 +104,11 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
     return {"id": p.id, "name": p.name, "base_url": p.base_url,
             "resolved_url": p.resolved_url, "resolved_path": p.resolved_path,
             "enabled": p.enabled, "proxy_url": p.proxy_url,
+            "catalog_last_attempt": (p.catalog_last_attempt.isoformat()
+                                      if p.catalog_last_attempt else None),
+            "catalog_last_success": (p.catalog_last_success.isoformat()
+                                     if p.catalog_last_success else None),
+            "catalog_last_error": p.catalog_last_error or "",
             "tls_insecure": bool(p.tls_insecure),
             "identity_mode": p.identity_mode or "minimal",
             "stb_timezone": p.stb_timezone or "",
@@ -147,12 +155,29 @@ def _portal_row(p: Portal, macs: list[MacAddress]) -> dict:
 @router.get("")
 async def list_portals(db=Depends(get_db)):
     portals = (await db.execute(select(Portal).order_by(Portal.name))).scalars().all()
+    counts: dict[int, dict[str, dict[str, int]]] = {}
+    grouped = (await db.execute(
+        select(CatalogChange.portal_id, CatalogChange.kind, CatalogChange.change_type,
+               func.count())
+        .where(CatalogChange.status == "pending")
+        .group_by(CatalogChange.portal_id, CatalogChange.kind, CatalogChange.change_type)
+    )).all()
+    for portal_id, kind, change_type, count in grouped:
+        counts.setdefault(portal_id, {k: {"new": 0, "changed": 0}
+                                      for k in ("live", "vod", "series")})
+        if kind in counts[portal_id] and change_type in ("new", "changed"):
+            counts[portal_id][kind][change_type] = count
     out = []
     for p in portals:
         macs = (await db.execute(select(MacAddress).where(MacAddress.portal_id == p.id)
                                  .order_by(MacAddress.order))).scalars().all()
-        out.append(_portal_row(p, list(macs)))
-    return {"items": out, "jobs": list_jobs()}
+        row = _portal_row(p, list(macs))
+        row["catalog_changes"] = counts.get(p.id, {k: {"new": 0, "changed": 0}
+                                                    for k in ("live", "vod", "series")})
+        row["catalog_pending"] = sum(sum(v.values()) for v in row["catalog_changes"].values())
+        out.append(row)
+    from ..services.catalog_scheduler import schedule_info
+    return {"items": out, "jobs": list_jobs(), "catalog_schedule": await schedule_info()}
 
 
 @router.post("")
@@ -812,12 +837,178 @@ async def start_genre_fetch(pid: int, db=Depends(get_db)):
 
 @router.post("/{pid}/fetch-items")
 async def start_items_fetch(pid: int, db=Depends(get_db)):
-    """Fetch the items of ENABLED genres (live, vod, series) + seasons."""
+    """Fetch the items of ENABLED genres (live, VOD, series) + seasons."""
     if not await db.get(Portal, pid):
         raise HTTPException(404, "portal not found")
     job = await submit("fetch_items", pid)
     await db_log("INFO", "fetch", f"items fetch job {job.id} queued for portal {pid}")
     return {"job": job.public()}
+
+
+@router.post("/{pid}/check-changes")
+async def check_catalog_changes(pid: int, db=Depends(get_db)):
+    """Queue a comparison scan of this portal's enabled genres.
+
+    It is the normal item fetch with change tracking enabled; the first fetch
+    of each genre establishes its baseline. If an item/full fetch is already
+    active, reuse that job because those fetches also capture differences.
+    """
+    if not await db.get(Portal, pid):
+        raise HTTPException(404, "portal not found")
+    job = await submit("catalog_check", pid)
+    if job.kind not in {"catalog_check", "fetch_items", "fetch_portal"}:
+        raise HTTPException(409, f"portal already has a {job.kind.replace('_', ' ')} job")
+    await db_log("INFO", "catalog", f"catalogue check job {job.id} queued for portal {pid}")
+    return {"job": job.public(), "reused": job.kind != "catalog_check"}
+
+
+@router.get("/{pid}/catalog-changes")
+async def get_catalog_changes(pid: int, kind: str = "live", change_type: str = "",
+                              q: str = "", page: int = Query(1, ge=1),
+                              per_page: int = Query(50, ge=1, le=100),
+                              db=Depends(get_db)):
+    """Pending review rows for one portal and content kind."""
+    if not await db.get(Portal, pid):
+        raise HTTPException(404, "portal not found")
+    if kind not in ("live", "vod", "series"):
+        raise HTTPException(400, "kind must be live|vod|series")
+    if change_type not in ("", "new", "changed"):
+        raise HTTPException(400, "change_type must be new|changed")
+
+    config = {
+        "live": (LiveSource, LiveGenre, LiveSource.live_genre_id,
+                 LivePlaylistSource, LivePlaylistSource.live_source_id, "portal_channel_id"),
+        "vod": (VodSource, VodGenre, VodSource.vod_genre_id,
+                VodPlaylistSource, VodPlaylistSource.vod_source_id, "portal_item_id"),
+        "series": (SerieSource, SerieGenre, SerieSource.serie_genre_id,
+                   SeriePlaylistSource, SeriePlaylistSource.serie_source_id, "portal_item_id"),
+    }
+    source_model, genre_model, genre_fk, link_model, link_fk, portal_id_attr = config[kind]
+    stmt = (select(CatalogChange, source_model, genre_model)
+            .join(source_model, source_model.id == CatalogChange.source_id)
+            .outerjoin(genre_model, genre_model.id == genre_fk)
+            .where(CatalogChange.portal_id == pid,
+                   CatalogChange.kind == kind,
+                   CatalogChange.status == "pending"))
+    if change_type:
+        stmt = stmt.where(CatalogChange.change_type == change_type)
+    search = q.strip()[:100]
+    if search:
+        source_key = getattr(source_model, portal_id_attr)
+        try:
+            source_key_match = source_key == search
+        except Exception:  # noqa: BLE001 - string portal keys are the usual case
+            source_key_match = False
+        stmt = stmt.where(or_(source_model.original_name.contains(search, autoescape=True),
+                              genre_model.name.contains(search, autoescape=True),
+                              source_key_match))
+    total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
+    rows = (await db.execute(stmt.order_by(CatalogChange.updated_at.desc(),
+                                           CatalogChange.id.desc())
+                             .offset((page - 1) * per_page).limit(per_page))).all()
+    source_ids = [source.id for _change, source, _genre in rows]
+    linked = set()
+    if source_ids:
+        linked = set((await db.execute(
+            select(link_fk).where(link_fk.in_(source_ids)).distinct()
+        )).scalars().all())
+
+    items = []
+    from ..services.catalog_changes import decode_changes
+    for change, source, genre in rows:
+        items.append({
+            "id": change.id,
+            "kind": kind,
+            "source_id": source.id,
+            "portal_item_id": getattr(source, portal_id_attr),
+            "name": source.original_name,
+            "genre": (genre.name if genre else None)
+                     or getattr(source, "genre", None)
+                     or getattr(source, "category_name", None)
+                     or "",
+            "change_type": change.change_type,
+            "changes": decode_changes(change.changes_json),
+            "status": change.status,
+            "enabled": bool(getattr(source, "enabled", False)),
+            "in_playlist": source.id in linked,
+            "detected_at": change.detected_at.isoformat() if change.detected_at else None,
+            "updated_at": change.updated_at.isoformat() if change.updated_at else None,
+        })
+    return {"total": total, "page": page, "per_page": per_page, "items": items}
+
+
+@router.post("/{pid}/catalog-changes/review")
+async def review_catalog_changes(pid: int, payload: dict, db=Depends(get_db)):
+    """Mark, ignore, or add selected new catalogue items to the output playlist."""
+    if not await db.get(Portal, pid):
+        raise HTTPException(404, "portal not found")
+    action = payload.get("action")
+    if action not in ("reviewed", "ignored", "add"):
+        raise HTTPException(400, "action must be reviewed|ignored|add")
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list) or not raw_ids:
+        raise HTTPException(400, "ids must be a non-empty list")
+    if len(raw_ids) > 500:
+        raise HTTPException(400, "no more than 500 change rows may be selected")
+    try:
+        ids = list(dict.fromkeys(int(value) for value in raw_ids))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "change ids must be integers")
+    if any(value <= 0 for value in ids):
+        raise HTTPException(400, "change ids must be positive")
+    rows = (await db.execute(select(CatalogChange).where(
+        CatalogChange.portal_id == pid, CatalogChange.status == "pending",
+        CatalogChange.id.in_(ids)))).scalars().all()
+    if action in ("reviewed", "ignored"):
+        for row in rows:
+            row.status = action
+        await db.commit()
+        return {"ok": True, "updated": len(rows), "status": action}
+
+    kind = payload.get("kind")
+    if kind not in ("live", "vod", "series"):
+        raise HTTPException(400, "kind must be live|vod|series")
+    new_rows = [row for row in rows if row.kind == kind and row.change_type == "new"]
+    if not new_rows:
+        return {"ok": True, "added": 0, "fallback": 0,
+                "skipped_changed": len(rows), "missing": 0, "season_jobs": []}
+    source_model = {"live": LiveSource, "vod": VodSource, "series": SerieSource}[kind]
+    source_ids = list(dict.fromkeys(row.source_id for row in new_rows))
+    sources = (await db.execute(select(source_model).where(
+        source_model.id.in_(source_ids), source_model.portal_id == pid))).scalars().all()
+    by_id = {source.id: source for source in sources}
+    source_ids = [source_id for source_id in source_ids if source_id in by_id]
+    for source_id in source_ids:
+        by_id[source_id].enabled = True
+    try:
+        synced = await sync_sources(
+            db, kind, source_ids, True,
+            live_match_existing=bool(payload.get("live_match_existing", True)),
+        )
+        for row in new_rows:
+            if row.source_id in by_id:
+                row.status = "reviewed"
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - return a clean transaction to the GUI
+        await db.rollback()
+        raise HTTPException(400, f"could not add selected sources: {exc}") from exc
+
+    season_jobs = []
+    if kind == "series":
+        from collections import defaultdict
+        pending: dict[int, list[int]] = defaultdict(list)
+        for source in sources:
+            if not source.seasons_fetched:
+                pending[source.portal_id].append(source.id)
+        for portal_id, series_ids in pending.items():
+            job = await submit("fetch_seasons", portal_id, series_ids=series_ids)
+            season_jobs.append(job.public())
+    await db_log("INFO", "catalog",
+                 f"portal {pid}: added {len(source_ids)} new {kind} source(s) from review")
+    return {"ok": True, "added": synced.get("created", 0),
+            "fallback": synced.get("fallback", 0),
+            "skipped_changed": len(rows) - len(new_rows),
+            "missing": len(new_rows) - len(source_ids), "season_jobs": season_jobs}
 
 
 @router.post("/jobs/{job_id}/cancel")

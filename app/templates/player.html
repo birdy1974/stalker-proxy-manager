@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Web Player · Stalker Proxy Manager</title>
+  <link href="/static/vendor/bootstrap/bootstrap.min.css" rel="stylesheet">
+  <link href="/static/vendor/bootstrap/bootstrap-icons.min.css" rel="stylesheet">
+  <style>
+    :root { color-scheme: dark; }
+    body { min-height: 100vh; background: #101820; color: #eef3f7; }
+    .player-shell { max-width: 1180px; }
+    .brand { color: #eef3f7; text-decoration: none; }
+    .brand-mark { color: #73c4ad; }
+    .card { background: #17232d; border-color: #2c3b46; }
+    .form-select, .form-control { background-color: #111b23; color: #eef3f7; border-color: #3a4a56; }
+    .form-select:focus, .form-control:focus { border-color: #73c4ad; box-shadow: 0 0 0 .2rem #73c4ad33; }
+    .video-frame { min-height: 240px; background: #000; }
+    video { display: block; width: 100%; max-height: 72vh; aspect-ratio: 16 / 9; background: #000; }
+    .muted { color: #a8b6c1; }
+    .accent { background: #287b69; border-color: #287b69; }
+    .accent:hover { background: #32917b; border-color: #32917b; }
+    @media (max-width: 600px) { .video-frame { min-height: 180px; } }
+  </style>
+</head>
+<body>
+  <header class="border-bottom border-secondary-subtle">
+    <div class="container player-shell py-3 d-flex justify-content-between align-items-center gap-3">
+      <a class="brand fw-semibold fs-5" href="/player"><i class="bi bi-broadcast-pin brand-mark me-2"></i>Stalker Proxy Manager</a>
+      <a class="btn btn-sm btn-outline-secondary" href="/" title="Administration"><i class="bi bi-gear me-1"></i>Admin</a>
+    </div>
+  </header>
+
+  <main class="container player-shell py-4">
+    <section id="login-panel" class="card mx-auto" style="max-width:440px">
+      <div class="card-header"><i class="bi bi-person-check me-2"></i>Sign in to your playlist</div>
+      <div class="card-body">
+        <p class="small muted">Use an output account created under <b>Users</b> — not the administrator login.</p>
+        <form id="login-form" autocomplete="on">
+          <label class="form-label small" for="username">Username</label>
+          <input class="form-control mb-3" id="username" name="username" autocomplete="username" required>
+          <label class="form-label small" for="password">Password</label>
+          <input class="form-control mb-3" id="password" name="password" type="password" autocomplete="current-password" required>
+          <button class="btn accent w-100" id="login-button" type="submit"><i class="bi bi-box-arrow-in-right me-1"></i>Log in</button>
+        </form>
+        <div id="login-status" class="small mt-3" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section id="player-panel" hidden>
+      <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 mb-3">
+        <div><h1 class="h4 mb-0">Web player</h1><div class="small muted">Signed in as <span id="account-name"></span></div></div>
+        <div class="d-flex gap-2">
+          <button class="btn btn-sm btn-outline-secondary" id="reload-playlist"><i class="bi bi-arrow-repeat me-1"></i>Reload playlist</button>
+          <button class="btn btn-sm btn-outline-secondary" id="logout"><i class="bi bi-box-arrow-right me-1"></i>Log out</button>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row g-3 align-items-end">
+            <div class="col-lg-6">
+              <label class="form-label small" for="channel">Playlist item</label>
+              <select class="form-select" id="channel" aria-label="Playlist item"><option value="">Loading playlist…</option></select>
+            </div>
+            <div class="col-lg-4">
+              <label class="form-label small" for="template">FFmpeg template</label>
+              <select class="form-select" id="template" aria-label="FFmpeg template"><option value="">Loading templates…</option></select>
+            </div>
+            <div class="col-lg-2 d-grid">
+              <button class="btn accent" id="play" type="button"><i class="bi bi-play-fill me-1"></i>Play</button>
+            </div>
+          </div>
+          <div class="small muted mt-2">Only enabled items in your allowed Live, VOD, Series and Local groups are shown. Browser-compatible enabled MPEG-TS templates are listed; playback stays on SPM and uses the normal fallback, connection-limit and stream-cleanup pipeline.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-body p-2 p-md-3">
+          <div class="video-frame rounded overflow-hidden"><video id="video" controls playsinline autoplay muted></video></div>
+          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 pt-2">
+            <div id="play-status" class="small muted" role="status" aria-live="polite">Choose a playlist item and template, then press Play.</div>
+            <div class="d-flex gap-2">
+              <button class="btn btn-sm btn-outline-secondary" id="sound" type="button"><i class="bi bi-volume-up me-1"></i>Enable sound</button>
+              <button class="btn btn-sm btn-outline-secondary" id="stop" type="button"><i class="bi bi-stop-fill me-1"></i>Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="playlist-status" class="small muted mt-2" role="status" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script src="/static/vendor/mpegts.js"></script>
+  <script>
+  (() => {
+    const $ = id => document.getElementById(id);
+    const loginPanel = $("login-panel"), playerPanel = $("player-panel");
+    const loginStatus = $("login-status"), playStatus = $("play-status");
+    const video = $("video"), channelSelect = $("channel"), templateSelect = $("template");
+    let engine = null, channels = [], templates = [], playingHandler = null;
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        credentials: "same-origin", cache: "no-store",
+        ...options,
+        headers: { ...(options.body ? {"Content-Type":"application/json"} : {}), ...(options.headers || {}) },
+      });
+      let data = {};
+      try { data = await response.json(); } catch {}
+      if (!response.ok) throw new Error(data.detail || `Request failed (${response.status})`);
+      return data;
+    }
+
+    function stopPlayback() {
+      if (playingHandler) video.removeEventListener("playing", playingHandler);
+      playingHandler = null;
+      try { engine?.pause(); } catch {}
+      try { engine?.unload(); } catch {}
+      try { engine?.detachMediaElement(); } catch {}
+      try { engine?.destroy(); } catch {}
+      engine = null;
+      try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
+    }
+
+    function fillChannels(items) {
+      channels = items || [];
+      channelSelect.replaceChildren(new Option(channels.length ? "Choose a playlist item…" : "No visible playlist items", ""));
+      channels.forEach(item => {
+        const type = ({live:"Live", vod:"VOD", episode:"Episode", local:"Local"})[item.kind] || item.kind;
+        const label = `${type}${item.group ? " · " + item.group : ""} · ${item.name || "Unnamed item"}`;
+        channelSelect.add(new Option(label, `${item.kind}:${item.id}`));
+      });
+      if (channels.length) channelSelect.selectedIndex = 1;
+      $("playlist-status").textContent = channels.length
+        ? `${channels.length} item${channels.length === 1 ? "" : "s"} in your allowed output playlist.`
+        : "No enabled playlist items match this account’s group access.";
+    }
+
+    function fillTemplates(items) {
+      templates = items || [];
+      templateSelect.replaceChildren(new Option(templates.length ? "Choose a template…" : "No browser-compatible templates", ""));
+      templates.forEach(item => {
+        templateSelect.add(new Option(`${item.name}${item.is_default ? " (default)" : ""}`, String(item.id)));
+      });
+      if (templates.length) {
+        const preferred = templates.findIndex(t => t.is_default);
+        templateSelect.selectedIndex = preferred >= 0 ? preferred + 1 : 1;
+      }
+    }
+
+    async function loadPlayer() {
+      const [playlist, templateData] = await Promise.all([
+        api("/player/api/playlist"), api("/player/api/templates"),
+      ]);
+      $("account-name").textContent = playlist.user || "";
+      fillChannels(playlist.items);
+      fillTemplates(templateData.items);
+      loginPanel.hidden = true;
+      playerPanel.hidden = false;
+    }
+
+    async function showLogin(message = "") {
+      stopPlayback();
+      playerPanel.hidden = true;
+      loginPanel.hidden = false;
+      loginStatus.textContent = message;
+      loginStatus.className = "small mt-3 " + (message ? "text-warning" : "");
+    }
+
+    $("login-form").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = $("login-button");
+      button.disabled = true;
+      loginStatus.textContent = "Signing in…";
+      try {
+        await api("/player/login", { method: "POST", body: JSON.stringify({
+          username: $("username").value.trim(), password: $("password").value,
+        }) });
+        $("password").value = "";
+        await loadPlayer();
+      } catch (error) {
+        loginStatus.textContent = error.message;
+        loginStatus.className = "small mt-3 text-warning";
+      } finally { button.disabled = false; }
+    });
+
+    $("reload-playlist").addEventListener("click", async () => {
+      try { await loadPlayer(); playStatus.textContent = "Playlist and templates reloaded."; }
+      catch (error) { if (/session|login|expired|disabled/i.test(error.message)) await showLogin(error.message); else playStatus.textContent = error.message; }
+    });
+
+    $("play").addEventListener("click", async () => {
+      const item = channels.find(row => `${row.kind}:${row.id}` === channelSelect.value);
+      const templateId = templateSelect.value;
+      if (!item) { playStatus.textContent = "Choose a playlist item first."; return; }
+      if (!templateId) { playStatus.textContent = "Choose an FFmpeg template first."; return; }
+      if (!window.mpegts || !mpegts.isSupported()) {
+        playStatus.textContent = "This browser does not support MediaSource MPEG-TS playback. Try a current Chrome, Edge or Firefox.";
+        return;
+      }
+      stopPlayback();
+      const template = templates.find(row => String(row.id) === templateId);
+      const url = `/player/stream/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.id)}.ts?tpl=${encodeURIComponent(templateId)}`;
+      video.muted = true;
+      playStatus.textContent = `Connecting to ${item.name} with ${template?.name || "the selected template"}…`;
+      try {
+        engine = mpegts.createPlayer({ type: "mpegts", isLive: item.kind === "live", url }, {
+          enableWorker: true,
+          enableStashBuffer: false,
+          stashInitialSize: 384,
+          // Discard old browser-side media data on long-running live playback.
+          autoCleanupSourceBuffer: true,
+          autoCleanupMaxBackwardDuration: 30,
+          autoCleanupMinBackwardDuration: 10,
+        });
+        engine.on(mpegts.Events.ERROR, (type, detail, info) => {
+          playStatus.textContent = `Player error: ${type}/${detail}${info?.msg ? ` — ${info.msg}` : ""}`;
+        });
+        engine.on(mpegts.Events.LOADING_COMPLETE, () => {
+          playStatus.textContent = "Stream ended.";
+        });
+        playingHandler = () => {
+          playStatus.textContent = `Playing: ${item.name} · ${template?.name || "template"}`;
+          playingHandler = null;
+        };
+        video.addEventListener("playing", playingHandler, { once: true });
+        engine.attachMediaElement(video);
+        engine.load();
+        video.play().catch(() => {
+          playStatus.textContent = "Stream is ready. Press Play in the video controls to start.";
+        });
+      } catch (error) {
+        stopPlayback();
+        playStatus.textContent = `Could not start the player: ${error.message}`;
+      }
+    });
+
+    $("stop").addEventListener("click", () => {
+      stopPlayback();
+      playStatus.textContent = "Playback stopped. An eligible live stream may stay warm briefly for quick zap-back.";
+    });
+    $("sound").addEventListener("click", () => {
+      video.muted = false;
+      video.volume = 1;
+      playStatus.textContent = "Sound enabled.";
+    });
+    $("logout").addEventListener("click", async () => {
+      stopPlayback();
+      try { await api("/player/logout", { method: "POST" }); } catch {}
+      await showLogin("You have been logged out.");
+    });
+
+    // A valid signed-in session survives page refresh; credentials never need
+    // to be stored in localStorage or appended to a playlist/stream URL.
+    loadPlayer().catch(error => {
+      if (!/login|required|expired|disabled/i.test(error.message)) {
+        loginStatus.textContent = error.message;
+        loginStatus.className = "small mt-3 text-warning";
+      }
+    });
+  })();
+  </script>
+</body>
+</html>

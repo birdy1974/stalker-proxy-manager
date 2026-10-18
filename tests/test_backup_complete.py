@@ -38,6 +38,9 @@ async def seed(prefix="a", ident=11):
                 values[c.name] = value
             if table.name == "area_item_templates":
                 values.update(kind="live", playlist_id=ident)
+            if table.name == "catalog_changes":
+                values.update(kind="live", source_id=ident, change_type="changed",
+                              status="pending", changes_json="{}")
             if table.name == "settings":
                 values["value"] = '"setting-value"'
             await db.execute(table.insert().values(**values))
@@ -97,7 +100,9 @@ async def test_full_restore_rebinds_every_relationship_and_preserves_every_value
             for key, value in records[0].items():
                 if key == backup.pk(backup.TABLES[name]).name and name != "settings":
                     assert new[key] == 201
-                elif backup.TABLES[name].c[key].foreign_keys or (name == "area_item_templates" and key == "playlist_id"):
+                elif (backup.TABLES[name].c[key].foreign_keys
+                      or (name == "area_item_templates" and key == "playlist_id")
+                      or (name == "catalog_changes" and key == "source_id")):
                     assert new[key] == 201, (name, key)
                 else:
                     assert new[key] == value, (name, key)

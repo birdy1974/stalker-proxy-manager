@@ -14,11 +14,33 @@ docker-compose; later GUI edits win without a restart.
 from __future__ import annotations
 
 import json
+import math
 
 from ..database import SessionLocal
 from ..models import Setting
 
 VALID_STRATEGIES = ("macs_first", "portal_first")
+
+
+async def quick_zap_linger_seconds() -> int:
+    """How long a departed live stream stays warm for zap-back (0–300 s)."""
+    from .stream_manager import LINGER_S, MAX_LINGER_S
+    value = await get_setting("quick_zap_linger_seconds", LINGER_S)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = float(LINGER_S)
+    if not math.isfinite(seconds):
+        seconds = float(LINGER_S)
+    return int(min(MAX_LINGER_S, max(0, round(seconds))))
+
+
+async def apply_quick_zap_linger_setting() -> int:
+    """Apply the persisted warm period to the live stream manager."""
+    from .stream_manager import set_linger_seconds
+    seconds = await quick_zap_linger_seconds()
+    set_linger_seconds(seconds)
+    return seconds
 
 
 async def get_setting(key: str, default=None):

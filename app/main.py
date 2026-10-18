@@ -123,10 +123,11 @@ async def access_log(request: Request, call_next):
 # --------------------------------------------------------------- sub-routers
 from .routers import (api_areas, api_backup, api_branding, api_enigma2, api_ffmpeg, api_epg,  # noqa: E402
                       api_misc, api_playlist, api_portals, api_sources, api_users,
-                      output, web)
+                      output, web, web_player)
 
 app.include_router(web.router)
 app.include_router(output.router)
+app.include_router(web_player.router)
 for r in (api_portals.router, api_sources.router, api_playlist.router,
           api_ffmpeg.router, api_users.router, api_areas.router, api_misc.router,
           api_epg.router, api_enigma2.router, api_enigma2.public,
@@ -154,7 +155,8 @@ async def not_found(request: Request, exc):  # noqa: ANN001
 
 @app.exception_handler(401)
 async def unauthorized(request: Request, exc):  # noqa: ANN001
-    if request.url.path.startswith("/api/"):
+    path = request.url.path
+    if path.startswith(("/api/", "/player/api/", "/player/stream/")):
         return JSONResponse({"detail": "not authenticated"}, status_code=401)
     from fastapi.responses import RedirectResponse
     return RedirectResponse("/login")
@@ -212,6 +214,10 @@ async def startup() -> None:
     # itself - see services/janitor.py.
     from .services.janitor import janitor_scheduler
     _bg.add(asyncio.create_task(janitor_scheduler(), name="spm-janitor"))
+    # Optional, restart-safe crawl of enabled catalogue genres. Settings default
+    # to 0 (off); each due portal is queued through the serialized fetch worker.
+    from .services.catalog_scheduler import catalog_scheduler
+    _bg.add(asyncio.create_task(catalog_scheduler(), name="spm-catalog"))
 
 
 async def _reap_sessions(interval: float = 300.0) -> None:
@@ -355,3 +361,5 @@ async def _seed_defaults() -> None:
             if await s.get(Setting, k) is None:
                 s.add(Setting(key=k, value=__import__("json").dumps(v)))
         await s.commit()
+    from .services.runtime_settings import apply_quick_zap_linger_setting
+    await apply_quick_zap_linger_setting()

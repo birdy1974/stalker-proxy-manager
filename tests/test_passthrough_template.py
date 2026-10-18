@@ -12,6 +12,7 @@ Verifies:
 from __future__ import annotations
 
 import asyncio
+import tracemalloc
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -108,6 +109,10 @@ async def test_passthrough_stream_process_wrapper():
     c3 = await stream.stdout.read()
     assert c3 == b""
     assert stream.returncode == 0
+    # EOF is a normal teardown too: do not leave this per-stream HTTP client
+    # and its connection pool for cyclic GC after the StreamHandle is removed.
+    mock_response.aclose.assert_awaited_once()
+    mock_client.aclose.assert_awaited_once()
 
     # Kill and wait
     stream.kill()
@@ -116,6 +121,73 @@ async def test_passthrough_stream_process_wrapper():
     assert rc == -9
     assert mock_response.aclose.await_count >= 1
     assert mock_client.aclose.await_count >= 1
+
+
+async def test_cancelled_passthrough_read_still_closes_response_and_client():
+    started = asyncio.Event()
+    closed = {"response": False, "client": False}
+
+    class Client:
+        async def aclose(self):
+            closed["client"] = True
+
+    class Response:
+        def aiter_bytes(self):
+            async def chunks():
+                started.set()
+                await asyncio.Event().wait()
+                yield b"never"
+            return chunks()
+
+        async def aclose(self):
+            closed["response"] = True
+
+    stream = PassthroughStream(Client(), Response())
+    read = asyncio.create_task(stream.stdout.read())
+    await started.wait()
+    read.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await read
+    await stream.aclose()
+    assert closed == {"response": True, "client": True}
+
+
+async def test_long_passthrough_does_not_retain_streamed_bytes():
+    """Consume 64 MiB without keeping a growing per-stream byte history."""
+    chunk_count, chunk_size = 1024, 64 * 1024
+    closed = {"response": False, "client": False}
+
+    class Client:
+        async def aclose(self):
+            closed["client"] = True
+
+    class Response:
+        def aiter_bytes(self):
+            async def chunks():
+                for _ in range(chunk_count):
+                    yield b"x" * chunk_size
+            return chunks()
+
+        async def aclose(self):
+            closed["response"] = True
+
+    stream = PassthroughStream(Client(), Response())
+    tracemalloc.start()
+    baseline, _ = tracemalloc.get_traced_memory()
+    seen = 0
+    for _ in range(chunk_count):
+        chunk = await stream.stdout.read()
+        assert len(chunk) == chunk_size
+        seen += len(chunk)
+        del chunk
+    assert await stream.stdout.read() == b""
+    current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert seen == chunk_count * chunk_size
+    assert peak - baseline < 4 * 1024 * 1024, f"stream retained {peak - baseline:,} traced bytes"
+    assert current - baseline < 512 * 1024
+    assert closed == {"response": True, "client": True}
 
 
 async def test_open_passthrough_connects_and_returns_stream():
