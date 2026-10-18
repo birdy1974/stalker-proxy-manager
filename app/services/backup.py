@@ -44,6 +44,7 @@ IDENTITIES = {
     "serie_playlist_sources": ("serie_playlist_id", "serie_source_id"),
     "serie_playlist_seasons": ("serie_playlist_id", "serie_season_id"),
     "area_item_templates": ("area_id", "kind", "playlist_id"),
+    "catalog_changes": ("kind", "source_id"),
 }
 NOTES = [
     "All database columns are included. Backups contain passwords and tokens; store them securely.",
@@ -73,6 +74,12 @@ def references(name, row):
         if not parent:
             raise ValueError("Unknown area item kind.")
         yield "playlist_id", parent, row.get("playlist_id")
+    if name == "catalog_changes":
+        parent = {"live": "live_sources", "vod": "vod_sources",
+                  "series": "serie_sources"}.get(row.get("kind"))
+        if not parent:
+            raise ValueError("Unknown catalog change kind.")
+        yield "source_id", parent, row.get("source_id")
 
 
 def subset(tables, roots, setting_keys=None):
@@ -265,8 +272,10 @@ def deletion_filters(names, setting_keys=None):
     if setting_keys is not None and "settings" in filters:
         filters["settings"] = TABLES["settings"].c.key.in_(setting_keys)
     order = list(Base.metadata.sorted_tables)
-    # Area exceptions have an implicit dependency on all four playlist tables.
-    order = [t for t in order if t.name != "area_item_templates"] + [TABLES["area_item_templates"]]
+    # These polymorphic references are not represented by database FKs, so
+    # process their child filters after all possible parent filters exist.
+    order = [t for t in order if t.name not in ("catalog_changes", "area_item_templates")]
+    order.extend([TABLES["catalog_changes"], TABLES["area_item_templates"]])
     nulls = {}
     for table in order:
         clauses = []
@@ -284,6 +293,13 @@ def deletion_filters(names, setting_keys=None):
                 if parent_name in filters:
                     parent = TABLES[parent_name]
                     clauses.append((table.c.kind == kind) & table.c.playlist_id.in_(
+                        select(pk(parent)).where(filters[parent_name])))
+        if table.name == "catalog_changes":
+            for kind, parent_name in (("live", "live_sources"), ("vod", "vod_sources"),
+                                      ("series", "serie_sources")):
+                if parent_name in filters:
+                    parent = TABLES[parent_name]
+                    clauses.append((table.c.kind == kind) & table.c.source_id.in_(
                         select(pk(parent)).where(filters[parent_name])))
         if clauses:
             filters[table.name] = or_(*([filters[table.name]] if table.name in filters else []), *clauses)

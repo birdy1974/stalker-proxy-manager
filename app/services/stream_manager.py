@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import logging
@@ -256,25 +257,42 @@ class PassthroughStream:
                 return chunk
             except StopAsyncIteration:
                 self._parent.returncode = 0
+                await self._parent.aclose()
                 return b""
             except asyncio.CancelledError:
                 self._parent.returncode = -9
+                self._parent._schedule_close()
                 raise
             except Exception:
                 self._parent.returncode = 1
+                await self._parent.aclose()
                 return b""
+
+    def _schedule_close(self) -> asyncio.Task | None:
+        """Start one strongly-held close task for EOF, cancellation or kill."""
+        if self._close_task is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return None
+            self._close_task = loop.create_task(self._close())
+        return self._close_task
 
     def kill(self) -> None:
         self.returncode = -9
-        try:
-            loop = asyncio.get_running_loop()
-            self._close_task = loop.create_task(self._close())
-        except RuntimeError:
-            pass
+        self._schedule_close()
 
     async def wait(self) -> int:
-        await self._close()
+        await self.aclose()
         return self.returncode if self.returncode is not None else 0
+
+    async def aclose(self) -> None:
+        """Close both response and per-stream HTTP client, even after normal EOF."""
+        task = self._schedule_close()
+        if task is not None:
+            await asyncio.shield(task)
+        else:
+            await self._close()
 
     async def _close(self) -> None:
         if self._closed:
@@ -282,11 +300,11 @@ class PassthroughStream:
         self._closed = True
         try:
             await self._response.aclose()
-        except Exception:
+        except Exception:  # noqa: BLE001 - cleanup must continue to the client
             pass
         try:
             await self._client.aclose()
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort socket teardown
             pass
 
 # input options that only exist for network protocols (stripped for file://)
@@ -759,10 +777,29 @@ MIDSTREAM_RESTART_KINDS = {k.strip() for k in
 #: preemptible: the moment anybody actually wants that MAC (the same user
 #: zapping to another channel, or another user with nothing else free) it is
 #: killed immediately. 0 disables parking entirely.
-LINGER_S = float(os.environ.get("SPM_LINGER_S", "8"))
+MAX_LINGER_S = 300
+LINGER_S = min(MAX_LINGER_S, max(0.0, float(os.environ.get("SPM_LINGER_S", "8"))))
 LINGER_BUFFER_KB = int(os.environ.get("SPM_LINGER_BUFFER_KB", "2048"))
 LINGER_KINDS = {k.strip() for k in os.environ.get("SPM_LINGER_KINDS", "live").split(",")
                 if k.strip()}
+
+
+def set_linger_seconds(value: float) -> float:
+    """Apply the Settings-tab warm period immediately, with a hard upper bound.
+
+    A parked stream holds one upstream connection and a fixed-size ring buffer,
+    so the duration is configurable but never allowed to become an accidental
+    unbounded reservation. 0 disables parking.
+    """
+    global LINGER_S
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if not math.isfinite(seconds):
+        seconds = 0.0
+    LINGER_S = min(float(MAX_LINGER_S), max(0.0, seconds))
+    return LINGER_S
 
 #: portal ids already told about `portal_first` (once per process, not per play)
 _PORTAL_FIRST_NOTED: set[int] = set()
@@ -2697,7 +2734,19 @@ class StreamManager:
 
     @staticmethod
     async def _kill_quiet(proc) -> None:
-        if proc and proc.returncode is None:
+        if proc is None:
+            return
+        # PassthroughStream marks returncode=0 at EOF, but its per-play
+        # AsyncClient still owns a connection pool until explicitly closed.
+        # Treat close as part of normal teardown as well as kill/cancellation.
+        aclose = getattr(proc, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001 - best-effort socket teardown
+                pass
+            return
+        if proc.returncode is None:
             try:
                 proc.kill()
                 await asyncio.wait_for(proc.wait(), 3)
@@ -2903,10 +2952,23 @@ class StreamManager:
         return "(copy)", f"ffmpeg -i {URL_PLACEHOLDER} -c copy -f mpegts pipe:1"
 
     async def _template_for(self, item, *, kind: str | None = None,
-                            user_name: str | None = None) -> tuple[str, str]:
-        """(template name, command with <url>) - area overlay then item then default."""
+                            user_name: str | None = None,
+                            template_id: int | None = None) -> tuple[str, str]:
+        """Resolve an enabled template, normally area overlay -> item -> default.
+
+        An explicit web-player choice is an id from the enabled template list,
+        never user-supplied command text; it is validated again here before
+        entering the normal stream pipeline.
+        """
         from .playback import template_map_for_username
         async with SessionLocal() as s:
+            if template_id is not None:
+                selected = await s.get(FFmpegTemplate, int(template_id))
+                if selected is None or not selected.enabled:
+                    raise FFmpegTemplateError("selected FFmpeg template is missing or disabled")
+                if selected.output_format != "mpegts":
+                    raise FFmpegTemplateError("selected web-player template must use MPEG-TS")
+                return selected.name, selected.command or mpegts_copy_command()
             tmap = await template_map_for_username(s, user_name)
             resolved = tmap.resolve(kind or "", item)
             return resolved.name, resolved.command
@@ -3546,7 +3608,8 @@ class StreamManager:
         return None, item_name
 
     async def open(self, kind: str, ref_id: int, user_name: str | None,
-                 force_proxy: bool = False) -> tuple[StreamHandle, object]:
+                 force_proxy: bool = False,
+                 template_id: int | None = None) -> tuple[StreamHandle, object]:
         """
         Build fallback chain for a playlist item and return
         (handle, async generator yielding mpegts bytes).
@@ -3575,8 +3638,12 @@ class StreamManager:
         else:
             raise ValueError(f"unknown kind {kind}")
 
-        tpl_name, command = await self._template_for(
-            item, kind=kind, user_name=user_name)
+        if template_id is None:
+            tpl_name, command = await self._template_for(
+                item, kind=kind, user_name=user_name)
+        else:
+            tpl_name, command = await self._template_for(
+                item, kind=kind, user_name=user_name, template_id=template_id)
         if force_proxy and kind != "local" \
                 and (command or "").strip() == REDIRECT_COMMAND:
             tpl_name, command = await self._copy_fallback_command()

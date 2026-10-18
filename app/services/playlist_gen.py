@@ -48,7 +48,31 @@ def local_id_from_xtream(stream_id: int) -> int | None:
 
 
 class UserAuth:
-    """Validates ?u=&p= credentials and applies expiry/enabled rules."""
+    """Validates output-user credentials and applies expiry/enabled rules."""
+
+    @staticmethod
+    def permitted(user: User | None, need: str = "m3u") -> bool:
+        """Account/protocol gate shared by password and web-player sessions."""
+        if not user or not user.enabled:
+            return False
+        if need == "m3u" and not user.m3u_enabled:
+            return False
+        if need == "xtream" and not user.xtream_enabled:
+            return False
+        # /get.php is Xtream-authenticated but intentionally returns the same
+        # /play/... URLs as native M3U. The player uses this shared stream gate.
+        if need == "stream" and not (user.m3u_enabled or user.xtream_enabled):
+            return False
+        if user.expire_date:
+            try:
+                exp = datetime.fromisoformat(user.expire_date.replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) > exp:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        return True
 
     @staticmethod
     async def verify(username: str | None, password: str | None,
@@ -57,26 +81,8 @@ class UserAuth:
             return None
         async with SessionLocal() as s:
             user = (await s.execute(select(User).where(User.name == username))).scalar_one_or_none()
-            if not user or not user.enabled or user.password != password:
+            if not user or user.password != password or not UserAuth.permitted(user, need):
                 return None
-            if need == "m3u" and not user.m3u_enabled:
-                return None
-            if need == "xtream" and not user.xtream_enabled:
-                return None
-            # /get.php is Xtream-authenticated but intentionally returns the
-            # same /play/... M3U URLs as the native playlist endpoint. Those
-            # stream URLs must therefore accept either enabled output protocol.
-            if need == "stream" and not (user.m3u_enabled or user.xtream_enabled):
-                return None
-            if user.expire_date:
-                try:
-                    exp = datetime.fromisoformat(user.expire_date.replace("Z", "+00:00"))
-                    if exp.tzinfo is None:
-                        exp = exp.replace(tzinfo=timezone.utc)
-                    if datetime.now(timezone.utc) > exp:
-                        return None
-                except ValueError:
-                    pass
             # touch last_active cheaply (best effort)
             user.last_active = datetime.now(timezone.utc)
             await s.commit()
@@ -105,6 +111,144 @@ def _allowed(group_name: str | None, whitelist: list[str]) -> bool:
     # case-insensitive; whitespace-insensitive since the match decides whether
     # an entire category shows up at all
     return _norm_group(group_name) in {_norm_group(w) for w in whitelist}
+
+
+async def web_player_playlist_items(user: User) -> list[dict]:
+    """Enabled output-playlist items visible through this account's group filter.
+
+    The browser player offers the same Live, VOD, episode and Local entries as
+    an M3U, but returns safe ids/labels instead of credential-bearing URLs.
+    """
+    groups = _groups(user)
+    items: list[dict] = []
+    async with SessionLocal() as s:
+        live = (await s.execute(select(LivePlaylist).where(
+            LivePlaylist.enabled.is_(True)).order_by(LivePlaylist.order,
+                                                       LivePlaylist.id))).scalars().all()
+        vods = (await s.execute(select(VodPlaylist).where(
+            VodPlaylist.enabled.is_(True)).order_by(VodPlaylist.order,
+                                                      VodPlaylist.id))).scalars().all()
+        series = (await s.execute(select(SeriePlaylist).where(
+            SeriePlaylist.enabled.is_(True)).order_by(SeriePlaylist.order,
+                                                        SeriePlaylist.id))).scalars().all()
+        locals_ = (await s.execute(select(LocalPlaylist).where(
+            LocalPlaylist.enabled.is_(True)).order_by(LocalPlaylist.order,
+                                                        LocalPlaylist.id))).scalars().all()
+
+        visible_live = [row for row in live if _allowed(
+            effective_group("live", row.group_name), groups["live"])]
+        visible_vod = [row for row in vods if _allowed(
+            effective_group("vod", row.group_name), groups["vod"])]
+        visible_series = [row for row in series if _allowed(
+            effective_group("series", row.group_name), groups["series"])]
+        visible_local = [row for row in locals_ if _allowed(
+            effective_group("local", row.group_name), groups["local"])]
+
+        for row in visible_live:
+            items.append({"kind": "live", "id": row.id,
+                          "name": best_title(row.custom_name),
+                          "group": effective_group("live", row.group_name),
+                          "logo": row.logo or "",
+                          "number": row.number if row.number is not None else row.order})
+        for row in visible_vod:
+            items.append({"kind": "vod", "id": row.id,
+                          "name": best_title(row.custom_name),
+                          "group": effective_group("vod", row.group_name),
+                          "logo": row.poster or row.logo or ""})
+
+        # Match M3U output: a series entry is one player-selectable episode from
+        # an enabled linked season, and the series group whitelist is applied
+        # before fetching its episode rows.
+        seasons: list = []
+        for batch in _chunked([row.id for row in visible_series]):
+            seasons.extend((await s.execute(
+                select(SeriePlaylistSeason.serie_playlist_id, SerieSeason.id,
+                       SerieSeason.season_number)
+                .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
+                .where(SeriePlaylistSeason.serie_playlist_id.in_(batch),
+                       SeriePlaylistSeason.enabled.is_(True))
+                .order_by(SerieSeason.season_number))).all())
+        episodes_by_season: dict[int, list] = {}
+        for batch in _chunked([row[1] for row in seasons]):
+            for season_id, episode_id, episode_number in (await s.execute(
+                    select(SerieEpisode.serie_season_id, SerieEpisode.id,
+                           SerieEpisode.episode_number)
+                    .where(SerieEpisode.serie_season_id.in_(batch))
+                    .order_by(SerieEpisode.episode_number))).all():
+                episodes_by_season.setdefault(season_id, []).append(
+                    (episode_id, episode_number))
+        series_by_id = {row.id: row for row in visible_series}
+        for playlist_id, season_id, season_number in seasons:
+            row = series_by_id.get(playlist_id)
+            if row is None:
+                continue
+            for episode_id, episode_number in episodes_by_season.get(season_id, ()):
+                items.append({"kind": "episode", "id": episode_id,
+                              "name": f"{best_title(row.custom_name)} "
+                                      f"S{season_number:02d}E{episode_number:02d}",
+                              "group": "Series: " + effective_group(
+                                  "series", row.group_name),
+                              "logo": row.poster or row.logo or ""})
+
+        files: dict[int, LocalFile] = {}
+        for batch in _chunked([row.local_file_id for row in visible_local
+                               if row.local_file_id]):
+            for file_row in (await s.execute(select(LocalFile).where(
+                    LocalFile.id.in_(batch)))).scalars().all():
+                files[file_row.id] = file_row
+        for row in visible_local:
+            file_row = files.get(row.local_file_id)
+            if file_row is not None:
+                items.append({"kind": "local", "id": row.id,
+                              "name": best_title(row.custom_name, file_row.filename),
+                              "group": effective_group("local", row.group_name),
+                              "logo": ""})
+    return items
+
+
+async def web_player_live_channels(user: User) -> list[dict]:
+    """Visible Live-only subset for callers that specifically need channels."""
+    return [row for row in await web_player_playlist_items(user)
+            if row["kind"] == "live"]
+
+
+async def user_can_play_playlist_item(user: User, kind: str, playlist_id: int) -> bool:
+    """Re-check item enablement, series-season links and the user's group filter."""
+    groups = _groups(user)
+    if kind == "episode":
+        async with SessionLocal() as s:
+            row = (await s.execute(
+                select(SeriePlaylist).join(
+                    SeriePlaylistSeason,
+                    SeriePlaylistSeason.serie_playlist_id == SeriePlaylist.id)
+                .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
+                .join(SerieEpisode, SerieEpisode.serie_season_id == SerieSeason.id)
+                .where(SerieEpisode.id == playlist_id,
+                       SeriePlaylist.enabled.is_(True),
+                       SeriePlaylistSeason.enabled.is_(True))
+            )).scalars().first()
+        return bool(row and _allowed(effective_group("series", row.group_name),
+                                     groups["series"]))
+
+    models = {"live": (LivePlaylist, "live"), "vod": (VodPlaylist, "vod"),
+              "local": (LocalPlaylist, "local")}
+    pair = models.get(kind)
+    if pair is None:
+        return False
+    model, group_kind = pair
+    async with SessionLocal() as s:
+        row = await s.get(model, playlist_id)
+        if not row or not row.enabled:
+            return False
+        if kind == "local" and not await s.get(LocalFile, row.local_file_id):
+            return False
+        return _allowed(effective_group(group_kind, row.group_name),
+                        groups[group_kind])
+
+
+async def user_can_play_live(user: User, playlist_id: int) -> bool:
+    """Compatibility helper for a single Live playlist row."""
+    return await user_can_play_playlist_item(user, "live", playlist_id)
 
 
 def _chunked(seq: list, size: int = 800):
@@ -189,17 +333,40 @@ def _extinf_title(title: str | None) -> str:
     return m3u_display_title(title)
 
 
-async def build_m3u(base_url: str, user: User) -> str:
+M3U_DELIVERY_MODES = ("template", "proxy")
+
+
+def _play_url(base_url: str, path: str, username: str, password: str,
+              delivery_mode: str) -> str:
+    """Build one output URL, optionally forcing the same SPM proxy as preview.
+
+    `mode=proxy` is understood by every `/play/...` route. For a Redirect
+    template, the output engine then uses the Copy fallback instead of handing
+    the client a 302 to the portal/CDN. Real FFmpeg templates remain in effect.
+    """
+    query = f"u={username}&p={password}"
+    if delivery_mode == "proxy":
+        query += "&mode=proxy"
+    return f"{base_url.rstrip('/')}/play/{path}?{query}"
+
+
+async def build_m3u(base_url: str, user: User, *,
+                    delivery_mode: str = "template") -> str:
     from .content_cache import generation
+    delivery_mode = (delivery_mode or "template").strip().lower()
+    if delivery_mode not in M3U_DELIVERY_MODES:
+        raise ValueError(f"delivery_mode must be one of {M3U_DELIVERY_MODES}")
     local_cache_ms = await vlc_local_network_caching_ms()
     # Writes to output-relevant tables bump this generation in database.py.
-    # A cache hit therefore needs no catalogue revision query at all.
+    # A cache hit therefore needs no catalogue revision query at all. Delivery
+    # mode is part of the key so the standard and proxy exports never collide.
     key = (user.id, user.groups_json or "", getattr(user, "area_id", None),
-           base_url, local_cache_ms, generation())
+           base_url, local_cache_ms, delivery_mode, generation())
     cached = _M3U_CACHE.get(key)
     if cached:
         return cached[1]
-    text = await _build_m3u(base_url, user, local_cache_ms=local_cache_ms)
+    text = await _build_m3u(base_url, user, local_cache_ms=local_cache_ms,
+                            delivery_mode=delivery_mode)
     _M3U_CACHE[key] = (time.monotonic(), text)
     # Bound memory when users/URLs change.
     if len(_M3U_CACHE) > 100:
@@ -207,7 +374,8 @@ async def build_m3u(base_url: str, user: User) -> str:
         _M3U_CACHE.pop(oldest, None)
     return text
 
-async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) -> str:
+async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500,
+                     delivery_mode: str = "template") -> str:
     """
     Render the final per-user playlist (groups filtered per user).
 
@@ -244,7 +412,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
             }
             attr = " ".join(f'{k}="{v}"' for k, v in attrs.items())
             lines.append(f"#EXTINF:-1 {attr},{title}")
-            lines.append(f"{base_url}/play/live/{it.id}.ts?u={u}&p={p}")
+            lines.append(_play_url(base_url, f"live/{it.id}.ts", u, p, delivery_mode))
 
         # ---- vod -------------------------------------------------------
         vods = (await s.execute(select(VodPlaylist).where(VodPlaylist.enabled.is_(True))
@@ -266,7 +434,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
                     f'group-title="{m3u_attr(it.group_name or "VOD")}"')
             lines.append(f"#EXTINF:-1 {attr},{title}")
             ext = tmap.resolve("vod", it).container
-            lines.append(f"{base_url}/play/vod/{it.id}.{ext}?u={u}&p={p}")
+            lines.append(_play_url(base_url, f"vod/{it.id}.{ext}", u, p, delivery_mode))
 
         # ---- series: one m3u entry per episode of enabled seasons ------
         # Filter by the user's group whitelist FIRST, then fetch seasons and
@@ -308,7 +476,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
                             f'group-title="{m3u_attr("Series: " + (sp.group_name or sp.custom_name))}"')
                     lines.append(f"#EXTINF:-1 {attr},{name}")
                     ext = tmap.resolve("series", sp).container
-                    lines.append(f"{base_url}/play/episode/{ep_id}.{ext}?u={u}&p={p}")
+                    lines.append(_play_url(base_url, f"episode/{ep_id}.{ext}", u, p, delivery_mode))
 
         # ---- local files ------------------------------------------------
         locals_ = (await s.execute(select(LocalPlaylist).where(LocalPlaylist.enabled.is_(True))
@@ -339,7 +507,7 @@ async def _build_m3u(base_url: str, user: User, *, local_cache_ms: int = 500) ->
                          f'group-title="{m3u_attr(effective_group("local", it.group_name))}",{name}')
             if direct and local_cache_ms > 0:
                 lines.append(f"#EXTVLCOPT:network-caching={local_cache_ms}")
-            lines.append(f"{base_url}/play/local/{it.id}{ext}?u={u}&p={p}")
+            lines.append(_play_url(base_url, f"local/{it.id}{ext}", u, p, delivery_mode))
 
     return "\n".join(lines) + "\n"
 

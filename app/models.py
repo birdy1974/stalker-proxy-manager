@@ -93,6 +93,12 @@ class Portal(Base):
     notes: Mapped[str | None] = mapped_column(Text)
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    # Last enabled-genre catalogue scan. The global interval lives in Settings;
+    # these per-portal timestamps make due checks restart-safe and let the UI
+    # distinguish a failed scan from a portal that has never been checked.
+    catalog_last_attempt: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    catalog_last_success: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    catalog_last_error: Mapped[str | None] = mapped_column(String(500))
 
     macs: Mapped[list["MacAddress"]] = relationship(
         back_populates="portal", cascade="all, delete-orphan",
@@ -153,6 +159,7 @@ class LiveGenre(Base):
     adult: Mapped[bool] = mapped_column(Boolean, default=False)
     item_count: Mapped[int | None] = mapped_column(Integer)     # cached portal total (dashboard Y in "X of Y")
     channels_fetched: Mapped[bool] = mapped_column(Boolean, default=False)
+    catalog_baseline: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class VodGenre(Base):
@@ -166,6 +173,7 @@ class VodGenre(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     item_count: Mapped[int | None] = mapped_column(Integer)
     items_fetched: Mapped[bool] = mapped_column(Boolean, default=False)
+    catalog_baseline: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class SerieGenre(Base):
@@ -179,6 +187,7 @@ class SerieGenre(Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     item_count: Mapped[int | None] = mapped_column(Integer)
     items_fetched: Mapped[bool] = mapped_column(Boolean, default=False)
+    catalog_baseline: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 # ===========================================================================
@@ -313,6 +322,33 @@ class SerieEpisode(Base):
     series_param: Mapped[bool] = mapped_column(Boolean, default=False)
 
     season: Mapped[SerieSeason] = relationship(back_populates="episodes")
+
+
+class CatalogChange(Base):
+    """Latest review state for one portal source item.
+
+    The source FK is polymorphic (live/vod/series), so `source_id` is paired
+    with `kind`. One row per typed source is enough: pending records retain the
+    latest before/after summary, while reviewed/ignored rows can be re-opened
+    if a later fetch detects another change. This is review state, not a full
+    catalogue snapshot or an output-playlist setting.
+    """
+
+    __tablename__ = "catalog_changes"
+    __table_args__ = (
+        UniqueConstraint("kind", "source_id", name="uq_catalog_change_source"),
+        Index("ix_catalog_changes_portal_status", "portal_id", "status", "kind"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    portal_id: Mapped[int] = mapped_column(ForeignKey("portals.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(10))             # live|vod|series
+    source_id: Mapped[int] = mapped_column(Integer)
+    change_type: Mapped[str] = mapped_column(String(10))      # new|changed
+    status: Mapped[str] = mapped_column(String(12), default="pending", index=True)
+    changes_json: Mapped[str] = mapped_column(Text, default="{}")
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 # ===========================================================================

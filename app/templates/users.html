@@ -34,15 +34,22 @@ function make() {
           ? `<span class="badge text-bg-warning me-1" title="${st.length} selected group(s) no longer exist: ${esc(st.join(', '))}">${k}: ${v.length} (${st.length} stale)</span>`
           : `<span class="badge text-bg-light me-1">${k}: ${v.length || "none"}</span>`;
       }).join("") },
-      { key: "links", label: "Output — M3U URL / Xtream login", render: r => `
+      { key: "links", label: "Output — M3U / Xtream", render: r => `
         <div class="d-flex gap-1 align-items-center">
-          <span class="muted-label mb-0" style="width:40px">M3U</span>
+          <span class="muted-label mb-0" style="width:66px">M3U</span>
           <input class="form-control form-control-sm mono" style="max-width:380px" readonly
-            value="${esc(r.m3u_url)}" onclick="event.stopPropagation();this.select()">
-          <button class="btn btn-sm btn-outline-secondary" title="copy M3U URL"
+            aria-label="Standard M3U URL" value="${esc(r.m3u_url)}" onclick="event.stopPropagation();this.select()">
+          <button class="btn btn-sm btn-outline-secondary" title="copy standard M3U URL"
             onclick="event.stopPropagation();navigator.clipboard.writeText('${esc(r.m3u_url)}');toast('M3U URL copied','ok')"><i class="bi bi-clipboard"></i></button>
-          <button class="btn btn-sm btn-outline-secondary" title="all output URLs (get.php, player_api, EPG)"
+          <button class="btn btn-sm btn-outline-secondary" title="all output URLs (proxy M3U, get.php, player_api, EPG)"
             onclick="event.stopPropagation();showLinks(${r.id})"><i class="bi bi-link-45deg"></i></button>
+        </div>
+        <div class="d-flex gap-1 align-items-center mt-1">
+          <span class="muted-label mb-0" style="width:66px" title="Forces portal streams through SPM, like the web preview player">Proxy M3U</span>
+          <input class="form-control form-control-sm mono" style="max-width:380px" readonly
+            aria-label="SPM proxy M3U URL" value="${esc(r.m3u_proxy_url)}" onclick="event.stopPropagation();this.select()">
+          <button class="btn btn-sm btn-outline-primary" title="copy SPM proxy M3U URL"
+            onclick="event.stopPropagation();navigator.clipboard.writeText('${esc(r.m3u_proxy_url)}');toast('Proxy M3U URL copied','ok')"><i class="bi bi-clipboard"></i></button>
         </div>
         <div class="small text-muted mono mt-1">Xtream: ${esc(r.xtream.url)} · ${esc(r.name)} / ${esc(r.password)}</div>` },
       { key: "actions", label: "", render: r => `
@@ -56,20 +63,27 @@ window.showLinks = (id) => {
   const u = table.items.find(x => x.id === id);
   const body = el("div");
   body.innerHTML = `
-    <div class="muted-label">M3U playlist URL</div>
+    <div class="muted-label">Standard M3U playlist URL (uses each item's delivery template)</div>
     <div class="input-group input-group-sm mb-3"><input class="form-control mono" readonly value="${esc(u.m3u_url)}"><button class="btn btn-outline-secondary" onclick="navigator.clipboard.writeText('${esc(u.m3u_url)}');toast('copied','ok')">copy</button></div>
+    <div class="muted-label">Proxy M3U playlist URL (forces portal streams through SPM, like web preview)</div>
+    <div class="input-group input-group-sm mb-1"><input class="form-control mono" readonly value="${esc(u.m3u_proxy_url)}"><button class="btn btn-outline-primary" onclick="navigator.clipboard.writeText('${esc(u.m3u_proxy_url)}');toast('Proxy M3U URL copied','ok')">copy</button></div>
+    <div class="small text-muted mb-3">Assigned FFmpeg templates still apply; items on Redirect use SPM's Copy fallback. Local files remain served from SPM.</div>
     <div class="muted-label">Xtream Codes API login</div>
     <table class="table table-sm small">
-      <tr><td class="text-muted" style="width:130px">Server URL</td><td class="mono">${esc(u.xtream.url)}</td></tr>
+      <tr><td class="text-muted" style="width:150px">Server URL</td><td class="mono">${esc(u.xtream.url)}</td></tr>
       <tr><td class="text-muted">Username</td><td class="mono">${esc(u.name)}</td></tr>
       <tr><td class="text-muted">Password</td><td class="mono">${esc(u.password)}</td></tr>
       <tr><td class="text-muted">player_api</td><td class="mono">${esc(u.xtream.player_api)}</td></tr>
       <tr><td class="text-muted">get.php</td><td class="mono small">${esc(u.xtream.get_php)}</td></tr>
+      <tr><td class="text-muted">get.php (proxy M3U)</td><td class="mono small">${esc(u.xtream.get_php_proxy)}</td></tr>
       <tr><td class="text-muted">EPG (xmltv)</td><td class="mono small">${esc(u.epg_url)}</td></tr>
     </table>`;
   const footer = el("div");
   const m = openModal({ title: `Output for ${u.name}`, body, footer, size: "lg" });
-  footer.append(mBtn("Copy EPG URL", "btn-outline-primary", async () => {
+  footer.append(mBtn("Copy proxy M3U URL", "btn-outline-primary", async () => {
+    try { await navigator.clipboard.writeText(u.m3u_proxy_url); toast("Proxy M3U URL copied", "ok"); }
+    catch (_) { toast("Clipboard unavailable; copy the Proxy M3U URL from the dialog", "warn"); }
+  }, "bi-clipboard"), mBtn("Copy EPG URL", "btn-outline-secondary", async () => {
     try { await navigator.clipboard.writeText(u.epg_url); toast("EPG URL copied", "ok"); }
     catch (_) { toast("Clipboard unavailable; copy the EPG URL from the table", "warn"); }
   }, "bi-clipboard"), mBtn("Close", "btn-outline-secondary", m.close));

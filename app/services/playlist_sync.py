@@ -228,7 +228,8 @@ async def _sync_local(db, ids: list[int], enabled: bool) -> dict:
 
 
 # -------------------------------------------------------------------- live
-async def _sync_live(db, ids: list[int], enabled: bool) -> dict:
+async def _sync_live(db, ids: list[int], enabled: bool, *,
+                     match_existing: bool = True) -> dict:
     """Add newly enabled live sources to the custom-channel playlist.
 
     Existing links are deliberately preserved. In particular, re-enabling a
@@ -266,7 +267,7 @@ async def _sync_live(db, ids: list[int], enabled: bool) -> dict:
         name = (src.original_name or "").strip()
         if not name:
             continue
-        playlist = by_name.get(_name_key(name))
+        playlist = by_name.get(_name_key(name)) if match_existing else None
         if playlist is not None:
             priority = priorities.get(playlist.id, 0) + 1
             db.add(LivePlaylistSource(live_playlist_id=playlist.id,
@@ -300,14 +301,20 @@ async def _sync_live(db, ids: list[int], enabled: bool) -> dict:
 
 
 # ------------------------------------------------------------------- public
-async def sync_sources(db, kind: str, ids, enabled: bool) -> dict:
-    """Mirror an Input-Sources switch into the output playlist (no commit)."""
+async def sync_sources(db, kind: str, ids, enabled: bool, *,
+                       live_match_existing: bool = True) -> dict:
+    """Mirror an Input-Sources switch into the output playlist (no commit).
+
+    Review Changes can opt to create separate same-name live channels; normal
+    source toggles retain their historical exact-name fallback behavior.
+    """
     ids = _clean_ids(ids)
     if kind not in SYNC_KINDS or not ids:
         return {"kind": kind, "created": 0, "enabled": 0, "disabled": 0}
     await lock_playlist_order(db, ORDER_MODELS[kind])
     if kind == "live":
-        out = await _sync_live(db, ids, enabled)
+        out = await _sync_live(db, ids, enabled,
+                               match_existing=live_match_existing)
     elif kind == "vod":
         out = await _sync_vod(db, ids, enabled)
     elif kind == "series":

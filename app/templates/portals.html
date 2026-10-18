@@ -19,6 +19,7 @@
   </div>
   <div class="card-body p-2">
     <div id="portals-table"></div>
+    <div id="catalog-schedule-status" class="small text-muted mt-2"></div>
     <div class="muted-label mt-2">Fetch history / running jobs</div>
     <div id="jobs-box" class="small"></div>
   </div>
@@ -149,8 +150,13 @@ function makeTable() {
     server: async () => {
       const d = await api("/api/portals");
       renderJobs(d.jobs);
+      const schedule = d.catalog_schedule || { enabled: false, hours: 0 };
+      $("#catalog-schedule-status").textContent = schedule.enabled
+        ? `Automatic enabled-genre checks: every ${schedule.hours} hour(s) · disable or change interval in Settings.`
+        : "Automatic catalogue checks are off · use Check changes to scan enabled genres now · schedule in Settings.";
       return { total: d.items.length, items: d.items };
     },
+
     columns: [
       { key: "enabled", label: "On", width: "40px", render: r =>
         `<div class="form-check form-switch mb-0"><input class="form-check-input" type="checkbox" ${r.enabled ? "checked" : ""}
@@ -161,7 +167,11 @@ function makeTable() {
           + (r.tls_insecure ? '<div><span class="badge text-bg-warning" title="certificate verification is OFF for this portal"><i class="bi bi-shield-exclamation"></i> TLS unverified</span></div>' : "")
           /* multi-MAC portals get the genre comparison here, under the address,
              so the MAC column holds nothing but one single-line row per MAC */
-          + ((r.macs || []).length >= 2 ? `<div><button class="btn btn-xs btn-outline-secondary mt-1" title="Select MACs and compare their Live, VOD and Series packages" onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button></div>` : ""),
+          + ((r.macs || []).length >= 2 ? `<div><button class="btn btn-xs btn-outline-secondary mt-1" title="Select MACs and compare their Live, VOD and Series packages" onclick="compareGenres(${r.id})"><i class="bi bi-diagram-3"></i> Compare genres across MACs</button></div>` : "")
+          + `<div class="d-flex flex-wrap gap-1 mt-1">
+              <button class="btn btn-xs btn-outline-primary" title="Review detected new or changed source items" onclick="reviewCatalog(${r.id})"><i class="bi bi-list-check"></i> Review${r.catalog_pending ? ` <span class="badge text-bg-warning">${r.catalog_pending}</span>` : ""}</button>
+              <button class="btn btn-xs btn-outline-secondary" title="Scan enabled genres now for new or changed items" onclick="checkCatalog(${r.id})"><i class="bi bi-arrow-repeat"></i> Check</button>
+            </div>`,
         filter: { type: "text", placeholder: "name…" } },
       { key: "resolved_path", label: "Resolved path", width: "110px", render: r => r.resolved_url ? `<span class="badge text-bg-light mono">${esc(r.resolved_path || "?")}</span>` : '<span class="text-muted small">not resolved</span>' },
       /* what the panel said about itself (version.js + get_modules, read on
@@ -245,9 +255,197 @@ function renderJobs(jobs) {
   box.innerHTML = jobs.map(j => `
     <div class="d-flex align-items-center gap-2 border rounded px-2 py-1 mb-1 bg-light">
       <span class="badge text-bg-${j.status === "running" ? "primary" : j.status === "done" ? "success" : j.status === "error" ? "danger" : "secondary"}">${j.status}</span>
-      <span class="flex-grow-1">fetch · portal #${j.portal_id} — <b>${esc(j.stage)}</b> ${esc(j.detail)} — ${j.done_items}${j.total_items ? "/" + j.total_items : ""} items</span>
+      <span class="flex-grow-1">${j.kind === "catalog_check" ? "catalog check" : "fetch"} · portal #${j.portal_id} — <b>${esc(j.stage)}</b> ${esc(j.detail)} — ${j.done_items}${j.total_items ? "/" + j.total_items : ""} items</span>
       ${(j.status === "running" || j.status === "queued") ? `<button class="btn btn-sm btn-outline-danger" onclick="api('/api/portals/jobs/${j.id}/cancel',{method:'POST'}).then(()=>toast('cancel requested','warn'))">cancel</button>` : ""}
     </div>`).join("");
+}
+
+async function checkCatalog(pid) {
+  try {
+    const r = await api(`/api/portals/${pid}/check-changes`, { method: "POST" });
+    toast(r.reused ? "A portal fetch is already running; it will also detect changes." : "Catalogue comparison queued for enabled genres.", "ok");
+    pollJobs();
+    waitJob(r.job.id, async job => {
+      await table.reload();
+      if (job?.status === "error") toast(`Catalogue scan failed: ${job.error || "see job details"}`, "error");
+      else if (job?.status === "cancelled") toast("Catalogue scan was cancelled.", "warn");
+      else if (job) toast("Catalogue scan finished; open Review to see pending differences.", "ok");
+      else toast("Catalogue scan is still running; check the job status below.", "warn");
+    }, 60 * 60 * 1000);
+  } catch (e) { /* api() already reports the reason */ }
+}
+
+async function reviewCatalog(pid) {
+  let portal = table.items.find(x => x.id === pid) || { id: pid, name: `portal #${pid}` };
+  const body = el("div");
+  body.innerHTML = `
+    <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+      <div id="catalog-review-last" class="small text-muted flex-grow-1"></div>
+      <button type="button" class="btn btn-sm btn-outline-primary" id="catalog-review-check"><i class="bi bi-arrow-repeat"></i> Check changes now</button>
+    </div>
+    <div class="small text-muted mb-2">A scan fetches all enabled genres. Source metadata is refreshed, but playlist names, groups, order and templates are not overwritten. New items are not added to output until you choose them here.</div>
+    <ul class="nav nav-tabs nav-subtabs mb-2" id="catalog-review-tabs">
+      ${["live", "vod", "series"].map(k => `<li class="nav-item"><button type="button" class="nav-link ${k === "live" ? "active" : ""}" data-kind="${k}">${k === "live" ? "Live" : k === "vod" ? "VOD" : "Series"} <span class="badge text-bg-light" data-count-kind="${k}">0</span></button></li>`).join("")}
+    </ul>
+    <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+      <select class="form-select form-select-sm" id="catalog-review-filter" style="width:auto">
+        <option value="">All pending</option><option value="new">New only</option><option value="changed">Changed only</option>
+      </select>
+      <input class="form-control form-control-sm" id="catalog-review-search" style="max-width:260px" placeholder="search title, genre or portal ID…">
+      <span class="small text-muted ms-auto" id="catalog-review-total"></span>
+    </div>
+    <div id="catalog-live-mode" class="small mb-2 d-none">
+      <label class="me-2" for="catalog-live-add-mode">When adding Live sources:</label>
+      <select class="form-select form-select-sm d-inline-block" id="catalog-live-add-mode" style="width:auto">
+        <option value="match">Attach exact-name matches as fallbacks</option>
+        <option value="new">Always create separate channels</option>
+      </select>
+    </div>
+    <div class="table-responsive border rounded" style="max-height:58vh;overflow:auto">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead class="table-light sticky-top"><tr><th style="width:34px"><input type="checkbox" class="form-check-input" id="catalog-review-select-all" aria-label="Select page"></th><th>Source and differences</th><th style="width:170px">State</th></tr></thead>
+        <tbody id="catalog-review-rows"><tr><td colspan="3" class="text-muted text-center p-3">Loading…</td></tr></tbody>
+      </table>
+    </div>
+    <div class="d-flex align-items-center justify-content-between mt-2 small">
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="catalog-review-prev">Previous</button>
+      <span id="catalog-review-page"></span>
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="catalog-review-next">Next</button>
+    </div>`;
+  const footer = el("div", { class: "d-flex flex-wrap gap-2 align-items-center w-100" });
+  const selectedCount = el("span", { class: "small text-muted me-auto", id: "catalog-review-selected" }, "0 selected");
+  const addBtn = mBtn("Add selected new to Playlist", "btn-accent", async () => act("add"), "bi-plus-circle");
+  const reviewedBtn = mBtn("Mark reviewed", "btn-outline-secondary", async () => act("reviewed"), "bi-check2");
+  const ignoreBtn = mBtn("Ignore selected", "btn-outline-secondary", async () => act("ignored"), "bi-eye-slash");
+  const closeBtn = mBtn("Close", "btn-outline-secondary", () => modal.close());
+  footer.append(selectedCount, addBtn, reviewedBtn, ignoreBtn, closeBtn);
+  const modal = openModal({ title: `Review catalogue changes — ${portal.name}`, body, footer, size: "xl" });
+  const state = { kind: "live", changeType: "", search: "", page: 1, perPage: 50, items: [], total: 0, busy: false, error: "" };
+  const countKinds = () => {
+    const counts = portal.catalog_changes || {};
+    for (const kind of ["live", "vod", "series"]) {
+      const n = (counts[kind]?.new || 0) + (counts[kind]?.changed || 0);
+      const badge = $(`[data-count-kind="${kind}"]`, body);
+      if (badge) badge.textContent = n;
+    }
+  };
+  const selected = () => $$("[data-change-id]:checked", body).map(n => Number(n.dataset.changeId));
+  const updateSelected = () => { selectedCount.textContent = `${selected().length} selected`; };
+  const showLastScan = () => {
+    const node = $("#catalog-review-last", body);
+    node.innerHTML = portal.catalog_last_success
+      ? `Last successful scan: ${esc(fmtTime(portal.catalog_last_success, { seconds: false }))}`
+      : "No successful item scan recorded yet. The first fetch of each enabled genre establishes a baseline.";
+    if (portal.catalog_last_error) node.innerHTML += `<div class="text-danger">Last scan error: ${esc(portal.catalog_last_error)}</div>`;
+  };
+  const renderRows = () => {
+    const host = $("#catalog-review-rows", body);
+    if (state.error) {
+      host.innerHTML = `<tr><td colspan="3" class="text-danger text-center p-3">${esc(state.error)}</td></tr>`;
+    } else if (!state.items.length) {
+      host.innerHTML = `<tr><td colspan="3" class="text-muted text-center p-3">${state.total ? "No items on this page." : "No pending differences for this filter."}</td></tr>`;
+    } else {
+      const pretty = value => value == null || value === "" ? "—"
+        : typeof value === "boolean" ? (value ? "Yes" : "No")
+        : String(value).length > 160 ? String(value).slice(0, 160) + "…" : String(value);
+      host.innerHTML = state.items.map(item => {
+        const differences = Object.entries(item.changes || {}).map(([label, pair]) =>
+          `<div class="small text-break"><b>${esc(label)}:</b> <span class="text-muted">${esc(pretty(pair?.before))}</span> <i class="bi bi-arrow-right"></i> <span>${esc(pretty(pair?.after))}</span></div>`).join("");
+        const detail = item.change_type === "new"
+          ? `<div class="small text-success">New source item found · portal ID <span class="mono">${esc(item.portal_item_id)}</span></div>`
+          : (differences || '<div class="small text-muted">Source metadata changed.</div>');
+        const typeBadge = item.change_type === "new"
+          ? '<span class="badge text-bg-success">NEW</span>'
+          : '<span class="badge text-bg-info">CHANGED</span>';
+        return `<tr>
+          <td><input type="checkbox" class="form-check-input" data-change-id="${item.id}" aria-label="Select ${esc(item.name)}"></td>
+          <td><div class="fw-semibold">${esc(item.name || "(untitled)")} ${typeBadge}</div>
+            <div class="small text-muted">${esc(item.genre || "No genre")}${item.portal_item_id ? ` · ID ${esc(item.portal_item_id)}` : ""}</div>
+            <div class="mt-1">${detail}</div></td>
+          <td><div>${item.in_playlist ? '<span class="badge text-bg-primary">In playlist</span>' : '<span class="badge text-bg-light">Not in playlist</span>'}</div>
+            <div class="small text-muted mt-1">${item.enabled ? "Source enabled" : "Source disabled"}</div>
+            <div class="small text-muted">${item.updated_at ? esc(fmtTime(item.updated_at, { seconds: false })) : ""}</div></td>
+        </tr>`;
+      }).join("");
+      $$('[data-change-id]', body).forEach(box => box.addEventListener("change", updateSelected));
+    }
+    const pages = Math.max(1, Math.ceil(state.total / state.perPage));
+    $("#catalog-review-total", body).textContent = `${state.total} pending`;
+    $("#catalog-review-page", body).textContent = `Page ${state.page} of ${pages}`;
+    $("#catalog-review-prev", body).disabled = state.page <= 1 || state.busy;
+    $("#catalog-review-next", body).disabled = state.page >= pages || state.busy;
+    $("#catalog-review-select-all", body).checked = state.items.length > 0 && selected().length === state.items.length;
+    updateSelected();
+  };
+  const load = async () => {
+    state.busy = true; state.error = "";
+    const params = new URLSearchParams({kind: state.kind, page: String(state.page), per_page: String(state.perPage)});
+    if (state.changeType) params.set("change_type", state.changeType);
+    if (state.search) params.set("q", state.search);
+    try {
+      const data = await api(`/api/portals/${pid}/catalog-changes?${params}`);
+      state.items = data.items || []; state.total = data.total || 0;
+      renderRows();
+    } catch (e) {
+      state.error = e.message || "Could not load catalogue differences.";
+    } finally { state.busy = false; renderRows(); }
+  };
+  const act = async action => {
+    const ids = selected();
+    if (!ids.length) return toast("select change rows first", "warn");
+    try {
+      const payload = {action, ids, kind: state.kind,
+        live_match_existing: $("#catalog-live-add-mode", body).value === "match"};
+      const result = await api(`/api/portals/${pid}/catalog-changes/review`, {method: "POST", body: payload});
+      if (action === "add") {
+        toast(`${result.added || 0} playlist item(s) added · ${result.fallback || 0} Live fallback(s)` +
+              (result.skipped_changed ? ` · ${result.skipped_changed} changed row(s) left pending` : "") +
+              (result.missing ? ` · ${result.missing} source(s) no longer available` : ""), "ok");
+        if (result.season_jobs?.length) toast("Fetching seasons for newly added series…", "info");
+      } else toast(`${result.updated || 0} row(s) ${action === "ignored" ? "ignored" : "marked reviewed"}`, "ok");
+      await load(); await table.reload();
+      portal = table.items.find(x => x.id === pid) || portal; countKinds(); showLastScan();
+    } catch (e) { /* api() already reports the reason */ }
+  };
+  $("#catalog-review-tabs", body).addEventListener("click", async event => {
+    const button = event.target.closest("[data-kind]");
+    if (!button) return;
+    state.kind = button.dataset.kind; state.page = 1;
+    $$("#catalog-review-tabs .nav-link", body).forEach(n => n.classList.toggle("active", n === button));
+    $("#catalog-live-mode", body).classList.toggle("d-none", state.kind !== "live");
+    await load();
+  });
+  $("#catalog-review-filter", body).addEventListener("change", async event => {
+    state.changeType = event.target.value; state.page = 1; await load();
+  });
+  let searchTimer;
+  $("#catalog-review-search", body).addEventListener("input", event => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => { state.search = event.target.value.trim(); state.page = 1; load(); }, 250);
+  });
+  $("#catalog-review-select-all", body).addEventListener("change", event => {
+    $$('[data-change-id]', body).forEach(box => { box.checked = event.target.checked; }); updateSelected();
+  });
+  $("#catalog-review-prev", body).addEventListener("click", async () => { if (state.page > 1) { state.page--; await load(); } });
+  $("#catalog-review-next", body).addEventListener("click", async () => { if (state.page < Math.ceil(state.total / state.perPage)) { state.page++; await load(); } });
+  $("#catalog-review-check", body).addEventListener("click", async event => {
+    const button = event.currentTarget; button.disabled = true;
+    try {
+      const result = await api(`/api/portals/${pid}/check-changes`, {method: "POST"});
+      toast(result.reused ? "An item fetch is already running; it will also detect changes." : "Catalogue comparison queued.", "ok");
+      pollJobs();
+      waitJob(result.job.id, async job => {
+        button.disabled = false; await table.reload();
+        portal = table.items.find(x => x.id === pid) || portal; countKinds(); showLastScan(); await load();
+        if (job?.status === "error") toast(`Catalogue scan failed: ${job.error || "see job details"}`, "error");
+        else if (job?.status === "cancelled") toast("Catalogue scan was cancelled.", "warn");
+        else if (!job) toast("Catalogue scan is still running; check the job status below.", "warn");
+      }, 60 * 60 * 1000);
+    } catch (e) { button.disabled = false; }
+  });
+  countKinds(); showLastScan();
+  $("#catalog-live-mode", body).classList.remove("d-none");
+  await load();
 }
 
 /* ============================= add / edit modal ============================= */
@@ -1145,13 +1343,14 @@ async function pollJobs() {
 function waitJob(jobId, onDone, timeoutMs = 300000) {
   const t0 = Date.now();
   const t = setInterval(async () => {
-    let done = Date.now() - t0 > timeoutMs;
+    const timedOut = Date.now() - t0 > timeoutMs;
+    let job = null;
     try {
       const d = await api("/api/portals");
-      const j = d.jobs.find(x => x.id === jobId);
-      done = done || (j && j.status !== "queued" && j.status !== "running");
+      job = d.jobs.find(x => x.id === jobId) || null;
     } catch (e) {}
-    if (done) { clearInterval(t); onDone(); }
+    const finished = job && job.status !== "queued" && job.status !== "running";
+    if (timedOut || finished) { clearInterval(t); onDone(job); }
   }, 1500);
 }
 makeTable();

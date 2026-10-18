@@ -88,6 +88,8 @@ async def restore(payload: dict, db=Depends(get_db)):
         result = await backup.restore(db, payload.get("data"), payload.get("tables"), keys(payload))
         await db.commit()
     await refresh_favicon()
+    from ..services.runtime_settings import apply_quick_zap_linger_setting
+    await apply_quick_zap_linger_setting()
     return result
 
 
@@ -146,4 +148,6 @@ async def delete_data(payload: dict, db=Depends(get_db)):
     from ..portal.pool import POOL
     await POOL.close_all()
     await refresh_favicon()
+    from ..services.runtime_settings import apply_quick_zap_linger_setting
+    await apply_quick_zap_linger_setting()
     return result

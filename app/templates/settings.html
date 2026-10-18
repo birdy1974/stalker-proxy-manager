@@ -96,6 +96,8 @@ const SETTING_DEFS = [
   ["prefer_free_mac", "Zap takes a free MAC first", ["true", "false"], "true"],
   ["fetch_page_budget", "Fetch page budget per genre (×14 items)", "number", 30],
   ["epg_refresh_hours", "EPG refresh interval (hours; 0 = paused)", "number", 24],
+  ["catalog_refresh_hours", "Catalog check interval (hours; 0 = manual only)", "number", 0],
+  ["quick_zap_linger_seconds", "Keep live channel warm after zap (seconds; 0 = off)", "number", 8],
   ["epg_portal_enabled", "Use source portal EPG", ["true", "false"], "true"],
   ["mac_health_minutes", "Multi-MAC status refresh (minutes, 0 = off)", "number", 60],
   ["mac_health_multi_only", "Only portals with ≥2 MACs", ["true", "false"], "true"],
@@ -104,6 +106,8 @@ const SETTING_DEFS = [
 ];
 const SETTING_HELP = {
   epg_refresh_hours: "Automatic refresh of enabled external and portal guides. Choose an interval from the suggestions or enter 1–168 hours; 0 pauses all automatic refresh, including per-source overrides. Each source has its own Schedule &amp; timing button. Save applies within one minute without restarting. Refresh all still works when paused. Failed feeds retry at the next interval.",
+  catalog_refresh_hours: "Optional full scan of enabled Live, VOD and Series genres for new or changed sources. 0 = manual only; 24 is a daily scan. This pages through catalogues (it is not a cheap count-only probe), queues one portal at a time, yields to playback, and never adds items to the output playlist automatically. Save applies within one minute; failed scans are retried at the next interval.",
+  quick_zap_linger_seconds: "Keeps the previous live stream and its portal connection warm after the viewer leaves, so zapping back can attach instead of starting over. 0 disables it. The parked stream is preemptible, and its replay buffer stays capped at 2 MiB per parked stream; the setting takes effect on the next disconnect.",
   epg_portal_enabled: "Check authenticated Stalker portal guide APIs. Use bulk guide data when available, otherwise up to 100 paced short-guide requests for enabled playlist inputs. Busy MACs are skipped. Coverage depends on the portal. Individual portal sources can also be disabled below.",
   vlc_local_network_caching_ms: "Written as #EXTVLCOPT:network-caching before each directly served local file. Lower starts faster; increase it on an unstable network. Takes effect when the playlist is reloaded.",
   fallback_strategy: "macs_first = try all MACs of a portal before the next portal; portal_first = hop portals immediately. Takes effect on the next play/fetch (no restart).",
@@ -123,9 +127,16 @@ async function loadSettings() {
         <select id="setting-${k}" class="form-select form-select-sm set-field" data-key="${k}" data-kind="str">
           ${type.map(o => `<option ${String(o) === String(v) ? "selected" : ""}>${o}</option>`).join("")}
         </select>${help}</div>`;
+    const hourlySchedule = ["epg_refresh_hours", "catalog_refresh_hours"].includes(k);
+    const lingerRange = k === "quick_zap_linger_seconds";
+    const rangeAttrs = hourlySchedule ? `min="0" max="168" step="1" list="${k}-hours"`
+      : lingerRange ? `min="0" max="300" step="1" list="${k}-seconds"` : "";
+    const rangeList = hourlySchedule
+      ? `<datalist id="${k}-hours"><option value="0"><option value="1"><option value="3"><option value="6"><option value="12"><option value="24"><option value="48"><option value="168"></datalist>`
+      : lingerRange ? `<datalist id="${k}-seconds"><option value="0"><option value="5"><option value="8"><option value="15"><option value="30"><option value="60"><option value="120"><option value="300"></datalist>` : "";
     return `<div class="mb-2"><label class="muted-label" for="setting-${k}">${label}</label>
       <input id="setting-${k}" class="form-control form-control-sm set-field" data-key="${k}" data-kind="${type === "number" ? "num" : "str"}"
-             type="${type}" ${k === "epg_refresh_hours" ? 'min="0" max="168" step="1" list="epg-hours"' : ""} value="${esc(v)}">${k === "epg_refresh_hours" ? '<datalist id="epg-hours"><option value="0"><option value="1"><option value="3"><option value="6"><option value="12"><option value="24"><option value="48"><option value="168"></datalist>' : ""}</div>${help}`;
+             type="${type}" ${rangeAttrs} value="${esc(v)}">${rangeList}</div>${help}`;
   }).join("");
 }
 $("#set-save").addEventListener("click", async () => {

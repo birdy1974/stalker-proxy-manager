@@ -28,7 +28,7 @@ from ..security import require_admin
 from ..services.db_logging import db_log
 from ..services import api_stats, portal_traffic
 from ..services.fetch_jobs import list_jobs
-from ..services.stream_manager import MANAGER
+from ..services.stream_manager import LINGER_S, MAX_LINGER_S, MANAGER
 
 router = APIRouter(prefix="/api", tags=["misc"], dependencies=[Depends(require_admin)])
 
@@ -177,6 +177,8 @@ DEFAULT_SETTINGS = {
     "prefer_free_mac": "true" if PREFER_FREE_MAC else "false",
     "epg_refresh_hours": 24,
     "epg_portal_enabled": True,
+    "catalog_refresh_hours": 0,
+    "quick_zap_linger_seconds": int(round(LINGER_S)),
     "logo_country": "netherlands",
     "tmdb_api_key": TMDB_API_KEY,              # initial env seed; stored GUI value wins
     "fetch_page_budget": FETCH_PAGE_BUDGET,
@@ -213,6 +215,15 @@ async def set_settings(payload: dict, db=Depends(get_db)):
             raise HTTPException(400, "EPG refresh hours must be a whole number from 0 (paused) to 168")
     if "epg_portal_enabled" in payload and not isinstance(payload["epg_portal_enabled"], bool):
         raise HTTPException(400, "Portal EPG enabled must be true or false")
+    if "catalog_refresh_hours" in payload:
+        value = payload["catalog_refresh_hours"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value) or not 0 <= value <= 168:
+            raise HTTPException(400, "Catalog refresh hours must be a whole number from 0 (off) to 168")
+    if "quick_zap_linger_seconds" in payload:
+        value = payload["quick_zap_linger_seconds"]
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not 0 <= value <= MAX_LINGER_S or value != int(value)):
+            raise HTTPException(400, "Quick-zap warm period must be a whole number from 0 (off) to 300 seconds")
     for k, v in payload.items():
         row = await db.get(Setting, k)
         if row is None:
@@ -220,6 +231,9 @@ async def set_settings(payload: dict, db=Depends(get_db)):
             db.add(row)
         row.value = json.dumps(v)
     await db.commit()
+    if "quick_zap_linger_seconds" in payload:
+        from ..services.runtime_settings import apply_quick_zap_linger_setting
+        await apply_quick_zap_linger_setting()
     # Settings such as VLC's local-file cache directive alter generated M3Us;
     # do not serve the previous value for the normal two-minute cache window.
     from ..services.playlist_gen import clear_m3u_cache

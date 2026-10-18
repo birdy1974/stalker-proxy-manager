@@ -38,6 +38,7 @@ from ..portal.resolver import resolve_portal
 from .db_logging import db_log
 from .portal_pace import pace_for_playback
 from .titles import portal_item_title
+from .catalog_changes import record_changes, source_diff, source_snapshot
 
 
 @dataclass
@@ -139,24 +140,59 @@ def _ensure_worker() -> None:
         asyncio.get_running_loop().create_task(_worker())
 
 
+_CATALOG_JOB_KINDS = {"fetch_portal", "fetch_items", "catalog_check"}
+
+
+async def _save_catalog_status(portal_id: int, *, attempted: bool = False,
+                               success: bool = False, error: str | None = None) -> None:
+    """Persist scan status without letting bookkeeping fail a portal fetch."""
+    try:
+        async with SessionLocal() as s:
+            portal = await s.get(Portal, portal_id)
+            if portal is None:
+                return
+            now = datetime.now(timezone.utc)
+            if attempted:
+                portal.catalog_last_attempt = now
+                portal.catalog_last_error = None
+            if success:
+                portal.catalog_last_success = now
+                portal.catalog_last_error = None
+            if error is not None:
+                portal.catalog_last_error = error[:500]
+            await s.commit()
+    except Exception as exc:  # noqa: BLE001 - catalogue status is advisory
+        try:
+            await db_log("WARNING", "fetch",
+                         f"portal {portal_id}: could not save catalogue scan status: {exc}")
+        except Exception:  # noqa: BLE001 - a logging failure must not stop the worker
+            pass
+
+
 async def _worker() -> None:
     while True:
         job = await _QUEUE.get()
         if job.status == "cancelled":
             continue
         job.status, job.started, job.stage = "running", time.time(), "starting"
+        if job.kind in _CATALOG_JOB_KINDS:
+            await _save_catalog_status(job.portal_id, attempted=True)
         try:
             if job.kind == "fetch_portal":
                 await _run_portal_fetch(job)
             elif job.kind == "fetch_genres":
                 await _run_genre_fetch(job)
-            elif job.kind == "fetch_items":
+            elif job.kind in ("fetch_items", "catalog_check"):
                 await _run_items_fetch(job)
             elif job.kind == "fetch_seasons":
                 await _run_seasons_fetch(job)
             job.status = "cancelled" if job._cancel.is_set() else "done"
+            if job.status == "done" and job.kind in _CATALOG_JOB_KINDS:
+                await _save_catalog_status(job.portal_id, success=True)
         except Exception as exc:  # noqa: BLE001
             job.status, job.error = "error", f"{type(exc).__name__}: {exc}"
+            if job.kind in _CATALOG_JOB_KINDS:
+                await _save_catalog_status(job.portal_id, error=job.error)
             await db_log("ERROR", "fetch", f"portal {job.portal_id}: job failed: {job.error}")
         finally:
             job.ended = time.time()
@@ -397,11 +433,14 @@ async def _sync_genres(s, model, portal_id: int, incoming: list[dict], syn_ok_no
 
 
 async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
-                        portal_name, budget=None) -> tuple[int, int]:
-    """
-    Fetch up to `budget` pages for one genre and hand each page to `upsert_many`
-    as a WHOLE (one SELECT + one COMMIT per page instead of one round trip per
-    item). Returns (n, total).
+                        portal_name, budget=None, *, return_complete=False):
+    """Fetch pages for one genre; optionally report whether its baseline is safe.
+
+    Pages are handed to `upsert_many` as wholes (one SELECT + one COMMIT per
+    page). Existing callers keep the historical ``(items, total)`` result;
+    catalogue tracking can request a third `complete` value, which is true
+    only when the walk reached a known total or a short terminal page without
+    page errors, truncation, or cancellation.
     """
     from ..config import FETCH_PAGE_CONCURRENCY
     from .runtime_settings import fetch_page_budget
@@ -409,19 +448,22 @@ async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
         budget = await fetch_page_budget()
 
     inserted, total = 0, 0
+    complete, page_error = True, False
     job.detail = f"{genre_name}: page 1"
     first = await fetch_page(1)
-    total = first.total
+    total = int(first.total or 0)
     pages = [first]
 
     # Page 1 tells us the total, so the rest can go out concurrently instead of
     # one ~1s round trip at a time. Bounded: panels rate-limit, and every page
     # shares one portal session now.
-    if total and len(first.items) >= 14:
-        last_page = min(budget, -(-total // 14))
+    if total:
+        expected_pages = -(-total // 14)
+        last_page = min(budget, expected_pages)
         remaining = list(range(2, last_page + 1))
         for start in range(0, len(remaining), FETCH_PAGE_CONCURRENCY):
             if job._cancel.is_set():
+                complete = False
                 break
             # A sync walking thousands of pages is the single biggest consumer of
             # a panel's rate budget. It can take a few seconds longer; the play
@@ -431,48 +473,58 @@ async def _paged_upsert(job, fetch_page, upsert_many, genre_name,
             job.detail = f"{genre_name}: pages {batch[0]}-{batch[-1]}"
             got = await asyncio.gather(*(fetch_page(pg) for pg in batch),
                                        return_exceptions=True)
-            stop = False
             for pg, res in zip(batch, got):
                 if isinstance(res, Exception):
+                    page_error = True
                     await db_log("WARNING", "fetch",
                                  f"[{portal_name}] {genre_name}: page {pg} failed "
                                  f"({type(res).__name__}: {res}) - skipping")
                     continue
                 pages.append(res)
-                if len(res.items) < 14:          # short page = end of list
-                    stop = True
-            if stop:
-                break
-    elif not total and len(first.items) >= 14:
-        # Portal did not report a total: fall back to walking pages serially.
+        # A reported total may include items filtered by the VOD/Series split,
+        # so success means every expected page answered, not that the filtered
+        # row count equals the portal's raw total.
+        complete = last_page >= expected_pages and not page_error and not job._cancel.is_set()
+    elif len(first.items or []) >= 14:
+        # Portal did not report a total: walk serially until a short page proves
+        # the end. Hitting the budget or a page error is not a baseline.
+        ended = False
         for page in range(2, budget + 1):
             if job._cancel.is_set():
+                complete = False
                 break
             await pace_for_playback(job.portal_id)
             job.detail = f"{genre_name}: page {page}"
             try:
                 data = await fetch_page(page)
             except Exception as exc:  # noqa: BLE001
+                page_error = True
                 await db_log("WARNING", "fetch",
                              f"[{portal_name}] {genre_name}: page {page} failed "
                              f"({type(exc).__name__}: {exc}) - stopping")
                 break
             pages.append(data)
-            if len(data.items) < 14:
+            if len(data.items or []) < 14:
+                ended = True
                 break
+        complete = ended and not page_error and not job._cancel.is_set()
 
     # asyncio.gather returns results in submission order, so `pages` is already
     # in page order and `order` stays stable without re-sorting.
     for data in pages:
         if job._cancel.is_set():
+            complete = False
             break
         if data.items:
             await upsert_many(data.items)
             inserted += len(data.items)
         job.done_items += len(data.items)
+    if job._cancel.is_set():
+        complete = False
     await db_log("INFO", "fetch",
                  f"[{portal_name}] {genre_name}: {inserted} items (portal total: {total or '?'})")
-    return inserted, total
+    result = (inserted, total, complete)
+    return result if return_complete else result[:2]
 
 
 # --------------------------------------------------------------------------- #
@@ -486,10 +538,14 @@ def _chunks(seq: list, size: int):
 
 
 async def _bulk_upsert(s, model, portal_id: int, key_col, items: list[dict],
-                       key_of, apply_fields, chunk_size: int = 500) -> int:
-    """
-    Upsert `items` with two round trips per chunk (SELECT existing + COMMIT)
-    instead of one session per row.
+                       key_of, apply_fields, chunk_size: int = 500, *,
+                       kind: str | None = None, track_changes: bool = False) -> int:
+    """Upsert one page/chunk and optionally retain safe before/after changes.
+
+    `track_changes` is false for the first fetch of a genre: that fetch is the
+    baseline, not a wall of thousands of items labelled NEW. Later enabled-genre
+    fetches record newly seen source IDs and metadata changes without changing
+    the normal source-upsert behavior.
     """
     done = 0
     for chunk in _chunks(items, chunk_size):
@@ -504,13 +560,32 @@ async def _bulk_upsert(s, model, portal_id: int, key_col, items: list[dict],
         existing = {getattr(r, key_col.key): r for r in (await s.execute(
             select(model).where(model.portal_id == portal_id,
                                 key_col.in_(keys)))).scalars().all()}
+        event_rows: list[tuple[Any, str, dict]] = []
         for key, item in rows_by_key.items():
             row = existing.get(key)
             if row is None:
                 row = model(portal_id=portal_id, **{key_col.key: key})
                 s.add(row)
-            apply_fields(row, item)
+                apply_fields(row, item)
+                if track_changes and kind:
+                    event_rows.append((row, "new", {}))
+            else:
+                before = source_snapshot(kind, row) if track_changes and kind else {}
+                old_cmd = getattr(row, "cmd", None)
+                apply_fields(row, item)
+                if track_changes and kind:
+                    changes = source_diff(kind, before, source_snapshot(kind, row),
+                                          old_cmd, getattr(row, "cmd", None))
+                    if changes:
+                        event_rows.append((row, "changed", changes))
             done += 1
+        # IDs for newly inserted rows are needed by CatalogChange.source_id.
+        if event_rows:
+            await s.flush()
+            await record_changes(s, portal_id, kind, [
+                (row.id, change_type, changes)
+                for row, change_type, changes in event_rows
+            ])
         await s.commit()
     return done
 
@@ -809,17 +884,18 @@ async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_na
     async with SessionLocal() as s:
         enabled = (await s.execute(select(LiveGenre).where(
             LiveGenre.portal_id == portal_id, LiveGenre.enabled.is_(True)))).scalars().all()
-        enabled = [(g.id, g.genre_portal_id, g.name) for g in enabled]
+        enabled = [(g.id, g.genre_portal_id, g.name, bool(g.catalog_baseline)) for g in enabled]
     if not enabled:
         await db_log("INFO", "fetch", f"[{portal_name}] live: no enabled genres - skipping")
         return
 
-    async def upsert_many(items, db_id: int) -> int:
+    async def upsert_many(items, db_id: int, track_changes: bool = False) -> int:
         async with SessionLocal() as s2:
             return await _bulk_upsert(
                 s2, LiveSource, portal_id, LiveSource.portal_channel_id, items,
                 lambda i: str(i.get("id", "") or ""),
-                lambda row, item: _live_fields(row, item, db_id))
+                lambda row, item: _live_fields(row, item, db_id),
+                kind="live", track_changes=track_changes)
 
     # ---- fast path: the COMPLETE channel list in a single request ----------
     # Real STBs ask for `get_all_channels` instead of paging through every
@@ -840,18 +916,19 @@ async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_na
             counts[gid] = counts.get(gid, 0) + 1
             bucket.setdefault(gid, []).append(row)
         total_rows = len(complete)
-        for db_id, gid, name in enabled:
+        for db_id, gid, name, previously_baselined in enabled:
             if job._cancel.is_set():
                 return
             rows = bucket.get(str(gid or ""), [])
             job.detail = f"live:{name} ({len(rows)} of {total_rows})"
             if rows:
-                await upsert_many(rows, db_id)
+                await upsert_many(rows, db_id, previously_baselined)
                 job.done_items += len(rows)
         async with SessionLocal() as s3:                 # ONE commit for all counters
-            for db_id, gid, _name in enabled:
+            for db_id, gid, _name, _previously_baselined in enabled:
                 g = await s3.get(LiveGenre, db_id)
                 g.item_count, g.channels_fetched = counts.get(str(gid or ""), 0), True
+                g.catalog_baseline = True
             await s3.commit()
         await db_log("INFO", "fetch",
                      f"[{portal_name}] live: {total_rows} channels via get_all_channels "
@@ -859,19 +936,22 @@ async def _fetch_live(job: Job, client: StalkerClient, portal_id: int, portal_na
         return
 
     # ---- fallback: page through every enabled genre ------------------------
-    for db_id, gid, name in enabled:
+    for db_id, gid, name, previously_baselined in enabled:
         if job._cancel.is_set():
             return
 
         async def page_fetch(p, _gid=gid):  # noqa: ANN202
             return await client.live_channels(_gid, p)
 
-        n, total = await _paged_upsert(job, page_fetch,
-                                       lambda items, _db_id=db_id: upsert_many(items, _db_id),
-                                       f"live:{name}", portal_name)
+        n, total, scan_complete = await _paged_upsert(
+            job, page_fetch,
+            lambda items, _db_id=db_id, _tracked=previously_baselined:
+                upsert_many(items, _db_id, _tracked),
+            f"live:{name}", portal_name, return_complete=True)
         async with SessionLocal() as s3:
             g = await s3.get(LiveGenre, db_id)
             g.item_count, g.channels_fetched = (total or n), True
+            g.catalog_baseline = bool(g.catalog_baseline or scan_complete)
             await s3.commit()
 
 
@@ -880,31 +960,35 @@ async def _fetch_vod(job: Job, client: StalkerClient, portal_id: int, portal_nam
     async with SessionLocal() as s:
         enabled = (await s.execute(select(VodGenre).where(
             VodGenre.portal_id == portal_id, VodGenre.enabled.is_(True)))).scalars().all()
-        enabled = [(g.id, g.genre_portal_id, g.name) for g in enabled]
+        enabled = [(g.id, g.genre_portal_id, g.name, bool(g.catalog_baseline)) for g in enabled]
     if not enabled:
         await db_log("INFO", "fetch", f"[{portal_name}] vod: no enabled genres - skipping")
         return
 
-    async def upsert_many(items, db_id: int) -> int:
+    async def upsert_many(items, db_id: int, track_changes: bool = False) -> int:
         async with SessionLocal() as s2:
             return await _bulk_upsert(
                 s2, VodSource, portal_id, VodSource.portal_item_id, items,
                 lambda i: str(i.get("id", "") or ""),
-                lambda row, item: _vod_fields(row, item, db_id))
+                lambda row, item: _vod_fields(row, item, db_id),
+                kind="vod", track_changes=track_changes)
 
-    for db_id, cid, name in enabled:
+    for db_id, cid, name, previously_baselined in enabled:
         if job._cancel.is_set():
             return
 
         async def page_fetch(p, _cid=cid):
             return await client.vod_list(_cid or None, p)
 
-        n, total = await _paged_upsert(job, page_fetch,
-                                       lambda items, _db_id=db_id: upsert_many(items, _db_id),
-                                       f"vod:{name}", portal_name)
+        n, total, scan_complete = await _paged_upsert(
+            job, page_fetch,
+            lambda items, _db_id=db_id, _tracked=previously_baselined:
+                upsert_many(items, _db_id, _tracked),
+            f"vod:{name}", portal_name, return_complete=True)
         async with SessionLocal() as s3:
             g = await s3.get(VodGenre, db_id)
             g.item_count, g.items_fetched = (total or n), True
+            g.catalog_baseline = bool(g.catalog_baseline or scan_complete)
             await s3.commit()
 
 
@@ -913,31 +997,35 @@ async def _fetch_series(job: Job, client: StalkerClient, portal_id: int, portal_
     async with SessionLocal() as s:
         enabled = (await s.execute(select(SerieGenre).where(
             SerieGenre.portal_id == portal_id, SerieGenre.enabled.is_(True)))).scalars().all()
-        enabled = [(g.id, g.genre_portal_id, g.name) for g in enabled]
+        enabled = [(g.id, g.genre_portal_id, g.name, bool(g.catalog_baseline)) for g in enabled]
     if not enabled:
         await db_log("INFO", "fetch", f"[{portal_name}] series: no enabled genres - skipping")
         return
 
-    async def upsert_many(items, db_id: int) -> int:
+    async def upsert_many(items, db_id: int, track_changes: bool = False) -> int:
         async with SessionLocal() as s2:
             return await _bulk_upsert(
                 s2, SerieSource, portal_id, SerieSource.portal_item_id, items,
                 lambda i: str(i.get("id", "") or ""),
-                lambda row, item: _serie_fields(row, item, db_id))
+                lambda row, item: _serie_fields(row, item, db_id),
+                kind="series", track_changes=track_changes)
 
-    for db_id, cid, name in enabled:
+    for db_id, cid, name, previously_baselined in enabled:
         if job._cancel.is_set():
             return
 
         async def page_fetch(p, _cid=cid):
             return await client.series_list(_cid or None, p)
 
-        n, total = await _paged_upsert(job, page_fetch,
-                                       lambda items, _db_id=db_id: upsert_many(items, _db_id),
-                                       f"series:{name}", portal_name)
+        n, total, scan_complete = await _paged_upsert(
+            job, page_fetch,
+            lambda items, _db_id=db_id, _tracked=previously_baselined:
+                upsert_many(items, _db_id, _tracked),
+            f"series:{name}", portal_name, return_complete=True)
         async with SessionLocal() as s3:
             g = await s3.get(SerieGenre, db_id)
             g.item_count, g.items_fetched = (total or n), True
+            g.catalog_baseline = bool(g.catalog_baseline or scan_complete)
             await s3.commit()
 
     await _fetch_seasons_episodes(job, client, portal_id, portal_name)

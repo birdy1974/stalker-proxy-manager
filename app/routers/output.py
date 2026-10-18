@@ -2,6 +2,7 @@
 Public output endpoints (NO admin auth - they carry user credentials instead):
 
   /playlist.m3u?u=&p=             per-user M3U (also /get.php for Xtream players)
+                                  add `delivery=proxy` for a preview-style SPM-proxied export
   /player_api.php                 Xtream Codes API subset
   /xmltv.php, /epg.xml            EPG output (merged sources land in Phase 3)
   /play/{kind}/{id}.ts?u=&p=      the actual proxied/transcoded streams
@@ -59,6 +60,13 @@ async def _authed(u: str | None, p: str | None, need: str = "m3u") -> User:
     return user
 
 
+def _m3u_delivery(value: str) -> str:
+    mode = (value or "template").strip().lower()
+    if mode not in ("template", "proxy"):
+        raise HTTPException(400, "delivery must be 'template' or 'proxy'")
+    return mode
+
+
 # ---------------------------------------------------------------- playlists
 def _m3u_response(text: str, *, filename: str | None = None) -> PlainTextResponse:
     """Serve an M3U body the way players (VLC, Kodi, TiviMate, …) expect it.
@@ -83,18 +91,26 @@ def _m3u_response(text: str, *, filename: str | None = None) -> PlainTextRespons
 
 
 @router.get("/playlist.m3u")
-async def playlist_m3u(request: Request, u: str = "", p: str = ""):
+async def playlist_m3u(request: Request, u: str = "", p: str = "",
+                       delivery: str = "template"):
     user = await _authed(u, p, "m3u")
-    text = await build_m3u(await base_url_of(request), user)
-    return _m3u_response(text, filename=f"playlist_{user.name}.m3u")
+    delivery = _m3u_delivery(delivery)
+    text = await build_m3u(await base_url_of(request), user,
+                           delivery_mode=delivery)
+    suffix = "_proxy" if delivery == "proxy" else ""
+    return _m3u_response(text, filename=f"playlist_{user.name}{suffix}.m3u")
 
 
 @router.get("/get.php")
 async def get_php(request: Request, username: str = "", password: str = "",
-                  type: str = Query("m3u_plus"), output: str = "ts"):  # noqa: A002
+                  type: str = Query("m3u_plus"), output: str = "ts",
+                  delivery: str = "template"):  # noqa: A002
     user = await _authed(username, password, "xtream")
-    text = await build_m3u(await base_url_of(request), user)
-    return _m3u_response(text, filename=f"playlist_{user.name}.m3u")
+    delivery = _m3u_delivery(delivery)
+    text = await build_m3u(await base_url_of(request), user,
+                           delivery_mode=delivery)
+    suffix = "_proxy" if delivery == "proxy" else ""
+    return _m3u_response(text, filename=f"playlist_{user.name}{suffix}.m3u")
 
 
 # ---------------------------------------------------------------- xtream api
@@ -316,7 +332,8 @@ async def _ensure_slot(user: User | None) -> None:
 
 async def _stream_response(kind: str, ref_id: int, user: User | None, label: str,
                             request: Request, mode: str = "",
-                            media_type: str = "video/mp2t"):
+                            media_type: str = "video/mp2t",
+                            template_id: int | None = None):
     """
     Serve a stream: either proxied through ffmpeg (default) or redirected
     straight to the resolved portal URL.
@@ -368,8 +385,11 @@ async def _stream_response(kind: str, ref_id: int, user: User | None, label: str
 
     await _ensure_slot(user)
     open_started = time.perf_counter()
+    open_kwargs = {"force_proxy": mode == "proxy"}
+    if template_id is not None:
+        open_kwargs["template_id"] = template_id
     handle, gen = await MANAGER.open(kind, ref_id, user.name if user else None,
-                                     force_proxy=(mode == "proxy"))
+                                     **open_kwargs)
     open_ms = (time.perf_counter() - open_started) * 1000
     if handle.dead:
         MANAGER.note_timing(kind=kind, mode="local" if kind == "local" else "proxy",

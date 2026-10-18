@@ -20,9 +20,10 @@ from app.models import (
     User,
 )
 from app.services.runtime_settings import (
-    fallback_strategy, fetch_page_budget, output_base_url,
-    vlc_local_network_caching_ms,
+    apply_quick_zap_linger_setting, fallback_strategy, fetch_page_budget,
+    output_base_url, quick_zap_linger_seconds, vlc_local_network_caching_ms,
 )
+from app.services import stream_manager
 from app.services.stream_manager import MANAGER
 from app.services.fetch_jobs import _paged_upsert
 from app.portal.client import Page
@@ -65,6 +66,30 @@ async def test_helpers_prefer_the_db_over_env():
     assert await vlc_local_network_caching_ms() == 0
     await _put("vlc_local_network_caching_ms", "invalid")
     assert await vlc_local_network_caching_ms() == 500
+
+
+async def test_quick_zap_linger_setting_applies_live_and_is_bounded(monkeypatch):
+    monkeypatch.setattr(stream_manager, "LINGER_S", 8.0)
+    await _put("quick_zap_linger_seconds", 12)
+    assert await quick_zap_linger_seconds() == 12
+    assert await apply_quick_zap_linger_setting() == 12
+    assert stream_manager.LINGER_S == 12.0
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url=BASE) as c:
+        response = await c.post("/api/settings", json={"quick_zap_linger_seconds": 30})
+        assert response.status_code == 200, response.text
+        assert stream_manager.LINGER_S == 30.0
+        assert await quick_zap_linger_seconds() == 30
+
+        for invalid in (-1, 301, 1.5, True):
+            response = await c.post("/api/settings", json={
+                "quick_zap_linger_seconds": invalid,
+            })
+            assert response.status_code == 400, (invalid, response.text)
+        response = await c.post("/api/settings", json={"quick_zap_linger_seconds": 0})
+        assert response.status_code == 200, response.text
+        assert stream_manager.LINGER_S == 0.0
 
 
 async def _two_mac_channel() -> int:
@@ -146,6 +171,10 @@ async def test_output_base_url_setting_rewrites_playlist_and_user_urls():
         assert users.status_code == 200, users.text
         row = users.json()["items"][0]
         assert row["m3u_url"].startswith("https://nas.lan:8880/")
+        assert row["m3u_proxy_url"].startswith("https://nas.lan:8880/playlist.m3u?")
+        assert row["m3u_proxy_url"].endswith("&delivery=proxy")
+        assert row["xtream"]["get_php_proxy"].startswith("https://nas.lan:8880/get.php?")
+        assert "delivery=proxy" in row["xtream"]["get_php_proxy"]
         assert row["xtream"]["url"] == "https://nas.lan:8880"
 
     # clearing the GUI override falls back to the incoming request host

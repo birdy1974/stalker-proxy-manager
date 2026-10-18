@@ -62,7 +62,7 @@
         <div class="row g-2 mt-1">
           <div class="col-md-3"><label class="muted-label" title="auto = each item gets the URL alias its own ffmpeg template produces (redirect items keep the panel's container, Matroska templates get .mkv, everything else .ts) and the player is raised to 4097 where service type 1 could not demux it. fixed = always use the containers configured above.">Container choice</label>
             <select class="form-select form-select-sm e2-field" id="f-container_mode"></select></div>
-          <div class="col-md-3"><label class="muted-label" title="template = whatever each item is assigned in the Playlist Builder. proxy/redirect append ?mode= and override it for this box only.">Delivery</label>
+          <div class="col-md-3"><label class="muted-label" title="Use item template follows Playlist Builder assignments. Always proxy keeps streams on SPM (like web preview); Redirect sends the receiver straight to the portal/CDN. This setting affects only this bouquet profile.">Delivery</label>
             <select class="form-select form-select-sm e2-field" id="f-delivery_mode"></select></div>
           <div class="col-md-3"><label class="muted-label" title="group_markers = one bouquet per group with markers per series/season (recommended). per_series = one bouquet per series. flat = everything in one.">Layout</label>
             <select class="form-select form-select-sm e2-field" id="f-layout"></select></div>
@@ -317,7 +317,11 @@ $("#e2-delete").addEventListener("click", () => {
   for (const f of ["container_live", "container_vod", "container_series"]) fill(f, META.containers);
   fill("layout", META.layouts);
   fill("container_mode", META.container_modes);
-  fill("delivery_mode", META.delivery_modes);
+  fill("delivery_mode", META.delivery_modes, {
+    template: "Use item template",
+    proxy: "Always proxy via SPM",
+    redirect: "Always redirect to portal/CDN",
+  });
   fill("transport", META.transports);
   fill("owif_auth", META.owif_auth);
   const sel = $("#f-user_id");

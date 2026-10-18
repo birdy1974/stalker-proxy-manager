@@ -44,17 +44,25 @@ def _row(u: User, base: str, available: dict | None = None,
                                                        for g in available.get(k, [])}]
                  for k in ("live", "vod", "series", "local")}
     epg_query = urlencode({"username": u.name, "password": u.password})
+    m3u_query = urlencode({"u": u.name, "p": u.password})
+    xtream_m3u_query = urlencode({"username": u.name, "password": u.password,
+                                 "type": "m3u_plus", "output": "ts"})
+    xtream_proxy_query = urlencode({"username": u.name, "password": u.password,
+                                    "type": "m3u_plus", "output": "ts",
+                                    "delivery": "proxy"})
     row = {"epg_url": f"{base}/xmltv.php?{epg_query}", "id": u.id, "name": u.name, "password": u.password,
             "m3u_enabled": u.m3u_enabled, "xtream_enabled": u.xtream_enabled,
             "expire_date": u.expire_date, "max_connections": u.max_connections,
             "enabled": u.enabled, "groups": groups,
             "area_id": u.area_id,
             "area_name": (areas or {}).get(u.area_id) if u.area_id else None,
-            "m3u_url": f"{base}/playlist.m3u?u={u.name}&p={u.password}",
+            "m3u_url": f"{base}/playlist.m3u?{m3u_query}",
+            "m3u_proxy_url": f"{base}/playlist.m3u?{m3u_query}&delivery=proxy",
             "xtream": {"server": base.rsplit(":", 1)[0].replace("://", "://") ,
                        "url": base, "username": u.name, "password": u.password,
                        "player_api": f"{base}/player_api.php",
-                       "get_php": f"{base}/get.php?username={u.name}&password={u.password}&type=m3u_plus&output=ts"},
+                       "get_php": f"{base}/get.php?{xtream_m3u_query}",
+                       "get_php_proxy": f"{base}/get.php?{xtream_proxy_query}"},
             }
     if stale is not None:
         row["groups_stale"] = stale
