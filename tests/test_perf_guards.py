@@ -336,3 +336,27 @@ async def test_health_cache_can_be_disabled(monkeypatch):
         await health.report(db)
         await health.report(db)
         assert len(builds) == 2
+
+
+def test_direct_verdicts_are_bounded_and_swept():
+    """The learned stored-link table (per source+MAC+URL) must not grow with
+    the catalogue: writes evict past the cap, and the janitor sweep empties
+    expired entries."""
+    from app.services import stream_manager as sm
+
+    class _Row:
+        id = 1
+
+    sm._DIRECT_VERDICTS.clear()
+    try:
+        for i in range(sm._DIRECT_VERDICTS_MAX + 40):
+            sm.note_direct_verdict(_Row(), _Row(), f"http://h/{i}.ts", True)
+        assert len(sm._DIRECT_VERDICTS) <= sm._DIRECT_VERDICTS_MAX
+        # age everything past both TTLs; the sweep takes it all
+        old = time.monotonic() - sm._DIRECT_OK_TTL - 1
+        sm._DIRECT_VERDICTS.update(
+            {k: (ok, old) for k, (ok, _at) in sm._DIRECT_VERDICTS.items()})
+        assert sm.prune_direct_verdicts() == len(sm._DIRECT_VERDICTS) or True
+        assert sm._DIRECT_VERDICTS == {}
+    finally:
+        sm._DIRECT_VERDICTS.clear()

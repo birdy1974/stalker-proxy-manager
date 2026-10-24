@@ -58,6 +58,8 @@ async def sweep_once() -> dict:
     try:
         from . import redirect_guard
         report["handoffs"] = redirect_guard.prune()
+        from .stream_manager import prune_direct_verdicts
+        report["direct_verdicts"] = prune_direct_verdicts()
     except Exception:  # noqa: BLE001
         log.exception("redirect guard prune failed")
     try:

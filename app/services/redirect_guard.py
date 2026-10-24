@@ -45,11 +45,25 @@ Two independent, env-gated behaviours for ``StreamManager.resolve()``
 Runtime kill switches (restart after changing):
     SPM_REDIRECT_VALIDATE=0     disable validation, keep demotion
     SPM_REOPEN_DEMOTE=0         disable demotion, keep validation
+    SPM_LINK_PROBE_TRUST=0      probe every fresh link exactly (the old shape)
+
+Two deliberate shortcuts keep a fast zap from paying a probe per channel,
+both bounded by PROBE_TTL and both only ever *skip* a probe - they can never
+manufacture a veto a real probe would not have made, and a proved-dead probe
+clears them for the whole origin:
+  * an ALIVE verdict is also remembered under the URL with its volatile
+    token parameters stripped, so the next freshly-minted link for the same
+    stream (new play_token, same everything else) reuses it;
+  * an origin with an alive probe inside the window is trusted for FRESHLY
+    MINTED links: the panel minted this token a moment ago and the host
+    answered a moment ago, so the probe would only re-ask the second half.
+Callers whose URL was NOT just minted (a stored link, a replayed cached
+link) pass `exact=True` and always get this URL's own verdict.
 
 REMOVAL: delete this file and tests/test_redirect_guard.py, then delete every
 block between ">>> redirect-guard" and "<<< redirect-guard" markers in
-app/services/stream_manager.py (one import + three hooks). Nothing else
-references this module.
+app/services/stream_manager.py (one import + the hooks in both stream paths).
+Nothing else references this module.
 """
 
 from __future__ import annotations
@@ -60,6 +74,9 @@ from dataclasses import dataclass
 
 import httpx
 
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from ..portal.links import VOLATILE_PARAMS
 from . import stream_identity
 
 VALIDATE_ENABLED = os.environ.get("SPM_REDIRECT_VALIDATE", "1") == "1"
@@ -76,15 +93,24 @@ VALIDATE_TIMEOUT = float(os.environ.get("SPM_REDIRECT_VALIDATE_TIMEOUT", "2.0"))
 PROBE_TTL_S = float(os.environ.get("SPM_LINK_PROBE_TTL", "20.0"))
 PROBE_DEAD_TTL_S = float(os.environ.get("SPM_LINK_PROBE_DEAD_TTL", "3.0"))
 PROBE_CACHE_MAX = int(os.environ.get("SPM_LINK_PROBE_CACHE_MAX", "500"))
+#: May a fresh link skip its probe on a recently-proven origin's say-so (and
+#: may alive verdicts be shared across play_token rotations)? See the header.
+PROBE_TRUST_ENABLED = os.environ.get("SPM_LINK_PROBE_TRUST", "1") == "1"
 DEMOTE_ENABLED = os.environ.get("SPM_REOPEN_DEMOTE", "1") == "1"
 DEMOTE_WINDOW = float(os.environ.get("SPM_REOPEN_DEMOTE_WINDOW", "300.0"))
 
 # route_key -> (source_key, mac_id, monotonic time of the last 302)
 _handed: dict[tuple, tuple[tuple, int | None, float]] = {}
 
-# url -> (monotonic time, verdict); see PROBE_TTL_S
+# url -> (monotonic time, verdict); see PROBE_TTL_S. Alive verdicts are ALSO
+# stored under the token-stripped URL (fresh mints of the same stream differ
+# only in volatile token parameters); dead verdicts stay exact-URL only - a
+# link that died on a busy slot must not veto the re-mint a second later.
 _probe_cache: dict[str, tuple[float, ProbeResult]] = {}
-_PROBE_STATS = {"probes": 0, "cache_hits": 0}
+# origin (host[:port]) -> monotonic time of its last ALIVE probe; a
+# proved-dead probe anywhere on the origin clears it.
+_origin_alive: dict[str, float] = {}
+_PROBE_STATS = {"probes": 0, "cache_hits": 0, "trust_hits": 0}
 
 
 def probe_stats() -> dict:
@@ -104,7 +130,41 @@ def _cached_probe(url: str) -> ProbeResult | None:
         return None
     _PROBE_STATS["cache_hits"] += 1
     return ProbeResult(verdict.alive,
-                       f"{verdict.detail} (probed {time.monotonic() - at:.1f}s ago)")
+                       f"{verdict.detail} (probed {time.monotonic() - at:.1f}s ago)",
+                       probed=verdict.probed)
+
+
+def _tokenless(url: str) -> str:
+    """The URL with volatile token parameters removed - the cache identity of
+    'the same stream, whatever play_token the panel minted this time'. Uses
+    the one VOLATILE_PARAMS list create_link's own strip_volatile uses, so
+    both sides of the trick agree on what is volatile."""
+    parts = urlsplit(url)
+    if not parts.query:
+        return url
+    pairs = parse_qsl(parts.query, keep_blank_values=True)
+    kept = [(k, v) for k, v in pairs if k.lower() not in VOLATILE_PARAMS]
+    if len(kept) == len(pairs):
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, parts.path,
+                       urlencode(kept, safe=":"), parts.fragment))
+
+
+def _trusted_origin(url: str) -> ProbeResult | None:
+    """An alive verdict on another link's evidence, inside PROBE_TTL."""
+    if not PROBE_TRUST_ENABLED or PROBE_TTL_S <= 0:
+        return None
+    origin = stream_identity.origin_of(url)
+    at = _origin_alive.get(origin) if origin else None
+    if at is None:
+        return None
+    age = time.monotonic() - at
+    if age > PROBE_TTL_S:
+        _origin_alive.pop(origin, None)
+        return None
+    _PROBE_STATS["trust_hits"] += 1
+    return ProbeResult(True, f"origin proven alive {age:.1f}s ago (probe skipped)",
+                       probed=False)
 
 
 def _remember_probe(url: str, verdict: ProbeResult) -> None:
@@ -122,6 +182,17 @@ def _remember_probe(url: str, verdict: ProbeResult) -> None:
                     len(_probe_cache) >= max(16, PROBE_CACHE_MAX):
                 _probe_cache.pop(key, None)
     _probe_cache[url] = (now, verdict)
+    origin = stream_identity.origin_of(url)
+    if verdict.alive:
+        tokenless = _tokenless(url)
+        if tokenless != url:
+            _probe_cache[tokenless] = (now, verdict)
+        if origin:
+            _origin_alive[origin] = now
+    elif origin:
+        # A proved-dead link ends the origin's credit immediately: whatever
+        # answered a moment ago, this host just refused a real link.
+        _origin_alive.pop(origin, None)
 
 
 def _source_key(source) -> tuple:
@@ -179,6 +250,10 @@ def prune() -> int:
         if ttl <= 0 or now - at > ttl:
             _probe_cache.pop(url, None)
             gone += 1
+    for origin, at in list(_origin_alive.items()):
+        if PROBE_TTL_S <= 0 or now - at > PROBE_TTL_S:
+            _origin_alive.pop(origin, None)
+            gone += 1
     return gone
 
 
@@ -187,7 +262,9 @@ def reset() -> None:
     _handed.clear()
     _shrug_reported.clear()
     _probe_cache.clear()
+    _origin_alive.clear()
     _PROBE_STATS["probes"] = _PROBE_STATS["cache_hits"] = 0
+    _PROBE_STATS["trust_hits"] = 0
 
 
 # HEAD answers that do NOT settle the question on HEAD alone: confirm with a
@@ -237,10 +314,16 @@ def _is_a_shrug(exc: BaseException) -> bool:
 class ProbeResult:
     """Verdict of `link_is_alive`. `bool(result)` is `alive`, so
     `if not await link_is_alive(url)` keeps working unchanged; `detail` is
-    the probe trace ("HEAD 200", "HEAD 502 -> GET 206", ...) for the logs."""
+    the probe trace ("HEAD 200", "HEAD 502 -> GET 206", ...) for the logs.
+
+    `probed` says whether THIS url (or this exact verdict, from cache) was
+    actually put to the origin - False for a trust shortcut or a disabled
+    validator. Only a probed verdict is evidence worth learning from;
+    a caller must not record "the stored link works" from a skip."""
 
     alive: bool
     detail: str
+    probed: bool = True
 
     def __bool__(self) -> bool:
         return self.alive
@@ -254,7 +337,8 @@ def _referer_of(url: str) -> str:
 
 
 async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
-                        client: httpx.AsyncClient | None = None) -> ProbeResult:
+                        client: httpx.AsyncClient | None = None,
+                        exact: bool = False) -> ProbeResult:
     """Whether a redirect candidate URL answers (conservative: inconclusive
     counts as alive). `client` is a test seam; production builds its own and
     walks the media-UA ladder (player identity first, one browser-UA retry).
@@ -263,17 +347,33 @@ async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
     only climbed when the one before it failed to *prove* anything. Two rungs
     are normally enough and cost ~150 ms; the third exists for streaming
     origins that shrug at both a HEAD and a Range they cannot honour.
+
+    With `exact=False` (the URL was minted moments ago) a recent alive
+    verdict for the same tokenless URL, or for the same origin, may answer
+    instead of a fresh probe - see PROBE_TRUST. `exact=True` is for URLs
+    whose own token is the question (a stored link, a replayed cached link):
+    only this URL's own cached verdict or a real probe answers.
     """
     if not VALIDATE_ENABLED:
-        return ProbeResult(True, "validation disabled")
+        return ProbeResult(True, "validation disabled", probed=False)
     if str(url or "").split("://", 1)[0].lower() not in ("http", "https"):
-        return ProbeResult(True, "non-HTTP url, not probed")
+        return ProbeResult(True, "non-HTTP url, not probed", probed=False)
     if client is not None:
         # Explicit test client: one attempt with whatever identity it carries.
         return await _probe(url, timeout, client)
     hit = _cached_probe(url)
     if hit is not None:
         return hit                      # a zap back to a link we just proved
+    if not exact and PROBE_TRUST_ENABLED:
+        tokenless = _tokenless(url)
+        if tokenless != url:
+            hit = _cached_probe(tokenless)
+            if hit is not None and hit.alive:
+                return ProbeResult(True, f"{hit.detail} [same stream, new token]",
+                                   probed=False)
+        trusted = _trusted_origin(url)
+        if trusted is not None:
+            return trusted
     _PROBE_STATS["probes"] += 1
     verdict = ProbeResult(True, "")
     uas = stream_identity.ladder(url)

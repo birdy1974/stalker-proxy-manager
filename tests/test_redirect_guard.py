@@ -370,10 +370,20 @@ async def test_probe_walks_player_to_browser_ua_on_456(monkeypatch):
     assert stream_identity.learned("http://cdn/play/live.php?stream=1") \
         == stream_identity.STB_UA
 
-    # second play, fresh token: one HEAD with the learned winner only
+    # Second play, fresh token: the alive verdict is remembered under the
+    # tokenless URL, so no probe is needed AT ALL (feature 2) - the answer
+    # is honestly flagged as unprobed.
     seen.clear()
     result2 = await link_is_alive("http://cdn/play/live.php?stream=1&token=b")
-    assert result2.alive
+    assert result2.alive and not result2.probed
+    assert seen == []
+
+    # With trust off, the same call falls back to probing - once, with the
+    # learned winner UA only.
+    monkeypatch.setattr(redirect_guard, "PROBE_TRUST_ENABLED", False)
+    seen.clear()
+    result3 = await link_is_alive("http://cdn/play/live.php?stream=1&token=c")
+    assert result3.alive
     assert len(seen) == 1 and "QtEmbedded" in seen[0].headers["user-agent"]
 
 
@@ -638,3 +648,86 @@ async def test_the_cache_can_be_switched_off(monkeypatch):
     await link_is_alive("http://cdn/again.ts")
     await link_is_alive("http://cdn/again.ts")
     assert len(calls) == 2
+
+
+# --------------------------------------------------------------------------- #
+#  (2) tokenless verdicts + origin trust: the fresh mint skips its probe
+# --------------------------------------------------------------------------- #
+
+def _counting_probe2(result=None, *, dead_for=()):
+    """Replace the network probe with a counter. `dead_for` urls (substring)
+    come back dead, everything else alive; returns the probed-url list."""
+    seen: list[str] = []
+
+    async def probe(url, timeout, client):                     # noqa: ARG001
+        seen.append(url)
+        if any(part in url for part in dead_for):
+            return ProbeResult(False, "HEAD 403 [mock]")
+        return result if result is not None else ProbeResult(True, "HEAD 200 [mock]")
+
+    return probe, seen
+
+
+async def test_a_fresh_token_reuses_the_alive_verdict(monkeypatch):
+    """The panel mints a new play_token for every zap; the exact URL is new
+    every time, so the old cache never hit. The tokenless identity does."""
+    probe, seen = _counting_probe2()
+    monkeypatch.setattr(redirect_guard, "_probe", probe)
+
+    a = await link_is_alive("http://cdn/play/live.php?stream=9&play_token=aaa")
+    b = await link_is_alive("http://cdn/play/live.php?stream=9&play_token=bbb")
+    assert a.alive and a.probed
+    assert b.alive and not b.probed and "new token" in b.detail
+    assert len(seen) == 1                       # probed once, reused once
+
+
+async def test_exact_calls_never_borrow_another_urls_verdict(monkeypatch):
+    """A stored link's token IS the question: exact=True ignores the
+    tokenless verdict and the origin trust, and this URL is probed."""
+    probe, seen = _counting_probe2(dead_for=("token=old",))
+    monkeypatch.setattr(redirect_guard, "_probe", probe)
+
+    await link_is_alive("http://cdn/play/live.php?stream=9&token=new")
+    stored = await link_is_alive("http://cdn/play/live.php?stream=9&token=old",
+                                  exact=True)
+    assert not stored and stored.probed         # this URL itself was asked
+    assert len(seen) == 2
+
+
+async def test_a_dead_verdict_never_crosses_tokens(monkeypatch):
+    """A slot-busy 403 on one mint must not veto the re-mint a second later:
+    dead verdicts stay exact-URL only."""
+    probe, seen = _counting_probe2(dead_for=("token=dead",))
+    monkeypatch.setattr(redirect_guard, "_probe", probe)
+
+    assert not await link_is_alive("http://cdn/play?token=dead")
+    assert await link_is_alive("http://cdn/play?token=fresh")
+    assert len(seen) == 2                       # the fresh mint WAS probed
+
+
+async def test_origin_trust_skips_the_probe_and_a_dead_probe_revokes_it(monkeypatch):
+    probe, seen = _counting_probe2(dead_for=("/broken",))
+    monkeypatch.setattr(redirect_guard, "_probe", probe)
+
+    await link_is_alive("http://edge/ts/1.ts")          # proves the origin
+    other = await link_is_alive("http://edge/ts/2.ts")  # minted: trusted
+    assert other and not other.probed
+    assert len(seen) == 1
+
+    # Stored links still get probed despite the trust; a proved-dead one
+    # strips the origin's credit, so the next fresh mint is probed again.
+    assert not await link_is_alive("http://edge/broken.ts", exact=True)
+    followup = await link_is_alive("http://edge/ts/3.ts")
+    assert followup and followup.probed
+    assert len(seen) == 3
+
+
+async def test_trust_can_be_switched_off(monkeypatch):
+    probe, seen = _counting_probe2()
+    monkeypatch.setattr(redirect_guard, "_probe", probe)
+    monkeypatch.setattr(redirect_guard, "PROBE_TRUST_ENABLED", False)
+
+    await link_is_alive("http://cdn/play?token=aaa")
+    await link_is_alive("http://cdn/play?token=bbb")
+    await link_is_alive("http://cdn/other")
+    assert len(seen) == 3                       # every fresh link probed
