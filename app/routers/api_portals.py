@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -1031,12 +1032,47 @@ async def genres(pid: int, db=Depends(get_db)):
 
 
 # Pending fetched genre channels (not yet stored in database because genre is disabled)
-# Key: (portal_id, kind, genre_id) -> list of raw item dicts
-_PENDING_GENRE_ITEMS: dict[tuple[int, str, int], list[dict]] = {}
+# Key: (portal_id, kind, genre_id) -> (stored_at monotonic, list of raw item dicts)
+_PENDING_GENRE_ITEMS: dict[tuple[int, str, int], tuple[float, list[dict]]] = {}
+#: A preview exists so the user can look before enabling - a look-then-enable
+#: flow measured in minutes. Nothing ever removed entries for genres that
+#: were previewed but never enabled, and each value is a WHOLE genre's item
+#: list (thousands of dicts on a big panel), so browsing disabled genres
+#: across portals accumulated entire catalogues in RAM, forever.
+_PENDING_GENRE_TTL = 3600.0
+_PENDING_GENRE_MAX = 64
 
 
 def clear_pending_genre_items() -> None:
     _PENDING_GENRE_ITEMS.clear()
+
+
+def prune_pending_genre_items() -> int:
+    """Drop previews older than the TTL (janitor sweep); returns the count."""
+    now = time.monotonic()
+    stale = [k for k, (at, _items) in _PENDING_GENRE_ITEMS.items()
+             if now - at >= _PENDING_GENRE_TTL]
+    for key in stale:
+        _PENDING_GENRE_ITEMS.pop(key, None)
+    return len(stale)
+
+
+def _pending_get(key: tuple[int, str, int]) -> list[dict] | None:
+    entry = _PENDING_GENRE_ITEMS.get(key)
+    if entry is None:
+        return None
+    if time.monotonic() - entry[0] >= _PENDING_GENRE_TTL:
+        _PENDING_GENRE_ITEMS.pop(key, None)   # stale preview: refetch instead
+        return None
+    return entry[1]
+
+
+def _pending_put(key: tuple[int, str, int], items: list[dict]) -> None:
+    _PENDING_GENRE_ITEMS.pop(key, None)
+    _PENDING_GENRE_ITEMS[key] = (time.monotonic(), items)
+    prune_pending_genre_items()
+    while len(_PENDING_GENRE_ITEMS) > _PENDING_GENRE_MAX:
+        _PENDING_GENRE_ITEMS.pop(next(iter(_PENDING_GENRE_ITEMS)), None)
 
 
 async def _fetch_genre_items_for_preview(
@@ -1213,8 +1249,11 @@ async def toggle_genres(pid: int, payload: dict, db=Depends(get_db)):
     for r in rows:
         r.enabled = enabled
         if enabled:
-            # Only store the channels if the genre gets enabled
-            pending = _PENDING_GENRE_ITEMS.pop((pid, kind, r.id), None)
+            # Only store the channels if the genre gets enabled. Age does not
+            # matter here: enabling is the user accepting the previewed list,
+            # and the next genre fetch refreshes it anyway.
+            entry = _PENDING_GENRE_ITEMS.pop((pid, kind, r.id), None)
+            pending = entry[1] if entry else None
             if pending:
                 await _store_pending_genre_items(db, pid, kind, r, pending)
     await db.commit()
@@ -1270,13 +1309,14 @@ async def portal_items(pid: int, kind: str, db=Depends(get_db), q: str = "", pag
         # Not yet stored in database (e.g. because genre is disabled).
         # Fetch the channel list first, but do not store it in the database as the genre is still disabled.
         cache_key = (pid, kind, genre_id)
-        if cache_key in _PENDING_GENRE_ITEMS:
-            raw_items = _PENDING_GENRE_ITEMS[cache_key]
+        cached = _pending_get(cache_key)
+        if cached is not None:
+            raw_items = cached
         else:
             raw_items = await _fetch_genre_items_for_preview(db, pid, kind, genre_row)
             if not genre_row.enabled:
                 # Do not store in database as genre is still disabled
-                _PENDING_GENRE_ITEMS[cache_key] = raw_items
+                _pending_put(cache_key, raw_items)
             else:
                 # Genre is already enabled: store immediately
                 await _store_pending_genre_items(db, pid, kind, genre_row, raw_items)

@@ -40,6 +40,19 @@ _CACHE_TABLES = (
 )
 
 
+# Tables the playlist-health report reads. Its snapshot cache must notice
+# writes the rendered output does not care about (a MAC going offline, an
+# episode appearing, a source cmd edited) - see content_cache.
+_HEALTH_TABLES = (
+    "portals", "mac_addresses", "settings",
+    "live_playlist", "live_playlist_sources", "live_sources",
+    "vod_playlist", "vod_playlist_sources", "vod_sources",
+    "serie_playlist", "serie_playlist_sources", "serie_playlist_seasons",
+    "serie_sources", "serie_seasons", "serie_episodes",
+    "local_playlist", "local_files", "local_sources",
+)
+
+
 @event.listens_for(engine.sync_engine, "after_cursor_execute")
 def _invalidate_rendered_output(_conn, _cursor, statement, _params, _context, _many):  # noqa: ANN001
     sql = (statement or "").lstrip().lower()
@@ -48,6 +61,9 @@ def _invalidate_rendered_output(_conn, _cursor, statement, _params, _context, _m
     if any(name in sql for name in _CACHE_TABLES):
         from .services.content_cache import invalidate
         invalidate()
+    if any(name in sql for name in _HEALTH_TABLES):
+        from .services.content_cache import invalidate_health
+        invalidate_health()
 
 
 # Enable WAL + foreign keys on SQLite (big perf + correctness win for dev).

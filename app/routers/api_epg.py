@@ -443,11 +443,11 @@ class TimingPreview(SourceTiming):
     sample_stop: str | None = Field(default=None, max_length=100)
 
 
-def _cached_sample(source):
+def _cached_sample(src_id, url):
     import io
     import xml.etree.ElementTree as ET
 
-    path = epg_svc._cache_path(source.id, source.url)
+    path = epg_svc._cache_path(src_id, url)
     if not path.exists():
         return None
     raw = epg_svc._decode(path.read_bytes())
@@ -495,7 +495,9 @@ async def timing_preview(src_id: int, body: TimingPreview, db=Depends(get_db)):
                 }
                 attrs.update({"spm-start": attrs["start"], "spm-stop": attrs["stop"]})
         else:
-            sample = await asyncio.to_thread(_cached_sample, source)
+            # Plain values into the thread: the ORM row belongs to this
+            # request's async session and must not be read off-loop.
+            sample = await asyncio.to_thread(_cached_sample, source.id, source.url)
             if not sample:
                 return {
                     "available": False,

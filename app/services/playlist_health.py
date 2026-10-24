@@ -39,11 +39,16 @@ from .item_info import local_file_path
 
 EVIDENCE_TTL = 900
 _OBSERVATIONS = OrderedDict()
+#: Bumped on every recorded observation; part of the report cache's validity
+#: key so a fresh probe/playback verdict is never hidden behind a snapshot.
+_evidence_version = 0
 _files_task = None
 _files_paths = None
 _files_result = {}
 _files_at = 0.0
 KINDS = ("live", "vod", "series", "local")
+_SEVERITY = {"unavailable": 0, "failed": 0, "warning": 1,
+             "unverified": 2, "healthy": 3, "skipped": 4}
 
 
 def signature(source, path=None):
@@ -89,11 +94,29 @@ def record_playback(source, *, failed=False, ttl=EVIDENCE_TTL):
     _remember(signature(source), "warning" if failed else "healthy", ttl, "playback")
 
 
-def _remember(key, verdict, ttl, method):
-    now = time.monotonic()
+def _sweep_observations(now: float | None = None) -> None:
+    """Drop expired evidence. Builds sweep too (not just _remember), so the
+    snapshot's evidence deadline below is always in the future right after a
+    build - otherwise one lingered expired entry would invalidly invalidate
+    every subsequent snapshot until the next verdict arrived."""
+    now = time.monotonic() if now is None else now
     for old, entry in list(_OBSERVATIONS.items()):
         if now - entry[0] >= entry[2]:
             _OBSERVATIONS.pop(old, None)
+
+
+def _evidence_deadline() -> float:
+    """Monotonic instant the earliest live evidence expires (inf if none)."""
+    if not _OBSERVATIONS:
+        return float("inf")
+    return min(stamp + ttl for stamp, _v, ttl, _m in _OBSERVATIONS.values())
+
+
+def _remember(key, verdict, ttl, method):
+    global _evidence_version
+    _evidence_version += 1
+    now = time.monotonic()
+    _sweep_observations(now)
     _OBSERVATIONS[key] = (now, verdict, ttl, method)
     _OBSERVATIONS.move_to_end(key)
     while len(_OBSERVATIONS) > 4096:
@@ -152,8 +175,10 @@ async def inspect_files(paths):
 async def rows_for(db, model, field, ids):
     rows = []
     ids = list(set(ids))
-    for i in range(0, len(ids), 500):
-        stmt = select(model).where(field.in_(ids[i : i + 500]))
+    # 2000-wide chunks: comfortably under SQLite's and Postgres' bind limits,
+    # and a 12k-episode library drops from 24 round trips to 6.
+    for i in range(0, len(ids), 2000):
+        stmt = select(model).where(field.in_(ids[i : i + 2000]))
         # Series raw metadata/posters and account credentials aren't diagnostics.
         if model is SerieSource:
             stmt = stmt.options(
@@ -181,11 +206,10 @@ def aggregate(candidates):
     return "healthy" if "healthy" in states else "unverified"
 
 
-async def report(db):
+async def _build_report(db, strategy):
     from .stream_manager import MANAGER
-    from .runtime_settings import fallback_strategy
 
-    strategy = await fallback_strategy()
+    _sweep_observations()
     now, mono = datetime.now(timezone.utc), time.monotonic()
     portals = {
         p.id: p
@@ -218,6 +242,44 @@ async def report(db):
     ).all():
         macs[mac.portal_id].append(mac)
 
+    # Per-portal MAC facts, computed once per report. candidate() used to
+    # re-derive the eligible list and re-scan it three times (busy flags,
+    # error statuses, expiry - re-parsing expire_date strings) for EVERY
+    # candidate: tens of thousands of identical scans per report once series
+    # episodes are counted. A report is a snapshot, so snapshot these once;
+    # it is also more consistent than re-reading live busy flags mid-build.
+    _portal_facts: dict = {}
+    _sig_memo: dict = {}
+
+    def mac_facts(portal_id):
+        facts = _portal_facts.get(portal_id)
+        if facts is None:
+            eligible = [m for m in macs[portal_id] if mac_is_usable(m.status)]
+
+            def summarize(group):
+                return {
+                    "all_busy": all(MANAGER.is_mac_busy(m.id) for m in group),
+                    "all_error": all(
+                        (m.status or "unknown").lower()
+                        in ("offline", "error", "unauthorized")
+                        for m in group
+                    ),
+                    "all_expired": all(
+                        (expiry := parse_expiry(m.expire_date)) is not None
+                        and expiry <= now
+                        for m in group
+                    ),
+                }
+
+            facts = {
+                "has_macs": bool(macs[portal_id]),
+                "eligible": eligible,
+                "full": summarize(eligible),
+                "first": summarize(eligible[:1]),
+            }
+            _portal_facts[portal_id] = facts
+        return facts
+
     def candidate(src, portal_id, kind, *, name=None, path=None, used=None):
         result = {
             "kind": kind,
@@ -249,19 +311,20 @@ async def report(db):
             return blocked("Portal is missing")
         if not portal.enabled:
             return blocked("Portal is disabled")
-        eligible = [m for m in macs[portal.id] if mac_is_usable(m.status)]
-        if not eligible:
+        facts = mac_facts(portal.id)
+        if not facts["eligible"]:
             return blocked(
                 "No MAC accounts configured"
-                if not macs[portal.id]
+                if not facts["has_macs"]
                 else "All MAC accounts are banned or expired"
             )
+        group_facts = facts["full"]
         if strategy == "portal_first":
             if portal.id in used:
                 result["status"] = "skipped"
                 reasons.append("Skipped by portal-first fallback policy")
                 return result
-            eligible = eligible[:1]
+            group_facts = facts["first"]
         used.add(portal.id)
         if not portal.resolved_url:
             reasons.append("Portal not resolved yet; playback may resolve it")
@@ -269,23 +332,21 @@ async def report(db):
             reasons.append(
                 "Input source is deselected; explicit playlist links can still play"
             )
-        if all(MANAGER.is_mac_busy(m.id) for m in eligible):
+        if group_facts["all_busy"]:
             reasons.append("All eligible MACs are busy (temporary)")
-        if all(
-            (m.status or "unknown").lower() in ("offline", "error", "unauthorized")
-            for m in eligible
-        ):
+        if group_facts["all_error"]:
             reasons.append(
                 "All eligible MACs have recorded connection/authentication errors; retryable"
             )
-        if all(
-            (expiry := parse_expiry(m.expire_date)) is not None and expiry <= now
-            for m in eligible
-        ):
+        if group_facts["all_expired"]:
             reasons.append(
                 "All eligible accounts have a reported expiry in the past; recheck portal"
             )
-        key = signature(src)
+        # The same source row is evaluated once per item/episode linking it;
+        # its signature (a sha256 over its fields) cannot change mid-report.
+        key = _sig_memo.get(id(src))
+        if key is None:
+            key = _sig_memo[id(src)] = signature(src)
         observation = _OBSERVATIONS.get(key)
         evidence = (
             observation
@@ -472,17 +533,13 @@ async def report(db):
                                 f"S{season.season_number:02d}E{ep.episode_number:02d}"
                             )
                         out["source_count"] += len(candidates)
-                        out["sources"] = sorted(
-                            out["sources"] + candidates,
-                            key=lambda c: {
-                                "unavailable": 0,
-                                "failed": 0,
-                                "warning": 1,
-                                "unverified": 2,
-                                "healthy": 3,
-                                "skipped": 4,
-                            }[c["status"]],
-                        )[:40]
+                        out["sources"].extend(candidates)
+                # Worst-first, capped for display. Sorted ONCE per series:
+                # this used to re-sort the running list after every single
+                # episode (stable sort => the final top-40 is identical).
+                out["sources"] = sorted(
+                    out["sources"], key=lambda c: _SEVERITY[c["status"]]
+                )[:40]
                 out["episodes_checked"] = total
                 out["episodes_unavailable"] = unavailable_episodes
                 out["problem_episodes"] = problem_episodes
@@ -616,3 +673,82 @@ async def report(db):
         "mode": "passive",
         "fallback_strategy": strategy,
     }
+
+
+# --------------------------------------------------------------------------- #
+#  report snapshot cache
+#
+#  A full report walks every enabled item, source link and series episode -
+#  ~0.5 s on a mid-size library - and the GUI asks for it from the dashboard,
+#  the playlist page and Settings, on 30 s polls plus per search keystroke.
+#  Recomputing from scratch for every keystroke/tab was the single largest
+#  steady-state CPU/DB cost in the app. The snapshot below serves repeats
+#  for SPM_HEALTH_CACHE_S (default 30 s, 0 disables) at most, and is
+#  invalidated the moment anything it reflects changes: writes to the tables
+#  the report reads bump the health generation (database.py hooks every
+#  INSERT/UPDATE/DELETE), every probe/playback verdict bumps
+#  _evidence_version, and the snapshot never outlives the earliest expiry
+#  of the evidence baked into it.
+#  `checked_at` inside the payload stays the time the snapshot was computed,
+#  so the GUI's "Checked ..." stamp remains honest. One build at a time:
+#  concurrent callers queue on the lock and then read the fresh snapshot.
+# --------------------------------------------------------------------------- #
+# 30 s matches the GUI's poll cadence: with precise invalidation above, the
+# TTL only bounds how stale the two un-versioned inputs can be (in-memory
+# MAC busy flags and local-file existence - both advisory, both labelled
+# with the snapshot's checked_at stamp).
+REPORT_CACHE_S = float(os.environ.get("SPM_HEALTH_CACHE_S", "30"))
+_report_cache: tuple[float, int, int, str, dict] | None = None
+_report_lock = asyncio.Lock()
+
+
+def _snapshot(strategy: str) -> dict | None:
+    if _report_cache is None or REPORT_CACHE_S <= 0:
+        return None
+    at, gen, evidence, built_for, result = _report_cache
+    now = time.monotonic()
+    # Valid only while (a) younger than the TTL, (b) no health-relevant
+    # table was written, (c) no new verdict was recorded, (d) none of the
+    # evidence it baked in has since expired, and (e) the fallback strategy
+    # it was computed under is still the configured one.
+    if now - at >= REPORT_CACHE_S or now >= _evidence_deadline():
+        return None
+    if built_for != strategy:
+        return None
+    from .content_cache import health_generation
+
+    if gen != health_generation() or evidence != _evidence_version:
+        return None
+    # The router pops "items" off the dict it gets; hand out a copy (the
+    # rows themselves are only ever read/serialized).
+    return {**result, "items": list(result["items"])}
+
+
+def clear_report_cache() -> None:
+    """Forget the snapshot (tests resetting the schema; nothing else needs it)."""
+    global _report_cache
+    _report_cache = None
+
+
+async def report(db):
+    """The full health report, served from the snapshot while it is valid."""
+    global _report_cache
+    from .runtime_settings import fallback_strategy
+
+    # One settings-row read per call - the price of knowing the snapshot was
+    # computed under the strategy that is still configured (the build needs
+    # the value anyway, so on a miss this is not even an extra query).
+    strategy = await fallback_strategy()
+    snap = _snapshot(strategy)
+    if snap is not None:
+        return snap
+    async with _report_lock:
+        snap = _snapshot(strategy)  # a waiter may have just built it
+        if snap is not None:
+            return snap
+        from .content_cache import health_generation
+
+        result = await _build_report(db, strategy)
+        _report_cache = (time.monotonic(), health_generation(),
+                         _evidence_version, strategy, result)
+        return {**result, "items": list(result["items"])}

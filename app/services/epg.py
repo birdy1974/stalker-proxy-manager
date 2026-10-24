@@ -28,6 +28,7 @@ import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from types import SimpleNamespace
 
 import httpx
 from sqlalchemy import delete, select
@@ -269,21 +270,62 @@ async def epg_candidates(db):
     return list(candidates.values())
 
 
-def rank_candidates(name, candidates, limit=20):
+def _prepare_candidates(candidates):
+    """Normalize every candidate alias ONCE for a batch of rankings.
+
+    Ranking used to re-run norm_name (six regex passes) plus digit/plus
+    extraction on every alias of every candidate for every playlist item -
+    O(items x candidates) regex work before any similarity scoring. 300
+    unmatched items against a 3000-channel guide measured ~15 s of CPU.
+    """
+    prepared = []
+    for candidate in candidates:
+        aliases = []
+        for alias in candidate["names"]:
+            normalized = norm_name(alias.replace("+", " plus "))
+            aliases.append((normalized, re.findall(r"\d+", normalized),
+                            "plus" in normalized.split()))
+        prepared.append((candidate, aliases))
+    return prepared
+
+
+def _rank_prepared(name, prepared, limit=20):
     # '+' denotes a distinct channel, especially Viaplay TV+, not decoration.
     want = norm_name((name or "").replace("+", " plus "))
     numbers = re.findall(r"\d+", want)
+    want_plus = "plus" in want.split()
+    want_len = len(want)
+    matcher = SequenceMatcher(None, want, "")
     ranked = []
-    for candidate in candidates:
+    for candidate, aliases in prepared:
         score = 0.0
-        for alias in candidate["names"]:
-            normalized = norm_name(alias.replace("+", " plus "))
-            value = _sim(want, normalized)
-            if numbers != re.findall(r"\d+", normalized):
-                value *= 0.5  # do not guess NPO 2 for NPO 1 / Viaplay 2 for 1
-            if ("plus" in want.split()) != ("plus" in normalized.split()):
-                value *= 0.5
-            score = max(score, value)
+        for normalized, digits, has_plus in aliases:
+            if not want or not normalized:
+                continue          # _sim() scored empty strings 0.0
+            factor = 1.0
+            if numbers != digits:
+                factor *= 0.5  # do not guess NPO 2 for NPO 1 / Viaplay 2 for 1
+            if want_plus != has_plus:
+                factor *= 0.5
+            # difflib's quick ratios are documented UPPER bounds on ratio().
+            # When even the bound (penalties applied) can neither beat the
+            # running score nor reach the 0.62 keep-threshold, the exact
+            # ratio cannot change which candidates are kept or their final
+            # scores - skip it. Most candidates are nowhere near, so this
+            # skips ~all of the full SequenceMatcher work on a guide-sized
+            # run while producing byte-identical output. The loosest bound
+            # (lengths only - exactly real_quick_ratio's formula) goes first
+            # because it needs no matcher work at all.
+            norm_len = len(normalized)
+            bound = factor * (2.0 * min(want_len, norm_len)
+                              / (want_len + norm_len))
+            if bound < 0.62 or bound <= score:
+                continue
+            matcher.set_seq2(normalized)
+            if factor * matcher.quick_ratio() < 0.62 \
+                    or factor * matcher.quick_ratio() <= score:
+                continue
+            score = max(score, factor * matcher.ratio())
         if score >= 0.62:
             ranked.append(
                 {k: v for k, v in candidate.items() if k != "names"}
@@ -293,11 +335,47 @@ def rank_candidates(name, candidates, limit=20):
     return ranked[:limit]
 
 
+def rank_candidates(name, candidates, limit=20):
+    return _rank_prepared(name, _prepare_candidates(candidates), limit)
+
+
+def _match_items(plain_items, candidates, review_all):
+    """Pure-CPU half of match_report: decide assignments, touch no database.
+
+    plain_items: (id, custom_name, epg_id, epg_sources_explicit) tuples.
+    Returns (assignments {item_id: tvg_id}, ambiguous, unmatched) - the same
+    decisions the old inline loop made, computed where they belong.
+    """
+    prepared = _prepare_candidates(candidates)
+    known = {row["tvg_id"] for row in candidates}
+    assignments, ambiguous, unmatched = {}, [], 0
+    for item_id, name, epg_id, explicit in plain_items:
+        if explicit:
+            continue
+        if epg_id in known and not review_all:
+            continue
+        choices = _rank_prepared(name, prepared)
+        if not choices:
+            unmatched += 1
+            continue
+        if not epg_id and len(choices) == 1 and choices[0]["score"] >= 0.86:
+            assignments[item_id] = choices[0]["tvg_id"]
+        else:
+            ambiguous.append(
+                {
+                    "id": item_id,
+                    "name": name,
+                    "epg_id": epg_id,
+                    "candidates": choices,
+                }
+            )
+    return assignments, ambiguous, unmatched
+
+
 async def match_report(review_all=False, progress=None):
     matched, ambiguous, unmatched = 0, [], 0
     async with SessionLocal() as db:
         candidates = await epg_candidates(db)
-        known = {row["tvg_id"] for row in candidates}
         items = (
             (
                 await db.execute(
@@ -309,27 +387,24 @@ async def match_report(review_all=False, progress=None):
             .scalars()
             .all()
         )
-        for item in items:
-            if item.epg_sources_explicit:
-                continue
-            if item.epg_id in known and not review_all:
-                continue
-            choices = rank_candidates(item.custom_name, candidates)
-            if not choices:
-                unmatched += 1
-                continue
-            if not item.epg_id and len(choices) == 1 and choices[0]["score"] >= 0.86:
-                item.epg_id = choices[0]["tvg_id"]
-                matched += 1
-            else:
-                ambiguous.append(
-                    {
-                        "id": item.id,
-                        "name": item.custom_name,
-                        "epg_id": item.epg_id,
-                        "candidates": choices,
-                    }
-                )
+        plain = [
+            (it.id, it.custom_name, it.epg_id, it.epg_sources_explicit)
+            for it in items
+        ]
+        by_id = {it.id: it for it in items}
+        # The ranking is O(items x candidates) difflib work - seconds of
+        # pure CPU on a full guide, even with the quick-ratio skips. It used
+        # to run inline here, on the event loop, inside every EPG refresh:
+        # streams, watchdogs and the GUI froze for its duration. The session
+        # stays open across the thread hop (it did before too, while ranking
+        # inline), but nothing in the worker thread touches it or the ORM
+        # objects - decisions come back as plain data and are applied here.
+        assignments, ambiguous, unmatched = await asyncio.to_thread(
+            _match_items, plain, candidates, review_all
+        )
+        for item_id, tvg_id in assignments.items():
+            by_id[item_id].epg_id = tvg_id
+            matched += 1
         await db.commit()
     if matched:
         from .playlist_gen import clear_m3u_cache
@@ -345,6 +420,97 @@ async def match_report(review_all=False, progress=None):
 
 async def match_epg_to_playlist(progress=None) -> int:
     return (await match_report(progress=progress))["matched"]
+
+
+def _parse_channels(raw: bytes, src_id: int) -> tuple[dict, list[dict]]:
+    """Pass 1 of an XMLTV ingest as pure CPU work: validate the document and
+    collect its channel rows. Runs in a worker thread - walked on the event
+    loop, a tens-of-MB guide froze streams, watchdogs and the GUI for
+    seconds per pass (there are two passes per source, per refresh)."""
+    # Reject HTML/error pages even if they happen to be well-formed XML.
+    first = next(ET.iterparse(io.BytesIO(raw), events=("start",)), None)
+    if first is None or first[1].tag != "tv":
+        raise ValueError("Response is not an XMLTV <tv> document")
+    root_attrs = dict(first[1].attrib)
+    chan_rows: list[dict] = []
+    # NB: only clear the ITEM elements - clearing every child as it ends would
+    # wipe <display-name> texts before the enclosing <channel> end event.
+    for _event, elm in ET.iterparse(io.BytesIO(raw), events=("end",)):
+        if elm.tag == "channel":
+            cid = elm.attrib.get("id")
+            names = [el.text or "" for el in elm.findall("display-name")]
+            icon = elm.find("icon")
+            if cid:
+                chan_rows.append(
+                    {
+                        "epg_source_id": src_id,
+                        "tvg_id": cid[:200],
+                        "name": (names[0] if names else cid)[:300],
+                        "icon": (icon.attrib.get("src") if icon is not None else None),
+                    }
+                )
+            elm.clear()
+        elif elm.tag == "programme":
+            elm.clear()
+    return root_attrs, chan_rows
+
+
+def _parse_programmes(raw: bytes, *, src_id: int, wanted: set, lo, hi,
+                      root_attrs: dict, timing, is_portal: bool) -> list[dict]:
+    """Pass 2 as pure CPU work: programme rows for the wanted tvg_ids inside
+    the bounded window. `timing` is a plain snapshot of the source's timezone
+    fields, so no ORM object is ever touched from the worker thread."""
+    rows: list[dict] = []
+    for _event, elm in ET.iterparse(io.BytesIO(raw), events=("end",)):
+        if elm.tag == "programme":
+            tvg = (elm.attrib.get("channel") or "")[:200]
+            try:
+                start, stop = programme_times(
+                    elm.attrib, root_attrs, timing, portal=is_portal
+                )
+                st, en = start.utc, stop.utc
+            except (ValueError, OverflowError):
+                st = en = None
+            if (
+                tvg
+                and st
+                and en
+                and en > st
+                and tvg in wanted
+                and en >= lo
+                and st <= hi
+            ):
+                ttl = (elm.findtext("title") or "").strip()[:400]
+                if ttl:
+                    cat = elm.findtext("category")
+                    icon = elm.find("icon")
+                    rows.append(
+                        {
+                            "epg_source_id": src_id,
+                            "tvg_id": tvg,
+                            "start_ts": st,
+                            "stop_ts": en,
+                            "title": ttl,
+                            "sub_title": (
+                                (elm.findtext("sub-title") or "").strip()[:400] or None
+                            ),
+                            "desc": ((elm.findtext("desc") or "").strip() or None),
+                            "category": (
+                                ((cat or "").strip()[:200] or None) if cat else None
+                            ),
+                            "icon": (
+                                icon.attrib.get("src") if icon is not None else None
+                            ),
+                        }
+                    )
+                    if len(rows) > 250000:
+                        raise ValueError(
+                            "Too many matched programmes; use a smaller guide"
+                        )
+            elm.clear()
+        elif elm.tag == "channel":
+            elm.clear()
+    return rows
 
 
 async def refresh_source(src_id: int, *, cached=False) -> dict:
@@ -407,12 +573,10 @@ async def _refresh_source_locked(src_id: int, *, cached=False) -> dict:
     else:
         await db_log("INFO", "epg", f"downloading {url} …")
         raw = await asyncio.wait_for(_fetch(url), timeout=90)
-    # Reject HTML/error pages even if they happen to be well-formed XML.
-    first = next(ET.iterparse(io.BytesIO(raw), events=("start",)), None)
-    if first is None or first[1].tag != "tv":
-        raise ValueError("Response is not an XMLTV <tv> document")
-
-    root_attrs = dict(first[1].attrib)
+    # ---- pass 1: channels only (must land in the DB before matching) -------
+    # Both XML passes run in a worker thread: iterparse over a real guide is
+    # seconds of pure CPU, and on the event loop it froze everything else.
+    root_attrs, chan_rows = await asyncio.to_thread(_parse_channels, raw, src_id)
     is_portal = url.startswith("portal://")
     if (
         is_portal
@@ -424,30 +588,7 @@ async def _refresh_source_locked(src_id: int, *, cached=False) -> dict:
         )
     now = datetime.now(timezone.utc)
     lo, hi = now - timedelta(hours=78), now + timedelta(days=7)
-    n_chan, n_prog = 0, 0
-    chan_rows: list[dict] = []
-
-    # ---- pass 1: channels only (must land in the DB before matching) -------
-    # NB: only clear the ITEM elements - clearing every child as it ends would
-    # wipe <display-name> texts before the enclosing <channel> end event.
-    for _event, elm in ET.iterparse(io.BytesIO(raw), events=("end",)):
-        if elm.tag == "channel":
-            cid = elm.attrib.get("id")
-            names = [el.text or "" for el in elm.findall("display-name")]
-            icon = elm.find("icon")
-            if cid:
-                chan_rows.append(
-                    {
-                        "epg_source_id": src_id,
-                        "tvg_id": cid[:200],
-                        "name": (names[0] if names else cid)[:300],
-                        "icon": (icon.attrib.get("src") if icon is not None else None),
-                    }
-                )
-                n_chan += 1
-            elm.clear()
-        elif elm.tag == "programme":
-            elm.clear()
+    n_chan = len(chan_rows)
 
     await _upsert_channels(src_id, chan_rows)
     # A removed guide channel must not remain a selectable stale match.
@@ -501,56 +642,17 @@ async def _refresh_source_locked(src_id: int, *, cached=False) -> dict:
         )
 
     # ---- pass 2: programmes (keep wanted ids within the bounded window only)
-    for _event, elm in ET.iterparse(io.BytesIO(raw), events=("end",)):
-        if elm.tag == "programme":
-            tvg = (elm.attrib.get("channel") or "")[:200]
-            try:
-                start, stop = programme_times(
-                    elm.attrib, root_attrs, src, portal=is_portal
-                )
-                st, en = start.utc, stop.utc
-            except (ValueError, OverflowError):
-                st = en = None
-            if (
-                tvg
-                and st
-                and en
-                and en > st
-                and tvg in wanted
-                and en >= lo
-                and st <= hi
-            ):
-                ttl = (elm.findtext("title") or "").strip()[:400]
-                if ttl:
-                    n_prog += 1
-                    cat = elm.findtext("category")
-                    icon = elm.find("icon")
-                    PROG_BUFFER.append(
-                        {
-                            "epg_source_id": src_id,
-                            "tvg_id": tvg,
-                            "start_ts": st,
-                            "stop_ts": en,
-                            "title": ttl,
-                            "sub_title": (
-                                (elm.findtext("sub-title") or "").strip()[:400] or None
-                            ),
-                            "desc": ((elm.findtext("desc") or "").strip() or None),
-                            "category": (
-                                ((cat or "").strip()[:200] or None) if cat else None
-                            ),
-                            "icon": (
-                                icon.attrib.get("src") if icon is not None else None
-                            ),
-                        }
-                    )
-                    if len(PROG_BUFFER) > 250000:
-                        raise ValueError(
-                            "Too many matched programmes; use a smaller guide"
-                        )
-            elm.clear()
-        elif elm.tag == "channel":
-            elm.clear()
+    # Plain-data snapshot of the timezone fields: the worker thread must not
+    # read ORM attributes (a lazy refresh there would do sync IO).
+    timing_snapshot = SimpleNamespace(
+        timezone_mode=getattr(src, "timezone_mode", None),
+        timezone_name=getattr(src, "timezone_name", None),
+    )
+    prog_rows = await asyncio.to_thread(
+        _parse_programmes, raw, src_id=src_id, wanted=wanted, lo=lo, hi=hi,
+        root_attrs=root_attrs, timing=timing_snapshot, is_portal=is_portal)
+    PROG_BUFFER.extend(prog_rows)
+    n_prog = len(prog_rows)
 
     await _flush_programmes(final=True, source_id=src_id, timing=timing_key(src))
     async with SessionLocal() as s:

@@ -40,6 +40,45 @@ PROBE_TIMEOUT = float(os.environ.get("SPM_PROBE_TIMEOUT", "30"))
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 300  # seconds — probing live streams is expensive
 
+# Every probe table is keyed by target (portal URLs carry a fresh play_token
+# per play in _CACHE's case), so without a cap the keyspace is history, not
+# configuration: months of GUI popups would accumulate one entry per token
+# ever seen, expired ones included - reads checked the TTL but nothing
+# evicted. Entries are small; the cap is about the count never stopping.
+_CACHE_MAX = 512
+
+
+def _cache_prune(cache: dict, ttl: float) -> int:
+    """Drop expired entries from one probe table; returns how many went."""
+    now = time.time()
+    stale = [k for k, (at, _value) in cache.items() if now - at >= ttl]
+    for key in stale:
+        cache.pop(key, None)
+    return len(stale)
+
+
+def _cache_put(cache: dict, key: str, value, ttl: float) -> None:
+    """Store one probe result and keep the table bounded.
+
+    Re-putting an existing key refreshes its position, so eviction is by
+    least-recently-stored rather than arbitrary; expired entries go before
+    live ones are considered.
+    """
+    cache.pop(key, None)
+    cache[key] = (time.time(), value)
+    if len(cache) > _CACHE_MAX:
+        _cache_prune(cache, ttl)
+    while len(cache) > _CACHE_MAX:
+        cache.pop(next(iter(cache)), None)
+
+
+def prune_caches() -> int:
+    """Forget every expired probe result (services/janitor.py sweeps hourly;
+    `_cache_put` additionally enforces the size cap on the way in)."""
+    return (_cache_prune(_CACHE, _CACHE_TTL)
+            + _cache_prune(_SUBS_CACHE, _SUBS_CACHE_TTL)
+            + _cache_prune(_CODECS_CACHE, _SUBS_CACHE_TTL))
+
 
 def _probe_args(target: str, *, is_url: bool,
                 user_agent: str | None = stream_identity.PLAYER_UA) -> list[str]:
@@ -119,10 +158,13 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
         from pathlib import Path as _P
         if _P(target).suffix.lower() in (".ts", ".m2ts", ".mts"):
             try:
-                out = probe_ts(target)
+                # Off the event loop: reading the scan window and walking TS
+                # packets in pure Python takes tens of ms on a NAS-class CPU,
+                # and this runs inside GUI popups while streams are playing.
+                out = await asyncio.to_thread(probe_ts, target)
                 if "error" not in out:
                     out.setdefault("container", _P(target).suffix.lower().lstrip("."))
-                    _CACHE[key] = (time.time(), out)
+                    _cache_put(_CACHE, key, out, _CACHE_TTL)
                     return out
             except Exception:  # noqa: BLE001 - fall through to ffmpeg
                 pass
@@ -219,7 +261,7 @@ async def probe_media(target: str, *, is_url: bool) -> dict:
         # open with too, so share the learning (next play skips the retry).
         stream_identity.remember(target, used_ua)
     if "error" not in out:
-        _CACHE[key] = (time.time(), out)
+        _cache_put(_CACHE, key, out, _CACHE_TTL)
     return out
 
 
@@ -290,9 +332,9 @@ async def subtitle_streams(target: str, *, is_url: bool,
     if not subs and proc.returncode not in (0, None):
         # nothing parsed AND ffmpeg unhappy: report failure, not "no subs",
         # so the caller logs the difference
-        _SUBS_CACHE[key] = (time.time(), None)
+        _cache_put(_SUBS_CACHE, key, None, _SUBS_CACHE_TTL)
         return None
-    _SUBS_CACHE[key] = (time.time(), subs)
+    _cache_put(_SUBS_CACHE, key, subs, _SUBS_CACHE_TTL)
     return subs
 
 
@@ -320,10 +362,9 @@ def prime_local_startup_cache(target: str, media: dict | None) -> None:
         _SUBS_CACHE.pop(subs_key, None)
         _CODECS_CACHE.pop(codecs_key, None)
         return
-    now = time.time()
     subs = media.get("subtitles")
     if isinstance(subs, list):
-        _SUBS_CACHE[subs_key] = (now, subs)
+        _cache_put(_SUBS_CACHE, subs_key, subs, _SUBS_CACHE_TTL)
     video = media.get("video")
     audio = media.get("audio")
     codecs = {
@@ -332,7 +373,7 @@ def prime_local_startup_cache(target: str, media: dict | None) -> None:
                  and isinstance(audio[0], dict) else None,
     }
     if codecs["video"] is not None or codecs["audio"] is not None:
-        _CODECS_CACHE[codecs_key] = (now, codecs)
+        _cache_put(_CODECS_CACHE, codecs_key, codecs, _SUBS_CACHE_TTL)
 
 
 def _parse_codecs(text: str) -> dict | None:
@@ -386,7 +427,7 @@ async def media_codecs(target: str, *, is_url: bool) -> dict | None:
         return None
     out = _parse_codecs(err.decode("utf-8", errors="replace"))
     if out is None and proc.returncode not in (0, None):
-        _CODECS_CACHE[key] = (time.time(), None)
+        _cache_put(_CODECS_CACHE, key, None, _SUBS_CACHE_TTL)
         return None
-    _CODECS_CACHE[key] = (time.time(), out)
+    _cache_put(_CODECS_CACHE, key, out, _SUBS_CACHE_TTL)
     return out
