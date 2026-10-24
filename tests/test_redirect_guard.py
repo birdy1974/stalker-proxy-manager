@@ -377,6 +377,33 @@ async def test_probe_walks_player_to_browser_ua_on_456(monkeypatch):
     assert len(seen) == 1 and "QtEmbedded" in seen[0].headers["user-agent"]
 
 
+async def test_probe_walks_player_to_browser_ua_on_462(monkeypatch):
+    """462 gets 456's treatment in the liveness probe too: a HEAD 462 is a
+    shrug (try GET), and a 462 final verdict spends the other identity
+    instead of vetoing a link the end player would have played."""
+    import functools
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(462) if "Lavf" in request.headers.get("user-agent", "") \
+            else httpx.Response(200)
+
+    factory = functools.partial(
+        httpx.AsyncClient, transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(redirect_guard.httpx, "AsyncClient", factory)
+
+    result = await link_is_alive("http://cdn/play/live.php?stream=1&token=a")
+    assert result.alive, result.detail
+    # HEAD 462 -> GET 462 with the player UA, then HEAD 200 with the browser
+    assert len(seen) == 3
+    assert all("Lavf" in r.headers["user-agent"] for r in seen[:2])
+    assert "QtEmbedded" in seen[-1].headers["user-agent"]
+    assert stream_identity.learned("http://cdn/play/live.php?stream=1") \
+        == stream_identity.STB_UA
+
+
 async def test_probe_player_ua_plays_without_any_retry(monkeypatch):
     """The common panel (and the reported one): player UA 200 on the first
     HEAD - the browser identity must never touch the media endpoint."""

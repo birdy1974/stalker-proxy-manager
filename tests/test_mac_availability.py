@@ -444,6 +444,18 @@ async def test_first_bytes_walks_the_media_ua_ladder(monkeypatch):
     assert got["ua"] == stream_identity.STB_UA
 
 
+async def test_first_bytes_walks_the_ladder_on_462_too(monkeypatch):
+    """462 is 456's sibling refusal: the MAC probe must spend the browser
+    rung on it as well, or it reports a playable MAC as held/no-data."""
+    scripts = [(462, []), (200, [b"x" * 512])]
+    monkeypatch.setattr(mac_probe, "_media_client",
+                        lambda **kw: _Client(scripts))
+    stream_identity.reset()
+    got = await mac_probe._first_bytes("http://cdn462.example/live.php?t=1")
+    assert got["bytes"] == 512 and got["status"] == 200
+    assert got["ua"] == stream_identity.STB_UA
+
+
 async def test_first_bytes_reports_a_timeout_without_lying(monkeypatch):
     monkeypatch.setattr(mac_probe, "_media_client",
                         lambda **kw: _Client([(200, [])]))

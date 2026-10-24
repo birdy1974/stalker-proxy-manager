@@ -1,4 +1,4 @@
-"""Media-endpoint user-agent ladder (the HTTP 456 / "ffmpeg templates don't
+"""Media-endpoint user-agent ladder (the HTTP 456/462 / "ffmpeg templates don't
 play while redirect/direct does" fix).
 
 A real MAG box contains two HTTP clients:
@@ -9,7 +9,7 @@ A real MAG box contains two HTTP clients:
     announcing ``Lavf53.32.100`` (``PLAYER_UA``).
 
 play/live.php-style origins answer the *browser* UA on the media endpoint with
-HTTP 456 (or 403) and zero bytes while the same fresh play_token plays for the
+HTTP 456/462 (or 403) and zero bytes while the same fresh play_token plays for the
 player UA - and other panels do exactly the reverse. The media path therefore
 tries player first, retries once with the browser UA on a pre-first-byte HTTP
 4xx, and remembers the winner per origin host. These tests pin all of that.
@@ -59,6 +59,14 @@ def _clean_state():
 def test_http_open_error_classifies_ffmpegs_answers():
     err456 = "[https @ 0x55d] HTTP error 456 Server returned 4XX Client Error"
     assert http_open_error(8, err456) == 456
+    # 462: 456's sibling non-standard refusal (production trace, backup.xp1.tv
+    # 2026-10-24). The numeric line wins over the 4XX wrapper behind it, so
+    # the answer must be 462 - not normalised to 456, and not None (the
+    # fall-through that made that failure read as a generic ffmpeg rc=8).
+    err462 = ("[http @ 0x565075ed54c0] HTTP error 462 \n"
+              "[in#0 @ 0x565075eb4a80] Error opening input: Server returned 4XX "
+              "Client Error, but not one of 40{0,1,3,4}")
+    assert http_open_error(8, err462) == 462
     assert http_open_error(8, "[http @ x] HTTP error 403 Forbidden") == 403
     assert http_open_error(8, "[http @ x] HTTP error 404 Not Found") == 404
     assert http_open_error(8, "[http @ x] HTTP error 429 Too Many") == 429
@@ -87,6 +95,10 @@ def test_http_open_error_distinguishes_fast_waf_from_slow_slot_refusal():
     assert http_open_error(8, err, elapsed=0.4) == 456      # WAF: fast refusal
     assert http_open_error(8, err, elapsed=6.5) is None     # slot: too slow
     assert http_open_error(8, err, elapsed=None) == 456     # no timing: trust it
+    # 462 obeys the same fast/slow rule (the 2026-10-24 refusal took ~1.1 s)
+    err462 = "[http @ x] HTTP error 462"
+    assert http_open_error(8, err462, elapsed=1.1) == 462
+    assert http_open_error(8, err462, elapsed=6.5) is None
     # boundary uses the configurable constant
     assert stream_identity.FAST_REFUSAL_S == 5.0
 
@@ -214,6 +226,7 @@ class _StallProc:
 
 
 _456 = b"[https @ 0x9] HTTP error 456 Server returned 4XX Client Error\n"
+_462 = b"[http @ 0x9] HTTP error 462 Server returned 4XX Client Error\n"
 _403 = b"[https @ 0x9] HTTP error 403 Forbidden\n"
 _TS = b"G" * 188
 
@@ -262,6 +275,24 @@ async def test_opener_456s_player_then_plays_with_browser_ua(monkeypatch):
     assert learned(_URL) == STB_UA
 
 
+async def test_opener_462s_player_then_plays_with_browser_ua(monkeypatch):
+    """Production trace (backup.xp1.tv, 2026-10-24): a just-minted play_token
+    was refused with HTTP 462 and, unrecognised, fell through as a generic
+    rc=8 - no identity retry, and the last fallback candidate burned. 462
+    gets exactly 456's ladder: one same-link respawn with the other UA."""
+    def policy(ua):
+        if ua == PLAYER_UA:
+            return _FakeProc([], rc=8, tail=_462)
+        return _FakeProc([_TS], rc=0)
+
+    calls = _install_spawn(monkeypatch, policy)
+    proc, first, fail = await MANAGER._open_with_identity(
+        _TPL_COPY, _URL, title="Ch", pace=False)
+    assert first == _TS and fail is None and proc is not None
+    assert calls == [(_URL, PLAYER_UA), (_URL, STB_UA)]
+    assert learned(_URL) == STB_UA
+
+
 async def test_opener_gives_up_after_both_identities_refused(monkeypatch):
     calls = _install_spawn(
         monkeypatch, lambda ua: _FakeProc([], rc=8, tail=_403))
@@ -290,6 +321,19 @@ async def test_opener_slow_456_skips_the_ua_rung_and_goes_to_mac_fallback(monkey
     monkeypatch.setattr(stream_identity, "FAST_REFUSAL_S", 0.0)
     calls = _install_spawn(
         monkeypatch, lambda ua: _FakeProc([], rc=8, tail=_456))
+    proc, first, fail = await MANAGER._open_with_identity(
+        _TPL_COPY, _URL, title="Ch", pace=False)
+    assert proc is None and fail is not None and fail["rc"] == 8
+    assert calls == [(_URL, PLAYER_UA)]   # one attempt, straight to MAC fallback
+
+
+async def test_opener_slow_462_skips_the_ua_rung_like_a_slow_456(monkeypatch):
+    """462 inherits the fast/slow split: outside the fast-refusal window it
+    is read as the panel's connection-slot check, so the opener must not
+    spend the browser rung on it either."""
+    monkeypatch.setattr(stream_identity, "FAST_REFUSAL_S", 0.0)
+    calls = _install_spawn(
+        monkeypatch, lambda ua: _FakeProc([], rc=8, tail=_462))
     proc, first, fail = await MANAGER._open_with_identity(
         _TPL_COPY, _URL, title="Ch", pace=False)
     assert proc is None and fail is not None and fail["rc"] == 8

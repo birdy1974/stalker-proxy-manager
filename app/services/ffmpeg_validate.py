@@ -181,12 +181,15 @@ def _timeout_hint(err: str, out_n: int) -> str:
         return "the panel answered 403 Forbidden (MAC/token rejected)"
     if "404 not found" in low:
         return "the panel answered 404 Not Found (stale link — re-fetch the source)"
-    # The non-standard 456 is its own diagnosis (see stream_identity): it is
+    # The non-standard 456/462 are their own diagnosis (see stream_identity):
     # the Stalker/WAF "unrecoverable" answer, and the two causes are very
-    # different to fix. ffmpeg 7 prints it as "HTTP error 456" and/or the
-    # wrapper "Server returned 4XX Client Error, but not one of 40{0,1,3,4}".
-    if "http error 456" in low or "returned 4xx client error" in low:
-        return ("HTTP 456 is the panel's non-standard 'unrecoverable' answer "
+    # different to fix. ffmpeg 7 prints it as "HTTP error 456" (or 462 - name
+    # the code the panel actually sent, not 456 by habit) and/or the wrapper
+    # "Server returned 4XX Client Error, but not one of 40{0,1,3,4}".
+    refusal = re.search(r"http error\s*(456|462)\b", low)
+    if refusal or "returned 4xx client error" in low:
+        code = refusal.group(1) if refusal else "456"
+        return (f"HTTP {code} is the panel's non-standard 'unrecoverable' answer "
                 "on the media endpoint, not a template error: either the MAC's "
                 "single connection slot was still held (a stream running on "
                 "that MAC — stop the channel on the box and re-run), or the "

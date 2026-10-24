@@ -203,7 +203,7 @@ def reset() -> None:
 #     token/channel is gone regardless of method.
 # Transport errors that are not connect-level join this set by `_is_a_shrug`
 # below - same reasoning, different way for the origin to say "not like this".
-_HEAD_STATUSES_TRY_GET = frozenset({403, 405, 429, 456, 500, 501, 502, 503, 504})
+_HEAD_STATUSES_TRY_GET = frozenset({403, 405, 429, 456, 462, 500, 501, 502, 503, 504})
 
 # A transport error on a probe is not a verdict - except one. ConnectError /
 # ConnectTimeout mean nothing listened at the other end (DNS, refused, no
@@ -279,7 +279,7 @@ async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
     uas = stream_identity.ladder(url)
     # The URL is handed to the END PLAYER after the 302, so the probe must
     # look like a media player, not the portal browser: play/live.php origins
-    # answer the browser UA here with HTTP 456/403 and would be vetoed as
+    # answer the browser UA here with HTTP 456/462/403 and would be vetoed as
     # "dead" while TiviMate/VLC play the same link. Learned origin first.
     for idx, ua in enumerate(uas):
         async with httpx.AsyncClient(
@@ -289,8 +289,8 @@ async def link_is_alive(url: str, *, timeout: float = VALIDATE_TIMEOUT,
         if verdict.alive:
             stream_identity.remember(url, ua)
             break
-        # A policy 4xx as the FINAL verdict may be identity-shaped (the 456
-        # case above); spend the one other identity the ladder offers. A
+        # A policy 4xx as the FINAL verdict may be identity-shaped (the
+        # 456/462 case above); spend the one other identity the ladder offers. A
         # proved 410, a connect-level error or an inconclusive "alive" verdict
         # ends the probe.
         tail = verdict.detail.rsplit(" ", 1)[-1]
