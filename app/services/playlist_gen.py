@@ -368,6 +368,13 @@ async def build_m3u(base_url: str, user: User, *,
     text = await _build_m3u(base_url, user, local_cache_ms=local_cache_ms,
                             delivery_mode=delivery_mode)
     _M3U_CACHE[key] = (time.monotonic(), text)
+    # Entries from older content generations can never be hit again (the
+    # generation is part of the key), so drop them instead of letting up to
+    # 100 stale full-playlist strings - megabytes each on a big library -
+    # sit in RAM until the size cap happens to evict them.
+    current = generation()
+    for old in [k for k in _M3U_CACHE if k[-1] != current]:
+        _M3U_CACHE.pop(old, None)
     # Bound memory when users/URLs change.
     if len(_M3U_CACHE) > 100:
         oldest = min(_M3U_CACHE, key=lambda k: _M3U_CACHE[k][0])

@@ -26,6 +26,7 @@ Exit:   0 all parsed, 1 something did not.
 const fs = require('fs'), path = require('path'), vm = require('vm');
 
 const DEFAULTS = [
+  'app/static/js/theme.js',
   'app/static/js/app.js',
   ...fs.readdirSync('app/templates').filter(f => f.endsWith('.html')).map(f => path.join('app/templates', f)),
 ];

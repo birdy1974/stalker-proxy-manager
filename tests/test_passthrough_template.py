@@ -224,6 +224,50 @@ async def test_open_passthrough_connects_and_returns_stream():
         await proc.wait()
 
 
+async def test_open_passthrough_retries_462_with_the_browser_ua():
+    """Passthrough checks the raw HTTP status against UA_POLICY_4XX itself
+    (there is no ffmpeg stderr to parse): a fast 462 to the player identity
+    must spend the browser rung on the SAME link, exactly like a 456 -
+    before this, 462 ended the open as a generic failure."""
+    from app.services import stream_identity
+    stream_identity.reset()
+    seen_uas = []
+
+    class Refused:
+        status_code = 462
+
+        async def aclose(self):
+            pass
+
+    class Playing:
+        status_code = 200
+
+        async def aiter_bytes(self, chunk_size=None):
+            yield b"MPEGTS-DATA"
+
+        async def aclose(self):
+            pass
+
+    async def fake_send(self, req, stream=False):
+        ua = req.headers.get("user-agent", "")
+        seen_uas.append(ua)
+        return Refused() if "Lavf" in ua else Playing()
+
+    url = "http://cdn462.example.com/live/ch1.ts"
+    try:
+        with patch.object(httpx.AsyncClient, "send", new=fake_send):
+            proc, first, err = await MANAGER._open_passthrough(
+                url, title="Ch 1", first_byte_timeout=5.0)
+        assert err is None and proc is not None
+        assert first == b"MPEGTS-DATA"
+        assert seen_uas == [stream_identity.PLAYER_UA, stream_identity.STB_UA]
+        assert stream_identity.learned(url) == stream_identity.STB_UA
+        assert await proc.stdout.read() == b""
+        await proc.wait()
+    finally:
+        stream_identity.reset()
+
+
 async def test_spawn_refuses_passthrough_marker():
     """StreamManager._spawn must refuse to run @passthrough as an FFmpeg binary."""
     proc = await MANAGER._spawn(PASSTHROUGH_COMMAND, "http://cdn.example.com/stream.ts")

@@ -539,6 +539,64 @@ REAP_GRACE = 45.0
 _LINK_CACHE: dict[tuple, tuple[str, float]] = {}
 #: (route_key, source_key, mac_id) -> monotonic of the last failed attempt
 _CANDIDATE_FAILURES: dict[tuple, float] = {}
+#: (source_key, mac_id, stored url) -> (playable, monotonic): what speculative
+#: direct play (portal/links.TRY_STORED_LINK) learned about one stored URL on
+#: one MAC. The URL is part of the key, so a re-fetched cmd starts clean; the
+#: MAC is part of it because an embedded token belongs to the MAC whose
+#: session fetched the catalogue, and a verdict earned on MAC A says nothing
+#: about MAC B. Only positive proof is recorded (a probe that answered, a
+#: first byte that flowed) - an ambiguous ffmpeg failure does not learn.
+_DIRECT_VERDICTS: dict[tuple, tuple[bool, float]] = {}
+_DIRECT_OK_TTL = 3600.0      # an embedded token can be rotated by the panel
+_DIRECT_DEAD_TTL = 600.0     # ... and a dead one can come back the same way
+_DIRECT_VERDICTS_MAX = 1024
+
+
+def direct_verdict(src, mac_row, url: str) -> bool | None:
+    """The remembered verdict for this stored URL on this MAC (None = untried)."""
+    if not url:
+        return None
+    key = (_RouteHealth.source_key(src), getattr(mac_row, "id", None), url)
+    entry = _DIRECT_VERDICTS.get(key)
+    if entry is None:
+        return None
+    ok, at = entry
+    if time.monotonic() - at > (_DIRECT_OK_TTL if ok else _DIRECT_DEAD_TTL):
+        _DIRECT_VERDICTS.pop(key, None)
+        return None
+    return ok
+
+
+def note_direct_verdict(src, mac_row, url: str, ok: bool) -> None:
+    """Remember that this stored URL played (or was proved dead) on this MAC."""
+    if not url:
+        return
+    key = (_RouteHealth.source_key(src), getattr(mac_row, "id", None), url)
+    _DIRECT_VERDICTS[key] = (bool(ok), time.monotonic())
+    if len(_DIRECT_VERDICTS) > _DIRECT_VERDICTS_MAX:
+        prune_direct_verdicts()
+    while len(_DIRECT_VERDICTS) > _DIRECT_VERDICTS_MAX:
+        oldest = min(_DIRECT_VERDICTS, key=lambda k: _DIRECT_VERDICTS[k][1])
+        _DIRECT_VERDICTS.pop(oldest, None)
+
+
+def prune_direct_verdicts() -> int:
+    """Drop expired verdicts (janitor sweep); returns how many went."""
+    now = time.monotonic()
+    stale = [k for k, (ok, at) in _DIRECT_VERDICTS.items()
+             if now - at > (_DIRECT_OK_TTL if ok else _DIRECT_DEAD_TTL)]
+    for key in stale:
+        _DIRECT_VERDICTS.pop(key, None)
+    return len(stale)
+
+
+#: First-byte window for a SPECULATIVE stored-link open on the ffmpeg path.
+#: The probe gate normally answers first; this bounds the case where it could
+#: not (validation off, origin shrugging at probes): a dead stored token must
+#: cost seconds at most before the same candidate asks the panel, never the
+#: full STREAM_START_TIMEOUT. A live source answers in ~550 ms (measured), so
+#: 3 s only ever bites the dead ones.
+DIRECT_TRY_WINDOW_S = float(os.environ.get("SPM_TRY_STORED_LINK_WINDOW_S", "3"))
 
 
 def note_link(kind: str, ref_id: int, mac_id: int | None, url: str,
@@ -819,6 +877,7 @@ def reset_zap_state() -> None:
     """Tests only: forget the link cache and the failure demotions."""
     _LINK_CACHE.clear()
     _CANDIDATE_FAILURES.clear()
+    _DIRECT_VERDICTS.clear()
     _PORTAL_FIRST_NOTED.clear()
     # MAC ids repeat across test databases: a cooldown from an earlier test must
     # not rank a fresh MAC behind another.
@@ -3294,7 +3353,12 @@ class StreamManager:
                 return plan_adopted(adopted, src=src, mac_row=mac_row)
         portal_direct = bool(getattr(portal, "direct_links", True))
         allow = portal_direct and (allow_direct if allow_direct is not None else True)
-        return plan_for(src, mac_row, ffmpeg=ffmpeg, allow_direct=allow)
+        # Both stream paths verify a speculative direct play and fall back to
+        # create_link on the same candidate, so they may opt in (the kill
+        # switch itself lives in link_policy, next to SPM_FFMPEG_USE_STORED_LINK).
+        return plan_for(src, mac_row, ffmpeg=ffmpeg, allow_direct=allow,
+                        speculative_ok=True,
+                        learned_for=lambda u: direct_verdict(src, mac_row, u))
 
     def _has_alternative(self, chain: list, step: int, candidates: list, mac_row,
                          requester: str | None) -> bool:
@@ -3429,7 +3493,7 @@ class StreamManager:
                         # The link was good minutes ago, not now: probe before
                         # replaying it (same probe the fresh link gets below).
                         # <<< redirect-guard note: link_is_alive is the guard's
-                        if await link_is_alive(cached_url):
+                        if await link_is_alive(cached_url, exact=True):
                             await db_log("INFO", "stream",
                                          f"[{item_name}] redirect: replaying the link resolved "
                                          f"{age:.0f}s ago on {mac_row.mac} (no create_link)")
@@ -3471,29 +3535,43 @@ class StreamManager:
                                      f"{portal.name}/"
                                      f"{mac_row.mac if mac_row is not None else 'xtream'}: "
                                      f"{plan.policy.reason}")
+                        _direct_dead = False
                         # >>> redirect-guard (features 1+2; delete with app/services/redirect_guard.py)
-                        _probe = await link_is_alive(plan.direct_url)
+                        _probe = await link_is_alive(plan.direct_url, exact=True)
                         if not _probe:
+                            # Proved dead, not merely unproven: remember it for
+                            # this (source, MAC, URL) and mint a fresh link on
+                            # THIS candidate below. Burning the candidate and
+                            # waiting for the retry pass (the old shape) made a
+                            # speculative try cost 2.5 s of sleep plus a chain
+                            # re-walk when it missed - slower than just asking.
+                            if _probe.probed:
+                                note_direct_verdict(_src, mac_row, plan.url, False)
                             await db_log("WARNING", "stream",
                                          f"[{item_name}] redirect: stored link dead "
-                                         f"({portal.name}; {_probe.detail}) -> next candidate")
+                                         f"({portal.name}; {_probe.detail}) "
+                                         "-> asking the panel on the same MAC")
                             note_candidate_failure(route_key, _src, mac_row)
                             direct_failed.add(cand_key)
                             every_candidate_busy = False
-                            continue
-                        note_handed_out(route_key, _src, mac_row)
+                            _direct_dead = True
+                        else:
+                            if _probe.probed:
+                                note_direct_verdict(_src, mac_row, plan.url, True)
+                            note_handed_out(route_key, _src, mac_row)
                         # <<< redirect-guard
-                        note_link(kind, ref_id, getattr(mac_row, "id", None),
-                                  plan.direct_url, requester)
-                        clear_candidate_failures(route_key)
-                        if mac_row is not None:
-                            self.lease_mac(mac_row.id, holder=requester,
-                                           item=item_name, kind=kind, ref=ref_id)
-                        self.route_health.succeeded(route_key, _src, mac_row)
-                        if out is not None:
-                            out["portal"] = portal.name
-                            out["mac"] = getattr(mac_row, "mac", "") or ""
-                        return plan.direct_url, item_name
+                        if not _direct_dead:
+                            note_link(kind, ref_id, getattr(mac_row, "id", None),
+                                      plan.direct_url, requester)
+                            clear_candidate_failures(route_key)
+                            if mac_row is not None:
+                                self.lease_mac(mac_row.id, holder=requester,
+                                               item=item_name, kind=kind, ref=ref_id)
+                            self.route_health.succeeded(route_key, _src, mac_row)
+                            if out is not None:
+                                out["portal"] = portal.name
+                                out["mac"] = getattr(mac_row, "mac", "") or ""
+                            return plan.direct_url, item_name
                     client = await POOL.get(PortalSession.from_rows(portal, mac_row))
                     repair = None
                     try:
@@ -3957,6 +4035,29 @@ class StreamManager:
                                        f"[{h.item_name}] fallback step {idx}/{len(chain)}: "
                                        + (f"portal '{portal.name}' - {plan.policy.reason}" if adopted
                                           else f"portal '{portal.name}' mac {mac_row.mac}"))
+                          # >>> redirect-guard (speculative stored-link gate; delete with app/services/redirect_guard.py)
+                          if not adopted and plan.policy.speculative:
+                              # The stored URL is a guess (shape only - often a
+                              # token from fetch time). One cheap probe decides
+                              # whether it may skip create_link; a proved-dead
+                              # verdict is learned and this same candidate asks
+                              # the panel below. Without the guard (or with
+                              # validation off) the capped first-byte window on
+                              # the open below is the bound instead.
+                              _probe = await link_is_alive(plan.direct_url,
+                                                            exact=True)
+                              if not _probe:
+                                  if _probe.probed:
+                                      note_direct_verdict(src, mac_row, plan.url,
+                                                          False)
+                                  await db_log("INFO", "stream",
+                                               f"[{h.item_name}] stored link dead "
+                                               f"({_probe.detail}) -> asking the "
+                                               "panel on the same MAC")
+                                  plan = self._plan(src, mac_row, portal,
+                                                    ffmpeg=True, allow_direct=False)
+                                  adopted = plan.adopted
+                          # <<< redirect-guard
                           url = None
                           repair = None      # set only when the panel answered
                           client = None
@@ -4090,7 +4191,9 @@ class StreamManager:
                                   # answers in ~550 ms), and a whole chain of
                                   # 12 s waits is what a player shows as a frozen
                                   # screen. See STREAM_START_TIMEOUT_REST.
-                                  first_byte_timeout=window)
+                                  first_byte_timeout=(min(window, DIRECT_TRY_WINDOW_S)
+                                                      if plan.policy.speculative
+                                                      else window))
                           except FFmpegTemplateError as exc:
                               if locked is not None:
                                   self.unlock_mac(locked, h.id)
@@ -4187,6 +4290,8 @@ class StreamManager:
                               await self._register(h)
                               registered = True
                           self.route_health.succeeded(h.route_key, src, mac_row, verified_media=True)
+                          if plan.policy.speculative:
+                              note_direct_verdict(src, mac_row, plan.url, True)
                           note_link(kind, ref_id, getattr(mac_row, "id", None), url,
                                     h.user_name)
                           clear_candidate_failures(h.route_key)

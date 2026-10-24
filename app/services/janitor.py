@@ -11,7 +11,12 @@ instead, and history grows forever:
   * the route-affinity / source-breaker tables (`MANAGER.route_health`) - one
     entry per (route, source) pair ever played or ever failed;
   * the log table, which is trimmed at boot but never again while the process
-    stays up.
+    stays up;
+  * the probe/TMDB result caches, keyed by target/title - expired entries
+    used to sit until overwritten, and portal URLs mint a fresh play_token
+    (hence a fresh key) on every play;
+  * the pending genre previews (`api_portals`) - one whole genre's item list
+    per disabled genre ever previewed, dropped only if it was later enabled.
 
 None of these leaks fast enough to notice in a week, which is exactly why it is
 worth a janitor rather than a bug report in a year. One pass an hour
@@ -53,8 +58,21 @@ async def sweep_once() -> dict:
     try:
         from . import redirect_guard
         report["handoffs"] = redirect_guard.prune()
+        from .stream_manager import prune_direct_verdicts
+        report["direct_verdicts"] = prune_direct_verdicts()
     except Exception:  # noqa: BLE001
         log.exception("redirect guard prune failed")
+    try:
+        from . import probe, tmdb
+        report["probe_caches"] = probe.prune_caches()
+        report["tmdb_cache"] = tmdb.prune_cache()
+    except Exception:  # noqa: BLE001
+        log.exception("probe/tmdb cache prune failed")
+    try:
+        from ..routers.api_portals import prune_pending_genre_items
+        report["pending_genres"] = prune_pending_genre_items()
+    except Exception:  # noqa: BLE001
+        log.exception("pending genre prune failed")
     try:
         from .db_logging import cleanup_logs
         await cleanup_logs(LOG_ROWS)

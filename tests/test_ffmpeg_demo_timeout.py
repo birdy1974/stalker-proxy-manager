@@ -192,6 +192,32 @@ async def test_playlist_demo_retries_456_with_the_browser_ua(monkeypatch, tmp_pa
         stream_identity.reset()
 
 
+async def test_playlist_demo_retries_462_with_the_browser_ua(monkeypatch, tmp_path):
+    """462 is 456's sibling (backup.xp1.tv, 2026-10-24): the demo must walk
+    the same one-rung ladder for it instead of reporting a bare rc=8."""
+    from app.services import stream_identity
+    stream_identity.reset()
+    fake = tmp_path / "ffmpeg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "case \"$*\" in\n"
+        "  *Lavf53.32.100*)\n"
+        "    echo '[http @ 0x9] HTTP error 462 Server returned 4XX Client Error' >&2\n"
+        "    exit 8 ;;\n"
+        "  *) head -c 200000 /dev/zero ;;\n"
+        "esac\n")
+    fake.chmod(0o755)
+    _use_fake_ffmpeg(monkeypatch, str(fake))
+    try:
+        r = await fv.run_demo(f"ffmpeg -i {URL_PLACEHOLDER} -f mpegts pipe:1",
+                              mode="playlist", url=STALLED_URL)
+        assert r["ok"] is True, r["detail"]
+        assert r["bytes"] == 200000
+        assert stream_identity.learned(STALLED_URL) == stream_identity.STB_UA
+    finally:
+        stream_identity.reset()
+
+
 # --------------------------------------------------------------------------
 # 3. the working case must be untouched
 # --------------------------------------------------------------------------
@@ -237,6 +263,23 @@ def test_timeout_hint_explains_a_456():
     assert "456" in hint
     assert "connection slot" in hint
     assert "anti-proxy" in hint
+
+
+def test_timeout_hint_explains_a_462_with_its_own_number():
+    """Production trace (backup.xp1.tv, 2026-10-24): the panel answered 462,
+    not 456, and the tail carries both the numeric line and the 4XX wrapper.
+    The hint must name 462 - explaining it as "HTTP 456 is..." sends the
+    operator searching the log for a code that never appeared."""
+    err = ("[http @ 0x565075ed54c0] HTTP error 462 \n"
+           "[in#0 @ 0x565075eb4a80] Error opening input: Server returned 4XX "
+           "Client Error, but not one of 40{0,1,3,4}\n"
+           "Error opening input file "
+           "http://backup.xp1.tv:80/play/live.php?mac=00:1A:79:32:BC:18&"
+           "stream=182819&extension=ts&play_token=***")
+    hint = fv._timeout_hint(err, 0)
+    assert "462" in hint
+    assert "HTTP 456 is" not in hint
+    assert "connection slot" in hint
 
 
 def test_timeout_hint_still_distinguishes_403_and_404():

@@ -11,8 +11,9 @@ box (see ``app/portal/identity.py``, ``STB_UA`` vs ``PLAYER_UA``):
 
 We used to present the browser UA for both. Lenient panels accept it, but
 ``play/live.php`` origins and the anti-proxy WAFs in front of them increasingly
-answer the browser UA on the MEDIA endpoint with HTTP 456 ("unrecoverable",
-also seen as 403), while the same freshly-resolved token plays fine for a
+answer the browser UA on the MEDIA endpoint with HTTP 456 ("unrecoverable";
+some panels use the sibling non-standard 462 for the same refusal, also seen
+as 403), while the same freshly-resolved token plays fine for a
 player-shaped request - the failure that reads as "redirect/direct works but
 every ffmpeg template fails with rc=8 and zero bytes". Other panels do the
 reverse and refuse a bare libav UA (the case the browser-UA injection was
@@ -52,16 +53,24 @@ __all__ = ["PLAYER_UA", "STB_UA", "origin_of", "learned", "remember",
 #: 456 (the Stalker/WAF "unrecoverable" answer behind this whole module) and
 #: 429 (occasional WAF rate answer) are not in that set, so retrying them
 #: ourselves with the other identity is the only way to learn the answer.
-UA_POLICY_4XX = frozenset({401, 403, 404, 429, 456})
+#: 462 is 456's sibling: another non-standard media-endpoint refusal some
+#: panels answer instead of 456 (production trace, backup.xp1.tv 2026-10-24:
+#: a just-minted play_token refused with "HTTP error 462", ffmpeg rc=8, zero
+#: bytes - and because nothing recognised the code it fell through as a
+#: generic rc=8: no identity retry, no explanatory log line). It gets
+#: exactly 456's treatment - a fast 462 spends the one other-UA rung, a slow
+#: one is read as the panel's connection-slot check (FAST_REFUSAL_S below)
+#: and skips straight to the MAC/source fallback.
+UA_POLICY_4XX = frozenset({401, 403, 404, 429, 456, 462})
 
 LADDER_ENABLED = os.environ.get("SPM_STREAM_UA_LADDER", "1") == "1"
 
 #: A 4xx only counts as an *identity* answer when it comes back fast. A WAF
 #: that refuses the client shape answers in tens of milliseconds; a Stalker
-#: backend that returns 456 because the MAC's single connection slot is still
-#: held (a zap overlap or a playlist demo that just used the MAC) first works
-#: through its connection table - measured ~6.5 s on a real panel, while a
-#: healthy answer reaches first bytes in ~2 s. Retrying the slow case with
+#: backend that returns 456/462 because the MAC's single connection slot is
+#: still held (a zap overlap or a playlist demo that just used the MAC) first
+#: works through its connection table - measured ~6.5 s on a real panel, while
+#: a healthy answer reaches first bytes in ~2 s. Retrying the slow case with
 #: the other UA cannot help (the slot is UA-independent) and would only add
 #: those seconds before the MAC/source fallback. Env-overridable.
 FAST_REFUSAL_S = float(os.environ.get("SPM_UA_LADDER_FAST_FAIL_S", "5"))
@@ -132,7 +141,7 @@ def reset() -> None:
 # either the direct status ("[http @ …] HTTP error 456") or the wrapper line
 # ("Error opening input: Server returned 4XX Client Error, but not one of
 # 40{0,1,3,4}") - the latter being ffmpeg 7.x's way of reporting precisely the
-# non-standard 456 this module exists for.
+# non-standard 456/462 this module exists for.
 _RE_HTTP_STATUS = re.compile(r"HTTP error\s*(\d{3})")
 _RE_4XX_WRAPPER = re.compile(r"returned\s+4XX\s+Client\s+Error", re.I)
 
@@ -144,8 +153,8 @@ def http_open_error(rc: int | None, stderr_tail: str,
     None covers everything that is not an identity-policy answer: transport
     timeouts (rc/stalls, caught by the caller as "no data"), muxer/filter
     errors at output init, and any 2xx-then-EOF death. Only a clear 4xx from
-    the HTTP layer - the documented 456 and the statuses in UA_POLICY_4XX -
-    justifies spending the one ladder retry.
+    the HTTP layer - the documented 456/462 and the other statuses in
+    UA_POLICY_4XX - justifies spending the one ladder retry.
 
     ``elapsed`` is the spawn-to-death time in seconds. When given, a refusal
     that took longer than ``FAST_REFUSAL_S`` is treated as a SLOW, non-
@@ -156,8 +165,11 @@ def http_open_error(rc: int | None, stderr_tail: str,
     m = _RE_HTTP_STATUS.search(text)
     status = int(m.group(1)) if m else None
     if status is None:
-        # ffmpeg 7 wording for an unrecognised 4xx (456/429/418/...): the
+        # ffmpeg 7 wording for an unrecognised 4xx (456/462/429/418/...): the
         # numeric line may be absent in some builds, so recognise the wrapper.
+        # A wrapper-only tail cannot say WHICH non-standard code it was, so it
+        # is reported as 456; harmless, since 456 and 462 take the same rung -
+        # only the number in the log line can be off, never the decision.
         if rc in (1, 8) and _RE_4XX_WRAPPER.search(text):
             status = 456
         else:

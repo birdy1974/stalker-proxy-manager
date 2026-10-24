@@ -21,6 +21,16 @@ _IMG = "https://image.tmdb.org/t/p/w342"
 # transient network blip takes effect on the very next popup.
 _CACHE: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 3600
+_CACHE_MAX = 512   # keyed by searched title: history-sized, so capped/pruned
+
+
+def prune_cache() -> int:
+    """Drop expired lookups (janitor sweep); returns how many went."""
+    now = time.time()
+    stale = [k for k, (at, _v) in _CACHE.items() if now - at >= _CACHE_TTL]
+    for key in stale:
+        _CACHE.pop(key, None)
+    return len(stale)
 
 
 async def _api_key() -> str:
@@ -115,5 +125,10 @@ async def tmdb_lookup(name: str, year: str | None = None, kind: str = "vod") -> 
         "episodes_count": d.get("number_of_episodes"),
         "homepage": d.get("homepage"),
     }
+    _CACHE.pop(cache_key, None)          # refresh position for LRU-ish eviction
     _CACHE[cache_key] = (time.time(), out)
+    if len(_CACHE) > _CACHE_MAX:
+        prune_cache()
+    while len(_CACHE) > _CACHE_MAX:
+        _CACHE.pop(next(iter(_CACHE)), None)
     return out

@@ -10,6 +10,7 @@ the SOURCES stored in the DB (never live portal calls - workflow steps 8/11).
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -478,6 +479,46 @@ async def toggle_local_files(payload: dict, db=Depends(get_db)):
     return {"ok": True, "count": len(rows), "playlist": synced}
 
 
+def _walk_local_source(base: Path, recursive: bool):
+    """One directory tree -> (found, skipped, seen) as plain data.
+
+    found: (relative_path, filename, size_bytes, mtime_iso) per video file.
+    Runs in a worker thread: walking a NAS mount and stat-ing every file is
+    seconds of blocking syscalls, and it used to interleave with one DB
+    await PER FILE on the event loop - a 10k-file library scans as 10k
+    round trips while streams wait. May raise PermissionError (unreadable
+    top directory in non-recursive mode), like the inline code did.
+    """
+    # os.walk() swallows unreadable sub-directories by default; collect them
+    # instead so the log and the GUI say why a scan came back empty
+    # (almost always: the mount is owned by another uid -> PUID/PGID).
+    skipped: list[str] = []
+
+    def _walk_error(err: OSError) -> None:
+        skipped.append(str(getattr(err, "filename", base)))
+
+    walker = (os.walk(base, onerror=_walk_error) if recursive
+              else [(str(base), [], os.listdir(base))])
+    found = []
+    seen = 0
+    for root, _, files in walker:
+        for fn in files:
+            if Path(fn).suffix.lower() not in VIDEO_EXTS:
+                continue
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, base)
+            seen += 1
+            try:
+                st = os.stat(full)
+            except OSError as e:  # unreadable file: skip, keep scanning
+                skipped.append(f"{full} ({e.strerror})")
+                continue
+            found.append((rel, fn, st.st_size,
+                          datetime.fromtimestamp(st.st_mtime,
+                                               timezone.utc).isoformat()))
+    return found, skipped, seen
+
+
 @router.post("/local/scan")
 async def scan_local(payload: dict, db=Depends(get_db)):
     """Scan enabled directories for video files -> local_files table."""
@@ -500,46 +541,35 @@ async def scan_local(payload: dict, db=Depends(get_db)):
         if not is_dir:
             await db_log("ERROR", "local", f"directory not accessible: {base}")
             continue
-        # os.walk() swallows unreadable sub-directories by default; collect them
-        # instead so the log and the GUI say why a scan came back empty
-        # (almost always: the mount is owned by another uid -> PUID/PGID).
-        skipped: list[str] = []
-
-        def _walk_error(err: OSError) -> None:
-            skipped.append(str(getattr(err, "filename", base)))
-
         try:
-            walker = (os.walk(base, onerror=_walk_error) if d.recursive
-                      else [(str(base), [], os.listdir(base))])
+            found, skipped, seen = await asyncio.to_thread(
+                _walk_local_source, base, d.recursive)
         except PermissionError:
             await db_log("ERROR", "local", permission_hint(base))
             continue
+        total_seen += seen
+        # One query for what this source already knows (the unique
+        # (source, relative_path) constraint makes the dict exact) instead
+        # of one SELECT per file on disk.
+        by_rel = {
+            f.relative_path: f
+            for f in (await db.execute(select(LocalFile).where(
+                LocalFile.local_source_id == d.id))).scalars().all()
+        }
         n_new = 0
-        for root, _, files in walker:
-            for fn in files:
-                if Path(fn).suffix.lower() not in VIDEO_EXTS:
-                    continue
-                rel = os.path.relpath(os.path.join(root, fn), base)
-                total_seen += 1
-                try:
-                    st = os.stat(os.path.join(root, fn))
-                except OSError as e:                      # unreadable file: skip, keep scanning
-                    skipped.append(f"{os.path.join(root, fn)} ({e.strerror})")
-                    continue
-                mtime = datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat()
-                existing = await db.scalar(select(LocalFile).where(
-                    LocalFile.local_source_id == d.id, LocalFile.relative_path == rel))
-                if existing:
-                    if existing.size_bytes != st.st_size or existing.mtime != mtime:
-                        existing.filename = fn
-                        existing.size_bytes = st.st_size
-                        existing.mtime = mtime
-                        existing.duration_s = None
-                        existing.media_probe = None
-                    continue
-                db.add(LocalFile(local_source_id=d.id, relative_path=rel, filename=fn,
-                                 size_bytes=st.st_size, mtime=mtime))
-                n_new += 1
+        for rel, fn, size_bytes, mtime in found:
+            existing = by_rel.get(rel)
+            if existing:
+                if existing.size_bytes != size_bytes or existing.mtime != mtime:
+                    existing.filename = fn
+                    existing.size_bytes = size_bytes
+                    existing.mtime = mtime
+                    existing.duration_s = None
+                    existing.media_probe = None
+                continue
+            db.add(LocalFile(local_source_id=d.id, relative_path=rel, filename=fn,
+                             size_bytes=size_bytes, mtime=mtime))
+            n_new += 1
         if skipped:
             total_skipped += len(skipped)
             await db_log("ERROR", "local",

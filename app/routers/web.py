@@ -32,7 +32,8 @@ def _static_versions() -> dict:
     import hashlib
 
     out: dict[str, str] = {}
-    for key, rel in (("js", "app/static/js/app.js"),
+    for key, rel in (("theme_js", "app/static/js/theme.js"),
+                     ("js", "app/static/js/app.js"),
                      ("backup_js", "app/static/js/settings-backup.js"),
                      ("ffmpeg_editor_js", "app/static/js/ffmpeg-editor.js"),
                      ("ffmpeg_advisor_js", "app/static/js/ffmpeg-advisor.js"),

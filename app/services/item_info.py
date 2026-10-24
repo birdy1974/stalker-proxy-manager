@@ -47,7 +47,7 @@ def choose_mac(portal, macs, *, avoid_busy: bool):
     a MAC that is streaming right now is skipped as well. A MAC holding an
     ffmpeg pipe or another user's redirect lease holds the panel's single
     connection slot, and a second concurrent media link on it is what the panel
-    answers with HTTP 456 - a demo run beside a playing box used to end as a
+    answers with HTTP 456/462 - a demo run beside a playing box used to end as a
     mysterious `rc=8, no bytes` on the FFmpeg tab. Getting no free MAC is an
     error with the occupancy spelled out, not a fallback onto the busy MAC.
     """
@@ -78,7 +78,7 @@ def choose_mac(portal, macs, *, avoid_busy: bool):
     raise ValueError(
         f"no free MAC on '{portal.name}' - {detail}. A MAC that is already "
         "streaming holds the panel's single connection slot, and a second "
-        "concurrent media link on it is answered HTTP 456 (ffmpeg rc=8, no "
+        "concurrent media link on it is answered HTTP 456/462 (ffmpeg rc=8, no "
         "bytes). Stop the channel on the box (or wait for the lease to "
         "expire) and try again.")
 

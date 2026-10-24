@@ -297,6 +297,11 @@ def note_refusal(portal_url: str, code: str) -> None:
     if not code:
         return
     key = (portal_host(portal_url), str(code))
+    # Codes are normalized panel words (finite in practice), but a panel that
+    # echoes free text into js.error could mint new keys forever; counting
+    # stops for *new* codes past the cap, known ones keep counting.
+    if key not in _refusals and len(_refusals) >= 512:
+        return
     _refusals[key] = _refusals.get(key, 0) + 1
 
 

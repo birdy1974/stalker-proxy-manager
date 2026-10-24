@@ -98,6 +98,8 @@ async def _schema_and_flush():
 
     await flush_logs()
     clear_m3u_cache()                  # the schema reset zeros ids; cached M3Us must die
+    from app.services.playlist_health import clear_report_cache
+    clear_report_cache()               # ...and so must health snapshots of old ids
     from app.routers.api_portals import clear_pending_genre_items
     clear_pending_genre_items()
     # The zap memory (resolved links, recently failed candidates) is keyed on
@@ -135,6 +137,7 @@ async def _schema_and_flush():
     yield
     await flush_logs()
     clear_m3u_cache()
+    clear_report_cache()
     clear_pending_genre_items()
 
 

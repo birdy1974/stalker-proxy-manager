@@ -350,8 +350,24 @@ async def test_a_tmp_link_channel_asks_and_gets_the_panels_answer(monkeypatch):
     await flush_logs()
 
 
-async def test_an_unfetched_row_behaves_exactly_as_before(monkeypatch):
-    """NULL flags (a database migrated but not re-fetched) => still create_link."""
+async def test_an_unfetched_row_tries_its_stored_link_first(monkeypatch):
+    """NULL flags (a database migrated but not re-fetched): the stream path now
+    TRIES the stored, finished-looking URL - the exact probe is what keeps
+    that from becoming a black screen (its dead verdict is tested below).
+    Validation is off suite-wide, so here the probe trusts and no create_link
+    happens at all."""
+    w = Wired(monkeypatch)
+    pl = await _channel(None)
+    url, _ = await MANAGER.resolve("live", pl)
+    assert url == CLEAN
+    assert (await w.state())["counters"]["create_links"] == 0
+    await flush_logs()
+
+
+async def test_an_unfetched_row_asks_as_before_with_the_try_switched_off(monkeypatch):
+    """SPM_TRY_STORED_LINK=0 restores the 'unknown flags always ask' article."""
+    from app.portal import links
+    monkeypatch.setattr(links, "TRY_STORED_LINK", False)
     w = Wired(monkeypatch)
     pl = await _channel(None)
     await MANAGER.resolve("live", pl)
@@ -420,8 +436,23 @@ async def test_the_pipe_plays_a_permanent_stored_link_without_asking(monkeypatch
     await flush_logs()
 
 
-async def test_a_stale_token_in_the_url_overrides_clean_flags(monkeypatch):
-    """The guard that makes the fast path safe enough to be the default."""
+async def test_a_stale_token_is_the_first_thing_tried(monkeypatch):
+    """OwnTV's core zap trick, with verification: a token-carrying stored URL
+    is tried as it stands instead of being refused sight unseen. (When it is
+    in fact dead, the probe learns that and the same MAC mints in the same
+    pass - see test_a_proved_dead_stored_link_asks_on_the_same_mac below.)"""
+    w = Wired(monkeypatch)
+    pl = await _channel("", cmd=f"ffmpeg {CLEAN}?play_token=from-the-fetch")
+    url, _ = await MANAGER.resolve("live", pl)
+    assert url == f"{CLEAN}?play_token=from-the-fetch"
+    assert (await w.state())["counters"]["create_links"] == 0
+    await flush_logs()
+
+
+async def test_a_stale_token_asks_with_the_try_switched_off(monkeypatch):
+    """The old guard, one env var away (SPM_TRY_STORED_LINK=0)."""
+    from app.portal import links
+    monkeypatch.setattr(links, "TRY_STORED_LINK", False)
     w = Wired(monkeypatch)
     pl = await _channel("", cmd=f"ffmpeg {CLEAN}?play_token=from-the-fetch")
     await MANAGER.resolve("live", pl)
@@ -434,7 +465,9 @@ def test_the_transcode_path_never_takes_the_shortcut():
 
     A tmp/load-balanced channel, a template cmd, a stored session token and a
     cmd with no URL are the four ways a stored URL is not playable as it
-    stands - all of them still ask, `ffmpeg=True` or not.
+    stands. This is the strict policy every caller gets by default (the GUI
+    preview, the MAC probe); only callers that verify and fall back - the
+    stream manager - opt into trying the token (next tests).
     """
     def plan(src):
         return plan_for(src, _Mac(), ffmpeg=True)
@@ -574,4 +607,233 @@ async def test_the_update_endpoint_accepts_the_switch(monkeypatch):
     async with SessionLocal() as s:
         await api_portals.update_portal(pid, {"direct_links": True}, db=s)
         assert (await s.get(Portal, pid)).direct_links is True
+    await flush_logs()
+
+
+# =========================================================================== #
+#  speculative direct play (SPM_TRY_STORED_LINK): try, verify, learn
+# =========================================================================== #
+
+TOKEN_URL = f"{CLEAN}?play_token=from-the-fetch"
+
+
+def test_speculative_direct_is_shape_gated_and_never_overrides_the_panel():
+    """The policy ladder, link_policy level (ffmpeg on, caller opted in)."""
+    def pol(url, flags=None, **kw):
+        return link_policy(url=url, link_flags=flags, ffmpeg=True,
+                           speculative_ok=True, **kw)
+
+    # the three new yeses, all flagged so callers bind them to verification
+    assert pol(TOKEN_URL, "").direct and pol(TOKEN_URL, "").speculative
+    assert pol(CLEAN, None).direct and pol(CLEAN, None).speculative
+    assert pol("http://h/play/live.php?stream=1&token=a", "").speculative
+
+    # shape gate (speculative only): no query and no dot in the final path
+    # segment -> not finished. With flags KNOWN clean the same URL is proven
+    # direct (R2/R2b never had a shape gate - the flags are the evidence).
+    assert pol("http://h/play/1002", None).create_link
+    assert pol("http://h/play/1002", "").direct
+    assert not pol("http://h/play/1002", "").speculative
+
+    # everything the panel said out loud still wins over the guess
+    assert pol(CLEAN, "use_http_tmp_link").create_link
+    assert pol(CLEAN, "", force_ch_link_check=True).create_link
+    assert pol("http://h/stalker_portal/c/ch/1.ts", "").create_link
+    assert pol(CLEAN, "", allow_direct=False).create_link
+    # the redirect path (ffmpeg=False) verifies by exact probe, so it may
+    # speculate too - the ffmpeg flag only gates the FFMPEG_STORED_LINK switch
+    redir = link_policy(url=TOKEN_URL, link_flags="", ffmpeg=False,
+                        speculative_ok=True)
+    assert redir.direct and redir.speculative
+
+    # without the caller's opt-in nothing speculative ever happens
+    strict = link_policy(url=TOKEN_URL, link_flags="", ffmpeg=True)
+    assert strict.create_link and not strict.speculative
+    # and proven direct play is never relabelled speculative
+    assert pol(CLEAN, "").direct and not pol(CLEAN, "").speculative
+
+
+def test_the_kill_switch_collapses_speculative_back_to_ask(monkeypatch):
+    from app.portal import links
+    monkeypatch.setattr(links, "TRY_STORED_LINK", False)
+    pol = link_policy(url=TOKEN_URL, link_flags="", ffmpeg=True,
+                      speculative_ok=True)
+    assert pol.create_link and "session token" in pol.reason
+
+
+def test_a_learned_verdict_beats_the_shape_but_not_the_panel():
+    def pol(url, flags=None, learned=None, **kw):
+        return link_policy(url=url, link_flags=flags, ffmpeg=True,
+                           speculative_ok=True, learned=learned, **kw)
+
+    # proved playable on this MAC: the token and even the shape stop mattering
+    assert pol("http://h/play/1002", None, learned=True).direct
+    # proved dead: ask at once, no matter how promising it looks
+    dead = pol(TOKEN_URL, "", learned=False)
+    assert dead.create_link and "proved dead" in dead.reason
+    # ...but a verdict never talks over the panel's statements
+    assert pol(CLEAN, "use_http_tmp_link", learned=True).create_link
+    assert pol(CLEAN, "", learned=True, force_ch_link_check=True).create_link
+    assert pol("http://h/stalker_portal/c/ch/1.ts", "", learned=True).create_link
+
+
+def test_plan_for_carries_learning_and_never_speculates_for_series():
+    src = _Src(f"ffmpeg {TOKEN_URL}", link_flags="")
+    plan = plan_for(src, _Mac(), ffmpeg=True, speculative_ok=True,
+                    learned_for=lambda url: False)
+    assert plan.policy.create_link, "learned dead -> ask without trying"
+    tried = plan_for(src, _Mac(), ffmpeg=True, speculative_ok=True,
+                     learned_for=lambda url: None)
+    assert tried.policy.direct and tried.policy.speculative
+    assert tried.direct_url == TOKEN_URL
+
+    # a classic series episode creates its link with series=N; the try must
+    # never swallow that (same reason proven direct never did)
+    ep_src = _Src(f"ffmpeg {TOKEN_URL}", link_flags="")
+    ep_src.series_param = True
+    ep_src.episode_number = 3
+    episode = plan_for(ep_src, _Mac(), ffmpeg=True, speculative_ok=True)
+    assert episode.policy.create_link
+
+
+# --------------------------------------------------------------------------- #
+#  end to end: a dead stored link costs one probe, not a candidate
+# --------------------------------------------------------------------------- #
+
+def _fake_probe(monkeypatch, *, dead_for=()):
+    """stream_manager.link_is_alive stand-in: `dead_for` substrings come back
+    proved-dead, everything else proved-alive; returns the probed URL list."""
+    from app.services import stream_manager
+    from app.services.redirect_guard import ProbeResult
+
+    probed: list[str] = []
+
+    async def fake(url, **_kw):
+        probed.append(url)
+        if any(part in url for part in dead_for):
+            return ProbeResult(False, "HEAD 403 [fake]")
+        return ProbeResult(True, "HEAD 200 [fake]")
+
+    monkeypatch.setattr(stream_manager, "link_is_alive", fake)
+    return probed
+
+
+async def _rows():
+    """The (source, MAC) row objects `_channel` created, for verdict reads."""
+    from sqlalchemy import select
+    from app.models import LiveSource, MacAddress
+    async with SessionLocal() as s:
+        src = (await s.scalars(select(LiveSource))).first()
+        mac = (await s.scalars(select(MacAddress))).first()
+        return src, mac
+
+
+async def test_a_proved_dead_stored_link_asks_on_the_same_mac(monkeypatch):
+    """Redirect: exact probe says the fetch-time token died -> learn it and
+    create_link on the SAME candidate in the SAME pass (no 2.5 s retry wait,
+    no candidate burned). The next zap skips the stored URL without even
+    probing it."""
+    from app.services.stream_manager import direct_verdict
+
+    w = Wired(monkeypatch)
+    pl = await _channel("", cmd=f"ffmpeg {TOKEN_URL}")
+    probed = _fake_probe(monkeypatch, dead_for=("from-the-fetch",))
+
+    url, _ = await MANAGER.resolve("live", pl, requester="zap-1")
+    assert url == CLEAN, "the minted link, from the same candidate"
+    assert (await w.state())["counters"]["create_links"] == 1
+    src, mac = await _rows()
+    assert direct_verdict(src, mac, TOKEN_URL) is False
+
+    from app.services import stream_manager
+    MANAGER.release_mac(mac.id)            # zap-1 let go of the MAC...
+    stream_manager._LINK_CACHE.clear()     # ...and no link replay, so only
+                                           # the learned plan can decide
+    probed.clear()
+    url, _ = await MANAGER.resolve("live", pl, requester="zap-2")
+    assert url == CLEAN
+    assert TOKEN_URL not in probed, "learned dead: stored URL is not retried"
+    assert (await w.state())["counters"]["create_links"] == 2
+    await flush_logs()
+
+
+async def test_a_stored_link_that_proves_alive_is_learned(monkeypatch):
+    from app.services.stream_manager import direct_verdict
+
+    w = Wired(monkeypatch)
+    pl = await _channel("", cmd=f"ffmpeg {TOKEN_URL}")
+    _fake_probe(monkeypatch)                      # everything proved alive
+
+    url, _ = await MANAGER.resolve("live", pl, requester="zap-1")
+    assert url == TOKEN_URL
+    assert (await w.state())["counters"]["create_links"] == 0
+    src, mac = await _rows()
+    assert direct_verdict(src, mac, TOKEN_URL) is True
+    await flush_logs()
+
+
+async def _run_pipe(monkeypatch, pl):
+    """Drive mgr.open with a fake ffmpeg for one chunk; returns what the
+    fake was asked to open (url + first-byte window)."""
+    from app.services import stream_manager
+
+    monkeypatch.setattr(stream_manager, "STREAM_START_TIMEOUT", 0.2)
+    monkeypatch.setattr(stream_manager, "STREAM_STALL_TIMEOUT", 0.2)
+    mgr = stream_manager.StreamManager()
+    mgr.mac_locks.clear()
+    seen: dict = {}
+
+    async def fake_open(command, url, *, title="", pace=False,
+                        first_byte_timeout=None):      # noqa: ARG001
+        seen["url"] = url
+        seen["window"] = first_byte_timeout
+        return _OneShotProc(), b"\x47" * 188 * 4, None
+
+    async def noop(*_a, **_kw):
+        return None
+
+    monkeypatch.setattr(mgr, "_open_with_identity", fake_open)
+    monkeypatch.setattr(mgr, "_register", noop)
+    monkeypatch.setattr(mgr, "_deregister", noop)
+    handle, gen = await mgr.open("live", pl, "box")
+    assert not handle.dead
+    assert await gen.__anext__()
+    await gen.aclose()
+    return seen
+
+
+async def test_the_pipe_tries_a_token_stored_link_with_a_capped_window(monkeypatch):
+    """FFmpeg path: the speculative try goes to the stored URL, its first-byte
+    window is clamped to SPM_TRY_STORED_LINK_WINDOW_S, and bytes flowing is
+    learned as playable."""
+    from app.services import stream_manager
+    from app.services.stream_manager import direct_verdict
+
+    w = Wired(monkeypatch)
+    pl = await _channel("", cmd=f"ffmpeg {TOKEN_URL}")
+    monkeypatch.setattr(stream_manager, "DIRECT_TRY_WINDOW_S", 0.05)
+    seen = await _run_pipe(monkeypatch, pl)
+
+    assert seen["url"] == TOKEN_URL, "ffmpeg got the stored URL, unasked"
+    assert seen["window"] == 0.05, "the speculative open is window-capped"
+    assert (await w.state())["counters"]["create_links"] == 0
+    src, mac = await _rows()
+    assert direct_verdict(src, mac, TOKEN_URL) is True
+    await flush_logs()
+
+
+async def test_the_pipe_asks_the_panel_when_the_stored_link_probes_dead(monkeypatch):
+    """FFmpeg path: proved-dead stored link -> learn it, re-plan, create_link
+    on the same candidate; ffmpeg opens the minted URL."""
+    from app.services.stream_manager import direct_verdict
+
+    w = Wired(monkeypatch)
+    pl = await _channel("", cmd=f"ffmpeg {TOKEN_URL}")
+    _fake_probe(monkeypatch, dead_for=("from-the-fetch",))
+    seen = await _run_pipe(monkeypatch, pl)
+
+    assert seen["url"] == CLEAN, "ffmpeg got the minted link"
+    assert (await w.state())["counters"]["create_links"] == 1
+    src, mac = await _rows()
+    assert direct_verdict(src, mac, TOKEN_URL) is False
     await flush_logs()

@@ -26,6 +26,20 @@ notices a dead stream and falls back; our *redirect* mode sends the player away
 and never learns anything, so an unflagged row keeps asking until a fetch has
 stored the panel's own answer. The URL-shape rules are therefore a second guard
 on rows the panel *did* describe, not a substitute for it.
+
+**Speculative direct play** is the one deliberate loosening of the rules above,
+and it exists because the two stream paths are no longer blind the way that
+reasoning assumed: the redirect path probes a stored link before handing it
+out (redirect_guard) and the ffmpeg path knows its first byte, and both can
+fall back to `create_link` *on the same candidate* when the stored link proves
+dead, then remember the verdict (stream_manager's direct-verdict table). With
+a verifier and a fallback in place, "the panel said nothing against this link
+(no rebuild flags) and the URL is shaped like a finished stream URL" is
+enough to TRY the stored URL - token and all - the way OwnTV and every box
+does, and only pay the create_link round trip when the try fails. It is
+strictly opt-in per caller (`speculative_ok`): a caller that cannot verify
+and fall back (the GUI preview resolver) keeps the strict rules above, and
+`SPM_TRY_STORED_LINK=0` restores them everywhere.
 """
 
 from __future__ import annotations
@@ -66,6 +80,17 @@ REBUILD_FLAGS = (FLAG_TMP_LINK, FLAG_LOAD_BALANCING)
 #: Kill switch, for a panel that publishes permanent-looking links it refuses.
 FFMPEG_STORED_LINK = os.environ.get(
     "SPM_FFMPEG_USE_STORED_LINK", "1").strip().lower() not in ("0", "off", "no", "false")
+
+#: Speculative direct play (see the module header): when the channel's flags
+#: do not demand a rebuild and the stored URL merely *looks* finished, a
+#: caller that verifies (probe / first byte) and can fall back to create_link
+#: on the same candidate may try the stored URL first - including one that
+#: carries a token from fetch time, and rows whose flags were never stored.
+#: Boxes and player apps (OwnTV, STB-Proxy) never ask at all in this shape;
+#: the round trip saved is the zap's biggest single wait on panels that embed
+#: playable URLs in the catalogue. Kill switch restores the strict R2 rules.
+TRY_STORED_LINK = os.environ.get(
+    "SPM_TRY_STORED_LINK", "1").strip().lower() not in ("0", "off", "no", "false")
 
 # VOLATILE_PARAMS (defined with the link helpers above) doubles as the policy's
 # "this URL is session-bound" test, deliberately: `strip_volatile` removes those
@@ -186,18 +211,23 @@ class LinkPolicy:
     create_link: bool
     reason: str
     flags_known: bool = True
+    #: direct, but on shape alone (see TRY_STORED_LINK): the caller MUST
+    #: verify (probe/first byte), must fall back to create_link on the same
+    #: candidate when the verdict is dead, and should remember the verdict.
+    #: Never set unless the caller opted in via `speculative_ok`.
+    speculative: bool = False
 
     @property
     def direct(self) -> bool:
         return not self.create_link
 
 
-def why_not_self_served(url: str) -> str:
-    """Why this URL must not be handed to a player as it stands ("" = it may).
+def _hard_blocker(url: str) -> str:
+    """Why this URL is not even ADDRESSABLE as stored ("" = it is).
 
-    The answer is a sentence rather than a bool because it goes into the stream
-    log: "asked the panel for a link" is only useful if it says *why* the stored
-    one was not good enough.
+    Template-ness and absoluteness only - never worth a speculative try: a
+    template cmd is by construction not finished, and a relative/non-HTTP
+    value is not something a player (or ffmpeg) could open as it stands.
     """
     if not url:
         return "no URL in the stored cmd to play directly"
@@ -210,27 +240,64 @@ def why_not_self_served(url: str) -> str:
         return f"the stored URL is a template the panel finishes (contains {marker!r})"
     if parts.scheme not in ("http", "https") or not parts.netloc:
         return "the stored cmd is not an absolute http(s) URL"
+    return ""
+
+
+def _stale_token(url: str) -> str:
+    """The first volatile (session-token) query parameter name in `url`."""
+    parts = urlsplit(url or "")
+    return next((name for name, _ in parse_qsl(parts.query, keep_blank_values=True)
+                 if name.lower() in VOLATILE_PARAMS), "")
+
+
+def why_not_self_served(url: str) -> str:
+    """Why this URL must not be handed to a player as it stands ("" = it may).
+
+    The answer is a sentence rather than a bool because it goes into the stream
+    log: "asked the panel for a link" is only useful if it says *why* the stored
+    one was not good enough.
+    """
+    hard = _hard_blocker(url)
+    if hard:
+        return hard
     # A token from the session that fetched the catalogue is worse than no
     # token: it is expired, and some panels answer an expired one with a refusal
     # instead of falling back to the unauthenticated rules. We cannot tell
     # whether it still works, and a 302 to a dead link is a black screen with no
     # fallback chain behind it - so ask, and get a token that does.
-    stale = [name for name, _ in parse_qsl(parts.query, keep_blank_values=True)
-             if name.lower() in VOLATILE_PARAMS]
+    stale = _stale_token(url)
     if stale:
-        return f"the stored URL carries a session token from fetch time ({stale[0]})"
+        return f"the stored URL carries a session token from fetch time ({stale})"
     return ""
+
+
+def _looks_finished(url: str) -> bool:
+    """OwnTV's 'this cmd already IS a stream URL' shape test: a query string
+    or a dotted path (`/live/123.ts`, `/play/live.php?…`), as opposed to a
+    bare placeholder (`/live/123`, `/ch/12345_`) the panel still has to
+    finish. Only ever consulted for speculative direct play."""
+    parts = urlsplit(url or "")
+    return bool(parts.query) or "." in parts.path
 
 
 def link_policy(*, url: str, link_flags: str | None = None,
                 force_ch_link_check: bool = False, ffmpeg: bool = False,
-                allow_direct: bool = True) -> LinkPolicy:
+                allow_direct: bool = True, speculative_ok: bool = False,
+                learned: bool | None = None) -> LinkPolicy:
     """Ask the panel for a link, or play the stored one? See this module's header.
 
     `url` is what the caller would hand to the player (the `cmd` already run
     through `extract_url`), so the decision is testable without a client, a
     portal, or a database - and the *reason* is part of the answer, because it
     belongs in the stream log.
+
+    `speculative_ok` is the caller's promise that it verifies a speculative
+    direct play and falls back to create_link on the same candidate (see
+    TRY_STORED_LINK); `learned` is that same caller's memory for this exact
+    stored URL on this MAC (True = it played, False = it was proved dead,
+    None = never tried). A learned verdict outranks shape and token worries
+    because it is evidence, but never outranks the panel's own statements
+    (rebuild flags, force_ch_link_check) or a hard shape blocker.
     """
     known = flags_known(link_flags)
     if ffmpeg and not FFMPEG_STORED_LINK:
@@ -242,7 +309,7 @@ def link_policy(*, url: str, link_flags: str | None = None,
     if not allow_direct:
         return LinkPolicy(True, "this portal is set to ask for every link (its flags are "
                                 "not trusted)", known)
-    if not known:
+    if not known and not (speculative_ok and TRY_STORED_LINK):
         return LinkPolicy(True, "this row has no link flags stored (it predates them) - "
                                 "a fetch fills them in", False)
     if not url:
@@ -251,12 +318,33 @@ def link_policy(*, url: str, link_flags: str | None = None,
     if blocking:
         return LinkPolicy(True, f"the channel says its link is not permanent "
                                 f"({', '.join(blocking)})", True)
+    hard = _hard_blocker(url)
+    if hard:
+        return LinkPolicy(True, f"asking the panel for a link: {hard}", True)
+    if learned is False:
+        return LinkPolicy(True, "asking the panel for a link: the stored link was "
+                                "proved dead on this MAC earlier", known)
+    if learned is True:
+        return LinkPolicy(False, "playing the stored link: it was proved playable "
+                                 "on this MAC earlier"
+                                 + (" (ffmpeg plays it directly)" if ffmpeg else ""), known)
     blocker = why_not_self_served(url)
-    if blocker:
-        return LinkPolicy(True, f"asking the panel for a link: {blocker}", True)
-    return LinkPolicy(False, "playing the stored link: the channel flags say nothing needs "
-                             "rebuilding and the URL needs no token"
-                             + (" (ffmpeg plays it directly)" if ffmpeg else ""), True)
+    if not blocker:
+        if known:
+            return LinkPolicy(False, "playing the stored link: the channel flags say nothing needs "
+                                     "rebuilding and the URL needs no token"
+                                     + (" (ffmpeg plays it directly)" if ffmpeg else ""), True)
+        blocker = ("this row has no link flags stored (it predates them) - "
+                   "a fetch fills them in")
+    # What remains is unproven, not unplayable: an unflagged row, or a token
+    # left in the URL by the fetching session. A verifying caller may try it
+    # (the create_link it falls back to is the very answer we would have
+    # asked for anyway); everybody else asks, exactly as before.
+    if speculative_ok and TRY_STORED_LINK and _looks_finished(url):
+        return LinkPolicy(False, "trying the stored link (unverified): the panel said "
+                                 "nothing against it and the URL looks finished - "
+                                 "create_link is the fallback", known, speculative=True)
+    return LinkPolicy(True, f"asking the panel for a link: {blocker}", True)
 
 
 @dataclass(frozen=True)
@@ -311,8 +399,14 @@ class LinkPlan:
 
 
 def plan_for(src, mac_row, *, ffmpeg: bool = False,
-             allow_direct: bool = True) -> LinkPlan:
-    """The single place that reads a source row and a MAC row for a stream open."""
+             allow_direct: bool = True, speculative_ok: bool = False,
+             learned_for=None) -> LinkPlan:
+    """The single place that reads a source row and a MAC row for a stream open.
+
+    `learned_for` maps the extracted stored URL to the caller's remembered
+    verdict for it on this MAC (see link_policy); it is a callable because
+    the URL is only known once the row's cmd overrides have been read here.
+    """
     stored = str(getattr(src, "cmd", "") or "")
     # Per-MAC translation (channel_id_translations, saved from the Compare
     # popup): when THIS mac has one, its cmd is the only one in the right id
@@ -349,8 +443,11 @@ def plan_for(src, mac_row, *, ffmpeg: bool = False,
         ep_num = getattr(src, "episode_number", None)
         if ep_num is not None:
             series = int(ep_num)
+    learned = learned_for(url) if learned_for is not None else None
     policy = link_policy(url=url, link_flags=link_flags, force_ch_link_check=force,
-                         ffmpeg=ffmpeg, allow_direct=allow_direct and series is None)
+                         ffmpeg=ffmpeg, allow_direct=allow_direct and series is None,
+                         speculative_ok=speculative_ok and series is None,
+                         learned=learned)
     return LinkPlan(policy=policy, cmd=cmd, url=url, link_flags=link_flags,
                     force_ch_link_check=force, mac=str(getattr(mac_row, "mac", "") or ""),
                     series=series, alt_cmd=alt_cmd, item_id=item_id)
