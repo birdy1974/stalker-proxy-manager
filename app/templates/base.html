@@ -4,6 +4,12 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  {# Color theme: MUST stay a plain synchronous script ahead of the
+     stylesheets - it sets data-bs-theme before the first paint, so nobody
+     sees a flash of the wrong theme. The dropdown further down (and the
+     localStorage/os-preference logic) lives in the same file. #}
+  <script src="/static/js/theme.js?v={{ static_v.theme_js }}"></script>
   <title>{{ title }} · Stalker Proxy Manager</title>
   {# tab icon: chosen in Settings, served by /favicon.ico (see services/branding.py) #}
   {{ favicon_tags() }}
@@ -48,6 +54,28 @@
         <li class="nav-item"><a class="nav-link {{ 'active' if active=='settings' }}" href="/settings"
               title="Global settings: output base URL, fallback order, EPG, TMDB"><i class="bi bi-sliders"></i> Settings</a></li>
       </ul>
+      <div class="dropdown me-2">
+        <button class="btn btn-sm btn-outline-light dropdown-toggle d-flex align-items-center gap-1"
+                id="theme-toggle" data-bs-toggle="dropdown" aria-expanded="false"
+                data-spm-theme-button title="Color theme">
+          <i class="bi bi-circle-half" data-spm-theme-mode-icon></i>
+          <span class="visually-hidden">Color theme</span>
+        </button>
+        <ul class="dropdown-menu dropdown-menu-end" aria-labelledby="theme-toggle">
+          <li><button type="button" class="dropdown-item d-flex align-items-center gap-2"
+                data-spm-theme-value="light" aria-pressed="false">
+                <i class="bi bi-sun-fill"></i> Light
+                <i class="bi bi-check2 ms-auto" data-spm-theme-check hidden></i></button></li>
+          <li><button type="button" class="dropdown-item d-flex align-items-center gap-2"
+                data-spm-theme-value="dark" aria-pressed="false">
+                <i class="bi bi-moon-stars-fill"></i> Dark
+                <i class="bi bi-check2 ms-auto" data-spm-theme-check hidden></i></button></li>
+          <li><button type="button" class="dropdown-item d-flex align-items-center gap-2"
+                data-spm-theme-value="auto" aria-pressed="false">
+                <i class="bi bi-circle-half"></i> Auto (system)
+                <i class="bi bi-check2 ms-auto" data-spm-theme-check hidden></i></button></li>
+        </ul>
+      </div>
       <a href="/" id="api-indicator" class="btn btn-sm btn-outline-light me-2 d-flex align-items-center gap-1"
          title="API status: serving requests / active streams. Click for the dashboard.">
         <span id="api-led" class="rounded-circle d-inline-block" style="width:.55rem;height:.55rem;background:#6c757d"></span>

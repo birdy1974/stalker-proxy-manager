@@ -1,31 +1,69 @@
-/* Stalker Proxy Manager - neutral modern theme (few colors, high contrast) */
+/* Stalker Proxy Manager - neutral modern theme (few colors, high contrast).
+ *
+ * Light/dark: the light palette below is the original look, unchanged. Dark
+ * is the same semantic variables with dark values under [data-bs-theme="dark"],
+ * which theme.js sets on <html> before first paint (localStorage "spm-theme":
+ * auto|light|dark; auto follows the OS). Bootstrap 5.3 themes its components
+ * off that attribute itself; these variables cover only SPM's custom surfaces.
+ * In dark, Bootstrap's --bs-body-bg/-secondary-bg/-tertiary-bg are aligned to
+ * the slate surfaces so the components that read them (cards, tables,
+ * dropdowns, modals, bg-body) match --spm-surface instead of sitting on
+ * Bootstrap's neutral #212529 family next to slate cards. */
 :root {
   --spm-slate: #1f2937;
   --spm-slate-2: #111827;
   --spm-accent: #0d9488;       /* single teal accent */
+  --spm-accent-hover: #0f766e;
   --spm-bg: #f4f6f8;
+  --spm-surface: #fff;
+  --spm-surface-2: #f9fafb;
+  --spm-surface-3: #f3f4f6;
+  --spm-hover: #f0fdfa;
+  --spm-heading: #1f2937;
+  --spm-muted: #6b7280;
+  --spm-faint: #9ca3af;
+  --spm-thumb: #e5e7eb;
   --spm-border: #e5e7eb;
+}
+[data-bs-theme="dark"] {
+  --spm-accent-hover: #14b8a6;
+  --spm-bg: #10161d;
+  --spm-surface: #1a222c;
+  --spm-surface-2: #222c38;
+  --spm-surface-3: #1e2833;
+  --spm-hover: #14332f;
+  --spm-heading: #e8eef4;
+  --spm-muted: #9aa7b4;
+  --spm-faint: #7d8b98;
+  --spm-thumb: #26313e;
+  --spm-border: #2c3644;
+  --bs-body-bg: #1a222c;
+  --bs-body-bg-rgb: 26, 34, 44;
+  --bs-secondary-bg: #222c38;
+  --bs-secondary-bg-rgb: 34, 44, 56;
+  --bs-tertiary-bg: #1e2833;
+  --bs-tertiary-bg-rgb: 30, 40, 51;
 }
 body { background: var(--spm-bg); }
 .bg-slate { background: var(--spm-slate) !important; }
 .bg-slate-2 { background: var(--spm-slate-2) !important; }
 
 .card { border: 1px solid var(--spm-border); box-shadow: 0 1px 2px rgba(16,24,40,.04); }
-.card-header { background: #fff; border-bottom: 1px solid var(--spm-border); font-weight: 600; }
+.card-header { background: var(--spm-surface); border-bottom: 1px solid var(--spm-border); font-weight: 600; }
 .text-accent { color: var(--spm-accent) !important; }
 .btn-accent { background: var(--spm-accent); color: #fff; border: none; }
-.btn-accent:hover { background: #0f766e; color: #fff; }
+.btn-accent:hover { background: var(--spm-accent-hover); color: #fff; }
 
 /* stat cards */
 .stat { border-left: 3px solid var(--spm-accent); }
-.stat .num { font-size: 1.6rem; font-weight: 700; color: var(--spm-slate); }
-.stat .lbl { font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; color: #6b7280; }
+.stat .num { font-size: 1.6rem; font-weight: 700; color: var(--spm-heading); }
+.stat .lbl { font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; color: var(--spm-muted); }
 
 /* tables: sticky header + filter row (spec) */
-.table-host { position: relative; overflow: auto; max-height: calc(100vh - 300px); border: 1px solid var(--spm-border); border-radius: .5rem; background: #fff; }
+.table-host { position: relative; overflow: auto; max-height: calc(100vh - 300px); border: 1px solid var(--spm-border); border-radius: .5rem; background: var(--spm-surface); }
 .table-spm { margin: 0; font-size: .85rem; }
-.table-spm thead th { position: sticky; top: 0; z-index: 3; background: #f9fafb; border-bottom: 2px solid var(--spm-border); white-space: nowrap; user-select: none; }
-.table-spm thead tr.filters th { top: 33px; z-index: 3; font-weight: 400; padding: .25rem .4rem; background: #f3f4f6; }
+.table-spm thead th { position: sticky; top: 0; z-index: 3; background: var(--spm-surface-2); border-bottom: 2px solid var(--spm-border); white-space: nowrap; user-select: none; }
+.table-spm thead tr.filters th { top: 33px; z-index: 3; font-weight: 400; padding: .25rem .4rem; background: var(--spm-surface-3); }
 .table-spm th.sortable { cursor: pointer; }
 .table-spm th.sortable:hover { color: var(--spm-accent); }
 .table-spm td { vertical-align: middle; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 460px; }
@@ -42,10 +80,10 @@ body { background: var(--spm-bg); }
    lives under the address on multi-MAC portals. */
 .table-spm td.col-portal { max-width: 280px; }
 .table-spm td.col-portal .portal-url { display: block; overflow: hidden; text-overflow: ellipsis; }
-.table-spm tbody tr:hover { background: #f0fdfa; }
+.table-spm tbody tr:hover { background: var(--spm-hover); }
 .table-spm .filters input, .table-spm .filters select { font-size: .75rem; padding: .1rem .3rem; height: 26px; }
 
-.row-drag { cursor: grab; color: #9ca3af; }
+.row-drag { cursor: grab; color: var(--spm-faint); }
 /* the grip of a row that cannot be dragged (a locked channel number) */
 .row-drag.row-locked { cursor: not-allowed; color: #d97706; }
 tr.dragging, div.dragging { opacity: .4; }
@@ -61,8 +99,8 @@ tr.dragging, div.dragging { opacity: .4; }
 
 .log-INFO { color: #374151; } .log-WARNING { color: #b45309; } .log-ERROR { color: #b91c1c; } .log-DEBUG { color: #9ca3af; }
 
-.muted-label { font-size: .72rem; color: #6b7280; text-transform: uppercase; letter-spacing: .04em; }
-.poster-thumb { width: 34px; height: 48px; object-fit: cover; border-radius: 3px; background: #e5e7eb; }
+.muted-label { font-size: .72rem; color: var(--spm-muted); text-transform: uppercase; letter-spacing: .04em; }
+.poster-thumb { width: 34px; height: 48px; object-fit: cover; border-radius: 3px; background: var(--spm-thumb); }
 .logo-thumb { height: 26px; max-width: 90px; object-fit: contain; }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .78rem; }
 .ff-cmd { font-family: ui-monospace, Menlo, monospace; font-size: .78rem; background: #0b1220; color: #d1e7dd; border-radius: .5rem; padding: .75rem; white-space: pre-wrap; word-break: break-all; }
@@ -73,7 +111,7 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 @keyframes slide { 0% { background-position: 100% 0; } 100% { background-position: -100% 0; } }
 .job-progress { min-width: 160px; }
 .player-modal .modal-dialog { max-width: 900px; }
-.footer-note { color: #9ca3af; font-size: .72rem; }
+.footer-note { color: var(--spm-faint); font-size: .72rem; }
 
 /* thin separator between the stages of the pipeline in the top nav */
 .navbar-divider { width: 1px; height: 22px; margin: 0 .45rem; background: rgba(255,255,255,.22); align-self: center; }
@@ -90,13 +128,13 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 /* favicon picker (Settings): one tile per candidate tab icon, the active one
    outlined in the accent colour. Tiles are <button>s so the whole thing is
    keyboard-reachable. */
-.favicon-tile { width: 84px; padding: .45rem .25rem; background: #fff; border: 1px solid var(--spm-border);
+.favicon-tile { width: 84px; padding: .45rem .25rem; background: var(--spm-surface); border: 1px solid var(--spm-border);
   border-radius: .5rem; display: flex; flex-direction: column; align-items: center; gap: .3rem; cursor: pointer; }
-.favicon-tile:hover { border-color: var(--spm-accent); background: #f0fdfa; }
+.favicon-tile:hover { border-color: var(--spm-accent); background: var(--spm-hover); }
 .favicon-tile img { width: 34px; height: 34px; object-fit: contain; }
-.favicon-tile span { font-size: .68rem; line-height: 1.1; color: #6b7280; text-align: center; word-break: break-word; }
+.favicon-tile span { font-size: .68rem; line-height: 1.1; color: var(--spm-muted); text-align: center; word-break: break-word; }
 .favicon-tile.active { border-color: var(--spm-accent); box-shadow: 0 0 0 2px rgba(13,148,136,.25); }
-.favicon-tile.active span { color: var(--spm-slate); font-weight: 600; }
+.favicon-tile.active span { color: var(--spm-heading); font-weight: 600; }
 .genre-compare .cmp-matrix th:nth-child(1),
 .genre-compare .cmp-matrix td:nth-child(1) {
   position: sticky;
@@ -184,3 +222,55 @@ textarea.ff-edit { font-family: ui-monospace, Menlo, monospace; font-size: .8rem
 .ff-adv-flash { background: rgba(255, 193, 7, .25); }
 .ff-adv summary { cursor: pointer; width: fit-content; }
 .ff-adv code { white-space: normal; word-break: break-word; }
+
+/* --- dark-mode bridges ------------------------------------------------------
+ * Status/log colours are semantic pairs (pastel chip in light, deep chip with
+ * a bright label in dark). The Bootstrap utilities below them are fixed-light
+ * by design - btn-light / text-bg-light / bg-light / table-light do NOT flip
+ * with data-bs-theme - so in dark they are re-pointed at the same "quiet
+ * surface" instead of glowing white (a column of white list buttons, light
+ * count pills). Light mode is untouched by everything in this block. */
+[data-bs-theme="dark"] .st-online { background: #064e3b; color: #6ee7b7; }
+[data-bs-theme="dark"] .st-offline { background: #7f1d1d; color: #fca5a5; }
+[data-bs-theme="dark"] .st-unknown { background: #374151; color: #d1d5db; }
+[data-bs-theme="dark"] .st-error { background: #7c2d12; color: #fdba74; }
+[data-bs-theme="dark"] .st-unauthorized { background: #78350f; color: #fde68a; }
+[data-bs-theme="dark"] .st-expired { background: #701a75; color: #f0abfc; }
+[data-bs-theme="dark"] .st-busy { background: #1e3a8a; color: #93c5fd; }
+
+[data-bs-theme="dark"] .log-INFO { color: #d1d5db; }
+[data-bs-theme="dark"] .log-WARNING { color: #fbbf24; }
+[data-bs-theme="dark"] .log-ERROR { color: #f87171; }
+[data-bs-theme="dark"] .log-DEBUG { color: #8b98a5; }
+
+[data-bs-theme="dark"] .btn-light {
+  --bs-btn-color: var(--spm-heading);
+  --bs-btn-bg: var(--spm-surface-2);
+  --bs-btn-border-color: var(--spm-border);
+  --bs-btn-hover-color: var(--spm-heading);
+  --bs-btn-hover-bg: #2b3947;
+  --bs-btn-hover-border-color: var(--spm-accent);
+  --bs-btn-focus-shadow-rgb: 13, 148, 136;
+  --bs-btn-active-color: var(--spm-heading);
+  --bs-btn-active-bg: #2b3947;
+  --bs-btn-active-border-color: var(--spm-accent);
+  --bs-btn-disabled-color: var(--spm-muted);
+  --bs-btn-disabled-bg: var(--spm-surface-2);
+  --bs-btn-disabled-border-color: var(--spm-border);
+}
+[data-bs-theme="dark"] .text-bg-light {
+  color: var(--spm-heading) !important;
+  background-color: var(--spm-surface-2) !important;
+}
+[data-bs-theme="dark"] .bg-light { background-color: var(--spm-surface-2) !important; }
+[data-bs-theme="dark"] .table-light {
+  --bs-table-color: var(--spm-heading);
+  --bs-table-bg: var(--spm-surface-2);
+  --bs-table-border-color: var(--spm-border);
+  --bs-table-striped-bg: var(--spm-surface-3);
+  --bs-table-striped-color: var(--spm-heading);
+  --bs-table-active-bg: var(--spm-surface-3);
+  --bs-table-active-color: var(--spm-heading);
+  --bs-table-hover-bg: var(--spm-hover);
+  --bs-table-hover-color: var(--spm-heading);
+}

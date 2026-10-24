@@ -1,34 +1,59 @@
 <!doctype html>
+<!-- data-bs-theme="dark" is only the no-JS default (this page's original
+     look); theme.js applies the shared per-browser choice before first paint. -->
 <html lang="en" data-bs-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <script src="/static/js/theme.js"></script>
   <title>Web Player · Stalker Proxy Manager</title>
   <link href="/static/vendor/bootstrap/bootstrap.min.css" rel="stylesheet">
   <link href="/static/vendor/bootstrap/bootstrap-icons.min.css" rel="stylesheet">
   <style>
-    :root { color-scheme: dark; }
-    body { min-height: 100vh; background: #101820; color: #eef3f7; }
+    /* The palette follows data-bs-theme (same choice as the admin GUI - see
+       theme.js): the dark values are this page's original look, the light
+       block is the admin GUI's slate/teal palette. The video itself stays
+       black in both. */
+    :root, [data-bs-theme="dark"] { color-scheme: dark;
+      --pl-bg: #101820; --pl-card: #17232d; --pl-border: #2c3b46;
+      --pl-input: #111b23; --pl-input-border: #3a4a56;
+      --pl-text: #eef3f7; --pl-muted: #a8b6c1; --pl-mark: #73c4ad;
+      --pl-accent: #287b69; --pl-accent-hover: #32917b;
+      --pl-live-bg: #1a5c4a; --pl-live-fg: #a8f0d8; --pl-live-border: #287b69;
+      --pl-vod-bg: #2a3d6b; --pl-vod-fg: #a8c4ff; --pl-vod-border: #3a5a9a;
+      --pl-ep-bg: #5a2d6b; --pl-ep-fg: #e0b0ff; --pl-ep-border: #7a4a8a;
+      --pl-local-bg: #6b4a2a; --pl-local-fg: #ffd6a8; --pl-local-border: #9a6a3a; }
+    [data-bs-theme="light"] { color-scheme: light;
+      --pl-bg: #f4f6f8; --pl-card: #ffffff; --pl-border: #e5e7eb;
+      --pl-input: #ffffff; --pl-input-border: #ced4da;
+      --pl-text: #1f2937; --pl-muted: #6b7280; --pl-mark: #0d9488;
+      --pl-accent: #0d9488; --pl-accent-hover: #0f766e;
+      --pl-live-bg: #d1fae5; --pl-live-fg: #065f46; --pl-live-border: #6ee7b7;
+      --pl-vod-bg: #dbeafe; --pl-vod-fg: #1e40af; --pl-vod-border: #93c5fd;
+      --pl-ep-bg: #fae8ff; --pl-ep-fg: #86198f; --pl-ep-border: #f0abfc;
+      --pl-local-bg: #ffedd5; --pl-local-fg: #9a3412; --pl-local-border: #fdba74; }
+    body { min-height: 100vh; background: var(--pl-bg); color: var(--pl-text); }
     .player-shell { max-width: 1180px; }
-    .brand { color: #eef3f7; text-decoration: none; }
-    .brand-mark { color: #73c4ad; }
-    .card { background: #17232d; border-color: #2c3b46; }
-    .form-select, .form-control { background-color: #111b23; color: #eef3f7; border-color: #3a4a56; }
-    .form-select:focus, .form-control:focus { border-color: #73c4ad; box-shadow: 0 0 0 .2rem #73c4ad33; }
+    .brand { color: var(--pl-text); text-decoration: none; }
+    .brand-mark { color: var(--pl-mark); }
+    .card { background: var(--pl-card); border-color: var(--pl-border); }
+    .form-select, .form-control { background-color: var(--pl-input); color: var(--pl-text); border-color: var(--pl-input-border); }
+    .form-select:focus, .form-control:focus { border-color: var(--pl-mark); box-shadow: 0 0 0 .2rem rgba(13, 148, 136, .25); }
     .video-frame { min-height: 240px; background: #000; }
     video { display: block; width: 100%; max-height: 72vh; aspect-ratio: 16 / 9; background: #000; }
-    .muted { color: #a8b6c1; }
-    .accent { background: #287b69; border-color: #287b69; }
-    .accent:hover { background: #32917b; border-color: #32917b; }
+    .muted { color: var(--pl-muted); }
+    .accent { background: var(--pl-accent); border-color: var(--pl-accent); color: #fff; }
+    .accent:hover { background: var(--pl-accent-hover); border-color: var(--pl-accent-hover); color: #fff; }
     .kind-badge { font-size: 0.70rem; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; padding: .22em .45em; border-radius: .35rem; }
-    .kind-live { background: #1a5c4a; color: #a8f0d8; border: 1px solid #287b69; }
-    .kind-vod { background: #2a3d6b; color: #a8c4ff; border: 1px solid #3a5a9a; }
-    .kind-episode { background: #5a2d6b; color: #e0b0ff; border: 1px solid #7a4a8a; }
-    .kind-local { background: #6b4a2a; color: #ffd6a8; border: 1px solid #9a6a3a; }
+    .kind-live { background: var(--pl-live-bg); color: var(--pl-live-fg); border: 1px solid var(--pl-live-border); }
+    .kind-vod { background: var(--pl-vod-bg); color: var(--pl-vod-fg); border: 1px solid var(--pl-vod-border); }
+    .kind-episode { background: var(--pl-ep-bg); color: var(--pl-ep-fg); border: 1px solid var(--pl-ep-border); }
+    .kind-local { background: var(--pl-local-bg); color: var(--pl-local-fg); border: 1px solid var(--pl-local-border); }
     .filter-pills { display:flex; flex-wrap:wrap; gap:.4rem; }
-    .filter-pill { font-size:.78rem; padding:.28em .7em; border-radius:999px; border:1px solid #3a4a56; background:#111b23; color:#a8b6c1; cursor:pointer; }
-    .filter-pill.active { background:#287b69; border-color:#287b69; color:#fff; }
-    .filter-pill:hover { border-color:#73c4ad; }
+    .filter-pill { font-size:.78rem; padding:.28em .7em; border-radius:999px; border:1px solid var(--pl-input-border); background:var(--pl-input); color:var(--pl-muted); cursor:pointer; }
+    .filter-pill.active { background:var(--pl-accent); border-color:var(--pl-accent); color:#fff; }
+    .filter-pill:hover { border-color:var(--pl-mark); }
     @media (max-width: 600px) { .video-frame { min-height: 180px; } }
   </style>
 </head>
@@ -36,7 +61,10 @@
   <header class="border-bottom border-secondary-subtle">
     <div class="container player-shell py-3 d-flex justify-content-between align-items-center gap-3">
       <a class="brand fw-semibold fs-5" href="/player"><i class="bi bi-broadcast-pin brand-mark me-2"></i>Stalker Proxy Manager</a>
-      <a class="btn btn-sm btn-outline-secondary" href="/" title="Administration"><i class="bi bi-gear me-1"></i>Admin</a>
+      <span class="d-flex gap-2">
+        <button class="btn btn-sm btn-outline-secondary" type="button" data-spm-theme-toggle title="Color theme"><i class="bi bi-sun-fill" data-spm-theme-flip-icon></i></button>
+        <a class="btn btn-sm btn-outline-secondary" href="/" title="Administration"><i class="bi bi-gear me-1"></i>Admin</a>
+      </span>
     </div>
   </header>
 
