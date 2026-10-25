@@ -21,8 +21,8 @@
       "profile": "high",
       "level": "4.1",
       "vf_preset": "none",
-      "low_power": true,
-      "rc_mode": "CQP",
+      "low_power": false,
+      "rc_mode": "VBR",
       "global_quality": "26",
       "async_depth": "4",
       "audio_codec": "ac3",
@@ -33,10 +33,10 @@
       "subs": "drop",
       "extra_input": "-analyzeduration 1000000 -probesize 1000000",
       "extra_output": "",
-      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1920:h=1080:format=nv12,setsar=1 -map 0:v:0 -map 0:a:0? -dn -sn -c:v h264_vaapi -profile:v high -level 4.1 -g 50 -low_power 1 -rc_mode CQP -global_quality 26 -async_depth 4 -c:a ac3 -b:a 384k -ac 2 -ar 48000 -f mpegts -mpegts_flags +resend_headers -flush_packets 1 pipe:1",
+      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1920:h=1080:format=nv12,setsar=1 -map 0:v:0 -map 0:a:0? -dn -sn -c:v h264_vaapi -b:v 4000k -maxrate 4400k -bufsize 8000k -profile:v high -level 4.1 -g 50 -rc_mode VBR -async_depth 4 -c:a ac3 -b:a 384k -ac 2 -ar 48000 -f mpegts -mpegts_flags +resend_headers -flush_packets 1 pipe:1",
       "command_source": "fields",
       "advice_goal": "fast_start",
-      "advice_ignored": ""
+      "advice_ignored": "low-power-off"
     },
     {
       "name": "Enigma2 - Live (with subtitles)",
@@ -56,8 +56,8 @@
       "profile": "high",
       "level": "4.1",
       "vf_preset": "none",
-      "low_power": true,
-      "rc_mode": "CQP",
+      "low_power": false,
+      "rc_mode": "VBR",
       "global_quality": "26",
       "async_depth": "4",
       "audio_codec": "ac3",
@@ -68,10 +68,10 @@
       "subs": "dvb",
       "extra_input": "-analyzeduration 1000000 -probesize 1000000",
       "extra_output": "",
-      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1920:h=1080:format=nv12,setsar=1 -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v h264_vaapi -profile:v high -level 4.1 -g 50 -low_power 1 -rc_mode CQP -global_quality 26 -async_depth 4 -c:a ac3 -b:a 384k -ac 2 -ar 48000 -c:s dvbsub -f mpegts -mpegts_flags +resend_headers -flush_packets 1 pipe:1",
+      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1920:h=1080:format=nv12,setsar=1 -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v h264_vaapi -b:v 4000k -maxrate 4400k -bufsize 8000k -profile:v high -level 4.1 -g 50 -rc_mode VBR -async_depth 4 -c:a ac3 -b:a 384k -ac 2 -ar 48000 -c:s dvbsub -f mpegts -mpegts_flags +resend_headers -flush_packets 1 pipe:1",
       "command_source": "fields",
       "advice_goal": "fast_start",
-      "advice_ignored": ""
+      "advice_ignored": "low-power-off"
     },
     {
       "name": "Enigma2 - VOD",
@@ -91,8 +91,8 @@
       "profile": "high",
       "level": "4.1",
       "vf_preset": "none",
-      "low_power": true,
-      "rc_mode": "CQP",
+      "low_power": false,
+      "rc_mode": "VBR",
       "global_quality": "26",
       "async_depth": "4",
       "audio_codec": "copy",
@@ -106,7 +106,7 @@
       "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -analyzeduration 1000000 -probesize 1000000 -i <url> -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v copy -c:a copy -c:s copy -f matroska -live 1 -flush_packets 1 pipe:1",
       "command_source": "fields",
       "advice_goal": "balanced",
-      "advice_ignored": ""
+      "advice_ignored": "low-power-off"
     },
     {
       "name": "Enigma2 - VOD (transcode)",
@@ -126,8 +126,8 @@
       "profile": "high",
       "level": "4.1",
       "vf_preset": "none",
-      "low_power": true,
-      "rc_mode": "CQP",
+      "low_power": false,
+      "rc_mode": "VBR",
       "global_quality": "26",
       "async_depth": "4",
       "audio_codec": "ac3",
@@ -138,10 +138,10 @@
       "subs": "keep",
       "extra_input": "-analyzeduration 1000000 -probesize 1000000",
       "extra_output": "",
-      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1920:h=1080:format=nv12,fps=25,setsar=1 -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v h264_vaapi -profile:v high -level 4.1 -g 50 -r 25 -low_power 1 -rc_mode CQP -global_quality 26 -async_depth 4 -c:a ac3 -b:a 384k -ac 2 -ar 48000 -c:s copy -f matroska -live 1 -flush_packets 1 pipe:1",
+      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1920:h=1080:format=nv12,fps=25,setsar=1 -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v h264_vaapi -b:v 4000k -maxrate 4400k -bufsize 8000k -profile:v high -level 4.1 -g 50 -r 25 -rc_mode VBR -async_depth 4 -c:a ac3 -b:a 384k -ac 2 -ar 48000 -c:s copy -f matroska -live 1 -flush_packets 1 pipe:1",
       "command_source": "fields",
       "advice_goal": "balanced",
-      "advice_ignored": ""
+      "advice_ignored": "low-power-off"
     },
     {
       "name": "Web player - LAN",
@@ -371,8 +371,8 @@
       "profile": "main",
       "level": "3.1",
       "vf_preset": "none",
-      "low_power": true,
-      "rc_mode": "CQP",
+      "low_power": false,
+      "rc_mode": "VBR",
       "global_quality": "26",
       "async_depth": "4",
       "audio_codec": "mp2",
@@ -383,10 +383,10 @@
       "subs": "dvb",
       "extra_input": "-analyzeduration 1000000 -probesize 1000000",
       "extra_output": "",
-      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1024:h=576:format=nv12,fps=25,setsar=1 -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v h264_vaapi -profile:v main -level 3.1 -g 50 -r 25 -low_power 1 -rc_mode CQP -global_quality 26 -async_depth 4 -c:a mp2 -b:a 192k -ac 2 -ar 48000 -c:s dvbsub -f mpegts -mpegts_flags +resend_headers -flush_packets 1 pipe:1",
+      "command": "ffmpeg -rw_timeout 10000000 -reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 5 -fflags +genpts+discardcorrupt -err_detect ignore_err -init_hw_device vaapi=intel:/dev/dri/renderD128 -hwaccel vaapi -hwaccel_device intel -hwaccel_output_format vaapi -analyzeduration 1000000 -probesize 1000000 -i <url> -vf scale_vaapi=w=1024:h=576:format=nv12,fps=25,setsar=1 -map 0:v:0 -map 0:a:0? -map 0:s? -dn -c:v h264_vaapi -b:v 1200k -maxrate 1300k -bufsize 2400k -profile:v main -level 3.1 -g 50 -r 25 -rc_mode VBR -async_depth 4 -c:a mp2 -b:a 192k -ac 2 -ar 48000 -c:s dvbsub -f mpegts -mpegts_flags +resend_headers -flush_packets 1 pipe:1",
       "command_source": "fields",
       "advice_goal": "balanced",
-      "advice_ignored": ""
+      "advice_ignored": "low-power-off"
     },
     {
       "name": "Redirect (bypass ffmpeg)",

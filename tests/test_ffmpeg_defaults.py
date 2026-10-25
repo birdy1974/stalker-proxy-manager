@@ -133,28 +133,29 @@ async def test_seed_recovers_missing_and_multiple_legacy_defaults():
     assert len([row for row in await rows() if row.is_default and row.enabled]) == 1
 
 
-async def test_duo2_live_ships_lp_cqp_and_source_fps_and_upgrades_existing_fields_rows():
+async def test_duo2_live_ships_standard_encoder_vbr_and_source_fps_and_upgrades_existing_fields_rows():
     await _seed_defaults()
     row = (await catalog())[E2_DUO2_LIVE_PRESET_NAME]
     async with SessionLocal() as db:
         old = await db.get(FFmpegTemplate, row.id)
-        old.rc_mode, old.fps = 'VBR', '25'
+        old.rc_mode, old.fps, old.low_power = 'CQP', '25', True
         await db.commit()
     await _seed_defaults()
     updated = (await catalog())[E2_DUO2_LIVE_PRESET_NAME]
-    assert updated.rc_mode == 'CQP' and updated.fps == ''
-    assert updated.low_power is True and updated.global_quality == '26'
+    assert updated.rc_mode == 'VBR' and updated.fps == ''
+    assert updated.low_power is False and updated.global_quality == '26'
     tokens = shlex.split(updated.command)
-    assert tokens[tokens.index('-rc_mode') + 1] == 'CQP'
+    assert tokens[tokens.index('-rc_mode') + 1] == 'VBR'
+    assert '-low_power' not in tokens and '-global_quality' not in tokens
     assert '-r' not in tokens and 'fps=' not in updated.command
-    # CQP is the mode the reference EncSliceLP entrypoint accepts; the stored
-    # 4000k/4400k/8000k tuning is deliberately not rendered beside it.
-    assert '-b:v' not in tokens and '-maxrate' not in tokens and '-bufsize' not in tokens
-    assert tokens[tokens.index('-global_quality') + 1] == '26'
+    # VBR renders the Enigma2 tuning as target, peak and VBV buffer.
+    assert '-b:v 4000k' in updated.command
+    assert '-maxrate 4400k' in updated.command and '-bufsize 8000k' in updated.command
     assert (updated.video_bitrate, updated.maxrate, updated.bufsize) == ('4000k', '4400k', '8000k')
     opts = FFmpegOptions(**{key:getattr(updated,key) for key in FFmpegOptions.__dataclass_fields__})
     assert updated.command == build_command(opts)
-    assert (await catalog())[REFERENCE_PRESET_NAME].rc_mode == 'CQP'
+    reference = (await catalog())[REFERENCE_PRESET_NAME]
+    assert reference.rc_mode == 'CQP' and reference.low_power is True
 
 
 def test_parsing_source_fps_does_not_invent_a_25_fps_override():

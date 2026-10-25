@@ -69,6 +69,24 @@ async def test_advice_follows_goal_and_dismissals_and_survives_bad_input():
     assert junk.status_code == 200 and junk.json()["goal"] == "balanced"
 
 
+async def test_advice_hides_the_low_power_tip_for_enigma2_template_names(monkeypatch):
+    from app.routers import api_ffmpeg
+
+    async def fake_environment(devices=()):
+        return {"vaapi": {"/dev/dri/renderD128": {
+            "h264_low_power": True, "h264_encode": True}}}
+
+    monkeypatch.setattr(api_ffmpeg, "_environment", fake_environment)
+    opts = fields(low_power=False, rc_mode="VBR")
+    async with client() as c:
+        generic = (await c.post("/api/ffmpeg/advice", json={
+            "options": opts, "name": "Web player - LAN"})).json()
+        enigma2 = (await c.post("/api/ffmpeg/advice", json={
+            "options": opts, "name": "Enigma2 - Live"})).json()
+    assert any(f["id"] == "low-power-off" for f in generic["findings"])
+    assert not any(f["id"] == "low-power-off" for f in enigma2["findings"])
+
+
 async def test_advice_includes_the_last_live_measurement_of_the_named_template():
     ffmpeg_speed.record("My template", 0.6)
     async with client() as c:

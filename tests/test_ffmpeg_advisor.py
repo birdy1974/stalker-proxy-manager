@@ -180,6 +180,16 @@ def test_low_power_needs_the_gpu_to_say_so():
     assert f["severity"] == "critical"
     assert by_id(adv.advise(opts(low_power=False), env=env, goal="low_cpu"),
                  "low-power-off")["severity"] == "warn"
+    # Enigma2 receiver templates deliberately use the standard encoder, so
+    # the "turn low-power on" optimisation tip is hidden for them. The
+    # critical unsupported-entrypoint warning is a compatibility fact and
+    # remains visible if an Enigma2 row is manually switched back to LP.
+    for name in ("Enigma2 - Live", "Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)",
+                 "Dreambox DM800se (Enigma2 / MPEG2-SD)"):
+        assert "low-power-off" not in ids(
+            adv.advise(opts(low_power=False), env=env, template_name=name)), name
+        assert "low-power-unsupported" in ids(
+            adv.advise(opts(low_power=True), env=env_no, template_name=name)), name
 
 
 def test_threads_flag_rules():

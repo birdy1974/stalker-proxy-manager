@@ -1,31 +1,35 @@
-# Selected FFmpeg templates — Quick Zap VAAPI CQP
+# Selected FFmpeg templates — Quick Zap VAAPI
 
 `quick-zap-vaapi-cqp.json` is one directly importable SPM version-1
-**FFmpeg section** file. It contains the selected **13-template** set:
+**FFmpeg section** file. (The filename is retained so existing download
+links keep working.) It contains the selected **13-template** set:
 
 - nine logical client/scenario templates for Enigma2, the SPM web player and
   VLC;
 - four retained SPM standard templates: Copy, Dreambox DM800se, Redirect and
   Pass-through proxy.
 
-The VAAPI transcodes are for Intel hosts using `/dev/dri/renderD128` whose
-low-power H.264 encoder accepts `-rc_mode CQP`.
+The generic web-player/VLC VAAPI transcodes use the Intel low-power H.264
+encoder with `-rc_mode CQP`. **Enigma2 and Dreambox transcodes deliberately
+use the standard VAAPI encoder instead: low-power is off and
+`-rc_mode VBR` is selected.** The host therefore needs a standard
+`h264_vaapi` encoder on `/dev/dri/renderD128` that accepts VBR.
 
 ## Templates in the file
 
 | # | Template | What it does |
 |---:|---|---|
-| 1 | `Enigma2 - Live` | Fastest Enigma2 live transcode: VAAPI low-power 1080p H.264 High@4.1 CQP 26, AC3, MPEG-TS, subtitles dropped |
-| 2 | `Enigma2 - Live (with subtitles)` | Enigma2 live VAAPI low-power 1080p H.264 High@4.1 CQP 26, AC3, MPEG-TS, DVB subtitles |
-| 3 | `Enigma2 - VOD` | Enigma2 VOD/series default: video, audio and subtitles copied into Matroska; no transcode, so the source H.264 level is preserved |
-| 4 | `Enigma2 - VOD (transcode)` | Enigma2 VOD/series rescue: VAAPI low-power 1080p H.264 High@4.1 CQP 26, AC3, Matroska, subtitles copied |
+| 1 | `Enigma2 - Live` | Fastest Enigma2 live transcode: standard VAAPI encoder (low-power off), 1080p H.264 High@4.1 VBR 4000k/4400k/8000k, AC3, MPEG-TS, subtitles dropped |
+| 2 | `Enigma2 - Live (with subtitles)` | Enigma2 live standard VAAPI encoder (low-power off), 1080p H.264 High@4.1 VBR 4000k/4400k/8000k, AC3, MPEG-TS, DVB subtitles |
+| 3 | `Enigma2 - VOD` | Enigma2 VOD/series default: video, audio and subtitles copied into Matroska; no transcode, so the source H.264 level is preserved. Its stored encoder fields are also VBR with low-power off, inactive while copying |
+| 4 | `Enigma2 - VOD (transcode)` | Enigma2 VOD/series rescue: standard VAAPI encoder (low-power off), 1080p H.264 High@4.1 VBR 4000k/4400k/8000k, AC3, Matroska, subtitles copied |
 | 5 | `Web player - LAN` | Web-player local-network template: H.264 video copied, audio converted to AAC, MPEG-TS |
 | 6 | `Web player - Internet (slow)` | VAAPI low-power 720p H.264 CQP 32, AAC 96k, MPEG-TS |
 | 7 | `Web player - Internet (fast)` | VAAPI low-power 1080p H.264 CQP 25, AAC 192k, MPEG-TS |
 | 8 | `VLC - Internet (slow)` | VAAPI low-power 720p H.264 CQP 30, AAC 128k, MPEG-TS |
 | 9 | `VLC - Internet (fast)` | Lean MPEG-TS remux: source video and audio copied |
 | 10 | `Copy / passthrough (no transcode)` | Retained SPM standard: FFmpeg remux with source video/audio copied |
-| 11 | `Dreambox DM800se (Enigma2 / MPEG2-SD)` | Retained SPM standard: compatibility transcode for the older Dreambox DM800se |
+| 11 | `Dreambox DM800se (Enigma2 / MPEG2-SD)` | Retained SPM standard: standard VAAPI encoder (low-power off), 576p H.264 Main@3.1 VBR 1200k/1300k/2400k, MP2, MPEG-TS, DVB subtitles |
 | 12 | `Redirect (bypass ffmpeg)` | Retained SPM standard: sends the player directly to the original stream with HTTP 302 |
 | 13 | `Pass-through proxy (bypass ffmpeg)` | Retained SPM standard: proxies the original bytes through SPM without starting FFmpeg |
 
@@ -34,6 +38,15 @@ legacy Dreambox DM800se compatibility template, which intentionally remains
 Main@3.1 at 576p for that older receiver. Copy, Redirect and Pass-through do
 not encode video, so their stored level field does not alter the source
 stream's level.
+
+Every Enigma2 row, including the copy-based `Enigma2 - VOD` row and the
+Dreambox row, stores **VAAPI rate control = `VBR`** and **VAAPI low-power
+(LP encoder) = off**. On the transcode rows FFmpeg now receives
+`-rc_mode VBR` with `-b:v`, `-maxrate` and `-bufsize`, and no `-low_power`
+or `-global_quality`. These rows also carry `advice_ignored=low-power-off`;
+after SPM itself is updated, its advisor additionally hides that
+“turn low-power on” optimisation tip for Enigma2/Duo2 template names. A
+genuine host-compatibility warning is not hidden.
 
 ## Removed from this file
 
@@ -78,16 +91,17 @@ existing assignments.
 
 The same additive rule also means that re-importing a newer copy of this file
 does not update a same-named template already in the database. If an earlier
-copy was imported, either edit `Enigma2 - Live`, `Enigma2 - Live (with
-subtitles)` and `Enigma2 - VOD (transcode)` and set **Level** to `4.1`, or
-delete those custom rows before importing this file again. Field-sourced
-shipped Enigma2 built-ins are refreshed to 4.1 by SPM on boot after updating
-SPM itself.
+copy was imported, edit each logical Enigma2 row and set **Level** to
+`4.1`, **VAAPI rate control** to `VBR`, and **VAAPI low-power (LP encoder)**
+to off — or delete those custom rows before importing this file again.
+The relevant custom rows are `Enigma2 - Live`, `Enigma2 - Live (with
+subtitles)`, `Enigma2 - VOD` and `Enigma2 - VOD (transcode)`. Field-sourced
+shipped Enigma2 built-ins, including Dreambox and `Vu+ Duo2 live`, are
+refreshed to VBR with low-power off by SPM on boot after updating SPM
+itself.
 
-The shipped `Vu+ Duo2 live` preset itself is corrected to CQP in SPM's seeded
-defaults; after updating SPM, its field-sourced row is refreshed on boot.
-`Enigma2 - Live (with subtitles)` contains that corrected recipe under the
-logical name.
+`Enigma2 - Live (with subtitles)` contains the shipped `Vu+ Duo2 live`
+recipe under the logical name.
 
 For Enigma2, keep the bouquet profile on delivery **Use item template** and
 container **Auto**: live uses player 4097/`.ts`; VOD and series use player
@@ -102,16 +116,21 @@ codec/container and the original bitrate fits the link. The selected set
 optimizes the cases where FFmpeg is required:
 
 - bounded input analysis (`-analyzeduration 1000000 -probesize 1000000`);
-- VAAPI low-power H.264 with explicit CQP and `async_depth=4`;
+- generic web-player/VLC VAAPI transcodes with low-power CQP and
+  `async_depth=4`;
+- Enigma2/Dreambox VAAPI transcodes with the standard encoder, VBR and
+  `async_depth=4`;
 - subtitles dropped on the fast-start MPEG-TS templates, except where an
   Enigma2 template deliberately preserves them;
 - copy/remux instead of transcoding where the client already accepts the
   source video.
 
-CQP does **not** impose a hard bitrate ceiling. The slow-internet QP values
-are starting budgets: raise QP by 2 if a high-motion channel stalls, or lower
-it by 2 if the picture is too soft and the link has headroom. The stored
-bitrate fields are dormant while CQP is selected.
+CQP does **not** impose a hard bitrate ceiling. The generic slow-internet
+QP values are starting budgets: raise QP by 2 if a high-motion channel
+stalls, or lower it by 2 if the picture is too soft and the link has
+headroom. Their stored bitrate fields are dormant while CQP is selected.
+The Enigma2 VBR fields are active: 1080p uses 4000k target / 4400k maxrate
+/ 8000k bufsize, and the Dreambox uses 1200k / 1300k / 2400k.
 
 `Web player - LAN`, `VLC - Internet (fast)` and
 `Copy / passthrough (no transcode)` are H.264-oriented copy templates because

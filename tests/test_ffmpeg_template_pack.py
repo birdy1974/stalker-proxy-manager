@@ -137,6 +137,25 @@ def test_selected_template_file_is_a_fields_true_ffmpeg_section_export():
     dreambox = by_name["Dreambox DM800se (Enigma2 / MPEG2-SD)"]
     assert dreambox["profile"] == "main" and dreambox["level"] == "3.1"
 
+    # Enigma2 templates use the standard VAAPI encoder with VBR, not the
+    # low-power encoder. The copy row stores the same options for if its
+    # codec is changed later, while the transcode rows render them and the
+    # active bitrate tuning.
+    for name in ("Enigma2 - Live", "Enigma2 - Live (with subtitles)",
+                 "Enigma2 - VOD", "Enigma2 - VOD (transcode)",
+                 "Dreambox DM800se (Enigma2 / MPEG2-SD)"):
+        row = by_name[name]
+        assert row["rc_mode"] == "VBR" and row["low_power"] is False, name
+        assert row["advice_ignored"] == "low-power-off", name
+        tokens = shlex.split(row["command"])
+        assert "-low_power" not in tokens, name
+        if row["video_codec"] == "h264_vaapi":
+            assert tokens[tokens.index("-rc_mode") + 1] == "VBR", name
+            assert tokens[tokens.index("-b:v") + 1] == row["video_bitrate"], name
+            assert tokens[tokens.index("-maxrate") + 1] == row["maxrate"], name
+            assert tokens[tokens.index("-bufsize") + 1] == row["bufsize"], name
+            assert "-global_quality" not in tokens, name
+
     zap = by_name["Enigma2 - Live"]
     assert zap["subs"] == "drop" and "-sn" in shlex.split(zap["command"])
 

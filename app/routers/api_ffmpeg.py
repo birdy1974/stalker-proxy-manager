@@ -257,9 +257,10 @@ async def advice(payload: dict):
     """Optimisation advice for the editor's current fields (advisory only)."""
     opts = FFmpegOptions(**coerce_options(payload.get("options")))
     env = await _environment([opts.device])
-    live = ffmpeg_speed.latest(str(payload.get("name") or ""))
+    name = str(payload.get("name") or "")
+    live = ffmpeg_speed.latest(name)
     report = advise(opts, goal=clean_goal(payload.get("goal")), env=env, live=live,
-                    ignored=payload.get("ignored") or "")
+                    ignored=payload.get("ignored") or "", template_name=name)
     return {**report, "goals": goals_public(), "live": live,
             "environment": _env_public(env, opts.device)}
 
@@ -273,9 +274,10 @@ async def advice_preview(payload: dict):
     if not isinstance(ids, list):
         raise HTTPException(422, "ids must be a list of advice ids")
     env = await _environment([opts.device])
-    live = ffmpeg_speed.latest(str(payload.get("name") or ""))
+    name = str(payload.get("name") or "")
+    live = ffmpeg_speed.latest(name)
     res = apply_selected(opts, [str(i) for i in ids], goal=clean_goal(payload.get("goal")),
-                         env=env, live=live)
+                         env=env, live=live, template_name=name)
     after = FFmpegOptions(**coerce_options(res["options"]))
     res["command"] = build_command(after)
     res["errors"] = field_errors(after)
@@ -292,7 +294,8 @@ async def advice_summary(db=Depends(get_db)):
     out = {}
     for t in usable:
         rep = advise(_opts(t), goal=clean_goal(t.advice_goal), env=env,
-                     live=ffmpeg_speed.latest(t.name), ignored=t.advice_ignored or "")
+                     live=ffmpeg_speed.latest(t.name), ignored=t.advice_ignored or "",
+                     template_name=t.name)
         out[str(t.id)] = rep["counts"]
     return {"items": out}
 

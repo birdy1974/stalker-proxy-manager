@@ -114,6 +114,7 @@ def test_enigma2_presets_are_shipped_and_fit_the_duo2():
 
     remux = presets[E2_VOD_REMUX_PRESET_NAME]
     assert remux["video_codec"] == "copy" and remux["audio_codec"] == "copy"
+    assert remux["rc_mode"] == "VBR" and remux["low_power"] is False
     # VOD is Matroska so SRT/ASS survive on exteplayer3; MPEG-TS+dvbsub is
     # the 502/no-data failure on the box.
     assert remux["output_format"] == "matroska" and remux["subs"] == "keep"
@@ -124,6 +125,8 @@ def test_enigma2_presets_are_shipped_and_fit_the_duo2():
     # the 4K/HEVC rescue path: GPU video, box-friendly audio, Matroska + copy subs
     assert hw["video_codec"] == "h264_vaapi" and hw["resolution"] == "1080p"
     assert hw["profile"] == "high" and hw["level"] == "4.1"
+    assert hw["rc_mode"] == "VBR" and hw["low_power"] is False
+    assert "-rc_mode VBR" in hw["command"] and "-low_power" not in hw["command"]
     assert hw["audio_codec"] == "ac3" and hw["output_format"] == "matroska"
     assert hw["subs"] == "keep"
     assert "-f matroska" in hw["command"] and "-c:s copy" in hw["command"]
@@ -133,6 +136,8 @@ def test_enigma2_presets_are_shipped_and_fit_the_duo2():
     live = presets[E2_DUO2_LIVE_PRESET_NAME]
     # live stays MPEG-TS: the box renders DVB bitmap subs natively there
     assert live["profile"] == "high" and live["level"] == "4.1"
+    assert live["rc_mode"] == "VBR" and live["low_power"] is False
+    assert "-rc_mode VBR" in live["command"] and "-low_power" not in live["command"]
     assert live["output_format"] == "mpegts" and live["subs"] == "dvb"
     assert "-f mpegts" in live["command"] and "-c:s dvbsub" in live["command"]
 
