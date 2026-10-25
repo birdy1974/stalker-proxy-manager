@@ -33,11 +33,13 @@ async def _seed_player_data() -> tuple[int, int, int, int]:
                                original_name="Movie One", enabled=True)
         s.add(vod_source)
         await s.flush()
-        news = LivePlaylist(custom_name="News One", group_name="News", enabled=True, order=1)
+        news = LivePlaylist(custom_name="News One", group_name="News", enabled=True, order=1,
+                            logo="https://images.example/news.png")
         hidden = LivePlaylist(custom_name="Sports Two", group_name="Sports", enabled=True, order=2)
         disabled = LivePlaylist(custom_name="Disabled News", group_name="News", enabled=False, order=3)
         movie = VodPlaylist(vod_source_id=vod_source.id, custom_name="Movie One",
-                            group_name="Movies", enabled=True, order=1)
+                            group_name="Movies", enabled=True, order=1,
+                            poster="https://images.example/movie.jpg")
         hidden_movie = VodPlaylist(vod_source_id=vod_source.id, custom_name="Hidden Movie",
                                    group_name="Action", enabled=True, order=2)
         s.add_all([news, hidden, disabled, movie, hidden_movie])
@@ -55,7 +57,8 @@ async def _seed_player_data() -> tuple[int, int, int, int]:
         s.add(episode)
         playlist_series = SeriePlaylist(serie_source_id=serie_source.id,
                                         custom_name="Drama Show", group_name="Drama",
-                                        enabled=True, order=1)
+                                        enabled=True, order=1,
+                                        poster="https://images.example/show.jpg")
         s.add(playlist_series)
         await s.flush()
         s.add(SeriePlaylistSeason(serie_playlist_id=playlist_series.id,
@@ -125,6 +128,18 @@ async def test_consumer_player_login_lists_visible_output_playlist_and_ts_templa
         assert page.status_code == 200
         assert 'id="login-form"' in page.text
         assert "/api/dashboard" not in page.text  # the consumer page does not need admin APIs
+        for marker in (
+            'id="previous-thumbnails"',
+            'id="next-thumbnails"',
+            'id="channel-thumbnails"',
+            'id="show-more-thumbnails"',
+            "function renderThumbnails",
+            "function surroundingItems",
+            "function chooseThumbnail",
+            "thumbnailUrl(item.logo)",
+            "data-thumb-key",
+        ):
+            assert marker in page.text
 
         before_login = await client.get("/player/api/playlist")
         assert before_login.status_code == 401
@@ -144,6 +159,12 @@ async def test_consumer_player_login_lists_visible_output_playlist_and_ts_templa
             ("vod", "Movie One"),
             ("episode", "Drama Show S01E01"),
             ("local", "Local Movie.mp4"),
+        ]
+        assert [(item["name"], item["logo"]) for item in playlist.json()["items"]] == [
+            ("News One", "https://images.example/news.png"),
+            ("Movie One", "https://images.example/movie.jpg"),
+            ("Drama Show S01E01", "https://images.example/show.jpg"),
+            ("Local Movie.mp4", ""),
         ]
 
         templates = await client.get("/player/api/templates")

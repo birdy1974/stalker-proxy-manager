@@ -23,7 +23,9 @@
       --pl-live-bg: #1a5c4a; --pl-live-fg: #a8f0d8; --pl-live-border: #287b69;
       --pl-vod-bg: #2a3d6b; --pl-vod-fg: #a8c4ff; --pl-vod-border: #3a5a9a;
       --pl-ep-bg: #5a2d6b; --pl-ep-fg: #e0b0ff; --pl-ep-border: #7a4a8a;
-      --pl-local-bg: #6b4a2a; --pl-local-fg: #ffd6a8; --pl-local-border: #9a6a3a; }
+      --pl-local-bg: #6b4a2a; --pl-local-fg: #ffd6a8; --pl-local-border: #9a6a3a;
+      --pl-thumb-bg: #0d151d; --pl-thumb-fallback: #33516e;
+      --pl-thumb-overlay: rgba(2, 8, 14, .78); }
     [data-bs-theme="light"] { color-scheme: light;
       --pl-bg: #f4f6f8; --pl-card: #ffffff; --pl-border: #e5e7eb;
       --pl-input: #ffffff; --pl-input-border: #ced4da;
@@ -32,9 +34,12 @@
       --pl-live-bg: #d1fae5; --pl-live-fg: #065f46; --pl-live-border: #6ee7b7;
       --pl-vod-bg: #dbeafe; --pl-vod-fg: #1e40af; --pl-vod-border: #93c5fd;
       --pl-ep-bg: #fae8ff; --pl-ep-fg: #86198f; --pl-ep-border: #f0abfc;
-      --pl-local-bg: #ffedd5; --pl-local-fg: #9a3412; --pl-local-border: #fdba74; }
+      --pl-local-bg: #ffedd5; --pl-local-fg: #9a3412; --pl-local-border: #fdba74;
+      --pl-thumb-bg: #eef2f6; --pl-thumb-fallback: #b8c9d8;
+      --pl-thumb-overlay: rgba(15, 23, 42, .78); }
     body { min-height: 100vh; background: var(--pl-bg); color: var(--pl-text); }
-    .player-shell { max-width: 1180px; }
+    [hidden] { display:none !important; }
+    .player-shell { max-width: 1540px; }
     .brand { color: var(--pl-text); text-decoration: none; }
     .brand-mark { color: var(--pl-mark); }
     .card { background: var(--pl-card); border-color: var(--pl-border); }
@@ -54,7 +59,53 @@
     .filter-pill { font-size:.78rem; padding:.28em .7em; border-radius:999px; border:1px solid var(--pl-input-border); background:var(--pl-input); color:var(--pl-muted); cursor:pointer; }
     .filter-pill.active { background:var(--pl-accent); border-color:var(--pl-accent); color:#fff; }
     .filter-pill:hover { border-color:var(--pl-mark); }
-    @media (max-width: 600px) { .video-frame { min-height: 180px; } }
+
+    /* Poster/logo browser around the player, modelled on vu-movie's
+       one-click poster cards: previous items on the left, next items on the
+       right, and the complete filtered playlist underneath. */
+    .player-stage { display:grid; grid-template-columns:minmax(170px, 220px) minmax(0, 1fr) minmax(170px, 220px); grid-template-areas:"previous player next" "browse browse browse"; gap:1rem; align-items:start; }
+    .player-card { grid-area:player; min-width:0; }
+    .channel-rail-left { grid-area:previous; }
+    .channel-rail-right { grid-area:next; }
+    .channel-browse { grid-area:browse; }
+    .channel-rail { overflow:hidden; }
+    .channel-panel-head { display:flex; align-items:center; justify-content:space-between; gap:.5rem; padding:.65rem .8rem; border-bottom:1px solid var(--pl-border); font-size:.82rem; font-weight:700; letter-spacing:.02em; }
+    .channel-panel-head h2 { font-size:.82rem; font-weight:700; margin:0; }
+    .channel-panel-count { color:var(--pl-muted); font-size:.72rem; font-weight:600; white-space:nowrap; }
+    .channel-rail-list { display:grid; gap:.65rem; max-height:690px; overflow-y:auto; padding:.7rem; scrollbar-gutter:stable; }
+    .channel-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(154px, 1fr)); gap:.75rem; padding:.85rem; }
+    .channel-panel-foot { display:flex; align-items:center; justify-content:space-between; gap:.75rem; padding:0 .85rem .85rem; }
+    .channel-empty { color:var(--pl-muted); font-size:.8rem; padding:1rem; text-align:center; }
+    .channel-thumb { appearance:none; width:100%; min-width:0; padding:0; overflow:hidden; text-align:left; color:var(--pl-text); background:var(--pl-input); border:1px solid var(--pl-border); border-radius:.8rem; cursor:pointer; font:inherit; transition:border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
+    .channel-thumb:hover, .channel-thumb:focus-visible { border-color:var(--pl-mark); box-shadow:0 0 0 .18rem rgba(13, 148, 136, .18); outline:none; transform:translateY(-1px); }
+    .channel-thumb.is-selected { border-color:var(--pl-mark); }
+    .channel-thumb.is-playing { border-color:var(--pl-mark); box-shadow:0 0 0 .22rem rgba(13, 148, 136, .30); }
+    .thumb-media { position:relative; display:grid; place-items:center; aspect-ratio:16 / 9; overflow:hidden; background:var(--pl-thumb-bg); }
+    .channel-grid .thumb-media { aspect-ratio:16 / 10; }
+    .thumb-media img { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    .thumb-media.is-logo img { object-fit:contain; padding:.45rem; }
+    .thumb-fallback { color:var(--pl-thumb-fallback); font-size:1.55rem; font-weight:800; letter-spacing:.04em; }
+    .thumb-kind { position:absolute; top:.45rem; left:.45rem; z-index:2; }
+    .thumb-play { position:absolute; right:.45rem; bottom:.45rem; z-index:2; display:inline-flex; align-items:center; gap:.3rem; padding:.24rem .48rem; border-radius:999px; background:var(--pl-thumb-overlay); color:#fff; font-size:.68rem; font-weight:700; opacity:0; transition:opacity .15s ease; }
+    .channel-thumb:hover .thumb-play, .channel-thumb:focus-visible .thumb-play, .channel-thumb.is-playing .thumb-play { opacity:1; }
+    .thumb-body { display:flex; flex-direction:column; gap:.18rem; padding:.55rem .65rem .65rem; }
+    .thumb-title { display:-webkit-box; overflow:hidden; -webkit-box-orient:vertical; -webkit-line-clamp:2; font-size:.82rem; font-weight:650; line-height:1.25; }
+    .thumb-meta { display:-webkit-box; overflow:hidden; -webkit-box-orient:vertical; -webkit-line-clamp:1; color:var(--pl-muted); font-size:.72rem; line-height:1.25; }
+
+    @media (max-width: 1200px) {
+      .player-stage { grid-template-columns:minmax(150px, 185px) minmax(0, 1fr) minmax(150px, 185px); }
+    }
+    @media (max-width: 900px) {
+      .player-stage { grid-template-columns:minmax(0, 1fr) minmax(0, 1fr); grid-template-areas:"player player" "previous next" "browse browse"; }
+      .channel-rail-list { max-height:460px; }
+    }
+    @media (max-width: 600px) {
+      .video-frame { min-height: 180px; }
+      .player-stage { gap:.7rem; }
+      .channel-grid { grid-template-columns:repeat(auto-fill, minmax(128px, 1fr)); padding:.65rem; }
+      .channel-rail-list { padding:.55rem; }
+      .thumb-title { font-size:.76rem; }
+    }
   </style>
 </head>
 <body>
@@ -140,17 +191,52 @@
         </div>
       </div>
 
-      <div class="card">
-        <div class="card-body p-2 p-md-3">
-          <div class="video-frame rounded overflow-hidden"><video id="video" controls playsinline autoplay muted></video></div>
-          <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 pt-2">
-            <div id="play-status" class="small muted" role="status" aria-live="polite">Choose a playlist item and template, then press Play.</div>
-            <div class="d-flex gap-2">
-              <button class="btn btn-sm btn-outline-secondary" id="sound" type="button"><i class="bi bi-volume-up me-1"></i>Enable sound</button>
-              <button class="btn btn-sm btn-outline-secondary" id="stop" type="button"><i class="bi bi-stop-fill me-1"></i>Stop</button>
+      <div class="player-stage" id="player-stage">
+        <aside class="card channel-rail channel-rail-left" aria-label="Previous channels and titles">
+          <div class="channel-panel-head">
+            <h2><i class="bi bi-chevron-double-left me-1"></i><span id="previous-heading">Previous</span></h2>
+            <span class="channel-panel-count" id="previous-count"></span>
+          </div>
+          <div class="channel-rail-list" id="previous-thumbnails"></div>
+          <div class="channel-empty" id="previous-thumbnails-empty">No earlier items</div>
+        </aside>
+
+        <div class="card player-card">
+          <div class="card-body p-2 p-md-3">
+            <div class="video-frame rounded overflow-hidden"><video id="video" controls playsinline autoplay muted></video></div>
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2 pt-2">
+              <div id="play-status" class="small muted" role="status" aria-live="polite">Choose a playlist item and template, then press Play.</div>
+              <div class="d-flex gap-2">
+                <button class="btn btn-sm btn-outline-secondary" id="sound" type="button"><i class="bi bi-volume-up me-1"></i>Enable sound</button>
+                <button class="btn btn-sm btn-outline-secondary" id="stop" type="button"><i class="bi bi-stop-fill me-1"></i>Stop</button>
+              </div>
             </div>
           </div>
         </div>
+
+        <aside class="card channel-rail channel-rail-right" aria-label="Next channels and titles">
+          <div class="channel-panel-head">
+            <h2><span id="next-heading">Next</span><i class="bi bi-chevron-double-right ms-1"></i></h2>
+            <span class="channel-panel-count" id="next-count"></span>
+          </div>
+          <div class="channel-rail-list" id="next-thumbnails"></div>
+          <div class="channel-empty" id="next-thumbnails-empty">No later items</div>
+        </aside>
+
+        <section class="card channel-browse" aria-label="All channels and titles">
+          <div class="channel-panel-head">
+            <h2><i class="bi bi-grid-3x3-gap me-1"></i>All channels &amp; titles</h2>
+            <span class="channel-panel-count" id="browse-count"></span>
+          </div>
+          <div class="channel-grid" id="channel-thumbnails"></div>
+          <div class="channel-empty" id="channel-thumbnails-empty">No thumbnails match the current filter.</div>
+          <div class="channel-panel-foot">
+            <span class="small muted" id="browse-showing"></span>
+            <button class="btn btn-sm btn-outline-secondary" id="show-more-thumbnails" type="button" hidden>
+              <i class="bi bi-chevron-down me-1"></i>Show more
+            </button>
+          </div>
+        </section>
       </div>
       <div id="playlist-status" class="small muted mt-2" role="status" aria-live="polite"></div>
     </section>
@@ -165,9 +251,15 @@
     const video = $("video"), channelSelect = $("channel"), templateSelect = $("template");
     const kindFilter = $("kind-filter"), searchFilter = $("search-filter"), filterCount = $("filter-count");
     const selectedMeta = $("selected-meta"), typeHint = $("type-hint");
+    const previousThumbnails = $("previous-thumbnails"), nextThumbnails = $("next-thumbnails");
+    const channelThumbnails = $("channel-thumbnails"), showMoreThumbnails = $("show-more-thumbnails");
     let engine = null, channels = [], templates = [], playingHandler = null;
     let currentKindFilter = "all";
     let nativeFallback = false;
+    let currentPlayingKey = "";
+    const THUMBNAIL_PAGE_SIZE = 120;
+    const SIDE_THUMBNAIL_LIMIT = 8;
+    let thumbnailLimit = THUMBNAIL_PAGE_SIZE;
 
     const KIND_LABEL = {live:"Live", vod:"VOD", episode:"Series", local:"Local"};
     const KIND_BADGE_CLASS = {live:"kind-live", vod:"kind-vod", episode:"kind-episode", local:"kind-local"};
@@ -193,6 +285,8 @@
       try { engine?.destroy(); } catch {}
       engine = null;
       nativeFallback = false;
+      currentPlayingKey = "";
+      syncThumbnailStates();
       try { video.pause(); video.removeAttribute("src"); video.load(); } catch {}
     }
 
@@ -208,6 +302,160 @@
       const q = (searchFilter.value || "").trim().toLowerCase();
       if (q) out = out.filter(i => (i.name||"").toLowerCase().includes(q) || (i.group||"").toLowerCase().includes(q) || (KIND_LABEL[i.kind]||i.kind).toLowerCase().includes(q));
       return out;
+    }
+
+    function itemKey(item) {
+      return item ? `${item.kind}:${item.id}` : "";
+    }
+
+    function thumbnailUrl(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return "";
+      return /^(https?:)?\//i.test(raw) || /^data:image\//i.test(raw) ? raw : "";
+    }
+
+    function thumbnailInitials(item) {
+      const words = String(item?.name || "?").trim().split(/\s+/).filter(Boolean);
+      return words.slice(0, 2).map(word => word[0] || "").join("").toUpperCase() || "?";
+    }
+
+    function createThumbnail(item) {
+      const key = itemKey(item);
+      const tile = document.createElement("button");
+      tile.type = "button";
+      tile.className = "channel-thumb";
+      tile.dataset.thumbKey = key;
+      tile.title = `Play ${item.name || "Unnamed item"}`;
+      tile.setAttribute("aria-label", tile.title);
+
+      const media = document.createElement("span");
+      media.className = `thumb-media${item.kind === "live" ? " is-logo" : ""}`;
+      const fallback = document.createElement("span");
+      fallback.className = "thumb-fallback";
+      fallback.textContent = thumbnailInitials(item);
+      media.appendChild(fallback);
+
+      const imageUrl = thumbnailUrl(item.logo);
+      if (imageUrl) {
+        const image = document.createElement("img");
+        image.src = imageUrl;
+        image.alt = "";
+        image.loading = "lazy";
+        image.decoding = "async";
+        image.referrerPolicy = "no-referrer";
+        image.addEventListener("error", () => image.remove(), { once: true });
+        media.appendChild(image);
+      }
+
+      const badge = document.createElement("span");
+      badge.className = `kind-badge ${KIND_BADGE_CLASS[item.kind] || "kind-live"} thumb-kind`;
+      badge.textContent = KIND_LABEL[item.kind] || item.kind;
+      media.appendChild(badge);
+
+      const playHint = document.createElement("span");
+      playHint.className = "thumb-play";
+      const playIcon = document.createElement("i");
+      playIcon.className = "bi bi-play-fill";
+      const playLabel = document.createElement("span");
+      playLabel.className = "thumb-play-label";
+      playLabel.textContent = "Play";
+      playHint.append(playIcon, playLabel);
+      media.appendChild(playHint);
+
+      const body = document.createElement("span");
+      body.className = "thumb-body";
+      const title = document.createElement("span");
+      title.className = "thumb-title";
+      title.textContent = item.name || "Unnamed item";
+      body.appendChild(title);
+      const metaParts = [];
+      if (item.number !== undefined && item.number !== null && item.number !== "") metaParts.push(`#${item.number}`);
+      if (item.group) metaParts.push(item.group);
+      if (metaParts.length) {
+        const meta = document.createElement("span");
+        meta.className = "thumb-meta";
+        meta.textContent = metaParts.join(" · ");
+        body.appendChild(meta);
+      }
+
+      tile.append(media, body);
+      return tile;
+    }
+
+    function renderThumbnailList(container, items) {
+      const fragment = document.createDocumentFragment();
+      items.forEach(item => fragment.appendChild(createThumbnail(item)));
+      container.replaceChildren(fragment);
+    }
+
+    function surroundingItems(visible) {
+      if (!visible.length) return { anchor: null, previous: [], next: [] };
+      const anchor = visible.find(item => itemKey(item) === channelSelect.value) || visible[0];
+      const peers = visible.filter(item => item.kind === anchor.kind);
+      const index = peers.findIndex(item => itemKey(item) === itemKey(anchor));
+      if (index < 0 || peers.length < 2) return { anchor, previous: [], next: [] };
+
+      const otherCount = peers.length - 1;
+      const previousCount = Math.min(SIDE_THUMBNAIL_LIMIT, Math.ceil(otherCount / 2));
+      const nextCount = Math.min(SIDE_THUMBNAIL_LIMIT, Math.max(0, otherCount - previousCount));
+      const previous = Array.from({ length: previousCount }, (_, offset) =>
+        peers[(index - offset - 1 + peers.length) % peers.length]);
+      const next = Array.from({ length: nextCount }, (_, offset) =>
+        peers[(index + offset + 1) % peers.length]);
+      return { anchor, previous, next };
+    }
+
+    function syncThumbnailStates() {
+      const selectedKey = channelSelect.value;
+      document.querySelectorAll("[data-thumb-key]").forEach(tile => {
+        const key = tile.dataset.thumbKey;
+        const playing = key === currentPlayingKey;
+        tile.classList.toggle("is-selected", key === selectedKey);
+        tile.classList.toggle("is-playing", playing);
+        if (playing) tile.setAttribute("aria-current", "true");
+        else tile.removeAttribute("aria-current");
+        const label = tile.querySelector(".thumb-play-label");
+        if (label) label.textContent = playing ? "Now playing" : "Play";
+      });
+    }
+
+    function renderThumbnails({ resetLimit = false } = {}) {
+      if (resetLimit) thumbnailLimit = THUMBNAIL_PAGE_SIZE;
+      const visible = filteredItems();
+      const { anchor, previous, next } = surroundingItems(visible);
+      const peerLabel = { live: "channels", vod: "movies", episode: "episodes", local: "local files" }[anchor?.kind] || "items";
+
+      $("previous-heading").textContent = `Previous ${peerLabel}`;
+      $("next-heading").textContent = `Next ${peerLabel}`;
+      $("previous-count").textContent = previous.length ? `${previous.length} shown` : "";
+      $("next-count").textContent = next.length ? `${next.length} shown` : "";
+      renderThumbnailList(previousThumbnails, previous);
+      renderThumbnailList(nextThumbnails, next);
+      previousThumbnails.hidden = !previous.length;
+      nextThumbnails.hidden = !next.length;
+      $("previous-thumbnails-empty").hidden = previous.length > 0;
+      $("next-thumbnails-empty").hidden = next.length > 0;
+
+      const shown = visible.slice(0, thumbnailLimit);
+      renderThumbnailList(channelThumbnails, shown);
+      channelThumbnails.hidden = !shown.length;
+      $("channel-thumbnails-empty").hidden = visible.length > 0;
+      $("browse-count").textContent = channels.length ? `${visible.length} / ${channels.length} shown by filter` : "";
+      $("browse-showing").textContent = visible.length
+        ? `Showing ${shown.length} of ${visible.length} thumbnails. Click a thumbnail to play it.`
+        : "";
+      showMoreThumbnails.hidden = shown.length >= visible.length;
+      syncThumbnailStates();
+    }
+
+    async function chooseThumbnail(key) {
+      const item = channels.find(row => itemKey(row) === key);
+      if (!item) return;
+      channelSelect.value = key;
+      updateSelectedMeta();
+      renderThumbnails();
+      await startPlayback();
+      document.querySelector(".player-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
     function fillChannels(items) {
@@ -262,6 +510,7 @@
       }
       if (!filtered.length) filterCount.textContent = channels.length ? `0 / ${channels.length}` : "";
       updateSelectedMeta();
+      renderThumbnails({ resetLimit: true });
     }
 
     function updatePlaylistStatus() {
@@ -283,13 +532,14 @@
 
     function updateSelectedMeta() {
       const item = channels.find(row => `${row.kind}:${row.id}` === channelSelect.value);
-      if (!item) { selectedMeta.innerHTML = ""; return; }
+      if (!item) { selectedMeta.innerHTML = ""; syncThumbnailStates(); return; }
       const badge = kindBadge(item.kind);
       const detail = item.kind === "live" ? "Live stream — low-latency, auto-cleanup enabled."
         : item.kind === "vod" ? "VOD — seekable, full-duration playback."
         : item.kind === "episode" ? "Series episode — seekable, grouped by show/season."
         : "Local file — proxied via SPM, transcoded to MPEG-TS.";
       selectedMeta.innerHTML = ` Selected: ${badge} ${item.group ? esc(item.group) + " · " : ""}${esc(item.name)} — <span class="muted">${detail}</span>`;
+      syncThumbnailStates();
     }
     function esc(s){ return String(s??"").replace(/[&<>\"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
 
@@ -332,6 +582,8 @@
       try { kindFilter.value = "all"; } catch {}
       document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === "all"));
       try { searchFilter.value = ""; } catch {}
+      currentPlayingKey = "";
+      renderThumbnails({ resetLimit: true });
       playerPanel.hidden = true;
       loginPanel.hidden = false;
       loginStatus.textContent = message;
@@ -392,10 +644,13 @@
       });
     });
     searchFilter.addEventListener("input", () => renderChannelSelect());
-    channelSelect.addEventListener("change", () => updateSelectedMeta());
+    channelSelect.addEventListener("change", () => {
+      updateSelectedMeta();
+      renderThumbnails();
+    });
 
-    $("play").addEventListener("click", async () => {
-      const item = channels.find(row => `${row.kind}:${row.id}` === channelSelect.value);
+    async function startPlayback() {
+      const item = channels.find(row => itemKey(row) === channelSelect.value);
       const templateId = templateSelect.value;
       if (!item) { playStatus.innerHTML = "Choose a playlist item first."; return; }
       if (!templateId) { playStatus.textContent = "Choose an FFmpeg template first."; return; }
@@ -404,6 +659,8 @@
         return;
       }
       stopPlayback();
+      currentPlayingKey = itemKey(item);
+      syncThumbnailStates();
       const template = templates.find(row => String(row.id) === templateId);
       const relativePath = `/player/stream/${encodeURIComponent(item.kind)}/${encodeURIComponent(item.id)}.ts?tpl=${encodeURIComponent(templateId)}`;
       const url = new URL(relativePath, window.location.href).href;
@@ -462,6 +719,16 @@
         stopPlayback();
         playStatus.innerHTML = `${badge} Could not start the player: ${esc(error.message)}`;
       }
+    }
+
+    $("play").addEventListener("click", () => { void startPlayback(); });
+    $("player-stage").addEventListener("click", event => {
+      const tile = event.target.closest("[data-thumb-key]");
+      if (tile) void chooseThumbnail(tile.dataset.thumbKey);
+    });
+    showMoreThumbnails.addEventListener("click", () => {
+      thumbnailLimit += THUMBNAIL_PAGE_SIZE;
+      renderThumbnails();
     });
 
     $("stop").addEventListener("click", () => {

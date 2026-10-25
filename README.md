@@ -240,6 +240,13 @@ rechecks both channel visibility and template enablement; it accepts template ID
 not user-supplied FFmpeg commands. Browser playback uses a bounded MediaSource
 back-buffer and the server's capped parked-stream replay ring.
 
+The signed-in player is surrounded by clickable channel-logo/movie-poster
+thumbnails: previous items of the selected item's type on the left, the next
+items on the right, and the complete filtered playlist in a grid underneath.
+Clicking a thumbnail selects that item and starts it with the chosen template;
+the underneath grid renders in batches with **Show more** for large playlists.
+Items without usable artwork fall back to their initials.
+
 **Probe stream** stops only this preview, releases its connection, and runs a
 fresh technical inspection. **Replay** resumes playback; **Enable sound**
 unmutes the initially muted player. The report includes all reported video,
