@@ -133,22 +133,25 @@ async def test_seed_recovers_missing_and_multiple_legacy_defaults():
     assert len([row for row in await rows() if row.is_default and row.enabled]) == 1
 
 
-async def test_duo2_live_ships_vbr_and_source_fps_and_upgrades_existing_fields_rows():
+async def test_duo2_live_ships_lp_cqp_and_source_fps_and_upgrades_existing_fields_rows():
     await _seed_defaults()
     row = (await catalog())[E2_DUO2_LIVE_PRESET_NAME]
     async with SessionLocal() as db:
         old = await db.get(FFmpegTemplate, row.id)
-        old.rc_mode, old.fps = 'CQP', '25'
+        old.rc_mode, old.fps = 'VBR', '25'
         await db.commit()
     await _seed_defaults()
     updated = (await catalog())[E2_DUO2_LIVE_PRESET_NAME]
-    assert updated.rc_mode == 'VBR' and updated.fps == ''
+    assert updated.rc_mode == 'CQP' and updated.fps == ''
+    assert updated.low_power is True and updated.global_quality == '26'
     tokens = shlex.split(updated.command)
-    assert tokens[tokens.index('-rc_mode') + 1] == 'VBR'
+    assert tokens[tokens.index('-rc_mode') + 1] == 'CQP'
     assert '-r' not in tokens and 'fps=' not in updated.command
-    assert '-b:v 4000k' in updated.command
-    assert '-maxrate 4400k' in updated.command and '-bufsize 8000k' in updated.command
-    assert '-global_quality' not in tokens
+    # CQP is the mode the reference EncSliceLP entrypoint accepts; the stored
+    # 4000k/4400k/8000k tuning is deliberately not rendered beside it.
+    assert '-b:v' not in tokens and '-maxrate' not in tokens and '-bufsize' not in tokens
+    assert tokens[tokens.index('-global_quality') + 1] == '26'
+    assert (updated.video_bitrate, updated.maxrate, updated.bufsize) == ('4000k', '4400k', '8000k')
     opts = FFmpegOptions(**{key:getattr(updated,key) for key in FFmpegOptions.__dataclass_fields__})
     assert updated.command == build_command(opts)
     assert (await catalog())[REFERENCE_PRESET_NAME].rc_mode == 'CQP'

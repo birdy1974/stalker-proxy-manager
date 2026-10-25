@@ -178,8 +178,8 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
     assert "-rc_mode CQP" in vaapi["command"]
     assert "-global_quality 26" in vaapi["command"]
     assert "-async_depth 4" in vaapi["command"]
-    # VAAPI templates use explicit rate control; Duo2 live is rate-driven,
-    # while the other VAAPI presets retain CQP.
+    # VAAPI templates use explicit rate control; the low-power presets retain
+    # CQP, the only mode some EncSliceLP drivers advertise.
     for name, p in presets.items():
         if p["video_codec"].endswith("_vaapi"):
             assert f"-rc_mode {p['rc_mode']}" in p["command"], name

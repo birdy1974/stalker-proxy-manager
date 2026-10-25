@@ -1257,11 +1257,15 @@ def default_presets() -> list[dict]:
            output_format="matroska", subs="keep"),
         # Live TV for the same box: MPEG-TS straight into the DVB pipeline
         # (service reference 1 or 4097) with the DVB bitmap subtitles the box
-        # renders natively.
+        # renders natively. Keep the low-power encoder on CQP: the reference
+        # EncSliceLP entrypoint can advertise CQP only and rejects VBR before
+        # the first frame. The stored bitrate tuning remains dormant for an
+        # operator who deliberately turns low-power off on a VBR-capable
+        # standard encoder.
         mk(E2_DUO2_LIVE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            extra_input=fast_input,
-           maxrate="4400k", bufsize="8000k", fps="", gop="50", rc_mode="VBR",
+           maxrate="4400k", bufsize="8000k", fps="", gop="50", rc_mode="CQP",
            profile="high", level="4.0", low_power=True, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
            subs="dvb"),
