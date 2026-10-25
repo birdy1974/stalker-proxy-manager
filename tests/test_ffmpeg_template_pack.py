@@ -1,12 +1,13 @@
-"""The downloadable Quick Zap VAAPI CQP template pack.
+"""The downloadable selected FFmpeg template set.
 
-The JSON under docs/ is an operator-facing artifact, so these tests pin both
-directions that matter: every row still renders from its own fields, and the
-file merges into a seeded install through the same endpoint the FFmpeg page
-uses. SPM's legacy merge is additive: the pack's logical client/scenario
-names are inserted beside the shipped templates exactly once. Three pack
-rows intentionally use those logical names for recipes that also ship under
-SPM's historical built-in names.
+The JSON under docs/ is an operator-facing artifact, so these tests pin the
+directions that matter: every non-marker row still renders from its own
+fields, the file contains the selected 13-template catalog, and it imports
+through the same endpoint the FFmpeg page uses. SPM's legacy merge is
+additive: into an empty template table it creates those 13 rows; into a
+seeded install it adds the nine logical rows and skips the four retained
+shipped rows already present. It cannot delete shipped templates that are
+absent from the file.
 """
 
 from __future__ import annotations
@@ -22,9 +23,10 @@ from app.database import SessionLocal
 from app.main import _seed_defaults, app
 from app.models import FFmpegTemplate
 from app.services.ffmpeg_templates import (
-    E2_DUO2_LIVE_PRESET_NAME, E2_VOD_REMUX_PRESET_NAME,
-    E2_VOD_TRANSCODE_PRESET_NAME, FFmpegOptions, build_command,
-    default_presets,
+    COPY_PRESET_NAME, E2_DUO2_LIVE_PRESET_NAME, E2_VOD_REMUX_PRESET_NAME,
+    E2_VOD_TRANSCODE_PRESET_NAME, FFmpegOptions, PASSTHROUGH_COMMAND,
+    PASSTHROUGH_PRESET_NAME, REDIRECT_COMMAND, REDIRECT_PRESET_NAME,
+    REFERENCE_PRESET_NAME, build_command, default_presets,
 )
 
 PACK_PATH = (Path(__file__).resolve().parents[1]
@@ -40,7 +42,22 @@ EXPECTED_NAMES = [
     "Web player - Internet (fast)",
     "VLC - Internet (slow)",
     "VLC - Internet (fast)",
+    COPY_PRESET_NAME,
+    "Dreambox DM800se (Enigma2 / MPEG2-SD)",
+    REDIRECT_PRESET_NAME,
+    PASSTHROUGH_PRESET_NAME,
 ]
+
+RETAINED_SHIPPED_NAMES = EXPECTED_NAMES[9:]
+REMOVED_SHIPPED_NAMES = {
+    REFERENCE_PRESET_NAME,
+    "VAAPI 1080p ~2.5M",
+    "QSV 720p ~1M",
+    "Software 720p ~1.2M (libx264)",
+    E2_VOD_REMUX_PRESET_NAME,
+    E2_VOD_TRANSCODE_PRESET_NAME,
+    E2_DUO2_LIVE_PRESET_NAME,
+}
 
 
 def _pack() -> dict:
@@ -51,7 +68,7 @@ def _options(row: dict) -> FFmpegOptions:
     return FFmpegOptions(**{k: row[k] for k in FFmpegOptions.__dataclass_fields__})
 
 
-def test_quick_zap_pack_is_a_fields_true_ffmpeg_section_export():
+def test_selected_template_file_is_a_fields_true_ffmpeg_section_export():
     data = _pack()
     assert data["app"] == "stalker-proxy-manager"
     assert data["version"] == 1
@@ -59,13 +76,21 @@ def test_quick_zap_pack_is_a_fields_true_ffmpeg_section_export():
 
     rows = data["ffmpeg_templates"]
     assert [row["name"] for row in rows] == EXPECTED_NAMES
-    assert len({row["name"] for row in rows}) == len(rows)
+    assert len({row["name"] for row in rows}) == len(rows) == 13
+    assert not ({row["name"] for row in rows} & REMOVED_SHIPPED_NAMES)
 
     shipped = {p["name"]: p for p in default_presets()}
+    marker_commands = {
+        REDIRECT_PRESET_NAME: REDIRECT_COMMAND,
+        PASSTHROUGH_PRESET_NAME: PASSTHROUGH_COMMAND,
+    }
     for row in rows:
         assert row["enabled"] is True and row["is_default"] is False
         assert row["command_source"] == "fields"
-        assert build_command(_options(row)) == row["command"], row["name"]
+        if row["name"] in marker_commands:
+            assert row["command"] == marker_commands[row["name"]]
+        else:
+            assert build_command(_options(row)) == row["command"], row["name"]
         if row["video_codec"] == "h264_vaapi" and row["low_power"]:
             tokens = shlex.split(row["command"])
             assert row["rc_mode"] == "CQP", row["name"]
@@ -80,6 +105,13 @@ def test_quick_zap_pack_is_a_fields_true_ffmpeg_section_export():
     for logical_name, shipped_name in logical_aliases.items():
         row, preset = by_name[logical_name], shipped[shipped_name]
         assert row["is_builtin"] is False
+        assert row["command"] == preset["command"]
+        assert {k: row[k] for k in FFmpegOptions.__dataclass_fields__} == {
+            k: preset[k] for k in FFmpegOptions.__dataclass_fields__}
+
+    for name in RETAINED_SHIPPED_NAMES:
+        row, preset = by_name[name], shipped[name]
+        assert row["is_builtin"] is True
         assert row["command"] == preset["command"]
         assert {k: row[k] for k in FFmpegOptions.__dataclass_fields__} == {
             k: preset[k] for k in FFmpegOptions.__dataclass_fields__}
@@ -100,7 +132,7 @@ async def _template_names() -> list[str]:
             select(FFmpegTemplate.name).order_by(FFmpegTemplate.name))).scalars())
 
 
-async def test_quick_zap_pack_merges_beside_seeded_defaults_without_duplicates():
+async def test_selected_template_file_merges_beside_seeded_defaults_without_duplicates():
     await _seed_defaults()
     payload = {"mode": "merge", "data": _pack()}
 
@@ -111,7 +143,8 @@ async def test_quick_zap_pack_merges_beside_seeded_defaults_without_duplicates()
         body = first.json()
         assert body["imported"] == 9
         assert body["updated"] == 0
-        assert body["skipped"] == []
+        assert set(body["skipped"]) == {
+            f"ffmpeg:{name}" for name in RETAINED_SHIPPED_NAMES}
         assert set(EXPECTED_NAMES) <= set(await _template_names())
 
         second = await client.post("/api/import", json=payload)
@@ -123,3 +156,18 @@ async def test_quick_zap_pack_merges_beside_seeded_defaults_without_duplicates()
     names = await _template_names()
     assert len(names) == len(set(names))
     assert set(names) == {p["name"] for p in default_presets()} | set(EXPECTED_NAMES)
+
+
+async def test_selected_template_file_imports_exactly_13_into_an_empty_table():
+    payload = {"mode": "merge", "data": _pack()}
+
+    async with AsyncClient(transport=ASGITransport(app=app),
+                           base_url="http://testserver") as client:
+        result = await client.post("/api/import", json=payload)
+
+    assert result.status_code == 200, result.text
+    body = result.json()
+    assert body["imported"] == 13
+    assert body["updated"] == 0
+    assert body["skipped"] == []
+    assert set(await _template_names()) == set(EXPECTED_NAMES)
