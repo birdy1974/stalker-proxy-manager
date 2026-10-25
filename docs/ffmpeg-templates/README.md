@@ -15,10 +15,10 @@ low-power H.264 encoder accepts `-rc_mode CQP`.
 
 | # | Template | What it does |
 |---:|---|---|
-| 1 | `Enigma2 - Live` | Fastest Enigma2 live transcode: VAAPI low-power 1080p H.264 CQP 26, AC3, MPEG-TS, subtitles dropped |
-| 2 | `Enigma2 - Live (with subtitles)` | Enigma2 live VAAPI low-power 1080p H.264 CQP 26, AC3, MPEG-TS, DVB subtitles |
-| 3 | `Enigma2 - VOD` | Enigma2 VOD/series default: video, audio and subtitles copied into Matroska; no transcode |
-| 4 | `Enigma2 - VOD (transcode)` | Enigma2 VOD/series rescue: VAAPI low-power 1080p H.264 CQP 26, AC3, Matroska, subtitles copied |
+| 1 | `Enigma2 - Live` | Fastest Enigma2 live transcode: VAAPI low-power 1080p H.264 High@4.1 CQP 26, AC3, MPEG-TS, subtitles dropped |
+| 2 | `Enigma2 - Live (with subtitles)` | Enigma2 live VAAPI low-power 1080p H.264 High@4.1 CQP 26, AC3, MPEG-TS, DVB subtitles |
+| 3 | `Enigma2 - VOD` | Enigma2 VOD/series default: video, audio and subtitles copied into Matroska; no transcode, so the source H.264 level is preserved |
+| 4 | `Enigma2 - VOD (transcode)` | Enigma2 VOD/series rescue: VAAPI low-power 1080p H.264 High@4.1 CQP 26, AC3, Matroska, subtitles copied |
 | 5 | `Web player - LAN` | Web-player local-network template: H.264 video copied, audio converted to AAC, MPEG-TS |
 | 6 | `Web player - Internet (slow)` | VAAPI low-power 720p H.264 CQP 32, AAC 96k, MPEG-TS |
 | 7 | `Web player - Internet (fast)` | VAAPI low-power 1080p H.264 CQP 25, AAC 192k, MPEG-TS |
@@ -28,6 +28,12 @@ low-power H.264 encoder accepts `-rc_mode CQP`.
 | 11 | `Dreambox DM800se (Enigma2 / MPEG2-SD)` | Retained SPM standard: compatibility transcode for the older Dreambox DM800se |
 | 12 | `Redirect (bypass ffmpeg)` | Retained SPM standard: sends the player directly to the original stream with HTTP 302 |
 | 13 | `Pass-through proxy (bypass ffmpeg)` | Retained SPM standard: proxies the original bytes through SPM without starting FFmpeg |
+
+All Enigma2 **transcodes** in this file use H.264 level **4.1**, except the
+legacy Dreambox DM800se compatibility template, which intentionally remains
+Main@3.1 at 576p for that older receiver. Copy, Redirect and Pass-through do
+not encode video, so their stored level field does not alter the source
+stream's level.
 
 ## Removed from this file
 
@@ -69,6 +75,14 @@ them as built-in templates on boot; importing this file does not remove or
 disable those existing built-in rows. All rows in the file have
 `is_default=false`, so importing does not change the selected default or any
 existing assignments.
+
+The same additive rule also means that re-importing a newer copy of this file
+does not update a same-named template already in the database. If an earlier
+copy was imported, either edit `Enigma2 - Live`, `Enigma2 - Live (with
+subtitles)` and `Enigma2 - VOD (transcode)` and set **Level** to `4.1`, or
+delete those custom rows before importing this file again. Field-sourced
+shipped Enigma2 built-ins are refreshed to 4.1 by SPM on boot after updating
+SPM itself.
 
 The shipped `Vu+ Duo2 live` preset itself is corrected to CQP in SPM's seeded
 defaults; after updating SPM, its field-sourced row is refreshed on boot.

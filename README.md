@@ -631,8 +631,8 @@ Shipped presets (stored as rows in the database and **re-seeded on every boot** 
 | Copy / passthrough | remux only (`-c copy`); also the automatic fallback when no GPU device is mapped |
 | **Dreambox DM800se (Enigma2 / MPEG2-SD)** | downmix to an MPEG-2 transport stream the ancient Enigma2/openpli box can play (see below) |
 | **Enigma2 VOD - remux + subtitles (MKV)** | container swap only (`-c copy`) into **Matroska**, copying *every* subtitle track (SRT/ASS/PGS/DVB) — the way VOD & series get subtitles without any transcoding (see *Subtitles for VOD & series* below) |
-| **Enigma2 VOD - VAAPI 1080p H.264 + AC3 + subtitles (MKV)** | the 4K/HEVC rescue path: video re-encoded **on the GPU** to H.264 High@4.0 1080p with AC3 audio, subtitles copied through untouched |
-| **Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)** | live TV for a Vu+ Duo2: H.264 High@4.0 1080p, **CQP 26**, **source FPS (`src`)**, AC3 in MPEG-TS with DVB bitmap subtitles (service reference `1`/`4097`) |
+| **Enigma2 VOD - VAAPI 1080p H.264 + AC3 + subtitles (MKV)** | the 4K/HEVC rescue path: video re-encoded **on the GPU** to H.264 High@4.1 1080p with AC3 audio, subtitles copied through untouched |
+| **Vu+ Duo2 live (Enigma2 / H.264 1080p MPEG-TS)** | live TV for a Vu+ Duo2: H.264 High@4.1 1080p, **CQP 26**, **source FPS (`src`)**, AC3 in MPEG-TS with DVB bitmap subtitles (service reference `1`/`4097`) |
 | **Pass-through proxy (bypass ffmpeg)** | raw asynchronous byte pipe bypassing FFmpeg without 302: zero transcoding CPU, maintains connection socket for instant user activity detection, duration/bandwidth telemetry, and external playback without provider IP-locking issues. Bytes are forwarded as the socket delivers them (no re-chunking), the response headers count against the start window, and a slow 4xx (the panel's slot check) is not retried with the other user-agent |
 | **Redirect (bypass ffmpeg)** | not an ffmpeg command at all — the player is 302-redirected straight to the portal's CDN. **The default template**: any item without an explicit template assignment redirects (see below) |
 

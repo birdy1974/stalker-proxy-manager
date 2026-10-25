@@ -123,7 +123,7 @@ def test_enigma2_presets_are_shipped_and_fit_the_duo2():
     hw = presets[E2_VOD_TRANSCODE_PRESET_NAME]
     # the 4K/HEVC rescue path: GPU video, box-friendly audio, Matroska + copy subs
     assert hw["video_codec"] == "h264_vaapi" and hw["resolution"] == "1080p"
-    assert hw["profile"] == "high" and hw["level"] == "4.0"
+    assert hw["profile"] == "high" and hw["level"] == "4.1"
     assert hw["audio_codec"] == "ac3" and hw["output_format"] == "matroska"
     assert hw["subs"] == "keep"
     assert "-f matroska" in hw["command"] and "-c:s copy" in hw["command"]
@@ -132,6 +132,7 @@ def test_enigma2_presets_are_shipped_and_fit_the_duo2():
 
     live = presets[E2_DUO2_LIVE_PRESET_NAME]
     # live stays MPEG-TS: the box renders DVB bitmap subs natively there
+    assert live["profile"] == "high" and live["level"] == "4.1"
     assert live["output_format"] == "mpegts" and live["subs"] == "dvb"
     assert "-f mpegts" in live["command"] and "-c:s dvbsub" in live["command"]
 

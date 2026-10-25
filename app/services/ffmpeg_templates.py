@@ -1243,8 +1243,8 @@ def default_presets() -> list[dict]:
         # (service 5002). MPEG-TS has no slot for SRT/ASS, and dvbsub on a
         # VAAPI transcode is the 502/no-data failure.
         #  * remux  - copy into MKV, every subtitle track copied;
-        #  * VAAPI  - 4K/HEVC rescue: GPU H.264 High@4.0 1080p (BCM7424
-        #             ceiling) + AC3, subtitles copied beside the GPU path.
+        #  * VAAPI  - 4K/HEVC rescue: GPU H.264 High@4.1 1080p
+        #             + AC3, subtitles copied beside the GPU path.
         mk(E2_VOD_REMUX_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source", extra_input=fast_input,
            output_format="matroska", subs="keep"),
@@ -1252,7 +1252,7 @@ def default_presets() -> list[dict]:
            extra_input=fast_input,
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            maxrate="4400k", bufsize="8000k", fps="25", gop="50",
-           profile="high", level="4.0", low_power=True, async_depth="4",
+           profile="high", level="4.1", low_power=True, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
            output_format="matroska", subs="keep"),
         # Live TV for the same box: MPEG-TS straight into the DVB pipeline
@@ -1266,7 +1266,7 @@ def default_presets() -> list[dict]:
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            extra_input=fast_input,
            maxrate="4400k", bufsize="8000k", fps="", gop="50", rc_mode="CQP",
-           profile="high", level="4.0", low_power=True, async_depth="4",
+           profile="high", level="4.1", low_power=True, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
            subs="dvb"),
         mk("Dreambox DM800se (Enigma2 / MPEG2-SD)", hw_accel="vaapi",

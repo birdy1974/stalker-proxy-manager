@@ -122,6 +122,21 @@ def test_selected_template_file_is_a_fields_true_ffmpeg_section_export():
         k: shipped_duo2[k] for k in FFmpegOptions.__dataclass_fields__}
     assert duo2["command"] == shipped_duo2["command"]
 
+    # Every logical Enigma2 transcode is High@4.1. The VOD remux stores the
+    # same field value but copies the source video, so no level is rendered.
+    for name in ("Enigma2 - Live", "Enigma2 - Live (with subtitles)",
+                 "Enigma2 - VOD", "Enigma2 - VOD (transcode)"):
+        assert by_name[name]["profile"] == "high", name
+        assert by_name[name]["level"] == "4.1", name
+    for name in ("Enigma2 - Live", "Enigma2 - Live (with subtitles)",
+                 "Enigma2 - VOD (transcode)"):
+        tokens = shlex.split(by_name[name]["command"])
+        assert tokens[tokens.index("-level") + 1] == "4.1", name
+    # The retained Dreambox template is the deliberate legacy-Enigma2
+    # exception: its SD compatibility output stays Main@3.1.
+    dreambox = by_name["Dreambox DM800se (Enigma2 / MPEG2-SD)"]
+    assert dreambox["profile"] == "main" and dreambox["level"] == "3.1"
+
     zap = by_name["Enigma2 - Live"]
     assert zap["subs"] == "drop" and "-sn" in shlex.split(zap["command"])
 
