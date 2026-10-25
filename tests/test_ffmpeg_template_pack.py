@@ -3,8 +3,10 @@
 The JSON under docs/ is an operator-facing artifact, so these tests pin both
 directions that matter: every row still renders from its own fields, and the
 file merges into a seeded install through the same endpoint the FFmpeg page
-uses. SPM's legacy merge is additive: shipped names already present are
-skipped, distinct scenario names are inserted exactly once.
+uses. SPM's legacy merge is additive: the pack's logical client/scenario
+names are inserted beside the shipped templates exactly once. Three pack
+rows intentionally use those logical names for recipes that also ship under
+SPM's historical built-in names.
 """
 
 from __future__ import annotations
@@ -29,15 +31,15 @@ PACK_PATH = (Path(__file__).resolve().parents[1]
              / "docs" / "ffmpeg-templates" / "quick-zap-vaapi-cqp.json")
 
 EXPECTED_NAMES = [
-    "Vu+ Duo2 live - LP CQP (custom)",
-    "Vu+ Duo2 live - Quick Zap no subs (VAAPI LP CQP26)",
-    E2_VOD_REMUX_PRESET_NAME,
-    E2_VOD_TRANSCODE_PRESET_NAME,
-    "Web LAN - Copy video + AAC (fast start)",
-    "Web Internet Slow - VAAPI LP 720p CQP32",
-    "VLC Internet Slow - VAAPI LP 720p CQP30",
-    "Web Internet Fast - VAAPI LP 1080p CQP25",
-    "VLC Internet Fast - Copy MPEG-TS (fast start)",
+    "Enigma2 - Live",
+    "Enigma2 - Live (with subtitles)",
+    "Enigma2 - VOD",
+    "Enigma2 - VOD (transcode)",
+    "Web player - LAN",
+    "Web player - Internet (slow)",
+    "Web player - Internet (fast)",
+    "VLC - Internet (slow)",
+    "VLC - Internet (fast)",
 ]
 
 
@@ -71,20 +73,24 @@ def test_quick_zap_pack_is_a_fields_true_ffmpeg_section_export():
             assert not ({"-b:v", "-maxrate", "-bufsize"} & set(tokens)), row["name"]
 
     by_name = {row["name"]: row for row in rows}
-    for name in (E2_VOD_REMUX_PRESET_NAME, E2_VOD_TRANSCODE_PRESET_NAME):
-        row, preset = by_name[name], shipped[name]
-        assert row["is_builtin"] is True
+    logical_aliases = {
+        "Enigma2 - VOD": E2_VOD_REMUX_PRESET_NAME,
+        "Enigma2 - VOD (transcode)": E2_VOD_TRANSCODE_PRESET_NAME,
+    }
+    for logical_name, shipped_name in logical_aliases.items():
+        row, preset = by_name[logical_name], shipped[shipped_name]
+        assert row["is_builtin"] is False
         assert row["command"] == preset["command"]
         assert {k: row[k] for k in FFmpegOptions.__dataclass_fields__} == {
             k: preset[k] for k in FFmpegOptions.__dataclass_fields__}
 
-    duo2 = by_name["Vu+ Duo2 live - LP CQP (custom)"]
+    duo2 = by_name["Enigma2 - Live (with subtitles)"]
     shipped_duo2 = shipped[E2_DUO2_LIVE_PRESET_NAME]
     assert {k: duo2[k] for k in FFmpegOptions.__dataclass_fields__} == {
         k: shipped_duo2[k] for k in FFmpegOptions.__dataclass_fields__}
     assert duo2["command"] == shipped_duo2["command"]
 
-    zap = by_name["Vu+ Duo2 live - Quick Zap no subs (VAAPI LP CQP26)"]
+    zap = by_name["Enigma2 - Live"]
     assert zap["subs"] == "drop" and "-sn" in shlex.split(zap["command"])
 
 
@@ -103,12 +109,9 @@ async def test_quick_zap_pack_merges_beside_seeded_defaults_without_duplicates()
         first = await client.post("/api/import", json=payload)
         assert first.status_code == 200, first.text
         body = first.json()
-        assert body["imported"] == 7
+        assert body["imported"] == 9
         assert body["updated"] == 0
-        assert set(body["skipped"]) == {
-            f"ffmpeg:{E2_VOD_REMUX_PRESET_NAME}",
-            f"ffmpeg:{E2_VOD_TRANSCODE_PRESET_NAME}",
-        }
+        assert body["skipped"] == []
         assert set(EXPECTED_NAMES) <= set(await _template_names())
 
         second = await client.post("/api/import", json=payload)
@@ -119,3 +122,4 @@ async def test_quick_zap_pack_merges_beside_seeded_defaults_without_duplicates()
 
     names = await _template_names()
     assert len(names) == len(set(names))
+    assert set(names) == {p["name"] for p in default_presets()} | set(EXPECTED_NAMES)
