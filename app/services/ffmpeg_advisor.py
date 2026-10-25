@@ -195,11 +195,25 @@ _RES_LADDER = ["360p", "480p", "576p", "720p", "1080p", "1440p", "2160p"]
 # --------------------------------------------------------------------------- #
 #  context + finding helpers
 # --------------------------------------------------------------------------- #
+def is_enigma2_template_name(name: object) -> bool:
+    """Whether a template name identifies the Enigma2/Duo2 receiver path.
+
+    The editor and summary already know the row name; `FFmpegOptions` does
+    not. Keep the match deliberately name-based and narrow: shipped and
+    logical Enigma2 names, plus Duo2-named receiver templates.
+    """
+    normalized = " " + re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip() + " "
+    return " enigma2 " in normalized or " duo2 " in normalized
+
+
 class Ctx:
     """Everything a rule may look at, computed once."""
 
-    def __init__(self, opts: FFmpegOptions, goal: str, env: dict | None, live: dict | None):
+    def __init__(self, opts: FFmpegOptions, goal: str, env: dict | None, live: dict | None,
+                 template_name: str = ""):
         self.o = opts
+        self.template_name = str(template_name or "")
+        self.enigma2 = is_enigma2_template_name(self.template_name)
         self.gid = goal
         self.g = GOALS[goal]
         self.env = env or {}
@@ -471,6 +485,8 @@ def r_low_power(c: Ctx):
         return None
     caps = c.vaapi_caps()
     if not c.o.low_power and caps.get("h264_low_power") is True:
+        if c.enigma2:
+            return None      # Enigma2 templates deliberately use the standard encoder
         return _f("low-power-off", c.g["lp_sev"], "load", ["low_power"],
                   "This GPU has the fixed-function low-power H.264 encoder, but low-power "
                   "is off.",
@@ -862,12 +878,12 @@ def as_options(options) -> FFmpegOptions:
 
 
 def advise(options, *, goal: str = DEFAULT_GOAL, env: dict | None = None,
-           live: dict | None = None, ignored=()) -> dict:
+           live: dict | None = None, ignored=(), template_name: str = "") -> dict:
     """Findings, scores and counts for one template. Never raises on odd
     values: a rule that fails on unexpected input is skipped."""
     opts = as_options(options)
     goal = clean_goal(goal)
-    ctx = Ctx(opts, goal, env, live)
+    ctx = Ctx(opts, goal, env, live, template_name=template_name)
     dismissed = set(clean_ignored(ignored).split(",")) - {""}
     findings: list[dict] = []
     for fn in RULES:
@@ -907,7 +923,7 @@ def _touched(fix: dict) -> set:
 
 
 def apply_selected(options, ids, *, goal: str = DEFAULT_GOAL, env: dict | None = None,
-                   live: dict | None = None) -> dict:
+                   live: dict | None = None, template_name: str = "") -> dict:
     """Compose the fixes of the chosen findings into one change set.
 
     Returns {"changes": [{field, from, to, ids}], "skipped": [{id, reason}],
@@ -915,7 +931,7 @@ def apply_selected(options, ids, *, goal: str = DEFAULT_GOAL, env: dict | None =
     order; one that would change something an earlier one already changed
     (differently) is skipped and reported, never silently merged."""
     opts = as_options(options)
-    report = advise(opts, goal=goal, env=env, live=live)
+    report = advise(opts, goal=goal, env=env, live=live, template_name=template_name)
     wanted = [f for f in report["findings"] if f["id"] in set(ids or [])]
     values = asdict(opts)
     original = dict(values)

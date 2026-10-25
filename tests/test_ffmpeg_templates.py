@@ -91,6 +91,10 @@ def test_low_power_and_rc_mode_are_toggleable():
     off = build_command(FFmpegOptions(low_power=False, rc_mode="auto"))
     assert "-low_power" not in off
     assert "-rc_mode" not in off
+    # Stateless parsing reads that absence as the standard encoder; an
+    # explicit editor base can still preserve a dormant field value.
+    assert parse_command(off)["options"]["low_power"] is False
+    assert parse_command(off, base={"low_power": True})["options"]["low_power"] is True
     # lowercase GUI leftovers still render as ffmpeg's uppercase aliases
     cbr = build_command(FFmpegOptions(rc_mode="cbr"))
     assert "-rc_mode CBR" in cbr
@@ -178,8 +182,8 @@ def test_default_presets_ship_the_optimised_vaapi_commands():
     assert "-rc_mode CQP" in vaapi["command"]
     assert "-global_quality 26" in vaapi["command"]
     assert "-async_depth 4" in vaapi["command"]
-    # VAAPI templates use explicit rate control; Duo2 live is rate-driven,
-    # while the other VAAPI presets retain CQP.
+    # VAAPI templates use explicit rate control; generic low-power presets
+    # retain CQP, while the Enigma2 presets use standard-encoder VBR.
     for name, p in presets.items():
         if p["video_codec"].endswith("_vaapi"):
             assert f"-rc_mode {p['rc_mode']}" in p["command"], name
@@ -364,6 +368,8 @@ def test_dreambox_preset_targets_mpeg2_ts_for_enigma2():
     assert dreambox["resolution"] == "576p"
     assert dreambox["video_codec"] == "h264_vaapi"
     assert dreambox["profile"] == "main" and dreambox["level"] == "3.1"
+    assert dreambox["rc_mode"] == "VBR" and dreambox["low_power"] is False
+    assert "-rc_mode VBR" in dreambox["command"] and "-low_power" not in dreambox["command"]
     assert dreambox["audio_codec"] == "mp2"
     assert dreambox["output_format"] == "mpegts"
     assert "-c:v h264_vaapi" in dreambox["command"]

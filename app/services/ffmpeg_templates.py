@@ -996,10 +996,14 @@ def parse_command(cmd: str, base: dict | None = None) -> dict:
     """
     opts = FFmpegOptions(**coerce_options(base))
     # Without a stored field value, absence of -r/fps means source timing,
-    # not the new-template default of 25 FPS. Keep explicit base values for
-    # partial parsing (e.g. dormant tuning on a copy template).
+    # not the new-template default of 25 FPS, and absence of -low_power means
+    # the standard encoder, not the new-template low-power default. Keep
+    # explicit base values for partial parsing (e.g. dormant tuning on a
+    # copy template).
     if "fps" not in (base or {}):
         opts.fps = ""
+    if "low_power" not in (base or {}):
+        opts.low_power = False
     warnings: list[str] = []
     try:
         toks = shlex.split(cmd)
@@ -1243,34 +1247,40 @@ def default_presets() -> list[dict]:
         # (service 5002). MPEG-TS has no slot for SRT/ASS, and dvbsub on a
         # VAAPI transcode is the 502/no-data failure.
         #  * remux  - copy into MKV, every subtitle track copied;
-        #  * VAAPI  - 4K/HEVC rescue: GPU H.264 High@4.0 1080p (BCM7424
-        #             ceiling) + AC3, subtitles copied beside the GPU path.
+        #  * VAAPI  - 4K/HEVC rescue: standard-encoder GPU H.264 High@4.1
+        #             1080p VBR + AC3, subtitles copied beside the GPU path.
+        # Enigma2 templates deliberately keep VAAPI low-power off and use VBR;
+        # the copy row stores the same fields even though they are inactive
+        # until its codec is changed away from copy.
         mk(E2_VOD_REMUX_PRESET_NAME, hw_accel="none", video_codec="copy",
            audio_codec="copy", resolution="source", extra_input=fast_input,
+           rc_mode="VBR", low_power=False,
            output_format="matroska", subs="keep"),
         mk(E2_VOD_TRANSCODE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
            extra_input=fast_input,
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
-           maxrate="4400k", bufsize="8000k", fps="25", gop="50",
-           profile="high", level="4.0", low_power=True, async_depth="4",
+           maxrate="4400k", bufsize="8000k", fps="25", gop="50", rc_mode="VBR",
+           profile="high", level="4.1", low_power=False, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
            output_format="matroska", subs="keep"),
         # Live TV for the same box: MPEG-TS straight into the DVB pipeline
         # (service reference 1 or 4097) with the DVB bitmap subtitles the box
-        # renders natively.
+        # renders natively. The Enigma2 path uses the standard VAAPI encoder
+        # with VBR and low-power off; its 4000k/4400k/8000k tuning is rendered
+        # as the target, peak and VBV buffer.
         mk(E2_DUO2_LIVE_PRESET_NAME, hw_accel="vaapi", resolution="1080p",
            aspect="16:9", video_codec="h264_vaapi", video_bitrate="4000k",
            extra_input=fast_input,
            maxrate="4400k", bufsize="8000k", fps="", gop="50", rc_mode="VBR",
-           profile="high", level="4.0", low_power=True, async_depth="4",
+           profile="high", level="4.1", low_power=False, async_depth="4",
            audio_codec="ac3", audio_bitrate="384k", audio_channels="2",
            subs="dvb"),
         mk("Dreambox DM800se (Enigma2 / MPEG2-SD)", hw_accel="vaapi",
            resolution="576p", aspect="16:9", video_codec="h264_vaapi",
            extra_input=fast_input,
            video_bitrate="1200k", maxrate="1300k", bufsize="2400k",
-           fps="25", gop="50", profile="main", level="3.1",
-           low_power=True, async_depth="4",
+           fps="25", gop="50", profile="main", level="3.1", rc_mode="VBR",
+           low_power=False, async_depth="4",
            audio_codec="mp2", audio_bitrate="192k", subs="dvb"),
     ]
     for p in presets:
