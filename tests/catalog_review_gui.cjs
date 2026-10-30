@@ -111,6 +111,31 @@ w.eval(template.slice(
   assert.match(w.document.querySelector('#catalog-review-selected').textContent,
                /1 selected · 1 Playlist item\(s\), 2 update\(s\)/);
 
+  const detailsButton = w.document.querySelector('#catalog-review-details-toggle');
+  assert.ok(detailsButton, 'details toggle is present');
+  assert.equal(detailsButton.textContent.trim(), 'Hide details');
+  assert.equal(detailsButton.getAttribute('aria-expanded'), 'true');
+  assert.equal(w.document.querySelector('.catalog-review-details').hidden, false);
+  assert.equal(w.document.querySelector('.catalog-review-summary').hidden, true);
+
+  detailsButton.click();
+  assert.equal(detailsButton.textContent.trim(), 'Show details');
+  assert.equal(detailsButton.getAttribute('aria-expanded'), 'false');
+  assert.equal(w.document.querySelector('.catalog-review-details').hidden, true);
+  const summary = w.document.querySelector('.catalog-review-summary');
+  assert.equal(summary.hidden, false);
+  assert.match(summary.textContent, /2 source difference\(s\) · Playlist will update \(2\)/);
+  assert.equal(w.document.querySelector('#catalog-review-source-heading').textContent, 'Source');
+  assert.equal(checkbox.checked, true, 'hiding details keeps the row selected');
+
+  detailsButton.click();
+  assert.equal(detailsButton.textContent.trim(), 'Hide details');
+  assert.equal(detailsButton.getAttribute('aria-expanded'), 'true');
+  assert.equal(w.document.querySelector('.catalog-review-details').hidden, false);
+  assert.equal(w.document.querySelector('.catalog-review-summary').hidden, true);
+  assert.equal(w.document.querySelector('#catalog-review-source-heading').textContent, 'Source and differences');
+  assert.equal(checkbox.checked, true, 'showing details keeps the row selected');
+
   const button = [...w.document.querySelectorAll('button')]
     .find(node => node.textContent === 'Update Playlist & mark reviewed');
   assert.ok(button, 'review button is present');
@@ -121,7 +146,7 @@ w.eval(template.slice(
   assert.deepEqual(review.options.body.ids, [99]);
   assert.ok(toasts.some(message => /1 Playlist item\(s\) updated \(2 field\(s\)\)/.test(message)));
 
-  console.log('Catalog Review DOM checks passed: exact Playlist preview, selection summary and reviewed action.');
+  console.log('Catalog Review DOM checks passed: exact Playlist preview, details show/hide, selection summary and reviewed action.');
   dom.window.close();
 })().catch(error => {
   console.error(error);

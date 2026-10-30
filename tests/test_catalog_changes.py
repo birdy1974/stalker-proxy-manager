@@ -499,6 +499,11 @@ def test_review_popup_shows_playlist_update_preview_and_action():
                 / "app/templates/portals.html").read_text(encoding="utf-8")
     assert "Update Playlist & mark reviewed" in template
     assert "Playlist update if reviewed" in template
+    assert "catalog-review-details-toggle" in template
+    assert "Hide details" in template and "Show details" in template
+    assert "catalog-review-details" in template
+    assert "catalog-review-summary" in template
+    assert "showDetails" in template
     assert "playlist_update" in template
     assert "playlist_items_updated" in template
 
