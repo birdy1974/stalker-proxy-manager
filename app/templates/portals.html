@@ -68,8 +68,10 @@ function probeMac(pid, mid, mac) {
       <div>${esc(r.detail || "")}</div>
       ${r.media ? `<div class="small text-muted mt-2">HTTP ${esc(String(r.media.status ?? "-"))} · ${esc(String(r.media.bytes))} bytes · ${esc(String(r.media.elapsed_s))}s · ${esc(r.media.ua || "")}</div>` : ""}
       ${r.elapsed_s ? `<div class="small text-muted mt-1">test took ${esc(String(r.elapsed_s))}s</div>` : ""}`;
-    openModal({ title: okish ? "MAC is available" : "MAC is not available", body, size: "md",
-                footer: el("div", {}) });
+    const footer = el("div");
+    const modal = openModal({ title: okish ? "MAC is available" : "MAC is not available", body,
+                              footer, size: "md", closeButton: true });
+    footer.append(mBtn("Close", "btn-outline-secondary", () => modal.close()));
     toast(okish ? `${mac}: available` : `${mac}: ${r.reason || "not available"}`,
           okish ? "ok" : "warn");
     table.reload();

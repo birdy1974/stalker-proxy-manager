@@ -20,6 +20,7 @@ Three things decide that question, and they are all tested here:
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -578,3 +579,16 @@ async def test_probe_endpoint_reports_the_panel_verdict(monkeypatch):
         rep = (await c.post(f"/api/portals/{pid}/macs/{mid}/probe", json={})).json()
     assert rep["available"] is True
     assert rep["reason"] == "free" and rep["mac"] == GOOD
+
+
+def test_mac_probe_result_popup_has_explicit_close_controls():
+    template = (Path(__file__).resolve().parents[1]
+                / "app/templates/portals.html").read_text(encoding="utf-8")
+    probe = template[template.index("function probeMac"):
+                     template.index("function pinIdentity")]
+
+    # The application modal uses a static backdrop and disables Esc, so an
+    # informational result without its own button would trap the user until
+    # a page reload. Pin both explicit exits used by this popup.
+    assert "closeButton: true" in probe
+    assert 'mBtn("Close", "btn-outline-secondary", () => modal.close())' in probe
