@@ -48,21 +48,30 @@ async def _seed_player_data() -> tuple[int, int, int, int]:
                                    original_name="Drama Show", enabled=True)
         s.add(serie_source)
         await s.flush()
-        season = SerieSeason(serie_source_id=serie_source.id, season_number=1,
-                             enabled=True)
-        s.add(season)
+        season_one = SerieSeason(serie_source_id=serie_source.id, season_number=1,
+                                 name="Season One", enabled=True)
+        season_two = SerieSeason(serie_source_id=serie_source.id, season_number=2,
+                                 name="Season Two", enabled=True)
+        s.add_all([season_one, season_two])
         await s.flush()
-        episode = SerieEpisode(serie_season_id=season.id, episode_number=1,
-                               name="Pilot", cmd="ffmpeg http://cdn/episode.ts")
-        s.add(episode)
+        s.add_all([
+            SerieEpisode(serie_season_id=season_one.id, episode_number=1,
+                         name="Pilot", cmd="ffmpeg http://cdn/episode.ts"),
+            SerieEpisode(serie_season_id=season_two.id, episode_number=1,
+                         name="Season Two Premiere", cmd="ffmpeg http://cdn/episode-s2.ts"),
+        ])
         playlist_series = SeriePlaylist(serie_source_id=serie_source.id,
                                         custom_name="Drama Show", group_name="Drama",
                                         enabled=True, order=1,
                                         poster="https://images.example/show.jpg")
         s.add(playlist_series)
         await s.flush()
-        s.add(SeriePlaylistSeason(serie_playlist_id=playlist_series.id,
-                                  serie_season_id=season.id, enabled=True))
+        s.add_all([
+            SeriePlaylistSeason(serie_playlist_id=playlist_series.id,
+                                serie_season_id=season_one.id, enabled=True),
+            SeriePlaylistSeason(serie_playlist_id=playlist_series.id,
+                                serie_season_id=season_two.id, enabled=True),
+        ])
 
         secret_source = SerieSource(portal_id=portal.id, portal_item_id="show-secret",
                                     original_name="Secret Show", enabled=True)
@@ -133,11 +142,18 @@ async def test_consumer_player_login_lists_visible_output_playlist_and_ts_templa
             'id="next-thumbnails"',
             'id="channel-thumbnails"',
             'id="show-more-thumbnails"',
+            'id="series-season-controls"',
+            'id="series-season-filter"',
+            'id="series-season-back"',
             "function renderThumbnails",
             "function surroundingItems",
             "function chooseThumbnail",
+            "function seriesSeasonFolders",
+            "function setSeriesSeasonFolder",
             "thumbnailUrl(item.logo)",
             "data-thumb-key",
+            "data-series-season-key",
+            "series_season_key",
         ):
             assert marker in page.text
 
@@ -158,13 +174,38 @@ async def test_consumer_player_login_lists_visible_output_playlist_and_ts_templa
             ("live", "News One"),
             ("vod", "Movie One"),
             ("episode", "Drama Show S01E01"),
+            ("episode", "Drama Show S02E01"),
             ("local", "Local Movie.mp4"),
         ]
         assert [(item["name"], item["logo"]) for item in playlist.json()["items"]] == [
             ("News One", "https://images.example/news.png"),
             ("Movie One", "https://images.example/movie.jpg"),
             ("Drama Show S01E01", "https://images.example/show.jpg"),
+            ("Drama Show S02E01", "https://images.example/show.jpg"),
             ("Local Movie.mp4", ""),
+        ]
+
+        episodes = [item for item in playlist.json()["items"]
+                    if item["kind"] == "episode"]
+        assert episodes[0]["series_id"] == episodes[1]["series_id"]
+        assert episodes[0]["season_id"] != episodes[1]["season_id"]
+        assert [item["group"] for item in episodes] == ["Series: Drama"] * 2
+        assert [item["series_name"] for item in episodes] == ["Drama Show"] * 2
+        assert [item["series_order"] for item in episodes] == [1, 1]
+        assert [item["season_number"] for item in episodes] == [1, 2]
+        assert [item["season_name"] for item in episodes] == [
+            "Season One", "Season Two",
+        ]
+        assert [item["episode_number"] for item in episodes] == [1, 1]
+        assert [item["episode_name"] for item in episodes] == [
+            "Pilot", "Season Two Premiere",
+        ]
+        series_id = episodes[0]["series_id"]
+        assert [item["series_season_key"] for item in episodes] == [
+            f"series:{series_id}:season:1", f"series:{series_id}:season:2",
+        ]
+        assert [item["series_season_name"] for item in episodes] == [
+            "Drama Show - Season One", "Drama Show - Season Two",
         ]
 
         templates = await client.get("/player/api/templates")

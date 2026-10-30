@@ -64,7 +64,7 @@
             <select class="form-select form-select-sm e2-field" id="f-container_mode"></select></div>
           <div class="col-md-3"><label class="muted-label" title="Use item template follows Playlist Builder assignments. Always proxy keeps streams on SPM (like web preview); Redirect sends the receiver straight to the portal/CDN. This setting affects only this bouquet profile.">Delivery</label>
             <select class="form-select form-select-sm e2-field" id="f-delivery_mode"></select></div>
-          <div class="col-md-3"><label class="muted-label" title="group_markers = one bouquet per group with markers per series/season (recommended). per_series = one bouquet per series. flat = everything in one.">Layout</label>
+          <div class="col-md-3"><label class="muted-label" title="group_markers = one bouquet per group with markers per series/season (recommended). per_series = one bouquet per series. flat = everything in one. season_bouquets = one Series bouquet that opens Show - Season sub-bouquets; Live/VOD keep group bouquets. Nested bouquets work in the receiver UI, but some OpenWebif/API views do not expand them.">Layout</label>
             <select class="form-select form-select-sm e2-field" id="f-layout"></select></div>
           <div class="col-md-6"><label class="muted-label">Content</label>
             <div class="d-flex gap-3 pt-1">
@@ -225,9 +225,15 @@ async function preview() {
   const r = await api(`/api/enigma2/profiles/${current.id}/preview`, { method: "POST" });
   const body = el("div");
   const warn = (r.summary.warnings || []).map(w => `<div class="alert alert-warning py-1 px-2 small mb-1">${esc(w)}</div>`).join("");
-  const tabs = r.files.map((f, i) => `<option value="${i}">${esc(f.title)} — ${f.services} services (${esc(f.name)})</option>`).join("");
+  const tabs = r.files.map((f, i) => {
+    const detail = f.links ? `${f.links} bouquet links` : `${f.services} services`;
+    const level = f.top_level === false ? "child · " : "";
+    return `<option value="${i}">${level}${esc(f.title)} — ${detail} (${esc(f.name)})</option>`;
+  }).join("");
+  const generated = r.summary.child_files
+    ? ` · ${r.summary.files_count} generated files (${r.summary.child_files} child season files)` : "";
   body.innerHTML = `${warn}
-    <div class="small text-muted mb-2">${r.summary.bouquets} bouquets · ${r.summary.services} services
+    <div class="small text-muted mb-2">${r.summary.bouquets} bouquets${generated} · ${r.summary.services} services
       · <span title="effective delivery per item: its ffmpeg template, plus this profile's delivery override">${r.summary.deliveries.ts} ts ·
       ${r.summary.deliveries.mkv} mkv · ${r.summary.deliveries.direct} direct</span>
       · URLs point at <span class="mono">${esc(r.base_url)}</span></div>

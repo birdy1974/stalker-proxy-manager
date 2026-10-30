@@ -323,10 +323,16 @@ async def push_bundle(profile, bundle: Bundle, *, dry_run: bool = False) -> Repo
         rep.error = ("nothing to push: this profile renders no services "
                      "(check its content types and group filters)")
         return rep
+    if not bundle.top_level_files:
+        rep.error = ("nothing to push: this profile renders bouquet files "
+                     "but no top-level bouquet to register")
+        return rep
 
     prefix = slugify(profile.bouquet_prefix)
+    # Upload every generated file, including nested child bouquets. Only
+    # top-level bouquet names belong in the receiver's bouquets.tv index.
     wanted = {f.name: f.text for f in bundle.files}
-    index = bouquets_add_file(list(wanted))
+    index = bouquets_add_file(bundle.top_level_names)
 
     def _run() -> Report:
         with _connect(profile) as ftp:
@@ -336,7 +342,8 @@ async def push_bundle(profile, bundle: Bundle, *, dry_run: bool = False) -> Repo
             stale = sorted(n for n in names
                            if n.startswith(f"userbouquet.{prefix}_")
                            and n.endswith(".tv") and n not in wanted)
-            merged = merge_bouquets_tv(existing_tv or "", list(wanted), prefix)
+            merged = merge_bouquets_tv(existing_tv or "",
+                                       bundle.top_level_names, prefix)
 
             if dry_run:
                 rep.step("connect", True, f"{profile.host}:{profile.ftp_port} as {profile.login}")

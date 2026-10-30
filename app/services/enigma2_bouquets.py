@@ -75,7 +75,7 @@ CONTAINER_MODES = ("auto", "fixed")
 # gstreamer/ffmpeg). Service type 1 hands the bytes to the DVB pipeline
 # unchanged, so it can only ever play raw MPEG-TS.
 FFMPEG_PLAYERS = ("4097", "5001", "5002")
-LAYOUTS = ("group_markers", "per_series", "flat")
+LAYOUTS = ("group_markers", "per_series", "flat", "season_bouquets")
 DELIVERY_MODES = ("template", "proxy", "redirect")
 TRANSPORTS = ("ftp", "download", "ssh")
 # Where the files belong on the receiver.
@@ -251,6 +251,13 @@ class BouquetFile:
     title: str                      # #NAME value, as shown in the box
     lines: list[str] = field(default_factory=list)
     services: int = 0
+    links: int = 0                  # nested `FROM BOUQUET` entries
+    top_level: bool = True          # registered in bouquets.tv
+
+    @property
+    def entries(self) -> int:
+        """Playable services plus bouquet links, for splitting/bookkeeping."""
+        return self.services + self.links
 
     @property
     def text(self) -> str:
@@ -270,10 +277,29 @@ class Bundle:
     def services(self) -> int:
         return sum(f.services for f in self.files)
 
+    @property
+    def top_level_files(self) -> list[BouquetFile]:
+        """Files the receiver should see directly in `bouquets.tv`."""
+        return [f for f in self.files if f.top_level]
+
+    @property
+    def child_files(self) -> list[BouquetFile]:
+        """Generated files reached through another bouquet, not the index."""
+        return [f for f in self.files if not f.top_level]
+
+    @property
+    def top_level_names(self) -> list[str]:
+        return [f.name for f in self.top_level_files]
+
     def summary(self) -> dict:
-        return {"bouquets": len(self.files), "services": self.services,
+        return {"bouquets": len(self.top_level_files),
+                "files_count": len(self.files),
+                "child_files": len(self.child_files),
+                "services": self.services,
                 "deliveries": self.deliveries,
-                "files": [{"name": f.name, "title": f.title, "services": f.services}
+                "files": [{"name": f.name, "title": f.title,
+                           "services": f.services, "links": f.links,
+                           "top_level": f.top_level}
                           for f in self.files],
                 "warnings": self.warnings}
 
@@ -287,9 +313,11 @@ class _Writer:
     top of a continuation so the user can still see where they are.
     """
 
-    def __init__(self, prefix: str, slug: str, title: str, max_entries: int) -> None:
+    def __init__(self, prefix: str, slug: str, title: str, max_entries: int,
+                 *, top_level: bool = True) -> None:
         self.prefix, self.slug, self.title = prefix, slug, title
         self.max_entries = max(50, int(max_entries or 1500))
+        self.top_level = top_level
         self.files: list[BouquetFile] = []
         self._start()
 
@@ -298,20 +326,27 @@ class _Writer:
         suffix = "" if n == 1 else f"_{n}"
         title = self.title if n == 1 else f"{self.title} ({n})"
         self.cur = BouquetFile(name=bouquet_filename(self.prefix, self.slug + suffix),
-                               title=title)
+                               title=title, top_level=self.top_level)
         self.files.append(self.cur)
 
     def marker(self, label: str) -> None:
         self.cur.lines += marker_line(label)
 
     def service(self, player: str, sid: int, url: str, name: str) -> None:
-        if self.cur.services >= self.max_entries:
+        if self.cur.entries >= self.max_entries:
             self._start(continued=True)
         self.cur.lines += service_line(player, sid, url, name)
         self.cur.services += 1
 
+    def bouquet(self, filename: str) -> None:
+        """Add a nested-bouquet entry, splitting exactly like a service."""
+        if self.cur.entries >= self.max_entries:
+            self._start(continued=True)
+        self.cur.lines.append(_BOUQUET_LINE.format(file=filename))
+        self.cur.links += 1
+
     def done(self) -> list[BouquetFile]:
-        return [f for f in self.files if f.services]
+        return [f for f in self.files if f.entries]
 
 
 # --------------------------------------------------------------------------- #
@@ -378,6 +413,10 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
     pgroups = _profile_groups(profile)
     prefix = profile.bouquet_prefix or "spm"
     layout = profile.layout if profile.layout in LAYOUTS else "group_markers"
+    # The nested show-season hierarchy is a Series-only presentation. Live
+    # and VOD keep the established grouped-bouquet behaviour in this mode
+    # rather than silently falling through to an unrelated layout branch.
+    other_layout = "group_markers" if layout == "season_bouquets" else layout
     mode = profile.delivery_mode if profile.delivery_mode in DELIVERY_MODES else "template"
 
     async with SessionLocal() as s:
@@ -392,10 +431,10 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
 
         if profile.include_live:
             bundle.files += await _live_files(s, profile, base_url, user, ugroups,
-                                              pgroups, prefix, layout, mode, res, tmap)
+                                              pgroups, prefix, other_layout, mode, res, tmap)
         if profile.include_vod:
             bundle.files += await _vod_files(s, profile, base_url, user, ugroups,
-                                             pgroups, prefix, layout, mode, res, tmap)
+                                             pgroups, prefix, other_layout, mode, res, tmap)
         if profile.include_series:
             bundle.files += await _series_files(s, profile, base_url, user, ugroups,
                                                 pgroups, prefix, layout, mode, res, tmap)
@@ -404,6 +443,11 @@ async def build_bundle(profile: Enigma2Profile, base_url: str) -> Bundle:
                                                pgroups, prefix, mode, res, tmap)
     bundle.deliveries = dict(res.counts)
     bundle.warnings += sorted(res.notes)
+    if bundle.child_files:
+        bundle.warnings.append(
+            "this layout uses nested Enigma2 bouquets: the receiver's own "
+            "channel list opens the Show - Season sub-bouquets, but some "
+            "OpenWebif/API views do not expand nested bouquets")
     if res.counts["direct"]:
         if mode == "redirect":
             bundle.warnings.append(
@@ -505,7 +549,9 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
                     bouquets in the box's list;
     group_markers   one bouquet per group, a marker per series and per season
                     (the default: browsable, and the bouquet count stays sane);
-    flat            everything in one bouquet, markers per series.
+    flat            everything in one bouquet, markers per series;
+    season_bouquets one top-level Series bouquet whose entries open a child
+                    bouquet for each combined "Show - Season N" folder.
     """
     series = (await s.execute(select(SeriePlaylist).where(SeriePlaylist.enabled.is_(True))
                               .order_by(SeriePlaylist.order, SeriePlaylist.id))).scalars().all()
@@ -537,6 +583,24 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
             for ep_id, ep_num in eps_by_season.get(season_id, []):
                 yield season_number, ep_num, ep_id
 
+    def season_groups(sp):
+        """Enabled episodes grouped by the season's displayed number.
+
+        A playlist series can link several `SerieSeason` rows with the same
+        number when fallback sources describe the same season. The nested
+        layout presents those rows as one combined Show - Season folder, so
+        aggregate before choosing child bouquet names and sort the combined
+        episode list by episode number (then stable episode id).
+        """
+        grouped: dict[int, list[tuple[int, int]]] = {}
+        for _sp_id, season_id, season_number in [r for r in season_rows if r[0] == sp.id]:
+            grouped.setdefault(season_number, []).extend(
+                eps_by_season.get(season_id, []))
+        for season_number in sorted(grouped):
+            eps = sorted(grouped[season_number], key=lambda ep: (ep[1], ep[0]))
+            if eps:
+                yield season_number, eps
+
     def add(w, sp, with_series_marker: bool) -> None:
         show = best_title(sp.custom_name)
         if with_series_marker:
@@ -552,6 +616,29 @@ async def _series_files(s, profile, base_url, user, ugroups, pgroups, prefix,
                       f"{show} S{season_number:02d}E{ep_num:02d}")
 
     out: list[BouquetFile] = []
+    if layout == "season_bouquets":
+        children: list[BouquetFile] = []
+        for sp in series:
+            show = best_title(sp.custom_name)
+            for season_number, eps in season_groups(sp):
+                season_slug = (f"s{season_number:02d}" if season_number >= 0
+                               else f"sneg{abs(season_number):02d}")
+                w = _Writer(prefix, f"series_{sp.id}_{season_slug}",
+                            f"{show} - Season {season_number}",
+                            profile.max_entries, top_level=False)
+                for ep_id, ep_num in eps:
+                    d = res.for_item(tmap.resolve("series", sp).id, "series")
+                    w.service(d.player, ep_id,
+                              stream_url(base_url, "episode", ep_id,
+                                         d.container, user, mode),
+                              f"{show} S{season_number:02d}E{ep_num:02d}")
+                children += w.done()
+        if not children:
+            return []
+        root = _Writer(prefix, "series", "SPM - Series", profile.max_entries)
+        for child in children:
+            root.bouquet(child.name)
+        return root.done() + children
     if layout == "per_series":
         for sp in series:
             show = best_title(sp.custom_name)
@@ -705,9 +792,10 @@ def tarball_bytes(bundle: Bundle, prefix: str = "spm") -> bytes:
     import tarfile
     import time
 
-    names = [f.name for f in bundle.files]
+    # Ship every generated file (including nested child bouquets), but only
+    # register top-level files in the receiver's bouquets.tv index.
     payload = {f.name: f.text for f in bundle.files}
-    payload[BOUQUET_ADD_FILE] = bouquets_add_file(names)
+    payload[BOUQUET_ADD_FILE] = bouquets_add_file(bundle.top_level_names)
     buf = io.BytesIO()
     now = int(time.time())
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:

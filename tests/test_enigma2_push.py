@@ -147,6 +147,23 @@ def _bundle(*names: str) -> e2.Bundle:
     return b
 
 
+def _hierarchy_bundle() -> e2.Bundle:
+    """One registered Series root plus two generated, unregistered children."""
+    root_name = "userbouquet.spm_series.tv"
+    child_names = ("userbouquet.spm_series_1_s01.tv",
+                   "userbouquet.spm_series_1_s02.tv")
+    b = e2.Bundle()
+    b.files.append(e2.BouquetFile(
+        name=root_name, title="SPM - Series", links=len(child_names),
+        lines=[e2._BOUQUET_LINE.format(file=name) for name in child_names]))
+    for i, name in enumerate(child_names, 1):
+        b.files.append(e2.BouquetFile(
+            name=name, title=f"Show - Season {i}", services=2, top_level=False,
+            lines=[f"#SERVICE 5002:0:1:{i}:0:0:0:0:0:0:http%3a//nas/x:Show S0{i}E01",
+                   f"#DESCRIPTION Show S0{i}E01"]))
+    return b
+
+
 # --------------------------------------------------------------------------- #
 # the push
 # --------------------------------------------------------------------------- #
@@ -159,6 +176,32 @@ async def test_push_uploads_the_bouquets_and_merges_the_index():
     assert 'userbouquet.spm_vod_action.tv" ORDER BY bouquet' in tv
     assert "userbouquet.favourites.tv" in tv and "userbouquet.astra19.tv" in tv
     assert rep.reloaded
+
+
+async def test_push_uploads_child_bouquets_but_registers_only_the_root():
+    rep = await push.push_bundle(_profile(), _hierarchy_bundle())
+    assert rep.ok and not rep.error
+    assert FakeFTP.files["userbouquet.spm_series.tv"].count("#SERVICE 1:7:") == 2
+    assert FakeFTP.files["userbouquet.spm_series_1_s01.tv"].startswith(
+        "#NAME Show - Season 1")
+    assert FakeFTP.files["userbouquet.spm_series_1_s02.tv"].startswith(
+        "#NAME Show - Season 2")
+
+    tv = FakeFTP.files["bouquets.tv"]
+    assert 'userbouquet.spm_series.tv" ORDER BY bouquet' in tv
+    assert "userbouquet.spm_series_1_s01.tv" not in tv
+    assert "userbouquet.spm_series_1_s02.tv" not in tv
+
+    add = FakeFTP.files["bouquets.spm.add"]
+    assert add.count("FROM BOUQUET") == 1
+    assert 'FROM BOUQUET "userbouquet.spm_series.tv"' in add
+    assert "userbouquet.spm_series_1_s01.tv" not in add
+    assert "userbouquet.spm_series_1_s02.tv" not in add
+    assert set(rep.uploaded) == {
+        "userbouquet.spm_series.tv",
+        "userbouquet.spm_series_1_s01.tv",
+        "userbouquet.spm_series_1_s02.tv",
+    }
 
 
 async def test_the_box_gets_exactly_one_restore_point_before_anything_changes():
@@ -238,6 +281,21 @@ async def test_an_empty_bundle_never_wipes_the_receiver():
     rep = await push.push_bundle(_profile(), e2.Bundle())
     assert not rep.ok and "nothing to push" in rep.error
     assert FakeFTP.files["bouquets.tv"] == FOREIGN_TV
+
+
+async def test_a_child_only_bundle_is_refused_before_writing():
+    """Generated Show-Season files without their registered root are unreachable
+    on the receiver, so an orphan-only bundle must be treated like no push."""
+    before = dict(FakeFTP.files)
+    rep = await push.push_bundle(_profile(), e2.Bundle(files=[
+        e2.BouquetFile(name="userbouquet.spm_series_1_s01.tv",
+                       title="Show - Season 1", services=2, top_level=False,
+                       lines=["#SERVICE 5002:0:1:1:0:0:0:0:0:0:http%3a//nas/x:S01E01",
+                              "#DESCRIPTION S01E01"]),
+    ]))
+    assert not rep.ok and "no top-level bouquet" in rep.error
+    assert FakeFTP.files == before
+    assert not FakeFTP.instances
 
 
 async def test_a_wrong_password_is_reported_as_a_readable_failure():

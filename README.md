@@ -247,6 +247,14 @@ Clicking a thumbnail selects that item and starts it with the chosen template;
 the underneath grid renders in batches with **Show more** for large playlists.
 Items without usable artwork fall back to their initials.
 
+When **Series** is selected, browsing uses one combined folder level:
+**Series -> Show - Season -> episodes**. The grid first shows Show-Season
+folder tiles for all visible series, regardless of their Series group; opening
+one shows only that season's episodes. The folder dropdown, back button and
+playlist optgroups follow the same two-level Series view. This does not change
+the standard M3U `Series: <group>` groups, and Xtream continues to expose its
+native show/season/episode API.
+
 **Probe stream** stops only this preview, releases its connection, and runs a
 fresh technical inspection. **Replay** resumes playback; **Enable sound**
 unmutes the initially muted player. The report includes all reported video,
@@ -735,8 +743,16 @@ An Enigma2 box reads plain-text bouquet files, so SPM writes them. A **receiver 
 | **Container choice** | `auto` (default) resolves the URL alias **per item, from the ffmpeg template that item is assigned**; `fixed` uses the two *Container* dropdowns for everything |
 | **Container** | which URL alias the line points at in `fixed` mode: `ts` or `mkv`. It has to match the item's ffmpeg template — the preview warns when `mkv` is combined with a player that cannot show text subtitles |
 | **Delivery** | `Use item template` (whatever each item is assigned in the Playlist Builder), `Always proxy via SPM` (same proxied path as web preview; Redirect items use the Copy fallback), or `Always redirect to portal/CDN` — the override applies to this bouquet profile only |
-| **Layout** | `group_markers` (one bouquet per group, marker lines per series and season — the default), `per_series` (one bouquet per show), `flat` (one per content kind). Bouquets are auto-split into numbered parts above *Max per bouquet* (default 1500) because Enigma2 redraws the whole list on every zap |
+| **Layout** | `group_markers` (one bouquet per group, marker lines per series and season — the default), `per_series` (one bouquet per show), `flat` (one per content kind), `season_bouquets` (Live/VOD keep the group-marker layout; one registered `SPM - Series` root spans all visible series groups and opens nested `Show - Season N` child bouquets containing the episodes). Bouquets are auto-split into numbered parts above *Max per bouquet* (default 1500) because Enigma2 redraws the whole list on every zap |
 | **Output user** | whose credentials and group whitelist the URLs carry; the profile can narrow the group filter further, never widen it |
+
+With `season_bouquets`, SPM uploads and packs every generated child file but
+registers only the top-level bouquets in `bouquets.tv`; the preview therefore
+distinguishes visible top-level bouquets from all generated files. Duplicate
+fallback season rows with the same displayed season number are merged into one
+Show-Season folder. The receiver's own channel list opens nested bouquets,
+but some OpenWebif/API views do not expand them. M3U Series groups and the
+Xtream series-info API are unchanged.
 
 Defaults are the Vu+ Duo2 recipe: live = `4097` + `.ts`, VOD and series = **`5002` + `.mkv`** so the copied SRT/ASS tracks actually reach the box.
 

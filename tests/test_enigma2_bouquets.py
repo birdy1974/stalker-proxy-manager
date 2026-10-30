@@ -28,7 +28,7 @@ from app.database import SessionLocal
 from app.main import app
 from app.models import (
     Enigma2Profile, FFmpegTemplate, LivePlaylist, LocalFile, LocalPlaylist, LocalSource, Portal,
-    SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SerieSeason, SerieSource,
+    SerieEpisode, SeriePlaylist, SeriePlaylistSeason, SeriePlaylistSource, SerieSeason, SerieSource,
     User, VodPlaylist, VodSource,
 )
 from app.services import enigma2_bouquets as e2
@@ -207,6 +207,92 @@ async def test_flat_layout_collapses_everything_per_kind():
     names = {f.name for f in bundle.files}
     assert names == {"userbouquet.spm_live.tv", "userbouquet.spm_vod.tv",
                      "userbouquet.spm_series.tv"}
+
+
+async def test_season_bouquets_layout_nests_show_seasons_under_one_series_root():
+    """The opt-in hierarchy is Main -> Series -> Show - Season -> episodes.
+
+    Live and VOD keep their group bouquets, while the Series group's genre is
+    deliberately not another level: one registered Series root links to the
+    combined show-season files, and only those children contain services.
+    """
+    user = await _catalogue()
+    bundle = await e2.build_bundle(_profile(user, layout="season_bouquets"), NAS)
+
+    assert bundle.services == 9
+    assert bundle.summary()["bouquets"] == 4       # 2 Live + VOD + Series root
+    assert bundle.summary()["files_count"] == 6    # plus two season children
+    assert bundle.summary()["child_files"] == 2
+    assert {f.name for f in bundle.top_level_files} == {
+        "userbouquet.spm_live_news.tv",
+        "userbouquet.spm_live_sport.tv",
+        "userbouquet.spm_vod_action.tv",
+        "userbouquet.spm_series.tv",
+    }
+
+    root = next(f for f in bundle.files if f.name == "userbouquet.spm_series.tv")
+    children = bundle.child_files
+    assert root.title == "SPM - Series"
+    assert root.top_level and root.services == 0 and root.links == 2
+    assert [f.title for f in children] == ["Show - Season 1", "Show - Season 2"]
+    assert [f.services for f in children] == [2, 2]
+    assert all(not f.top_level for f in children)
+    for child in children:
+        assert f'FROM BOUQUET "{child.name}" ORDER BY bouquet' in root.text
+    assert children[0].text.index("Show S01E01") < children[0].text.index("Show S01E02")
+    assert children[1].text.index("Show S02E01") < children[1].text.index("Show S02E02")
+    assert any("nested Enigma2 bouquets" in warning for warning in bundle.warnings)
+
+    # Pull-install tarballs must carry the children (the root points at them)
+    # without registering those children as additional top-level bouquets.
+    blob = e2.tarball_bytes(bundle, "spm")
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+        members = set(tar.getnames())
+        add = tar.extractfile(e2.BOUQUET_ADD_FILE).read().decode()
+    assert all(child.name in members for child in children)
+    assert 'FROM BOUQUET "userbouquet.spm_series.tv" ORDER BY bouquet' in add
+    assert all(child.name not in add for child in children)
+    assert add.count("FROM BOUQUET") == 4
+
+
+async def test_season_bouquets_merge_duplicate_displayed_seasons():
+    """Fallback sources can expose the same season number twice; the viewer
+    still gets one Show - Season bouquet with the episodes in episode order."""
+    user = await _catalogue()
+    async with SessionLocal() as s:
+        sp = (await s.execute(select(SeriePlaylist))).scalar_one()
+        primary = await s.get(SerieSource, sp.serie_source_id)
+        fallback = SerieSource(
+            portal_id=primary.portal_id,
+            portal_item_id="fallback-show",
+            original_name="Show",
+            enabled=True)
+        s.add(fallback)
+        await s.flush()
+        duplicate = SerieSeason(
+            serie_source_id=fallback.id, season_number=1,
+            name="Season 1 (fallback)")
+        s.add(duplicate)
+        await s.flush()
+        s.add_all([
+            SeriePlaylistSource(
+                serie_playlist_id=sp.id, serie_source_id=fallback.id,
+                priority=2),
+            SeriePlaylistSeason(
+                serie_playlist_id=sp.id, serie_season_id=duplicate.id,
+                enabled=True),
+            SerieEpisode(
+                serie_season_id=duplicate.id, episode_number=3, name="E3",
+                cmd="ffmpeg http://x"),
+        ])
+        await s.commit()
+
+    bundle = await e2.build_bundle(_profile(user, layout="season_bouquets"), NAS)
+    season_one = [f for f in bundle.child_files if f.title == "Show - Season 1"]
+    assert len(season_one) == 1
+    assert season_one[0].services == 3
+    text = season_one[0].text
+    assert text.index("Show S01E01") < text.index("Show S01E02") < text.index("Show S01E03")
 
 
 async def test_big_bouquets_are_split_into_numbered_parts():
@@ -389,17 +475,42 @@ async def test_profile_crud_preview_and_public_pull():
         # invalid enum values are refused instead of writing a broken bouquet
         assert (await c.put(f"/api/enigma2/profiles/{pid}",
                             json={"player_vod": "9999"})).status_code == 400
+        assert "season_bouquets" in meta["layouts"]
+        assert (await c.put(f"/api/enigma2/profiles/{pid}",
+                            json={"layout": "by_show_then_season"})).status_code == 400
 
         pv = (await c.post(f"/api/enigma2/profiles/{pid}/preview")).json()
         assert pv["summary"]["services"] == 9
         assert any(f["name"] == "userbouquet.spm_live_news.tv" for f in pv["files"])
         assert pv["install_url"].endswith(f"/enigma2/{token}/install.sh")
 
+        # The nested layout registers only the Series root, while the preview
+        # still exposes every generated child file for inspection.
+        await c.put(f"/api/enigma2/profiles/{pid}",
+                    json={"layout": "season_bouquets"})
+        pv = (await c.post(f"/api/enigma2/profiles/{pid}/preview")).json()
+        assert pv["summary"]["bouquets"] == 4
+        assert pv["summary"]["files_count"] == 6
+        assert pv["summary"]["child_files"] == 2
+        assert pv["summary"]["services"] == 9
+        root = next(f for f in pv["files"] if f["name"] == "userbouquet.spm_series.tv")
+        children = [f for f in pv["files"] if not f["top_level"]]
+        assert root["top_level"] and root["services"] == 0 and root["links"] == 2
+        assert [f["title"] for f in children] == ["Show - Season 1", "Show - Season 2"]
+        assert pv["bouquets_add"].count("FROM BOUQUET") == 4
+        assert 'FROM BOUQUET "userbouquet.spm_series.tv"' in pv["bouquets_add"]
+        assert all(child["name"] not in pv["bouquets_add"] for child in children)
+
         # the box pulls with its token, no admin session involved
         tar_r = await c.get(f"/enigma2/{token}/bouquets.tar.gz")
         assert tar_r.status_code == 200
         with tarfile.open(fileobj=io.BytesIO(tar_r.content), mode="r:gz") as tar:
-            assert any(n.startswith("userbouquet.spm_") for n in tar.getnames())
+            members = set(tar.getnames())
+            add = tar.extractfile(e2.BOUQUET_ADD_FILE).read().decode()
+        assert all(child["name"] in members for child in children)
+        assert add.count("FROM BOUQUET") == 4
+        assert 'FROM BOUQUET "userbouquet.spm_series.tv"' in add
+        assert all(child["name"] not in add for child in children)
         sh = await c.get(f"/enigma2/{token}/install.sh")
         assert sh.status_code == 200 and sh.text.startswith("#!/bin/sh")
         assert (await c.get("/enigma2/nope/install.sh")).status_code == 404
@@ -413,7 +524,7 @@ async def test_profile_crud_preview_and_public_pull():
         # build status is written back for the list view
         async with SessionLocal() as s:
             row = await s.get(Enigma2Profile, pid)
-            assert row.service_count == 9 and row.bouquet_count >= 4
+            assert row.service_count == 9 and row.bouquet_count == 4
 
         assert (await c.delete(f"/api/enigma2/profiles/{pid}")).status_code == 200
         assert (await c.get("/api/enigma2/profiles")).json()["items"] == []
@@ -435,6 +546,8 @@ async def test_the_gui_page_renders():
     async with AsyncClient(transport=transport, base_url=BASE) as c:
         r = await c.get("/enigma2")
         assert r.status_code == 200 and "Receivers" in r.text
+        assert "season_bouquets = one Series bouquet that opens Show - Season sub-bouquets" in r.text
+        assert "some OpenWebif/API views do not expand them" in r.text
 
 
 # --------------------------------------------------------------------------- #

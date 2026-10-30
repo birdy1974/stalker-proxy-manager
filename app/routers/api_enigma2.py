@@ -195,7 +195,7 @@ async def _bundle(pid: int, request: Request, db) -> tuple[Enigma2Profile, e2.Bu
     base = await _base_url(request)
     bundle = await _cached_build(p, base)
     p.last_build_at = datetime.now(timezone.utc)
-    p.bouquet_count = len(bundle.files)
+    p.bouquet_count = len(bundle.top_level_files)
     p.service_count = bundle.services
     await db.commit()
     # The status UPDATE bumps the content generation; carry this same bundle
@@ -218,16 +218,17 @@ async def preview(pid: int, request: Request, db=Depends(get_db)):
         "base_url": base,
         "install_url": f"{base.rstrip('/')}/enigma2/{p.token}/install.sh",
         "files": [{"name": f.name, "title": f.title, "services": f.services,
+                   "links": f.links, "top_level": f.top_level,
                    "text": f.text} for f in bundle.files],
-        "bouquets_add": e2.bouquets_add_file([f.name for f in bundle.files])
-        if bundle.files else "",
+        "bouquets_add": e2.bouquets_add_file(bundle.top_level_names)
+        if bundle.top_level_files else "",
     }
 
 
 @router.get("/profiles/{pid}/bouquets.tar.gz")
 async def download(pid: int, request: Request, db=Depends(get_db)):
     p, bundle, _base = await _bundle(pid, request, db)
-    if not bundle.files:
+    if not bundle.files or not bundle.top_level_files:
         raise HTTPException(409, "nothing to download: this profile renders no services")
     data = e2.tarball_bytes(bundle, p.bouquet_prefix)
     return Response(data, media_type="application/gzip", headers={
@@ -300,12 +301,12 @@ async def public_tarball(token: str, request: Request, db=Depends(get_db)):
     base = await _base_url(request)
     bundle = await _cached_build(p, base)
     p.last_build_at = datetime.now(timezone.utc)
-    p.bouquet_count, p.service_count = len(bundle.files), bundle.services
+    p.bouquet_count, p.service_count = len(bundle.top_level_files), bundle.services
     await db.commit()
     _BUNDLE_CACHE[_bundle_key(p, base)] = bundle
     await db_log("INFO", "enigma2",
-                 f"profile '{p.name}': receiver pulled {len(bundle.files)} bouquets "
-                 f"({bundle.services} services)")
+                 f"profile '{p.name}': receiver pulled {len(bundle.top_level_files)} bouquets "
+                 f"({len(bundle.files)} bouquet files, {bundle.services} services)")
     return Response(e2.tarball_bytes(bundle, p.bouquet_prefix),
                     media_type="application/gzip")
 
