@@ -68,8 +68,10 @@ function probeMac(pid, mid, mac) {
       <div>${esc(r.detail || "")}</div>
       ${r.media ? `<div class="small text-muted mt-2">HTTP ${esc(String(r.media.status ?? "-"))} · ${esc(String(r.media.bytes))} bytes · ${esc(String(r.media.elapsed_s))}s · ${esc(r.media.ua || "")}</div>` : ""}
       ${r.elapsed_s ? `<div class="small text-muted mt-1">test took ${esc(String(r.elapsed_s))}s</div>` : ""}`;
-    openModal({ title: okish ? "MAC is available" : "MAC is not available", body, size: "md",
-                footer: el("div", {}) });
+    const footer = el("div");
+    const modal = openModal({ title: okish ? "MAC is available" : "MAC is not available", body,
+                              footer, size: "md", closeButton: true });
+    footer.append(mBtn("Close", "btn-outline-secondary", () => modal.close()));
     toast(okish ? `${mac}: available` : `${mac}: ${r.reason || "not available"}`,
           okish ? "ok" : "warn");
     table.reload();
@@ -283,7 +285,7 @@ async function reviewCatalog(pid) {
       <div id="catalog-review-last" class="small text-muted flex-grow-1"></div>
       <button type="button" class="btn btn-sm btn-outline-primary" id="catalog-review-check"><i class="bi bi-arrow-repeat"></i> Check changes now</button>
     </div>
-    <div class="small text-muted mb-2">A scan fetches all enabled genres. Source metadata is refreshed, but playlist names, groups, order and templates are not overwritten. New items are not added to output until you choose them here.</div>
+    <div class="small text-muted mb-2">A scan fetches all enabled genres and refreshes the source rows. For an item already in the Playlist, <b>Update Playlist &amp; mark reviewed</b> copies exactly the Playlist fields listed under “Playlist update if reviewed” into the existing Playlist item. Playlist order, enabled state, live channel number/lock and FFmpeg templates are not changed. Ignore dismisses a row without copying. New items are not added to output until you choose “Add selected new”.</div>
     <ul class="nav nav-tabs nav-subtabs mb-2" id="catalog-review-tabs">
       ${["live", "vod", "series"].map(k => `<li class="nav-item"><button type="button" class="nav-link ${k === "live" ? "active" : ""}" data-kind="${k}">${k === "live" ? "Live" : k === "vod" ? "VOD" : "Series"} <span class="badge text-bg-light" data-count-kind="${k}">0</span></button></li>`).join("")}
     </ul>
@@ -292,6 +294,7 @@ async function reviewCatalog(pid) {
         <option value="">All pending</option><option value="new">New only</option><option value="changed">Changed only</option>
       </select>
       <input class="form-control form-control-sm" id="catalog-review-search" style="max-width:260px" placeholder="search title, genre or portal ID…">
+      <button type="button" class="btn btn-sm btn-outline-secondary" id="catalog-review-details-toggle" aria-expanded="true" aria-controls="catalog-review-rows" title="Show or hide source differences and Playlist update details"><i class="bi bi-eye-slash"></i> Hide details</button>
       <span class="small text-muted ms-auto" id="catalog-review-total"></span>
     </div>
     <div id="catalog-live-mode" class="small mb-2 d-none">
@@ -303,7 +306,7 @@ async function reviewCatalog(pid) {
     </div>
     <div class="table-responsive border rounded" style="max-height:58vh;overflow:auto">
       <table class="table table-sm table-hover align-middle mb-0">
-        <thead class="table-light sticky-top"><tr><th style="width:34px"><input type="checkbox" class="form-check-input" id="catalog-review-select-all" aria-label="Select page"></th><th>Source and differences</th><th style="width:170px">State</th></tr></thead>
+        <thead class="table-light sticky-top"><tr><th style="width:34px"><input type="checkbox" class="form-check-input" id="catalog-review-select-all" aria-label="Select page"></th><th id="catalog-review-source-heading">Source and differences</th><th style="width:170px">State</th></tr></thead>
         <tbody id="catalog-review-rows"><tr><td colspan="3" class="text-muted text-center p-3">Loading…</td></tr></tbody>
       </table>
     </div>
@@ -315,12 +318,12 @@ async function reviewCatalog(pid) {
   const footer = el("div", { class: "d-flex flex-wrap gap-2 align-items-center w-100" });
   const selectedCount = el("span", { class: "small text-muted me-auto", id: "catalog-review-selected" }, "0 selected");
   const addBtn = mBtn("Add selected new to Playlist", "btn-accent", async () => act("add"), "bi-plus-circle");
-  const reviewedBtn = mBtn("Mark reviewed", "btn-outline-secondary", async () => act("reviewed"), "bi-check2");
+  const reviewedBtn = mBtn("Update Playlist & mark reviewed", "btn-outline-primary", async () => act("reviewed"), "bi-check2-square");
   const ignoreBtn = mBtn("Ignore selected", "btn-outline-secondary", async () => act("ignored"), "bi-eye-slash");
   const closeBtn = mBtn("Close", "btn-outline-secondary", () => modal.close());
   footer.append(selectedCount, addBtn, reviewedBtn, ignoreBtn, closeBtn);
   const modal = openModal({ title: `Review catalogue changes — ${portal.name}`, body, footer, size: "xl" });
-  const state = { kind: "live", changeType: "", search: "", page: 1, perPage: 50, items: [], total: 0, busy: false, error: "" };
+  const state = { kind: "live", changeType: "", search: "", page: 1, perPage: 50, items: [], total: 0, busy: false, error: "", showDetails: true };
   const countKinds = () => {
     const counts = portal.catalog_changes || {};
     for (const kind of ["live", "vod", "series"]) {
@@ -330,13 +333,38 @@ async function reviewCatalog(pid) {
     }
   };
   const selected = () => $$("[data-change-id]:checked", body).map(n => Number(n.dataset.changeId));
-  const updateSelected = () => { selectedCount.textContent = `${selected().length} selected`; };
+  const updateSelected = () => {
+    const ids = selected();
+    let playlistItems = 0, updates = 0;
+    for (const item of state.items || []) {
+      if (!ids.includes(item.id)) continue;
+      for (const target of item.playlist_update?.targets || []) {
+        const n = (target.updates?.length || 0) + (target.season_links?.length || 0);
+        if (n) { playlistItems += 1; updates += n; }
+      }
+    }
+    selectedCount.textContent = `${ids.length} selected` +
+      (updates ? ` · ${playlistItems} Playlist item(s), ${updates} update(s)` : "");
+  };
   const showLastScan = () => {
     const node = $("#catalog-review-last", body);
     node.innerHTML = portal.catalog_last_success
       ? `Last successful scan: ${esc(fmtTime(portal.catalog_last_success, { seconds: false }))}`
       : "No successful item scan recorded yet. The first fetch of each enabled genre establishes a baseline.";
     if (portal.catalog_last_error) node.innerHTML += `<div class="text-danger">Last scan error: ${esc(portal.catalog_last_error)}</div>`;
+  };
+  const applyDetailsVisibility = () => {
+    const button = $("#catalog-review-details-toggle", body);
+    if (button) {
+      button.setAttribute("aria-expanded", String(state.showDetails));
+      button.innerHTML = state.showDetails
+        ? '<i class="bi bi-eye-slash"></i> Hide details'
+        : '<i class="bi bi-eye"></i> Show details';
+    }
+    const heading = $("#catalog-review-source-heading", body);
+    if (heading) heading.textContent = state.showDetails ? "Source and differences" : "Source";
+    $$(".catalog-review-details", body).forEach(node => { node.hidden = !state.showDetails; });
+    $$(".catalog-review-summary", body).forEach(node => { node.hidden = state.showDetails; });
   };
   const renderRows = () => {
     const host = $("#catalog-review-rows", body);
@@ -348,11 +376,63 @@ async function reviewCatalog(pid) {
       const pretty = value => value == null || value === "" ? "—"
         : typeof value === "boolean" ? (value ? "Yes" : "No")
         : String(value).length > 160 ? String(value).slice(0, 160) + "…" : String(value);
+      const arrow = (label, before, after) =>
+        `<li><b>${esc(label)}:</b> <span class="text-muted">${esc(pretty(before))}</span> <i class="bi bi-arrow-right"></i> <span>${esc(pretty(after))}</span></li>`;
+      const planOf = item => item.playlist_update || { state: item.in_playlist ? "primary" : "none", targets: [], fallback_targets: [], source_only: [], update_count: 0 };
+      const planHtml = item => {
+        const plan = planOf(item);
+        const sourceOnly = plan.source_only?.length
+          ? `<div class="small text-muted mt-1">Source-only, already refreshed (no Playlist field): ${plan.source_only.map(esc).join(", ")}</div>` : "";
+        let inner = "";
+        if (plan.state === "primary" && plan.targets?.length) {
+          inner = plan.targets.map(target => {
+            const updates = [
+              ...(target.updates || []).map(u => arrow(u.label, u.before, u.after)),
+              ...(target.season_links || []).map(s => `<li><b>Seasons:</b> add ${esc(s.name)} (${s.episode_count} episode(s), ${s.enabled ? "enabled" : "disabled"})</li>`),
+            ].join("");
+            const kept = (target.kept || []).map(u =>
+              `<li class="text-muted"><b>${esc(u.label)} kept:</b> ${esc(pretty(u.before))} <span>(${esc(u.reason || "not updated")}; portal value ${esc(pretty(u.after))})</span></li>`).join("");
+            return `<div class="mt-1"><div class="small"><b>Playlist #${target.playlist_id} ${esc(target.name || "")}</b> <span class="badge text-bg-primary">primary</span></div>` +
+              (updates || kept
+                ? `<ul class="small mb-1 ps-3">${updates}${kept}</ul>`
+                : `<div class="small text-muted">No Playlist fields will change — this Playlist item already matches the mapped source fields.</div>`) + `</div>`;
+          }).join("");
+        } else if (plan.state === "fallback" && plan.fallback_targets?.length) {
+          inner = plan.fallback_targets.map(t =>
+            `<div class="small text-muted">Fallback #${t.priority} on Playlist #${t.playlist_id} ${esc(t.name || "")}: review will not change that item's name/group/artwork. This source's playback fields are already refreshed.</div>`).join("");
+        } else {
+          inner = item.change_type === "new"
+            ? `<div class="small text-muted">Not in Playlist. “Add selected new to Playlist” creates/links it; “Update Playlist &amp; mark reviewed” will only dismiss this row.</div>`
+            : `<div class="small text-muted">Not in Playlist. Review will not create or update a Playlist item for this source.</div>`;
+        }
+        return `<div class="border rounded p-2 mt-2 bg-body-tertiary"><div class="small fw-semibold"><i class="bi bi-collection-play"></i> Playlist update if reviewed</div>${inner}${sourceOnly}</div>`;
+      };
+      const summaryHtml = item => {
+        const plan = planOf(item);
+        const differenceCount = Object.keys(item.changes || {}).length;
+        const sourceSummary = differenceCount
+          ? `${differenceCount} source difference(s)`
+          : (item.change_type === "new" ? "New source item" : "Source metadata changed");
+        const playlistSummary = plan.state === "primary"
+          ? (plan.update_count ? `Playlist will update (${plan.update_count})` : "No Playlist field changes")
+          : plan.state === "fallback" ? "Fallback only" : "Not in Playlist";
+        return `${esc(sourceSummary)} · ${esc(playlistSummary)}`;
+      };
+      const stateBadge = item => {
+        const plan = item.playlist_update || {};
+        if (plan.state === "primary") return plan.update_count
+          ? '<span class="badge text-bg-warning">Playlist will update</span>'
+          : '<span class="badge text-bg-primary">In playlist</span>';
+        if (plan.state === "fallback") return '<span class="badge text-bg-secondary">Fallback only</span>';
+        return item.in_playlist
+          ? '<span class="badge text-bg-primary">In playlist</span>'
+          : '<span class="badge text-bg-light">Not in playlist</span>';
+      };
       host.innerHTML = state.items.map(item => {
         const differences = Object.entries(item.changes || {}).map(([label, pair]) =>
           `<div class="small text-break"><b>${esc(label)}:</b> <span class="text-muted">${esc(pretty(pair?.before))}</span> <i class="bi bi-arrow-right"></i> <span>${esc(pretty(pair?.after))}</span></div>`).join("");
         const detail = item.change_type === "new"
-          ? `<div class="small text-success">New source item found · portal ID <span class="mono">${esc(item.portal_item_id)}</span></div>`
+          ? `<div class="small text-success">New source item found · portal ID <span class="mono">${esc(item.portal_item_id)}</span></div>${differences ? `<div class="mt-1">${differences}</div>` : ""}`
           : (differences || '<div class="small text-muted">Source metadata changed.</div>');
         const typeBadge = item.change_type === "new"
           ? '<span class="badge text-bg-success">NEW</span>'
@@ -361,8 +441,9 @@ async function reviewCatalog(pid) {
           <td><input type="checkbox" class="form-check-input" data-change-id="${item.id}" aria-label="Select ${esc(item.name)}"></td>
           <td><div class="fw-semibold">${esc(item.name || "(untitled)")} ${typeBadge}</div>
             <div class="small text-muted">${esc(item.genre || "No genre")}${item.portal_item_id ? ` · ID ${esc(item.portal_item_id)}` : ""}</div>
-            <div class="mt-1">${detail}</div></td>
-          <td><div>${item.in_playlist ? '<span class="badge text-bg-primary">In playlist</span>' : '<span class="badge text-bg-light">Not in playlist</span>'}</div>
+            <div class="catalog-review-details" ${state.showDetails ? "" : "hidden"}><div class="mt-1">${detail}</div>${planHtml(item)}</div>
+            <div class="small text-muted mt-1 catalog-review-summary" ${state.showDetails ? "hidden" : ""}>${summaryHtml(item)}</div></td>
+          <td><div>${stateBadge(item)}</div>
             <div class="small text-muted mt-1">${item.enabled ? "Source enabled" : "Source disabled"}</div>
             <div class="small text-muted">${item.updated_at ? esc(fmtTime(item.updated_at, { seconds: false })) : ""}</div></td>
         </tr>`;
@@ -375,6 +456,7 @@ async function reviewCatalog(pid) {
     $("#catalog-review-prev", body).disabled = state.page <= 1 || state.busy;
     $("#catalog-review-next", body).disabled = state.page >= pages || state.busy;
     $("#catalog-review-select-all", body).checked = state.items.length > 0 && selected().length === state.items.length;
+    applyDetailsVisibility();
     updateSelected();
   };
   const load = async () => {
@@ -402,7 +484,10 @@ async function reviewCatalog(pid) {
               (result.skipped_changed ? ` · ${result.skipped_changed} changed row(s) left pending` : "") +
               (result.missing ? ` · ${result.missing} source(s) no longer available` : ""), "ok");
         if (result.season_jobs?.length) toast("Fetching seasons for newly added series…", "info");
-      } else toast(`${result.updated || 0} row(s) ${action === "ignored" ? "ignored" : "marked reviewed"}`, "ok");
+      } else if (action === "reviewed") {
+        toast(`${result.updated || 0} row(s) marked reviewed · ${result.playlist_items_updated || 0} Playlist item(s) updated (${result.playlist_fields_updated || 0} field(s)` +
+              (result.season_links_added ? `, ${result.season_links_added} season link(s)` : "") + `)`, "ok");
+      } else toast(`${result.updated || 0} row(s) ignored`, "ok");
       await load(); await table.reload();
       portal = table.items.find(x => x.id === pid) || portal; countKinds(); showLastScan();
     } catch (e) { /* api() already reports the reason */ }
@@ -422,6 +507,10 @@ async function reviewCatalog(pid) {
   $("#catalog-review-search", body).addEventListener("input", event => {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(() => { state.search = event.target.value.trim(); state.page = 1; load(); }, 250);
+  });
+  $("#catalog-review-details-toggle", body).addEventListener("click", () => {
+    state.showDetails = !state.showDetails;
+    applyDetailsVisibility();
   });
   $("#catalog-review-select-all", body).addEventListener("change", event => {
     $$('[data-change-id]', body).forEach(box => { box.checked = event.target.checked; }); updateSelected();

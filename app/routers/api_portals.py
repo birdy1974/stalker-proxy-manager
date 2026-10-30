@@ -877,14 +877,11 @@ async def get_catalog_changes(pid: int, kind: str = "live", change_type: str = "
         raise HTTPException(400, "change_type must be new|changed")
 
     config = {
-        "live": (LiveSource, LiveGenre, LiveSource.live_genre_id,
-                 LivePlaylistSource, LivePlaylistSource.live_source_id, "portal_channel_id"),
-        "vod": (VodSource, VodGenre, VodSource.vod_genre_id,
-                VodPlaylistSource, VodPlaylistSource.vod_source_id, "portal_item_id"),
-        "series": (SerieSource, SerieGenre, SerieSource.serie_genre_id,
-                   SeriePlaylistSource, SeriePlaylistSource.serie_source_id, "portal_item_id"),
+        "live": (LiveSource, LiveGenre, LiveSource.live_genre_id, "portal_channel_id"),
+        "vod": (VodSource, VodGenre, VodSource.vod_genre_id, "portal_item_id"),
+        "series": (SerieSource, SerieGenre, SerieSource.serie_genre_id, "portal_item_id"),
     }
-    source_model, genre_model, genre_fk, link_model, link_fk, portal_id_attr = config[kind]
+    source_model, genre_model, genre_fk, portal_id_attr = config[kind]
     stmt = (select(CatalogChange, source_model, genre_model)
             .join(source_model, source_model.id == CatalogChange.source_id)
             .outerjoin(genre_model, genre_model.id == genre_fk)
@@ -907,16 +904,16 @@ async def get_catalog_changes(pid: int, kind: str = "live", change_type: str = "
     rows = (await db.execute(stmt.order_by(CatalogChange.updated_at.desc(),
                                            CatalogChange.id.desc())
                              .offset((page - 1) * per_page).limit(per_page))).all()
-    source_ids = [source.id for _change, source, _genre in rows]
-    linked = set()
-    if source_ids:
-        linked = set((await db.execute(
-            select(link_fk).where(link_fk.in_(source_ids)).distinct()
-        )).scalars().all())
+    from ..services.catalog_changes import decode_changes, playlist_update_plans
+
+    decoded_changes = [decode_changes(change.changes_json) for change, _source, _genre in rows]
+    plans = await playlist_update_plans(db, pid, kind, rows)
 
     items = []
-    from ..services.catalog_changes import decode_changes
-    for change, source, genre in rows:
+    for (change, source, genre), changes in zip(rows, decoded_changes):
+        plan = plans.get(change.id, {"state": "none", "targets": [],
+                                      "fallback_targets": [], "source_only": [],
+                                      "update_count": 0})
         items.append({
             "id": change.id,
             "kind": kind,
@@ -928,10 +925,11 @@ async def get_catalog_changes(pid: int, kind: str = "live", change_type: str = "
                      or getattr(source, "category_name", None)
                      or "",
             "change_type": change.change_type,
-            "changes": decode_changes(change.changes_json),
+            "changes": changes,
             "status": change.status,
             "enabled": bool(getattr(source, "enabled", False)),
-            "in_playlist": source.id in linked,
+            "in_playlist": plan.get("state") != "none",
+            "playlist_update": plan,
             "detected_at": change.detected_at.isoformat() if change.detected_at else None,
             "updated_at": change.updated_at.isoformat() if change.updated_at else None,
         })
@@ -940,7 +938,13 @@ async def get_catalog_changes(pid: int, kind: str = "live", change_type: str = "
 
 @router.post("/{pid}/catalog-changes/review")
 async def review_catalog_changes(pid: int, payload: dict, db=Depends(get_db)):
-    """Mark, ignore, or add selected new catalogue items to the output playlist."""
+    """Review/ignore changes, or add selected new catalogue items to output.
+
+    Reviewing is the approval step for changed items already in the Playlist:
+    it copies the mapped source fields shown by the list endpoint's
+    `playlist_update` plan into the primary/canonical Playlist item, then
+    marks the change reviewed. Ignoring dismisses without copying anything.
+    """
     if not await db.get(Portal, pid):
         raise HTTPException(404, "portal not found")
     action = payload.get("action")
@@ -960,11 +964,34 @@ async def review_catalog_changes(pid: int, payload: dict, db=Depends(get_db)):
     rows = (await db.execute(select(CatalogChange).where(
         CatalogChange.portal_id == pid, CatalogChange.status == "pending",
         CatalogChange.id.in_(ids)))).scalars().all()
-    if action in ("reviewed", "ignored"):
+    if action == "ignored":
         for row in rows:
             row.status = action
         await db.commit()
-        return {"ok": True, "updated": len(rows), "status": action}
+        return {"ok": True, "updated": len(rows), "status": action,
+                "playlist_items_updated": 0, "playlist_fields_updated": 0,
+                "season_links_added": 0}
+    if action == "reviewed":
+        from ..services.catalog_changes import apply_reviewed_playlist_updates
+
+        try:
+            applied = await apply_reviewed_playlist_updates(db, pid, rows)
+            for row in rows:
+                row.status = action
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001 - keep review all-or-nothing
+            await db.rollback()
+            raise HTTPException(400, f"could not update the Playlist from review: {exc}") from exc
+        epg_changed = bool(applied.pop("epg_changed", False))
+        if epg_changed:
+            from .api_epg import queue_cached_refresh
+            queue_cached_refresh()
+        await db_log("INFO", "catalog",
+                     f"portal {pid}: reviewed {len(rows)} catalogue change(s); "
+                     f"updated {applied['playlist_items_updated']} Playlist item(s) "
+                     f"({applied['playlist_fields_updated']} field(s), "
+                     f"{applied['season_links_added']} season link(s))")
+        return {"ok": True, "updated": len(rows), "status": action, **applied}
 
     kind = payload.get("kind")
     if kind not in ("live", "vod", "series"):

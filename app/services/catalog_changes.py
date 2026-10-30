@@ -13,9 +13,15 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
-from ..models import CatalogChange, utcnow
+from ..models import (
+    CatalogChange, LiveGenre, LivePlaylist, LivePlaylistSource, LiveSource,
+    SerieEpisode, SerieGenre, SeriePlaylist, SeriePlaylistSeason,
+    SeriePlaylistSource, SerieSeason, SerieSource, VodGenre, VodPlaylist,
+    VodPlaylistSource, VodSource, utcnow,
+)
+from .titles import best_title
 
 KINDS = ("live", "vod", "series")
 
@@ -199,6 +205,354 @@ async def record_changes(db, portal_id: int, kind: str,
         row.updated_at = now
     await db.flush()
     return len(events)
+
+
+# --------------------------------------------------------------------------- #
+# Review: copying detected source changes into existing Playlist items
+# --------------------------------------------------------------------------- #
+# A catalogue scan has already refreshed the *source* rows by the time a
+# CatalogChange is reviewed. Playback-only source fields (cmd, link flags,
+# catch-up, duration) are therefore already live. The Playlist tables also
+# carry denormalised copies of a few source fields, though, and those copies
+# are what Playlist Builder/M3U/Xtream display. Reviewing a change now copies
+# the mapped fields below into the existing Playlist item for which this
+# source is primary/canonical. Fallback-only sources never rename/re-group a
+# shared channel. Playlist order, enabled state, live channel number/lock and
+# FFmpeg templates are deliberately not part of this map.
+_PLAYLIST_TRIGGER_LABELS = {
+    "Name", "Title", "Logo", "Poster", "EPG ID", "Year", "Rating",
+    "Description", "Genre", "Season metadata",
+}
+
+
+def _values_equal(current: Any, proposed: Any) -> bool:
+    if isinstance(current, (str, type(None))) and isinstance(proposed, (str, type(None))):
+        return (current or "") == (proposed or "")
+    return current == proposed
+
+
+def _playlist_display(field: str, value: Any) -> Any:
+    if field == "logo":
+        return _display_value("live", "Logo", value)
+    if field == "poster":
+        return _display_value("vod", "Poster", value)
+    if field == "overview":
+        return _display_value("vod", "Description", value)
+    return _display_value("live", "Name", value)
+
+
+def _playlist_value_map(kind: str, source, genre) -> dict[str, tuple[str, Any, set[str]]]:
+    """Playlist field -> (GUI label, latest source value, diff labels)."""
+    genre_name = genre.name if genre else None
+    if kind == "live":
+        return {
+            "custom_name": ("Playlist name", source.original_name, {"Name"}),
+            "group_name": ("Playlist group", genre_name, {"Genre"}),
+            "logo": ("Playlist logo", source.logo_original, {"Logo"}),
+            "epg_id": ("Playlist EPG ID", source.epg_original, {"EPG ID"}),
+        }
+    if kind == "vod":
+        return {
+            "custom_name": ("Playlist title", best_title(source.original_name), {"Title"}),
+            "group_name": ("Playlist group", genre_name or source.genre,
+                           {"Genre"}),
+            "poster": ("Playlist poster", source.poster, {"Poster"}),
+            "year": ("Playlist year", source.year, {"Year"}),
+            "rating": ("Playlist rating", source.rating, {"Rating"}),
+            "overview": ("Playlist description", source.description, {"Description"}),
+        }
+    if kind == "series":
+        return {
+            "custom_name": ("Playlist title", best_title(source.original_name), {"Title"}),
+            "group_name": ("Playlist group", genre_name or source.category_name,
+                           {"Genre"}),
+            "poster": ("Playlist poster", source.poster, {"Poster"}),
+            "year": ("Playlist year", source.year, {"Year"}),
+            "rating": ("Playlist rating", source.rating, {"Rating"}),
+            "overview": ("Playlist description", source.description, {"Description"}),
+        }
+    return {}
+
+
+def _is_derived_group(kind: str, current: Any, genre_names: set[str]) -> bool:
+    group = str(current or "").strip()
+    default = {"live": "Live", "vod": "VOD", "series": "Series"}.get(kind, "")
+    return group in ("", default) or group in genre_names
+
+
+def _compute_target_updates(kind: str, source, genre, playlist,
+                            change_labels: set[str], genre_names: set[str]):
+    """Internal (raw) Playlist field updates for one primary target."""
+    updates: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
+    for field, (label, proposed, triggers) in _playlist_value_map(kind, source, genre).items():
+        if field in ("custom_name", "group_name") and not str(proposed or "").strip():
+            continue
+        current = getattr(playlist, field, None)
+        if _values_equal(current, proposed):
+            continue
+        entry = {"field": field, "label": label,
+                 "before_raw": current, "after_raw": proposed}
+        if field == "group_name":
+            # A detected genre move follows the portal. Without that signal,
+            # only a group that still looks portal-derived (a genre name or
+            # the generic default) is moved; a genuinely custom Playlist
+            # group is reported as kept instead of silently overwritten.
+            if triggers & change_labels or _is_derived_group(kind, current, genre_names):
+                updates.append(entry)
+            else:
+                kept.append({**entry, "reason": "custom Playlist group kept"})
+        elif triggers & change_labels:
+            updates.append(entry)
+    return updates, kept
+
+
+async def _genre_names(db, portal_id: int, kind: str) -> set[str]:
+    model = {"live": LiveGenre, "vod": VodGenre, "series": SerieGenre}.get(kind)
+    if model is None:
+        return set()
+    rows = (await db.execute(select(model.name).where(model.portal_id == portal_id))).all()
+    return {str(name).strip() for (name,) in rows if str(name or "").strip()}
+
+
+async def _playlist_targets(db, kind: str, source_ids: list[int]):
+    """Return (primary/canonical targets, fallback-only placements)."""
+    primary: dict[int, list[tuple[Any, int | None]]] = {}
+    fallback: dict[int, list[dict[str, Any]]] = {}
+    if not source_ids:
+        return primary, fallback
+
+    if kind == "live":
+        links = (await db.execute(
+            select(LivePlaylistSource.live_source_id,
+                   LivePlaylistSource.live_playlist_id,
+                   LivePlaylistSource.priority)
+            .where(LivePlaylistSource.live_source_id.in_(source_ids)))).all()
+        playlist_ids = {pid for _sid, pid, _prio in links}
+        if not playlist_ids:
+            return primary, fallback
+        stats = {pid: (int(min_prio or 0), int(count or 0)) for pid, min_prio, count in (await db.execute(
+            select(LivePlaylistSource.live_playlist_id,
+                   func.min(LivePlaylistSource.priority), func.count())
+            .where(LivePlaylistSource.live_playlist_id.in_(playlist_ids))
+            .group_by(LivePlaylistSource.live_playlist_id))).all()}
+        playlists = {row.id: row for row in (await db.execute(
+            select(LivePlaylist).where(LivePlaylist.id.in_(playlist_ids)))).scalars().all()}
+        for sid, pid, prio in links:
+            playlist = playlists.get(pid)
+            if playlist is None:
+                continue
+            min_prio, chain_len = stats.get(pid, (prio, 1))
+            if prio == min_prio:
+                primary.setdefault(sid, []).append((playlist, prio))
+            else:
+                fallback.setdefault(sid, []).append({
+                    "playlist_id": pid, "name": playlist.custom_name,
+                    "priority": prio, "chain_len": chain_len,
+                })
+        return primary, fallback
+
+    if kind == "vod":
+        playlist_model, canonical_col = VodPlaylist, VodPlaylist.vod_source_id
+        link_model = VodPlaylistSource
+        link_playlist_col, link_source_col = link_model.vod_playlist_id, link_model.vod_source_id
+    elif kind == "series":
+        playlist_model, canonical_col = SeriePlaylist, SeriePlaylist.serie_source_id
+        link_model = SeriePlaylistSource
+        link_playlist_col, link_source_col = link_model.serie_playlist_id, link_model.serie_source_id
+    else:
+        return primary, fallback
+
+    playlists = (await db.execute(
+        select(playlist_model).where(canonical_col.in_(source_ids)))).scalars().all()
+    links = (await db.execute(
+        select(link_source_col, link_playlist_col, link_model.priority, playlist_model)
+        .join(playlist_model, playlist_model.id == link_playlist_col)
+        .where(link_source_col.in_(source_ids)))).all()
+    priority_by_pair = {(sid, pid): prio for sid, pid, prio, _pl in links}
+    for playlist in playlists:
+        sid = getattr(playlist, canonical_col.key)
+        primary.setdefault(sid, []).append(
+            (playlist, priority_by_pair.get((sid, playlist.id))))
+    fallback_pids = {pid for sid, pid, _prio, pl in links
+                     if getattr(pl, canonical_col.key) != sid}
+    chain_lengths = {}
+    if fallback_pids:
+        chain_lengths = {pid: int(count or 0) for pid, count in (await db.execute(
+            select(link_playlist_col, func.count())
+            .where(link_playlist_col.in_(fallback_pids))
+            .group_by(link_playlist_col))).all()}
+    for sid, pid, prio, playlist in links:
+        if getattr(playlist, canonical_col.key) == sid:
+            continue
+        fallback.setdefault(sid, []).append({
+            "playlist_id": pid, "name": playlist.custom_name,
+            "priority": prio, "chain_len": chain_lengths.get(pid, 1),
+        })
+    return primary, fallback
+
+
+async def _missing_season_links(db, primary) -> dict[tuple[int, int], list[dict[str, Any]]]:
+    """SeriePlaylistSeason rows a review would add for canonical targets."""
+    source_ids = list(primary)
+    playlist_ids = {playlist.id for targets in primary.values() for playlist, _prio in targets}
+    if not source_ids or not playlist_ids:
+        return {}
+    seasons = (await db.execute(
+        select(SerieSeason).where(SerieSeason.serie_source_id.in_(source_ids))
+        .order_by(SerieSeason.serie_source_id, SerieSeason.season_number))).scalars().all()
+    if not seasons:
+        return {}
+    existing = {(pid, season_id) for pid, season_id in (await db.execute(
+        select(SeriePlaylistSeason.serie_playlist_id,
+               SeriePlaylistSeason.serie_season_id)
+        .where(SeriePlaylistSeason.serie_playlist_id.in_(playlist_ids)))).all()}
+    counts = {season_id: int(count or 0) for season_id, count in (await db.execute(
+        select(SerieEpisode.serie_season_id, func.count())
+        .where(SerieEpisode.serie_season_id.in_([s.id for s in seasons]))
+        .group_by(SerieEpisode.serie_season_id))).all()}
+    by_source: dict[int, list[SerieSeason]] = {}
+    for season in seasons:
+        by_source.setdefault(season.serie_source_id, []).append(season)
+    missing: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for sid, targets in primary.items():
+        for playlist, _prio in targets:
+            rows = []
+            for season in by_source.get(sid, []):
+                if (playlist.id, season.id) in existing:
+                    continue
+                rows.append({
+                    "season_id": season.id,
+                    "season_number": season.season_number,
+                    "name": season.name or f"Season {season.season_number}",
+                    "enabled": bool(season.enabled),
+                    "episode_count": counts.get(season.id, 0),
+                })
+            if rows:
+                missing[(sid, playlist.id)] = rows
+    return missing
+
+
+def _display_updates(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [{
+        "field": entry["field"],
+        "label": entry["label"],
+        "before": _playlist_display(entry["field"], entry["before_raw"]),
+        "after": _playlist_display(entry["field"], entry["after_raw"]),
+        **({"reason": entry["reason"]} if entry.get("reason") else {}),
+    } for entry in entries]
+
+
+async def playlist_update_plans(db, portal_id: int, kind: str, entries) -> dict[int, dict[str, Any]]:
+    """Display-safe, exact Playlist consequences of reviewing each change.
+
+    `entries` are `(CatalogChange, source, genre)` triples for one kind. The
+    returned plan is keyed by CatalogChange id and is also the GUI contract:
+    primary targets list every Playlist field that *Update Playlist & mark
+    reviewed* will set, fallback placements explain why channel-level fields
+    stay put, and source-only labels have no Playlist counterpart.
+    """
+    entries = list(entries)
+    if not entries:
+        return {}
+    source_ids = [source.id for _change, source, _genre in entries]
+    genre_names = await _genre_names(db, portal_id, kind)
+    primary, fallback = await _playlist_targets(db, kind, source_ids)
+    season_missing = await _missing_season_links(db, primary) if kind == "series" else {}
+
+    plans: dict[int, dict[str, Any]] = {}
+    for change, source, genre in entries:
+        changes = decode_changes(change.changes_json)
+        labels = set(changes)
+        targets = []
+        update_count = 0
+        for playlist, priority in primary.get(source.id, []):
+            updates, kept = _compute_target_updates(
+                kind, source, genre, playlist, labels, genre_names)
+            season_links = season_missing.get((source.id, playlist.id), [])
+            update_count += len(updates) + len(season_links)
+            targets.append({
+                "playlist_id": playlist.id,
+                "name": playlist.custom_name,
+                "role": "primary",
+                "priority": priority,
+                "updates": _display_updates(updates),
+                "kept": _display_updates(kept),
+                "season_links": season_links,
+            })
+        plans[change.id] = {
+            "state": "primary" if targets else ("fallback" if fallback.get(source.id) else "none"),
+            "targets": targets,
+            "fallback_targets": fallback.get(source.id, []),
+            "source_only": [label for label in changes if label not in _PLAYLIST_TRIGGER_LABELS],
+            "update_count": update_count,
+        }
+    return plans
+
+
+async def apply_reviewed_playlist_updates(db, portal_id: int, rows) -> dict[str, Any]:
+    """Apply the plans for rows being marked reviewed; caller commits."""
+    totals: dict[str, Any] = {
+        "playlist_items_updated": 0,
+        "playlist_fields_updated": 0,
+        "season_links_added": 0,
+        "epg_changed": False,
+    }
+    updated_playlists: set[tuple[str, int]] = set()
+    by_kind: dict[str, list[CatalogChange]] = {}
+    for row in rows:
+        by_kind.setdefault(row.kind, []).append(row)
+
+    source_models = {"live": LiveSource, "vod": VodSource, "series": SerieSource}
+    genre_models = {"live": LiveGenre, "vod": VodGenre, "series": SerieGenre}
+    genre_fk = {"live": "live_genre_id", "vod": "vod_genre_id", "series": "serie_genre_id"}
+    for kind, kind_rows in by_kind.items():
+        source_model = source_models.get(kind)
+        if source_model is None:
+            continue
+        source_ids = list(dict.fromkeys(row.source_id for row in kind_rows))
+        sources = {source.id: source for source in (await db.execute(
+            select(source_model).where(source_model.id.in_(source_ids),
+                                       source_model.portal_id == portal_id))).scalars().all()}
+        genre_ids = {getattr(source, genre_fk[kind]) for source in sources.values()
+                     if getattr(source, genre_fk[kind], None)}
+        genres = {}
+        if genre_ids:
+            genre_model = genre_models[kind]
+            genres = {genre.id: genre for genre in (await db.execute(
+                select(genre_model).where(genre_model.id.in_(genre_ids)))).scalars().all()}
+        genre_names = await _genre_names(db, portal_id, kind)
+        primary, _fallback = await _playlist_targets(db, kind, list(sources))
+        season_missing = await _missing_season_links(db, primary) if kind == "series" else {}
+
+        for change in kind_rows:
+            source = sources.get(change.source_id)
+            if source is None:
+                continue
+            genre = genres.get(getattr(source, genre_fk[kind], None))
+            labels = set(decode_changes(change.changes_json))
+            for playlist, _priority in primary.get(source.id, []):
+                updates, _kept = _compute_target_updates(
+                    kind, source, genre, playlist, labels, genre_names)
+                changed = False
+                for update in updates:
+                    setattr(playlist, update["field"], update["after_raw"])
+                    totals["playlist_fields_updated"] += 1
+                    changed = True
+                    if kind == "live" and update["field"] == "epg_id":
+                        totals["epg_changed"] = True
+                for season in season_missing.get((source.id, playlist.id), []):
+                    db.add(SeriePlaylistSeason(
+                        serie_playlist_id=playlist.id,
+                        serie_season_id=season["season_id"],
+                        enabled=bool(season["enabled"])))
+                    totals["season_links_added"] += 1
+                    changed = True
+                if changed:
+                    updated_playlists.add((kind, playlist.id))
+    await db.flush()
+    totals["playlist_items_updated"] = len(updated_playlists)
+    return totals
 
 
 def aware_utc(value: datetime | None) -> datetime | None:
