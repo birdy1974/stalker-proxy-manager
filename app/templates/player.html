@@ -88,6 +88,9 @@
     .thumb-kind { position:absolute; top:.45rem; left:.45rem; z-index:2; }
     .thumb-play { position:absolute; right:.45rem; bottom:.45rem; z-index:2; display:inline-flex; align-items:center; gap:.3rem; padding:.24rem .48rem; border-radius:999px; background:var(--pl-thumb-overlay); color:#fff; font-size:.68rem; font-weight:700; opacity:0; transition:opacity .15s ease; }
     .channel-thumb:hover .thumb-play, .channel-thumb:focus-visible .thumb-play, .channel-thumb.is-playing .thumb-play { opacity:1; }
+    .thumb-folder-count { position:absolute; top:.45rem; right:.45rem; z-index:2; padding:.24rem .48rem; border-radius:999px; background:var(--pl-thumb-overlay); color:#fff; font-size:.68rem; font-weight:700; }
+    .series-season-folder .thumb-play { opacity:1; }
+    .series-season-controls select { min-width:min(360px, 70vw); }
     .thumb-body { display:flex; flex-direction:column; gap:.18rem; padding:.55rem .65rem .65rem; }
     .thumb-title { display:-webkit-box; overflow:hidden; -webkit-box-orient:vertical; -webkit-line-clamp:2; font-size:.82rem; font-weight:650; line-height:1.25; }
     .thumb-meta { display:-webkit-box; overflow:hidden; -webkit-box-orient:vertical; -webkit-line-clamp:1; color:var(--pl-muted); font-size:.72rem; line-height:1.25; }
@@ -187,6 +190,16 @@
               <span class="small muted" id="filter-count"></span>
             </div>
           </div>
+          <div class="series-season-controls d-flex flex-wrap gap-2 align-items-center mt-3" id="series-season-controls" hidden>
+            <span class="small muted"><i class="bi bi-folder2-open me-1"></i>Show–Season:</span>
+            <select class="form-select form-select-sm w-auto" id="series-season-filter" aria-label="Show and season folder">
+              <option value="">All Show–Season folders</option>
+            </select>
+            <button class="btn btn-sm btn-outline-secondary" id="series-season-back" type="button" hidden>
+              <i class="bi bi-arrow-left me-1"></i>All Show–Season folders
+            </button>
+            <span class="small muted" id="series-season-current" aria-live="polite"></span>
+          </div>
           <div class="small muted mt-2"><span id="type-hint">Only enabled items in your allowed Live, VOD, Series and Local groups are shown.</span> Browser-compatible enabled MPEG-TS templates are listed; playback stays on SPM and uses the normal fallback, connection-limit and stream-cleanup pipeline. <span id="selected-meta"></span></div>
         </div>
       </div>
@@ -225,7 +238,7 @@
 
         <section class="card channel-browse" aria-label="All channels and titles">
           <div class="channel-panel-head">
-            <h2><i class="bi bi-grid-3x3-gap me-1"></i>All channels &amp; titles</h2>
+            <h2><i class="bi bi-grid-3x3-gap me-1"></i><span id="browse-heading">All channels &amp; titles</span></h2>
             <span class="channel-panel-count" id="browse-count"></span>
           </div>
           <div class="channel-grid" id="channel-thumbnails"></div>
@@ -253,8 +266,12 @@
     const selectedMeta = $("selected-meta"), typeHint = $("type-hint");
     const previousThumbnails = $("previous-thumbnails"), nextThumbnails = $("next-thumbnails");
     const channelThumbnails = $("channel-thumbnails"), showMoreThumbnails = $("show-more-thumbnails");
+    const seriesSeasonControls = $("series-season-controls"), seriesSeasonFilter = $("series-season-filter");
+    const seriesSeasonBack = $("series-season-back"), seriesSeasonCurrent = $("series-season-current");
+    const browseHeading = $("browse-heading");
     let engine = null, channels = [], templates = [], playingHandler = null;
     let currentKindFilter = "all";
+    let currentSeriesSeasonKey = "";
     let nativeFallback = false;
     let currentPlayingKey = "";
     const THUMBNAIL_PAGE_SIZE = 120;
@@ -296,12 +313,171 @@
       return `<span class="kind-badge ${cls}">${label}</span>`;
     }
 
-    function filteredItems() {
+    function numericValue(value, fallback = Number.MAX_SAFE_INTEGER) {
+      if (value === null || value === undefined || value === "") return fallback;
+      const number = Number(value);
+      return Number.isFinite(number) ? number : fallback;
+    }
+
+    function compareText(a, b) {
+      return String(a || "").localeCompare(String(b || ""), undefined, { sensitivity: "base" });
+    }
+
+    function seriesSeasonInfo(item) {
+      if (!item || item.kind !== "episode") return null;
+      const legacyMatch = String(item.name || "").trim().match(/^(.*?)\s+S(-?\d+)E(-?\d+)$/i);
+      const legacySeriesName = legacyMatch?.[1]?.trim() || "";
+      const legacySeasonNumber = legacyMatch ? Number(legacyMatch[2]) : NaN;
+      const legacyEpisodeNumber = legacyMatch ? Number(legacyMatch[3]) : NaN;
+      const seriesId = numericValue(item.series_id ?? item.seriesId, NaN);
+      const seasonNumber = numericValue(item.season_number ?? item.seasonNumber, legacySeasonNumber);
+      const episodeNumber = numericValue(item.episode_number ?? item.episodeNumber, legacyEpisodeNumber);
+      const seriesName = String(item.series_name || item.seriesName || legacySeriesName || item.name || "Series").trim() || "Series";
+      const rawSeasonName = String(item.season_name || item.seasonName || "").trim();
+      const seasonName = rawSeasonName || (Number.isFinite(seasonNumber) ? `Season ${seasonNumber}` : "Season");
+      let key = String(item.series_season_key || item.seriesSeasonKey || "").trim();
+      if (!key && Number.isFinite(seriesId) && Number.isFinite(seasonNumber)) {
+        key = `series:${seriesId}:season:${seasonNumber}`;
+      }
+      if (!key && Number.isFinite(seasonNumber)) {
+        key = `legacy:${seriesName.toLocaleLowerCase()}:season:${seasonNumber}`;
+      }
+      if (!key) key = "series:unknown";
+      const rawFolderName = String(item.series_season_name || item.seriesSeasonName || "").trim();
+      const name = key === "series:unknown"
+        ? "Episodes without season"
+        : (rawFolderName || `${seriesName} - ${seasonName}`);
+      return {
+        key,
+        name,
+        seriesId,
+        seriesName,
+        seriesOrder: numericValue(item.series_order ?? item.seriesOrder),
+        seasonNumber,
+        seasonName: key === "series:unknown" ? "Season" : seasonName,
+        episodeNumber,
+        episodeName: String(item.episode_name || item.episodeName || (Number.isFinite(episodeNumber) ? `Episode ${episodeNumber}` : "Episode")).trim() || "Episode",
+      };
+    }
+
+    function itemSearchText(item) {
+      const info = seriesSeasonInfo(item);
+      const code = info && Number.isFinite(info.seasonNumber) && Number.isFinite(info.episodeNumber)
+        ? `S${String(info.seasonNumber).padStart(2, "0")}E${String(info.episodeNumber).padStart(2, "0")}`
+        : "";
+      return [
+        item.name,
+        item.group,
+        KIND_LABEL[item.kind] || item.kind,
+        info?.seriesName,
+        info?.seasonName,
+        info?.name,
+        info?.episodeName,
+        code,
+      ].filter(Boolean).join(" ").toLowerCase();
+    }
+
+    function compareSeriesEpisodes(a, b) {
+      const ai = seriesSeasonInfo(a);
+      const bi = seriesSeasonInfo(b);
+      return (ai?.seriesOrder ?? Number.MAX_SAFE_INTEGER) - (bi?.seriesOrder ?? Number.MAX_SAFE_INTEGER)
+        || numericValue(ai?.seriesId) - numericValue(bi?.seriesId)
+        || compareText(ai?.seriesName, bi?.seriesName)
+        || numericValue(ai?.seasonNumber) - numericValue(bi?.seasonNumber)
+        || numericValue(ai?.episodeNumber) - numericValue(bi?.episodeNumber)
+        || numericValue(a.id) - numericValue(b.id);
+    }
+
+    function seriesFolderActive() {
+      return currentKindFilter === "episode";
+    }
+
+    function baseFilteredItems() {
       let out = channels;
       if (currentKindFilter !== "all") out = out.filter(i => i.kind === currentKindFilter);
       const q = (searchFilter.value || "").trim().toLowerCase();
-      if (q) out = out.filter(i => (i.name||"").toLowerCase().includes(q) || (i.group||"").toLowerCase().includes(q) || (KIND_LABEL[i.kind]||i.kind).toLowerCase().includes(q));
+      if (q) out = out.filter(i => itemSearchText(i).includes(q));
+      if (currentKindFilter === "episode") out = [...out].sort(compareSeriesEpisodes);
       return out;
+    }
+
+    function filteredItems() {
+      const out = baseFilteredItems();
+      if (!seriesFolderActive() || !currentSeriesSeasonKey) return out;
+      return out.filter(item => seriesSeasonInfo(item)?.key === currentSeriesSeasonKey);
+    }
+
+    function seriesSeasonFolders(items = baseFilteredItems()) {
+      const byKey = new Map();
+      items.forEach(item => {
+        const info = seriesSeasonInfo(item);
+        if (!info) return;
+        let folder = byKey.get(info.key);
+        if (!folder) {
+          folder = { ...info, representative: item, episodes: [] };
+          byKey.set(info.key, folder);
+        }
+        folder.episodes.push(item);
+      });
+      const folders = [...byKey.values()];
+      folders.forEach(folder => {
+        folder.episodes.sort((a, b) =>
+          numericValue(seriesSeasonInfo(a)?.episodeNumber) - numericValue(seriesSeasonInfo(b)?.episodeNumber)
+          || numericValue(a.id) - numericValue(b.id));
+      });
+      folders.sort((a, b) =>
+        Number(a.key === "series:unknown") - Number(b.key === "series:unknown")
+        || a.seriesOrder - b.seriesOrder
+        || numericValue(a.seriesId) - numericValue(b.seriesId)
+        || compareText(a.seriesName, b.seriesName)
+        || numericValue(a.seasonNumber) - numericValue(b.seasonNumber)
+        || compareText(a.name, b.name));
+      return folders;
+    }
+
+    function activeSeriesSeasonFolder(folders = seriesSeasonFolders()) {
+      return folders.find(folder => folder.key === currentSeriesSeasonKey) || null;
+    }
+
+    function syncSeriesSeasonControls(baseItems = baseFilteredItems()) {
+      const active = seriesFolderActive();
+      if (!active) currentSeriesSeasonKey = "";
+      const folders = active ? seriesSeasonFolders(baseItems) : [];
+      if (active && currentSeriesSeasonKey && !folders.some(folder => folder.key === currentSeriesSeasonKey)) {
+        currentSeriesSeasonKey = "";
+      }
+      seriesSeasonControls.hidden = !active;
+      seriesSeasonFilter.replaceChildren(new Option(
+        `All Show–Season folders${folders.length ? ` (${folders.length})` : ""}`, ""));
+      folders.forEach(folder => {
+        seriesSeasonFilter.add(new Option(
+          `${folder.name} (${folder.episodes.length} episode${folder.episodes.length === 1 ? "" : "s"})`,
+          folder.key));
+      });
+      seriesSeasonFilter.value = currentSeriesSeasonKey;
+      seriesSeasonFilter.disabled = !folders.length;
+      const currentFolder = activeSeriesSeasonFolder(folders);
+      seriesSeasonBack.hidden = !currentFolder;
+      seriesSeasonCurrent.textContent = !active ? ""
+        : currentFolder ? `Series / ${currentFolder.name}`
+        : folders.length ? "Choose a folder or open one below."
+        : "No Show–Season folders match.";
+      return folders;
+    }
+
+    function setSeriesSeasonFolder(key) {
+      currentSeriesSeasonKey = key || "";
+      renderChannelSelect();
+    }
+
+    function setKindFilter(kind) {
+      const previousKind = currentKindFilter;
+      currentKindFilter = kind || "all";
+      kindFilter.value = currentKindFilter;
+      if (currentKindFilter !== previousKind) currentSeriesSeasonKey = "";
+      document.querySelectorAll("#kind-pills .filter-pill").forEach(b =>
+        b.classList.toggle("active", b.dataset.kind === currentKindFilter));
+      renderChannelSelect();
     }
 
     function itemKey(item) {
@@ -319,20 +495,23 @@
       return words.slice(0, 2).map(word => word[0] || "").join("").toUpperCase() || "?";
     }
 
-    function createThumbnail(item) {
+    function createThumbnail(item, folder = null) {
+      const isFolder = Boolean(folder);
+      const info = seriesSeasonInfo(item);
       const key = itemKey(item);
       const tile = document.createElement("button");
       tile.type = "button";
-      tile.className = "channel-thumb";
-      tile.dataset.thumbKey = key;
-      tile.title = `Play ${item.name || "Unnamed item"}`;
+      tile.className = `channel-thumb${isFolder ? " series-season-folder" : ""}`;
+      if (isFolder) tile.dataset.seriesSeasonKey = folder.key;
+      else tile.dataset.thumbKey = key;
+      tile.title = isFolder ? `Open ${folder.name}` : `Play ${item.name || "Unnamed item"}`;
       tile.setAttribute("aria-label", tile.title);
 
       const media = document.createElement("span");
       media.className = `thumb-media${item.kind === "live" ? " is-logo" : ""}`;
       const fallback = document.createElement("span");
       fallback.className = "thumb-fallback";
-      fallback.textContent = thumbnailInitials(item);
+      fallback.textContent = thumbnailInitials(isFolder ? { name: folder.seriesName } : item);
       media.appendChild(fallback);
 
       const imageUrl = thumbnailUrl(item.logo);
@@ -349,16 +528,23 @@
 
       const badge = document.createElement("span");
       badge.className = `kind-badge ${KIND_BADGE_CLASS[item.kind] || "kind-live"} thumb-kind`;
-      badge.textContent = KIND_LABEL[item.kind] || item.kind;
+      badge.textContent = isFolder ? "Season" : (KIND_LABEL[item.kind] || item.kind);
       media.appendChild(badge);
+
+      if (isFolder) {
+        const count = document.createElement("span");
+        count.className = "thumb-folder-count";
+        count.textContent = `${folder.episodes.length} ep.`;
+        media.appendChild(count);
+      }
 
       const playHint = document.createElement("span");
       playHint.className = "thumb-play";
       const playIcon = document.createElement("i");
-      playIcon.className = "bi bi-play-fill";
+      playIcon.className = isFolder ? "bi bi-folder2-open" : "bi bi-play-fill";
       const playLabel = document.createElement("span");
       playLabel.className = "thumb-play-label";
-      playLabel.textContent = "Play";
+      playLabel.textContent = isFolder ? "Open" : "Play";
       playHint.append(playIcon, playLabel);
       media.appendChild(playHint);
 
@@ -366,11 +552,13 @@
       body.className = "thumb-body";
       const title = document.createElement("span");
       title.className = "thumb-title";
-      title.textContent = item.name || "Unnamed item";
+      title.textContent = isFolder ? folder.name : (item.name || "Unnamed item");
       body.appendChild(title);
       const metaParts = [];
       if (item.number !== undefined && item.number !== null && item.number !== "") metaParts.push(`#${item.number}`);
-      if (item.group) metaParts.push(item.group);
+      if (isFolder) metaParts.push(`${folder.episodes.length} episode${folder.episodes.length === 1 ? "" : "s"}`);
+      else if (info) metaParts.push(info.name);
+      else if (item.group) metaParts.push(item.group);
       if (metaParts.length) {
         const meta = document.createElement("span");
         meta.className = "thumb-meta";
@@ -385,6 +573,12 @@
     function renderThumbnailList(container, items) {
       const fragment = document.createDocumentFragment();
       items.forEach(item => fragment.appendChild(createThumbnail(item)));
+      container.replaceChildren(fragment);
+    }
+
+    function renderSeriesSeasonFolderList(container, folders) {
+      const fragment = document.createDocumentFragment();
+      folders.forEach(folder => fragment.appendChild(createThumbnail(folder.representative, folder)));
       container.replaceChildren(fragment);
     }
 
@@ -417,16 +611,29 @@
         const label = tile.querySelector(".thumb-play-label");
         if (label) label.textContent = playing ? "Now playing" : "Play";
       });
+      document.querySelectorAll("[data-series-season-key]").forEach(tile => {
+        const active = tile.dataset.seriesSeasonKey === currentSeriesSeasonKey;
+        tile.classList.toggle("is-selected", active);
+        tile.removeAttribute("aria-current");
+        const label = tile.querySelector(".thumb-play-label");
+        if (label) label.textContent = "Open";
+      });
     }
 
     function renderThumbnails({ resetLimit = false } = {}) {
       if (resetLimit) thumbnailLimit = THUMBNAIL_PAGE_SIZE;
       const visible = filteredItems();
-      const { anchor, previous, next } = surroundingItems(visible);
+      const baseVisible = baseFilteredItems();
+      const folders = seriesFolderActive() ? seriesSeasonFolders(baseVisible) : [];
+      const activeFolder = activeSeriesSeasonFolder(folders);
+      const rootView = seriesFolderActive() && !activeFolder;
+      const { anchor, previous, next } = rootView
+        ? { anchor: null, previous: [], next: [] }
+        : surroundingItems(visible);
       const peerLabel = { live: "channels", vod: "movies", episode: "episodes", local: "local files" }[anchor?.kind] || "items";
 
-      $("previous-heading").textContent = `Previous ${peerLabel}`;
-      $("next-heading").textContent = `Next ${peerLabel}`;
+      $("previous-heading").textContent = rootView ? "Previous" : `Previous ${peerLabel}`;
+      $("next-heading").textContent = rootView ? "Next" : `Next ${peerLabel}`;
       $("previous-count").textContent = previous.length ? `${previous.length} shown` : "";
       $("next-count").textContent = next.length ? `${next.length} shown` : "";
       renderThumbnailList(previousThumbnails, previous);
@@ -435,16 +642,34 @@
       nextThumbnails.hidden = !next.length;
       $("previous-thumbnails-empty").hidden = previous.length > 0;
       $("next-thumbnails-empty").hidden = next.length > 0;
+      $("previous-thumbnails-empty").textContent = rootView ? "Open a Show–Season folder to browse episodes." : "No earlier item";
+      $("next-thumbnails-empty").textContent = rootView ? "Previous / next appears inside a folder." : "No later item";
 
-      const shown = visible.slice(0, thumbnailLimit);
-      renderThumbnailList(channelThumbnails, shown);
-      channelThumbnails.hidden = !shown.length;
-      $("channel-thumbnails-empty").hidden = visible.length > 0;
-      $("browse-count").textContent = channels.length ? `${visible.length} / ${channels.length} shown by filter` : "";
-      $("browse-showing").textContent = visible.length
-        ? `Showing ${shown.length} of ${visible.length} thumbnails. Click a thumbnail to play it.`
-        : "";
-      showMoreThumbnails.hidden = shown.length >= visible.length;
+      const shownFolders = rootView ? folders.slice(0, thumbnailLimit) : [];
+      const episodeItems = activeFolder ? [...activeFolder.episodes] : visible;
+      const shownItems = rootView ? [] : episodeItems.slice(0, thumbnailLimit);
+      browseHeading.textContent = rootView
+        ? "Series — Show–Season folders"
+        : activeFolder ? activeFolder.name : "All channels & titles";
+      if (rootView) renderSeriesSeasonFolderList(channelThumbnails, shownFolders);
+      else renderThumbnailList(channelThumbnails, shownItems);
+      const shownCount = rootView ? shownFolders.length : shownItems.length;
+      const totalCount = rootView ? folders.length : episodeItems.length;
+      channelThumbnails.hidden = !shownCount;
+      $("channel-thumbnails-empty").hidden = totalCount > 0;
+      $("channel-thumbnails-empty").textContent = rootView
+        ? "No Show–Season folders match the current filter."
+        : "No thumbnails match the current filter.";
+      $("browse-count").textContent = rootView
+        ? `${folders.length} folder${folders.length === 1 ? "" : "s"} · ${baseVisible.length} episode${baseVisible.length === 1 ? "" : "s"}`
+        : activeFolder ? `${episodeItems.length} episode${episodeItems.length === 1 ? "" : "s"} in ${activeFolder.name}`
+        : channels.length ? `${visible.length} / ${channels.length} shown by filter` : "";
+      $("browse-showing").textContent = rootView
+        ? folders.length ? `Showing ${shownFolders.length} of ${folders.length} Show–Season folders. Click a folder to open it.` : ""
+        : activeFolder
+          ? episodeItems.length ? `Showing ${shownItems.length} of ${episodeItems.length} episodes. Click an episode to play it.` : ""
+          : visible.length ? `Showing ${shownItems.length} of ${visible.length} thumbnails. Click a thumbnail to play it.` : "";
+      showMoreThumbnails.hidden = shownCount >= totalCount;
       syncThumbnailStates();
     }
 
@@ -458,6 +683,10 @@
       document.querySelector(".player-card")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
 
+    function openSeriesSeasonFolder(key) {
+      setSeriesSeasonFolder(key);
+    }
+
     function fillChannels(items) {
       channels = items || [];
       renderChannelSelect();
@@ -465,6 +694,8 @@
     }
 
     function renderChannelSelect() {
+      const baseItems = baseFilteredItems();
+      const folders = syncSeriesSeasonControls(baseItems);
       const filtered = filteredItems();
       const previousValue = channelSelect.value;
       channelSelect.replaceChildren();
@@ -482,6 +713,26 @@
         order.forEach(kind => {
           const list = groups[kind];
           if (!list.length) return;
+          if (kind === "episode" && seriesFolderActive()) {
+            folders
+              .filter(folder => !currentSeriesSeasonKey || folder.key === currentSeriesSeasonKey)
+              .forEach(folder => {
+                const folderGroup = document.createElement("optgroup");
+                folderGroup.label = `${folder.name} — ${folder.episodes.length}`;
+                folder.episodes.forEach(item => {
+                  const info = seriesSeasonInfo(item);
+                  const code = info && Number.isFinite(info.seasonNumber) && Number.isFinite(info.episodeNumber)
+                    ? `S${String(info.seasonNumber).padStart(2, "0")}E${String(info.episodeNumber).padStart(2, "0")}`
+                    : "";
+                  const label = `${item.name || "Unnamed item"}${code ? ` (${code}${info?.episodeName ? ` · ${info.episodeName}` : ""})` : ""}`;
+                  const opt = new Option(label, `${item.kind}:${item.id}`);
+                  opt.dataset.kind = item.kind;
+                  folderGroup.appendChild(opt);
+                });
+                channelSelect.appendChild(folderGroup);
+              });
+            return;
+          }
           const og = document.createElement("optgroup");
           og.label = `${KIND_LABEL[kind] || kind} — ${list.length}`;
           list.forEach(item => {
@@ -534,11 +785,12 @@
       const item = channels.find(row => `${row.kind}:${row.id}` === channelSelect.value);
       if (!item) { selectedMeta.innerHTML = ""; syncThumbnailStates(); return; }
       const badge = kindBadge(item.kind);
+      const info = seriesSeasonInfo(item);
       const detail = item.kind === "live" ? "Live stream — low-latency, auto-cleanup enabled."
         : item.kind === "vod" ? "VOD — seekable, full-duration playback."
         : item.kind === "episode" ? "Series episode — seekable, grouped by show/season."
         : "Local file — proxied via SPM, transcoded to MPEG-TS.";
-      selectedMeta.innerHTML = ` Selected: ${badge} ${item.group ? esc(item.group) + " · " : ""}${esc(item.name)} — <span class="muted">${detail}</span>`;
+      selectedMeta.innerHTML = ` Selected: ${badge} ${info ? esc(info.name) + " · " : item.group ? esc(item.group) + " · " : ""}${esc(item.name)} — <span class="muted">${detail}</span>`;
       syncThumbnailStates();
     }
     function esc(s){ return String(s??"").replace(/[&<>\"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
@@ -582,6 +834,8 @@
       try { kindFilter.value = "all"; } catch {}
       document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === "all"));
       try { searchFilter.value = ""; } catch {}
+      currentSeriesSeasonKey = "";
+      syncSeriesSeasonControls([]);
       currentPlayingKey = "";
       renderThumbnails({ resetLimit: true });
       playerPanel.hidden = true;
@@ -630,19 +884,12 @@
       catch (error) { if (/session|login|required|expired|disabled/i.test(error.message)) await showLogin(error.message); else playStatus.textContent = error.message; }
     });
 
-    kindFilter.addEventListener("change", () => {
-      currentKindFilter = kindFilter.value;
-      document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === currentKindFilter));
-      renderChannelSelect();
-    });
+    kindFilter.addEventListener("change", () => setKindFilter(kindFilter.value));
     document.querySelectorAll("#kind-pills .filter-pill").forEach(btn => {
-      btn.addEventListener("click", () => {
-        currentKindFilter = btn.dataset.kind;
-        kindFilter.value = currentKindFilter;
-        document.querySelectorAll("#kind-pills .filter-pill").forEach(b => b.classList.toggle("active", b.dataset.kind === currentKindFilter));
-        renderChannelSelect();
-      });
+      btn.addEventListener("click", () => setKindFilter(btn.dataset.kind));
     });
+    seriesSeasonFilter.addEventListener("change", () => setSeriesSeasonFolder(seriesSeasonFilter.value));
+    seriesSeasonBack.addEventListener("click", () => setSeriesSeasonFolder(""));
     searchFilter.addEventListener("input", () => renderChannelSelect());
     channelSelect.addEventListener("change", () => {
       updateSelectedMeta();
@@ -723,6 +970,8 @@
 
     $("play").addEventListener("click", () => { void startPlayback(); });
     $("player-stage").addEventListener("click", event => {
+      const folderTile = event.target.closest("[data-series-season-key]");
+      if (folderTile) { openSeriesSeasonFolder(folderTile.dataset.seriesSeasonKey); return; }
       const tile = event.target.closest("[data-thumb-key]");
       if (tile) void chooseThumbnail(tile.dataset.thumbKey);
     });

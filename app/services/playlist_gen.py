@@ -163,32 +163,50 @@ async def web_player_playlist_items(user: User) -> list[dict]:
         for batch in _chunked([row.id for row in visible_series]):
             seasons.extend((await s.execute(
                 select(SeriePlaylistSeason.serie_playlist_id, SerieSeason.id,
-                       SerieSeason.season_number)
+                       SerieSeason.season_number, SerieSeason.name)
                 .join(SerieSeason, SerieSeason.id == SeriePlaylistSeason.serie_season_id)
                 .where(SeriePlaylistSeason.serie_playlist_id.in_(batch),
                        SeriePlaylistSeason.enabled.is_(True))
                 .order_by(SerieSeason.season_number))).all())
         episodes_by_season: dict[int, list] = {}
         for batch in _chunked([row[1] for row in seasons]):
-            for season_id, episode_id, episode_number in (await s.execute(
+            for season_id, episode_id, episode_number, episode_name in (await s.execute(
                     select(SerieEpisode.serie_season_id, SerieEpisode.id,
-                           SerieEpisode.episode_number)
+                           SerieEpisode.episode_number, SerieEpisode.name)
                     .where(SerieEpisode.serie_season_id.in_(batch))
                     .order_by(SerieEpisode.episode_number))).all():
                 episodes_by_season.setdefault(season_id, []).append(
-                    (episode_id, episode_number))
+                    (episode_id, episode_number, episode_name))
         series_by_id = {row.id: row for row in visible_series}
-        for playlist_id, season_id, season_number in seasons:
+        season_names: dict[tuple[int, int], str] = {}
+        for playlist_id, _season_id, season_number, season_name in seasons:
+            display = (season_name or "").strip() or f"Season {season_number}"
+            season_names.setdefault((playlist_id, season_number), display)
+        for playlist_id, season_id, season_number, _season_name in seasons:
             row = series_by_id.get(playlist_id)
             if row is None:
                 continue
-            for episode_id, episode_number in episodes_by_season.get(season_id, ()):
+            show_name = best_title(row.custom_name)
+            season_name = season_names[(playlist_id, season_number)]
+            for episode_id, episode_number, episode_name in episodes_by_season.get(
+                    season_id, ()):
                 items.append({"kind": "episode", "id": episode_id,
-                              "name": f"{best_title(row.custom_name)} "
+                              "name": f"{show_name} "
                                       f"S{season_number:02d}E{episode_number:02d}",
                               "group": "Series: " + effective_group(
                                   "series", row.group_name),
-                              "logo": row.poster or row.logo or ""})
+                              "logo": row.poster or row.logo or "",
+                              "series_id": row.id,
+                              "series_name": show_name,
+                              "series_order": row.order,
+                              "season_id": season_id,
+                              "season_number": season_number,
+                              "season_name": season_name,
+                              "episode_number": episode_number,
+                              "episode_name": (episode_name or "").strip()
+                                              or f"Episode {episode_number}",
+                              "series_season_key": f"series:{row.id}:season:{season_number}",
+                              "series_season_name": f"{show_name} - {season_name}"})
 
         files: dict[int, LocalFile] = {}
         for batch in _chunked([row.local_file_id for row in visible_local
