@@ -9,7 +9,8 @@
       </div>
       <div class="card-body p-2" id="e2-list"></div>
       <div class="card-footer small text-muted" data-help="Receiver profiles">
-        A profile turns the playlist into Enigma2 <code>userbouquet.*.tv</code> files.
+        A profile turns the playlist into Enigma2 <code>userbouquet.*.tv</code>
+        files; nested Show-Season children use <code>subbouquet.*.tv</code>.
         VOD &amp; series get <b>subtitles</b> only when their player is
         <b>5002</b> (ServiceApp/exteplayer3) and the container is <b>mkv</b>.
       </div>
@@ -33,7 +34,7 @@
             <input class="form-control form-control-sm e2-field" id="f-name"></div>
           <div class="col-md-3"><label class="muted-label" title="Whose credentials and group whitelist the generated URLs carry">Output user</label>
             <select class="form-select form-select-sm e2-field" id="f-user_id"></select></div>
-          <div class="col-md-2"><label class="muted-label" title="File names: userbouquet.<prefix>_live_news.tv">Bouquet prefix</label>
+          <div class="col-md-2"><label class="muted-label" title="File names: userbouquet.<prefix>_live_news.tv; nested seasons use subbouquet.<prefix>_*.tv">Bouquet prefix</label>
             <input class="form-control form-control-sm mono e2-field" id="f-bouquet_prefix" value="spm"></div>
           <div class="col-md-2"><label class="muted-label" title="Split a bouquet into numbered parts above this many services - Enigma2 redraws the whole list on every zap">Max per bouquet</label>
             <input class="form-control form-control-sm e2-field" type="number" min="50" id="f-max_entries" value="1500"></div>

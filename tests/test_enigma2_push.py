@@ -8,7 +8,7 @@ that behaves like the vsftpd an OpenPLi image ships:
 
   * nothing is ever written in place - upload beside the target, then rename;
   * the box's own `bouquets.tv` becomes a restore point before we touch it;
-  * only `userbouquet.<prefix>_*.tv` may be deleted - a satellite bouquet a
+  * only SPM `userbouquet`/`subbouquet.<prefix>_*.tv` files may be deleted - a satellite bouquet a
     user spent an evening sorting is not ours to remove;
   * a dry run writes nothing at all.
 """
@@ -150,8 +150,8 @@ def _bundle(*names: str) -> e2.Bundle:
 def _hierarchy_bundle() -> e2.Bundle:
     """One registered Series root plus two generated, unregistered children."""
     root_name = "userbouquet.spm_series.tv"
-    child_names = ("userbouquet.spm_series_1_s01.tv",
-                   "userbouquet.spm_series_1_s02.tv")
+    child_names = ("subbouquet.spm_series_1_s01.tv",
+                   "subbouquet.spm_series_1_s02.tv")
     b = e2.Bundle()
     b.files.append(e2.BouquetFile(
         name=root_name, title="SPM - Series", links=len(child_names),
@@ -179,28 +179,44 @@ async def test_push_uploads_the_bouquets_and_merges_the_index():
 
 
 async def test_push_uploads_child_bouquets_but_registers_only_the_root():
+    # Simulate the previous, buggy release: Enigma2 found this nested child
+    # as an unlinked userbouquet, promoted it into bouquets.tv, and left the
+    # old file on the box. The next push must migrate it away.
+    old_child = "userbouquet.spm_series_1_s01.tv"
+    FakeFTP.files[old_child] = "#NAME Show - Season 1\n"
+    FakeFTP.files["subbouquet.spm_old.tv"] = "#NAME Old nested bouquet\n"
+    FakeFTP.files["subbouquet.foreign.tv"] = "#NAME Foreign nested bouquet\n"
+    FakeFTP.files["bouquets.tv"] += (
+        '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET '
+        f'"{old_child}" ORDER BY bouquet\n')
+
     rep = await push.push_bundle(_profile(), _hierarchy_bundle())
     assert rep.ok and not rep.error
     assert FakeFTP.files["userbouquet.spm_series.tv"].count("#SERVICE 1:7:") == 2
-    assert FakeFTP.files["userbouquet.spm_series_1_s01.tv"].startswith(
+    assert FakeFTP.files["subbouquet.spm_series_1_s01.tv"].startswith(
         "#NAME Show - Season 1")
-    assert FakeFTP.files["userbouquet.spm_series_1_s02.tv"].startswith(
+    assert FakeFTP.files["subbouquet.spm_series_1_s02.tv"].startswith(
         "#NAME Show - Season 2")
+    assert old_child not in FakeFTP.files
+    assert "subbouquet.spm_old.tv" not in FakeFTP.files
+    assert "subbouquet.foreign.tv" in FakeFTP.files
+    assert {old_child, "subbouquet.spm_old.tv"} <= set(rep.removed)
 
     tv = FakeFTP.files["bouquets.tv"]
     assert 'userbouquet.spm_series.tv" ORDER BY bouquet' in tv
-    assert "userbouquet.spm_series_1_s01.tv" not in tv
-    assert "userbouquet.spm_series_1_s02.tv" not in tv
+    assert old_child not in tv
+    assert "subbouquet.spm_series_1_s01.tv" not in tv
+    assert "subbouquet.spm_series_1_s02.tv" not in tv
 
     add = FakeFTP.files["bouquets.spm.add"]
     assert add.count("FROM BOUQUET") == 1
     assert 'FROM BOUQUET "userbouquet.spm_series.tv"' in add
-    assert "userbouquet.spm_series_1_s01.tv" not in add
-    assert "userbouquet.spm_series_1_s02.tv" not in add
+    assert "subbouquet.spm_series_1_s01.tv" not in add
+    assert "subbouquet.spm_series_1_s02.tv" not in add
     assert set(rep.uploaded) == {
         "userbouquet.spm_series.tv",
-        "userbouquet.spm_series_1_s01.tv",
-        "userbouquet.spm_series_1_s02.tv",
+        "subbouquet.spm_series_1_s01.tv",
+        "subbouquet.spm_series_1_s02.tv",
     }
 
 
@@ -288,7 +304,7 @@ async def test_a_child_only_bundle_is_refused_before_writing():
     on the receiver, so an orphan-only bundle must be treated like no push."""
     before = dict(FakeFTP.files)
     rep = await push.push_bundle(_profile(), e2.Bundle(files=[
-        e2.BouquetFile(name="userbouquet.spm_series_1_s01.tv",
+        e2.BouquetFile(name="subbouquet.spm_series_1_s01.tv",
                        title="Show - Season 1", services=2, top_level=False,
                        lines=["#SERVICE 5002:0:1:1:0:0:0:0:0:0:http%3a//nas/x:S01E01",
                               "#DESCRIPTION S01E01"]),
@@ -341,11 +357,12 @@ async def test_test_connection_reports_the_box_without_writing():
 
 async def test_restore_puts_the_backup_back_and_drops_our_bouquets():
     prof = _profile()
-    await push.push_bundle(prof, _bundle())
+    await push.push_bundle(prof, _hierarchy_bundle())
     rep = await push.restore(prof)
     assert rep.ok
     assert FakeFTP.files["bouquets.tv"] == FOREIGN_TV
-    assert not [n for n in FakeFTP.files if n.startswith("userbouquet.spm_")]
+    assert not [n for n in FakeFTP.files
+                if n.startswith(("userbouquet.spm_", "subbouquet.spm_"))]
     assert "userbouquet.favourites.tv" in FakeFTP.files
 
 

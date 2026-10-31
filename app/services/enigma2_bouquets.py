@@ -111,8 +111,34 @@ def clean_name(name: str) -> str:
     return out or "Unnamed"
 
 
-def bouquet_filename(prefix: str, slug: str) -> str:
-    return f"userbouquet.{slugify(prefix)}_{slugify(slug)}.tv"
+def bouquet_filename(prefix: str, slug: str, *, top_level: bool = True) -> str:
+    """Filename for one generated bouquet file.
+
+    Top-level bouquets use Enigma2's `userbouquet.` namespace. Nested
+    children deliberately use `subbouquet.`: when Enigma2 loads
+    `bouquets.tv`, it scans the directory for `userbouquet*.tv` files and,
+    with "load unlinked userbouquets" enabled, promotes every file not
+    directly referenced by `bouquets.tv` into the main bouquet list. That
+    scan does not treat a file linked only from another bouquet as linked,
+    so a nested `userbouquet.*` child is shown both under its parent and at
+    top level (or renamed `.del` when unlinked loading is off). The
+    `subbouquet.` namespace is the receiver's convention for files that
+    exist only as bouquet links.
+    """
+    namespace = "userbouquet" if top_level else "subbouquet"
+    return f"{namespace}.{slugify(prefix)}_{slugify(slug)}.tv"
+
+
+def bouquet_file_prefixes(prefix: str) -> tuple[str, str]:
+    """Filename prefixes SPM may create/delete for one bouquet prefix."""
+    pfx = slugify(prefix)
+    return (f"userbouquet.{pfx}_", f"subbouquet.{pfx}_")
+
+
+def is_our_bouquet_file(filename: str, prefix: str) -> bool:
+    """Whether `filename` is an SPM top-level or nested bouquet file."""
+    return filename.endswith(".tv") and \
+        filename.startswith(bouquet_file_prefixes(prefix))
 
 
 def slugify(text: str) -> str:
@@ -247,7 +273,7 @@ class _Resolver:
 
 @dataclass
 class BouquetFile:
-    name: str                       # userbouquet.spm_live.tv
+    name: str                       # userbouquet.spm_live.tv / subbouquet.spm_*.tv
     title: str                      # #NAME value, as shown in the box
     lines: list[str] = field(default_factory=list)
     services: int = 0
@@ -325,8 +351,10 @@ class _Writer:
         n = len(self.files) + 1
         suffix = "" if n == 1 else f"_{n}"
         title = self.title if n == 1 else f"{self.title} ({n})"
-        self.cur = BouquetFile(name=bouquet_filename(self.prefix, self.slug + suffix),
-                               title=title, top_level=self.top_level)
+        self.cur = BouquetFile(
+            name=bouquet_filename(self.prefix, self.slug + suffix,
+                                  top_level=self.top_level),
+            title=title, top_level=self.top_level)
         self.files.append(self.cur)
 
     def marker(self, label: str) -> None:
@@ -716,13 +744,17 @@ def merge_bouquets_tv(existing: str, filenames: list[str], prefix: str) -> str:
     """Put our bouquets into the receiver's `bouquets.tv` without touching the
     user's own.
 
-    Idempotent by construction: every line referencing a `userbouquet.<prefix>_*`
-    file is removed first (including files we no longer generate), then the
-    current set is appended in order. Satellite bouquets, favourites and any
-    other IPTV bouquet keep their position.
+    Idempotent by construction: every line referencing an SPM
+    `userbouquet.<prefix>_*` or nested `subbouquet.<prefix>_*` file is removed
+    first (including files we no longer generate and old child entries a
+    receiver may have promoted into the index), then the current top-level
+    set is appended in order. Satellite bouquets, favourites and any other
+    IPTV bouquet keep their position.
     """
     header = "#NAME Bouquets (TV)"
-    ours = re.compile(rf'FROM BOUQUET "userbouquet\.{re.escape(slugify(prefix))}_[^"]*"')
+    ours = re.compile(
+        rf'FROM BOUQUET "(?:userbouquet|subbouquet)\.'
+        rf'{re.escape(slugify(prefix))}_[^"]*"')
     kept = [ln for ln in (existing or "").splitlines()
             if ln.strip() and not ln.startswith("#NAME") and not ours.search(ln)]
     lines = [header, *kept, *[_BOUQUET_LINE.format(file=f) for f in filenames]]
@@ -766,10 +798,14 @@ tar xzf "$TMP/bouquets.tar.gz" -C "$TMP"
 echo "* backing up $DIR/{BOUQUETS_TV}"
 cp "$DIR/{BOUQUETS_TV}" "$DIR/{BOUQUETS_TV}.spm-backup" 2>/dev/null || true
 echo "* removing bouquets from a previous run"
-rm -f "$DIR"/userbouquet.{pfx}_*.tv
-cp "$TMP"/userbouquet.*.tv "$DIR"/
+rm -f "$DIR"/userbouquet.{pfx}_*.tv "$DIR"/subbouquet.{pfx}_*.tv
+for f in "$TMP"/userbouquet.*.tv "$TMP"/subbouquet.*.tv; do
+  if [ -e "$f" ]; then
+    cp "$f" "$DIR"/
+  fi
+done
 echo "* merging {BOUQUETS_TV}"
-grep -v 'userbouquet\.{pfx}_' "$DIR/{BOUQUETS_TV}" > "$TMP/{BOUQUETS_TV}" 2>/dev/null || \
+grep -v -e 'userbouquet\.{pfx}_' -e 'subbouquet\\.{pfx}_' "$DIR/{BOUQUETS_TV}" > "$TMP/{BOUQUETS_TV}" 2>/dev/null || \
   echo '#NAME Bouquets (TV)' > "$TMP/{BOUQUETS_TV}"
 cat "$TMP/{BOUQUET_ADD_FILE}" >> "$TMP/{BOUQUETS_TV}"
 cp "$TMP/{BOUQUETS_TV}" "$DIR/{BOUQUETS_TV}"
@@ -784,7 +820,8 @@ echo "done - {BOUQUETS_TV} backup: $DIR/{BOUQUETS_TV}.spm-backup"
 def tarball_bytes(bundle: Bundle, prefix: str = "spm") -> bytes:
     """The bundle as a .tar.gz the receiver can unpack.
 
-    Contents: every `userbouquet.*.tv`, plus `bouquets.spm.add` (the index
+    Contents: every generated bouquet file (`userbouquet.*.tv` at top level
+    and nested `subbouquet.*.tv`), plus `bouquets.spm.add` (the index
     lines the installer merges into the box's own `bouquets.tv`) and a copy of
     the installer for people who unpack it by hand.
     """
