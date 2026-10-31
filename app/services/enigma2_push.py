@@ -22,9 +22,9 @@ that boots into an empty channel list:
   previous one. One is deliberate: it is the last known-good state, and a pile
   of dated backups on a 512 MB flash is its own kind of failure. `restore()`
   puts it back and reloads.
-* **only our own files are ever deleted.** `userbouquet.<prefix>_*.tv` and
-  nothing else; foreign bouquets (satellite, favourites, other tools) are
-  preserved by `merge_bouquets_tv`.
+* **only our own files are ever deleted.** `userbouquet.<prefix>_*.tv`,
+  nested `subbouquet.<prefix>_*.tv`, and nothing else; foreign bouquets
+  (satellite, favourites, other tools) are preserved by `merge_bouquets_tv`.
 * **dry run first.** Every push can be planned without a single write, and the
   GUI shows what would happen.
 
@@ -41,7 +41,7 @@ import io
 from dataclasses import dataclass, field
 
 from .enigma2_bouquets import (BOUQUETS_TV, Bundle, E2_DIR, bouquets_add_file,
-                               merge_bouquets_tv, slugify)
+                               is_our_bouquet_file, merge_bouquets_tv, slugify)
 
 # how the OpenWebif call authenticates - selectable per profile, because an
 # out-of-the-box OpenPLi answers without any auth while a box whose web
@@ -295,7 +295,8 @@ async def test_connection(profile) -> Report:
         return rep
 
     rep.step("FTP login", True, welcome or f"{profile.host}:{profile.ftp_port}")
-    ours = [n for n in names if n.startswith(f"userbouquet.{slugify(profile.bouquet_prefix)}_")]
+    ours = [n for n in names
+            if is_our_bouquet_file(n, profile.bouquet_prefix)]
     rep.step(f"{E2_DIR} readable", True,
              f"{len(names)} files, {len(ours)} from a previous SPM push")
     rep.step(f"{BOUQUETS_TV} present", has_tv,
@@ -340,8 +341,8 @@ async def push_bundle(profile, bundle: Bundle, *, dry_run: bool = False) -> Repo
             names = ftp.listdir()
             existing_tv = ftp.read(BOUQUETS_TV)
             stale = sorted(n for n in names
-                           if n.startswith(f"userbouquet.{prefix}_")
-                           and n.endswith(".tv") and n not in wanted)
+                           if is_our_bouquet_file(n, prefix)
+                           and n not in wanted)
             merged = merge_bouquets_tv(existing_tv or "",
                                        bundle.top_level_names, prefix)
 
@@ -429,7 +430,7 @@ async def restore(profile) -> Report:
             ftp.write_atomic(BOUQUETS_TV, merge_bouquets_tv(backup, [], prefix))
             rep.step("restore", True, f"{BOUQUETS_TV} from {BACKUP_SUFFIX[1:]}")
             for name in sorted(n for n in ftp.listdir()
-                               if n.startswith(f"userbouquet.{prefix}_") and n.endswith(".tv")):
+                               if is_our_bouquet_file(n, prefix)):
                 ftp.delete(name)
                 rep.removed.append(name)
             rep.step("remove SPM bouquets", True,

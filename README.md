@@ -735,7 +735,7 @@ Note that a proxied stream is a live pipe: there is no HTTP Range, so **no seeki
 
 ### Enigma2 receivers: generated bouquets (the *Enigma2* tab)
 
-An Enigma2 box reads plain-text bouquet files, so SPM writes them. A **receiver profile** (Enigma2 tab) turns the playlist into `userbouquet.<prefix>_*.tv` files and decides, per content kind:
+An Enigma2 box reads plain-text bouquet files, so SPM writes them. A **receiver profile** (Enigma2 tab) turns the playlist into `userbouquet.<prefix>_*.tv` files (with nested `subbouquet.<prefix>_*.tv` children for the `season_bouquets` layout) and decides, per content kind:
 
 | Setting | Meaning |
 |---|---|
@@ -748,11 +748,15 @@ An Enigma2 box reads plain-text bouquet files, so SPM writes them. A **receiver 
 
 With `season_bouquets`, SPM uploads and packs every generated child file but
 registers only the top-level bouquets in `bouquets.tv`; the preview therefore
-distinguishes visible top-level bouquets from all generated files. Duplicate
-fallback season rows with the same displayed season number are merged into one
-Show-Season folder. The receiver's own channel list opens nested bouquets,
-but some OpenWebif/API views do not expand them. M3U Series groups and the
-Xtream series-info API are unchanged.
+distinguishes visible top-level bouquets from all generated files. Season
+children are deliberately named `subbouquet.<prefix>_*.tv`, not
+`userbouquet.<prefix>_*.tv`: Enigma2's *load unlinked userbouquets* scan does
+not treat a file linked only from the Series root as linked, so a
+`userbouquet.*` child would also be promoted into the receiver's main bouquet
+list. Duplicate fallback season rows with the same displayed season number
+are merged into one Show-Season folder. The receiver's own channel list opens
+nested bouquets, but some OpenWebif/API views do not expand them. M3U Series
+groups and the Xtream series-info API are unchanged.
 
 Defaults are the Vu+ Duo2 recipe: live = `4097` + `.ts`, VOD and series = **`5002` + `.mkv`** so the copied SRT/ASS tracks actually reach the box.
 
@@ -785,7 +789,7 @@ Three safety rules are built into the push, because a half-written `bouquets.tv`
 
 1. **Nothing is written in place.** Every file goes to a temporary name *in the same directory* and is then `RNFR`/`RNTO`'d over the target — a rename inside one directory is atomic, so enigma2 always reads either the old file or the new one. (Uploading to `/tmp` and renaming across would fail: `/tmp` is tmpfs, `/etc/enigma2` is flash, and `rename(2)` cannot cross filesystems.)
 2. **One restore point, always.** The box's `bouquets.tv` is copied to `bouquets.tv.spm-backup` before anything changes, every push, overwriting the previous one — the last known-good state, without a pile of dated files on a 512 MB flash.
-3. **Only our own files are deleted.** `userbouquet.<prefix>_*.tv` and nothing else; your satellite bouquets and favourites are merged back into `bouquets.tv` untouched, and a profile that renders *no* services refuses to push instead of clearing the box.
+3. **Only our own files are deleted.** `userbouquet.<prefix>_*.tv`, nested `subbouquet.<prefix>_*.tv`, and nothing else; your satellite bouquets and favourites are merged back into `bouquets.tv` untouched, and a profile that renders *no* services refuses to push instead of clearing the box.
 
 Then SPM calls **`GET /api/servicelistreload?mode=2`** — bouquets only; modes 0/1 would also re-read `lamedb` and throw away the tuner's service cache for a change that never touched it. *Web interface auth* is per profile: `none` (a stock OpenPLi answers its API without credentials) or `basic` with the user/password you set on the box. A failed reload is a warning, not a failed push — the files are already there, and the box menu can reload them.
 
@@ -795,7 +799,7 @@ Then SPM calls **`GET /api/servicelistreload?mode=2`** — bouquets only; modes 
 wget -qO- http://nas:8880/enigma2/<token>/install.sh | sh
 ```
 
-It downloads the tarball, backs `bouquets.tv` up, **merges** our entries into it (`grep -v userbouquet.<prefix>_` — your satellite bouquets and favourites are kept), copies the files into `/etc/enigma2` and reloads the service list via OpenWebif (`/api/servicelistreload?mode=2`). Re-run it (or put it in cron) after changing the playlist. *Download .tar.gz* gives you the same files by hand, and *rotate token* invalidates the old URLs. Pull needs nothing configured on the SPM side, which makes it the fallback when the box's FTP is disabled.
+It downloads the tarball, backs `bouquets.tv` up, **merges** our entries into it (`grep -v` for both SPM `userbouquet.<prefix>_` and nested `subbouquet.<prefix>_` lines — your satellite bouquets and favourites are kept), copies the files into `/etc/enigma2` and reloads the service list via OpenWebif (`/api/servicelistreload?mode=2`). Re-run it (or put it in cron) after changing the playlist. *Download .tar.gz* gives you the same files by hand, and *rotate token* invalidates the old URLs. Pull needs nothing configured on the SPM side, which makes it the fallback when the box's FTP is disabled.
 
 Service references use the SPM playlist id as the SID (`4097:0:1:2A:…`), so regenerating a bouquet does not renumber anything — the box's own favourites, picon names and the (later) EPG channel map keep pointing at the same services.
 

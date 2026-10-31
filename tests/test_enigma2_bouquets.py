@@ -76,17 +76,37 @@ def test_stream_url_picks_the_alias_and_the_mode():
     assert e2.stream_url(NAS, "live", 7, "ts", None) == f"{NAS}/play/live/7.ts"
 
 
+def test_nested_bouquets_use_the_subbouquet_namespace():
+    """A nested child must not be named `userbouquet.*.tv`: Enigma2's
+    load-unlinked-userbouquets scan only sees direct `bouquets.tv` links, so
+    it would promote a Show-Season child into the main list as well."""
+    assert e2.bouquet_filename("spm", "live_news") == \
+        "userbouquet.spm_live_news.tv"
+    assert e2.bouquet_filename("spm", "series_1_s01", top_level=False) == \
+        "subbouquet.spm_series_1_s01.tv"
+    assert e2.is_our_bouquet_file("userbouquet.spm_series.tv", "spm")
+    assert e2.is_our_bouquet_file("subbouquet.spm_series_1_s01.tv", "spm")
+    assert not e2.is_our_bouquet_file("subbouquet.foreign.tv", "spm")
+    assert not e2.is_our_bouquet_file("subbouquet.spm_series_1_s01.tv.del", "spm")
+
+
 def test_bouquets_tv_merge_is_idempotent_and_keeps_foreign_lines():
     existing = "\n".join([
         "#NAME Bouquets (TV)",
         '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.favourites.tv" ORDER BY bouquet',
         '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.spm_live_old.tv" ORDER BY bouquet',
+        '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.spm_series_1_s01.tv" ORDER BY bouquet',
+        '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "subbouquet.spm_series_1_s01.tv" ORDER BY bouquet',
+        '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "subbouquet.foreign.tv" ORDER BY bouquet',
         '#SERVICE 1:7:1:0:0:0:0:0:0:0:FROM BOUQUET "userbouquet.sat_de.tv" ORDER BY bouquet',
     ])
     out = e2.merge_bouquets_tv(existing, ["userbouquet.spm_live_news.tv"], "spm")
     assert out.splitlines()[0] == "#NAME Bouquets (TV)"
     assert "userbouquet.favourites.tv" in out and "userbouquet.sat_de.tv" in out
+    assert "subbouquet.foreign.tv" in out
     assert "userbouquet.spm_live_old.tv" not in out          # stale ours: gone
+    assert "userbouquet.spm_series_1_s01.tv" not in out      # old promoted child
+    assert "subbouquet.spm_series_1_s01.tv" not in out       # nested: not indexed
     assert "userbouquet.spm_live_news.tv" in out
     # running it again changes nothing
     assert e2.merge_bouquets_tv(out, ["userbouquet.spm_live_news.tv"], "spm") == out
@@ -234,6 +254,10 @@ async def test_season_bouquets_layout_nests_show_seasons_under_one_series_root()
     children = bundle.child_files
     assert root.title == "SPM - Series"
     assert root.top_level and root.services == 0 and root.links == 2
+    assert [f.name for f in children] == [
+        "subbouquet.spm_series_1_s01.tv",
+        "subbouquet.spm_series_1_s02.tv",
+    ]
     assert [f.title for f in children] == ["Show - Season 1", "Show - Season 2"]
     assert [f.services for f in children] == [2, 2]
     assert all(not f.top_level for f in children)
@@ -441,7 +465,9 @@ async def test_tarball_carries_the_files_and_the_index_lines():
 def test_installer_merges_instead_of_overwriting_bouquets_tv():
     sh = e2.install_script(NAS, "tok", "spm")
     assert "bouquets.tv.spm-backup" in sh                      # backup first
-    assert "grep -v 'userbouquet\\.spm_'" in sh                # keep foreign lines
+    assert "grep -v -e 'userbouquet\\.spm_' -e 'subbouquet\\.spm_'" in sh
+    assert 'rm -f "$DIR"/userbouquet.spm_*.tv "$DIR"/subbouquet.spm_*.tv' in sh
+    assert '"$TMP"/subbouquet.*.tv' in sh                    # copy nested files
     assert "servicelistreload?mode=2" in sh                    # reload at the end
     assert f"{NAS}/enigma2/tok/bouquets.tar.gz" in sh
 
